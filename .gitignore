@@ -1,0 +1,26 @@
+# Build artifacts
+seeds/esp32/.pio/
+firmware/esp32-node/.pio/
+*.o
+*.d
+*.a
+*.elf
+*.map
+*.bin
+
+# Compiled binaries
+seed
+
+# WiFi credentials
+seeds/esp32/data/wifi.json
+
+# Python
+__pycache__/
+*.pyc
+
+# OS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
