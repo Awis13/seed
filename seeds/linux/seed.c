@@ -541,6 +541,7 @@ static int health_check(int port) {
 #include "skills/exec.c"
 #include "skills/fs.c"
 #include "skills/net.c"
+#include "skills/notes.c"
 
 static void skills_init(void) {
     sysmon_init();
@@ -548,6 +549,7 @@ static void skills_init(void) {
     exec_init();
     fs_init();
     net_init();
+    notes_init();
 }
 
 /* ===== Request handler ===== */
@@ -801,7 +803,7 @@ static void handle(int fd, const char *ip) {
         event_add("firmware apply: new binary installed, restarting");
 
         json_resp(fd, 200, "OK",
-            "{\"ok\":true,\"warning\":\"restarting with watchdog, 30s grace period\"}");
+            "{\"ok\":true,\"warning\":\"restarting with watchdog, 45s grace period\"}");
 
         /* Fork watchdog */
         pid_t pid = fork();
@@ -830,7 +832,7 @@ static void handle(int fd, const char *ip) {
                 }
             }
 
-            sleep(30);
+            sleep(45);
 
             /* Health check (raw socket, no curl dependency) */
             int check = health_check(g_port);
@@ -926,6 +928,8 @@ static void handle(int fd, const char *ip) {
             "Hardware node accessible via HTTP. "
             "This is a **seed** — a minimal firmware that you can grow "
             "by uploading new C source code.\n\n"
+            "> **FIRST:** Run `GET /notes` — previous agents may have left "
+            "tasks, findings, or warnings for you.\n\n"
             "## Connection\n\n"
             "```\n"
             "Host: %s:%d\n"
