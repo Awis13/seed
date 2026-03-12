@@ -9,18 +9,21 @@
  * The seed grows into a full-featured mesh node.
  *
  * Endpoints:
- *   GET  /health             — always public, watchdog probe
- *   GET  /capabilities       — node capabilities
- *   GET  /config.md          — node config (markdown)
- *   POST /config.md          — write config
- *   GET  /events             — event log (?since=UNIX_TS)
- *   GET  /firmware/version   — version, build date, uptime
- *   GET  /firmware/source    — read source code
- *   POST /firmware/source    — upload new source code
- *   POST /firmware/build     — compile
- *   GET  /firmware/build/logs — compilation log
- *   POST /firmware/apply     — apply with watchdog + rollback
- *   GET  /skill              — markdown skill file for AI agents
+ *   GET  /health               — always public, watchdog probe
+ *   GET  /capabilities         — node capabilities
+ *   GET  /config.md            — node config (markdown)
+ *   POST /config.md            — write config
+ *   GET  /events               — event log (?since=UNIX_TS)
+ *   GET  /firmware/version     — version, build date, uptime
+ *   GET  /firmware/source      — read source code
+ *   POST /firmware/source      — upload new source code
+ *   POST /firmware/build       — compile
+ *   GET  /firmware/build/logs  — compilation log
+ *   POST /firmware/apply       — apply with watchdog + rollback
+ *   GET  /firmware/apply/status — watchdog progress
+ *   POST /firmware/rollback    — manual rollback to backup
+ *   POST /firmware/apply/reset — unlock after 3 failures
+ *   GET  /skill                — markdown skill file for AI agents
  */
 
 #define _GNU_SOURCE
@@ -34,6 +37,7 @@
 #include <errno.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <ifaddrs.h>
@@ -80,13 +84,13 @@ static void apply_failures_write(int n) {
 }
 static void apply_failures_reset(void) { unlink(FAIL_COUNT_FILE); }
 
-/* Constant-time token comparison — prevents timing side-channel */
-static int token_compare(const char *a, const char *b) {
-    size_t la = strlen(a), lb = strlen(b);
-    size_t len = la < lb ? la : lb;
-    volatile unsigned char result = (la != lb);
-    for (size_t i = 0; i < len; i++)
-        result |= (unsigned char)a[i] ^ (unsigned char)b[i];
+/* Constant-time token comparison — always iterates full token length.
+ * Token is 32 hex chars (16 bytes from /dev/urandom). We compare exactly
+ * 64 bytes to avoid leaking length via timing. Both buffers are char[65]. */
+static int token_compare(const char *submitted, const char *stored) {
+    volatile unsigned char result = 0;
+    for (int i = 0; i < 64; i++)
+        result |= (unsigned char)submitted[i] ^ (unsigned char)stored[i];
     return result == 0;
 }
 
@@ -114,7 +118,7 @@ static int rate_limit_check(const char *ip) {
     return 1; /* unknown IP, allow */
 }
 
-static void rate_limit_fail(const char *ip) {
+static int rate_limit_fail(const char *ip) {
     time_t now = time(NULL);
     int oldest = 0;
     time_t oldest_time = now + 1;
@@ -126,7 +130,7 @@ static void rate_limit_fail(const char *ip) {
             } else {
                 g_rate_limit[i].count++;
             }
-            return;
+            return g_rate_limit[i].count;
         }
         if (g_rate_limit[i].first_fail < oldest_time) {
             oldest_time = g_rate_limit[i].first_fail;
@@ -138,6 +142,30 @@ static void rate_limit_fail(const char *ip) {
     g_rate_limit[oldest].ip[63] = '\0';
     g_rate_limit[oldest].first_fail = now;
     g_rate_limit[oldest].count = 1;
+    return 1;
+}
+
+/* Clear rate limit on successful auth */
+static void rate_limit_clear(const char *ip) {
+    for (int i = 0; i < RATE_LIMIT_IPS; i++) {
+        if (strcmp(g_rate_limit[i].ip, ip) == 0) {
+            g_rate_limit[i].count = 0;
+            return;
+        }
+    }
+}
+
+/* Direct file copy — no shell involvement, avoids PATH manipulation risks */
+static int copy_file(const char *src, const char *dst) {
+    int sfd = open(src, O_RDONLY);
+    if (sfd < 0) return -1;
+    int dfd = open(dst, O_WRONLY | O_CREAT | O_TRUNC, 0755);
+    if (dfd < 0) { close(sfd); return -1; }
+    char buf[4096]; ssize_t n;
+    while ((n = read(sfd, buf, sizeof(buf))) > 0)
+        if (write(dfd, buf, n) != n) { close(sfd); close(dfd); return -1; }
+    close(sfd); close(dfd);
+    return 0;
 }
 
 /* Apply status: written by watchdog, read by /firmware/apply/status */
@@ -662,13 +690,13 @@ static void handle(int fd, const char *ip) {
             event_add("auth rate-limited %s", ip);
             goto done;
         }
-        rate_limit_fail(ip);
+        int fails = rate_limit_fail(ip);
         json_resp(fd, 401, "Unauthorized",
             "{\"error\":\"Authorization: Bearer <token> required\"}");
-        event_add("auth fail from %s (%d/%d)", ip,
-            g_rate_limit[0].count, RATE_LIMIT_MAX);
+        event_add("auth fail from %s (%d/%d)", ip, fails, RATE_LIMIT_MAX);
         goto done;
     }
+    rate_limit_clear(ip);
 
     /* === GET /capabilities === */
     if (strcmp(req.path, "/capabilities") == 0 && strcmp(req.method, "GET") == 0) {
@@ -681,7 +709,8 @@ static void handle(int fd, const char *ip) {
             "\"/health\",\"/capabilities\",\"/config.md\",\"/events\","
             "\"/firmware/version\",\"/firmware/source\",\"/firmware/build\","
             "\"/firmware/build/logs\",\"/firmware/apply\","
-            "\"/firmware/rollback\",\"/firmware/apply/reset\",\"/skill\"");
+            "\"/firmware/apply/status\",\"/firmware/rollback\","
+            "\"/firmware/apply/reset\",\"/skill\"");
         /* Append skill endpoints */
         for (int si = 0; si < g_skill_count; si++) {
             const skill_endpoint_t *ep = g_skills[si]->endpoints;
@@ -953,9 +982,7 @@ static void handle(int fd, const char *ip) {
                 sleep(2);
 
                 /* Copy backup over failed binary */
-                char rb[256];
-                snprintf(rb, sizeof(rb), "cp %s %s", BINARY_BACKUP, BINARY_FILE);
-                system(rb);
+                copy_file(BINARY_BACKUP, BINARY_FILE);
 
                 /* ALWAYS restart after rollback */
                 if (has_systemd) {
@@ -995,9 +1022,7 @@ static void handle(int fd, const char *ip) {
         }
         if (pid < 0) {
             /* fork failed — rollback */
-            char rb[256];
-            snprintf(rb, sizeof(rb), "cp %s %s", BINARY_BACKUP, BINARY_FILE);
-            system(rb);
+            copy_file(BINARY_BACKUP, BINARY_FILE);
             event_add("apply: fork failed, rolled back");
         }
         goto done;
@@ -1028,9 +1053,7 @@ static void handle(int fd, const char *ip) {
             goto done;
         }
         /* Copy backup over current binary */
-        char cmd[256];
-        snprintf(cmd, sizeof(cmd), "cp %s %s", BINARY_BACKUP, BINARY_FILE);
-        if (system(cmd) != 0) {
+        if (copy_file(BINARY_BACKUP, BINARY_FILE) != 0) {
             json_resp(fd, 500, "Error",
                 "{\"ok\":false,\"error\":\"rollback copy failed\"}");
             goto done;

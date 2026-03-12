@@ -39,6 +39,8 @@ static const char *fs_describe(void) {
 /* Validate path: must be absolute, no .. traversal */
 static int fs_valid_path(const char *path) {
     if (!path || path[0] != '/') return 0;
+    if (strstr(path, "/../") || strstr(path, "/..") == path + strlen(path) - 3)
+        return 0;
     return 1;
 }
 
@@ -243,22 +245,25 @@ static int fs_handle_write(int fd, http_req_t *req) {
     if (p) {
         p = strchr(p + 6, ':');
         if (p) {
-            /* Parse as octal if starts with 0, decimal otherwise */
-            int v = atoi(p + 1);
-            if (v > 0) mode = v;
+            p++;
+            while (*p == ' ' || *p == '"') p++;
+            /* Always parse as octal — file modes are octal by convention */
+            int v = (int)strtol(p, NULL, 8);
+            if (v > 0 && v <= 07777) mode = v;
         }
     }
 
-    /* Create parent directories */
+    /* Create parent directories (no shell) */
     char dir[1024];
     strncpy(dir, path, sizeof(dir) - 1);
     dir[sizeof(dir) - 1] = '\0';
     char *slash = strrchr(dir, '/');
     if (slash && slash != dir) {
         *slash = '\0';
-        char mkdir_cmd[1100];
-        snprintf(mkdir_cmd, sizeof(mkdir_cmd), "mkdir -p '%s'", dir);
-        system(mkdir_cmd);
+        for (char *p2 = dir + 1; *p2; p2++) {
+            if (*p2 == '/') { *p2 = '\0'; mkdir(dir, 0755); *p2 = '/'; }
+        }
+        mkdir(dir, 0755);
     }
 
     FILE *fp = fopen(path, "w");
