@@ -66,6 +66,32 @@ static void event_add(const char *fmt, ...) {
     va_end(ap);
 }
 
+// ===== Skill/plugin interface =====
+
+struct SkillEndpoint {
+    const char *method;       // "GET", "POST"
+    const char *path;         // "/gpio/list"
+    const char *description;  // "List available GPIO pins"
+};
+
+struct Skill {
+    const char *name;         // "gpio"
+    const char *version;      // "0.1.0"
+    const char *(*describe)();                          // returns markdown
+    const SkillEndpoint *endpoints;                     // NULL-terminated array
+    void (*register_routes)(AsyncWebServer &server);    // registers routes on the server
+};
+
+#define MAX_SKILLS 16
+static const Skill *g_skills[MAX_SKILLS];
+static int g_skill_count = 0;
+
+static int skill_register(const Skill *skill) {
+    if (g_skill_count >= MAX_SKILLS) return -1;
+    g_skills[g_skill_count++] = skill;
+    return 0;
+}
+
 // ===== Hardware Probe (run once at boot, cached) =====
 
 // Known I2C device addresses
@@ -798,6 +824,12 @@ static void handle_capabilities(AsyncWebServerRequest *request) {
     };
     for (int i = 0; eps[i]; i++) ep.add(eps[i]);
 
+    // Skill endpoints
+    for (int i = 0; i < g_skill_count; i++) {
+        const SkillEndpoint *se = g_skills[i]->endpoints;
+        for (int j = 0; se[j].path; j++) ep.add(se[j].path);
+    }
+
     String response;
     serializeJson(doc, response);
     request->send(200, "application/json", response);
@@ -1123,6 +1155,21 @@ static void handle_skill(AsyncWebServerRequest *request) {
     s += "| GET | /lora/recv | Last received packets |\n";
     s += "| GET | /skill | This file |\n";
 
+    // Skill endpoints
+    for (int i = 0; i < g_skill_count; i++) {
+        const SkillEndpoint *se = g_skills[i]->endpoints;
+        for (int j = 0; se[j].path; j++) {
+            s += "| " + String(se[j].method) + " | " + String(se[j].path) +
+                 " | " + String(se[j].description) + " |\n";
+        }
+    }
+
+    // Skill descriptions
+    for (int i = 0; i < g_skill_count; i++) {
+        s += "\n";
+        s += g_skills[i]->describe();
+    }
+
     request->send(200, "text/markdown; charset=utf-8", s);
 }
 
@@ -1165,6 +1212,13 @@ static void handle_wifi_post(AsyncWebServerRequest *request) {
     WiFi.begin(wifi_ssid.c_str(), wifi_pass.c_str());
 }
 
+// ===== Skills =====
+#include "skills/gpio.cpp"
+
+static void skills_init() {
+    skill_gpio_init();
+}
+
 // ===== Routes =====
 
 static void setup_routes() {
@@ -1184,6 +1238,11 @@ static void setup_routes() {
     server.on("/skill", HTTP_GET, handle_skill);
     server.on("/", HTTP_GET, handle_wifi_page);
     server.on("/wifi/config", HTTP_POST, handle_wifi_post);
+
+    // Register skill routes
+    for (int i = 0; i < g_skill_count; i++) {
+        g_skills[i]->register_routes(server);
+    }
 }
 
 // ===== Main =====
@@ -1200,6 +1259,7 @@ void setup() {
     hw_probe();
     token_load();
     wifi_setup();
+    skills_init();
     setup_routes();
     server.begin();
 
