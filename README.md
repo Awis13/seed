@@ -16,7 +16,7 @@ gcc -O2 -o seed seed.c && ./seed
 An AI agent connects, reads the hardware, writes new firmware,
 compiles it on the device. The node grows into whatever it needs to be.
 
-10-second watchdog — bad firmware auto-reverts. The device is never bricked.
+Watchdog — bad firmware auto-reverts. The device is never bricked.
 
 ## How it works
 
@@ -31,7 +31,7 @@ seed (1000 lines)
   |  POST /firmware/build   ->  compiles on the device
   |  POST /firmware/apply   ->  atomic binary swap
   |
-  |  10s watchdog: health check fails -> auto-rollback
+  |  watchdog: health check fails -> auto-rollback
   |
   v
 Full node (whatever the AI wrote)
@@ -184,7 +184,7 @@ Token is generated on first run, printed in the banner, saved to disk.
 | POST | `/firmware/source` | Upload new source (C in request body) |
 | POST | `/firmware/build` | Compile on the device |
 | GET | `/firmware/build/logs` | Compiler output |
-| POST | `/firmware/apply` | Hot-swap binary + 10s watchdog rollback |
+| POST | `/firmware/apply` | Hot-swap binary + watchdog rollback |
 | POST | `/firmware/apply/reset` | Unlock apply after 3 consecutive failures |
 | GET | `/skill` | Generate AI agent skill file |
 
@@ -225,7 +225,7 @@ If it works on hardware from 1975, it works on everything.
 Seed runs on your hardware, on your network. No cloud, no phone-home.
 
 - **Auth token** — 32 random hex bytes from `/dev/urandom`
-- **Watchdog** — 10 seconds to pass health check, or auto-rollback
+- **Watchdog** — 120 seconds to pass health check, or auto-rollback
 - **Failure lock** — 3 failed applies -> locked until manual reset
 - **No shell injection** — all inputs validated
 - **Audit log** — every action logged to `/events` with timestamps
@@ -234,7 +234,7 @@ Seed runs on your hardware, on your network. No cloud, no phone-home.
 works whether the caller is an AI agent, a human with curl, or a CI/CD pipeline.
 Think OTA updates without the cloud — like balena, but 40KB and self-hosted.
 
-The watchdog ensures bad firmware is killed in 10 seconds.
+The watchdog ensures bad firmware is caught and rolled back automatically.
 Run seed on hardware you control, on networks you trust.
 
 ## Hardware

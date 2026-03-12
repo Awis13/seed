@@ -803,7 +803,7 @@ static void handle(int fd, const char *ip) {
         event_add("firmware apply: new binary installed, restarting");
 
         json_resp(fd, 200, "OK",
-            "{\"ok\":true,\"warning\":\"restarting with watchdog, 45s grace period\"}");
+            "{\"ok\":true,\"warning\":\"restarting with watchdog, 120s grace period\"}");
 
         /* Fork watchdog */
         pid_t pid = fork();
@@ -832,7 +832,7 @@ static void handle(int fd, const char *ip) {
                 }
             }
 
-            sleep(45);
+            sleep(120);
 
             /* Health check (raw socket, no curl dependency) */
             int check = health_check(g_port);
@@ -950,7 +950,7 @@ static void handle(int fd, const char *ip) {
             "| POST | /firmware/source | Upload new source (C code in body) |\n"
             "| POST | /firmware/build | Compile (gcc -O2) |\n"
             "| GET | /firmware/build/logs | Compilation output |\n"
-            "| POST | /firmware/apply | Apply + restart (10s watchdog, auto-rollback) |\n"
+            "| POST | /firmware/apply | Apply + restart (120s watchdog, auto-rollback) |\n"
             "| POST | /firmware/apply/reset | Unlock apply after 3 consecutive failures |\n"
             "| GET | /skill | This file |\n",
             hostname, my_ip, g_port, g_token, g_token);
@@ -989,7 +989,7 @@ static void handle(int fd, const char *ip) {
             "- **Token persists in %s.** Survives restarts. "
             "Don't regenerate unless the user asks.\n"
             "- **Firmware path: %s.** Build output: %s. "
-            "Apply does atomic rename + 10s watchdog.\n"
+            "Apply does atomic rename + 120s watchdog.\n"
             "- **If apply fails 3 times**, /firmware/apply locks. "
             "Unlock with POST /firmware/apply/reset.\n\n",
             TOKEN_FILE, BINARY_FILE, BINARY_NEW);
