@@ -59,6 +59,7 @@
 #define BUILD_LOG       INSTALL_DIR "/build.log"
 #define CONFIG_FILE     INSTALL_DIR "/config.md"
 #define FAIL_COUNT_FILE INSTALL_DIR "/apply_failures"
+#define APPLY_STATUS_FILE INSTALL_DIR "/apply_status"
 #define SERVICE_NAME    "seed"
 
 /* ===== Globals ===== */
@@ -78,6 +79,16 @@ static void apply_failures_write(int n) {
     if (fp) { fprintf(fp, "%d\n", n); fclose(fp); }
 }
 static void apply_failures_reset(void) { unlink(FAIL_COUNT_FILE); }
+
+/* Apply status: written by watchdog, read by /firmware/apply/status */
+static void apply_status_write(const char *status, const char *detail) {
+    FILE *fp = fopen(APPLY_STATUS_FILE, "w");
+    if (fp) {
+        fprintf(fp, "{\"state\":\"%s\",\"detail\":\"%s\",\"timestamp\":%ld}\n",
+                status, detail ? detail : "", (long)time(NULL));
+        fclose(fp);
+    }
+}
 
 /* ===== Events ring buffer ===== */
 typedef struct { time_t ts; char msg[EVENT_MSG_LEN]; } event_t;
@@ -807,6 +818,8 @@ static void handle(int fd, const char *ip) {
         json_resp(fd, 200, "OK",
             "{\"ok\":true,\"warning\":\"restarting with watchdog, 120s grace period\"}");
 
+        apply_status_write("restarting", "killing old process, starting new binary");
+
         /* Fork watchdog */
         pid_t pid = fork();
         if (pid == 0) {
@@ -817,12 +830,16 @@ static void handle(int fd, const char *ip) {
             /* Try systemctl first, fall back to fork+exec */
             int has_systemd = (system("systemctl is-active " SERVICE_NAME " >/dev/null 2>&1") == 0);
             if (has_systemd) {
+                apply_status_write("restarting", "systemctl restart");
                 system("systemctl restart " SERVICE_NAME);
             } else {
                 /* No systemd: kill parent, fork+exec new binary ourselves */
                 pid_t ppid = getppid();
                 kill(ppid, SIGTERM);
+                sleep(2);
+                kill(ppid, SIGKILL);  /* make sure it's dead */
                 sleep(1);
+                apply_status_write("restarting", "starting new binary (no systemd)");
                 /* Start new binary */
                 pid_t child = fork();
                 if (child == 0) {
@@ -834,25 +851,45 @@ static void handle(int fd, const char *ip) {
                 }
             }
 
-            sleep(120);
+            /* Health check with retries — Pi Zero needs time to boot */
+            apply_status_write("waiting", "health check retries every 10s for 120s");
+            int confirmed = 0;
+            for (int attempt = 1; attempt <= 12; attempt++) {
+                sleep(10);
+                int check = health_check(g_port);
+                if (check == 0) {
+                    confirmed = 1;
+                    fprintf(stderr, "[watchdog] health check OK on attempt %d/12\n", attempt);
+                    break;
+                }
+                fprintf(stderr, "[watchdog] health check attempt %d/12 failed, retrying...\n", attempt);
+                apply_status_write("waiting",
+                    attempt < 6 ? "health check retry, process may still be starting"
+                                : "health check retry, getting concerned");
+            }
 
-            /* Health check (raw socket, no curl dependency) */
-            int check = health_check(g_port);
-            if (check != 0) {
+            if (!confirmed) {
                 /* ROLLBACK */
                 int fails = apply_failures_read() + 1;
                 apply_failures_write(fails);
-                fprintf(stderr, "[watchdog] health check FAILED (%d/3), rolling back\n", fails);
+                fprintf(stderr, "[watchdog] all health checks FAILED (%d/3), rolling back\n", fails);
+                apply_status_write("rolling_back", "health check failed after 120s");
+
                 if (has_systemd) {
                     system("systemctl stop " SERVICE_NAME);
                 } else {
                     system("pkill -f " BINARY_FILE);
+                    sleep(1);
+                    system("pkill -9 -f " BINARY_FILE);  /* force kill */
                 }
                 sleep(2);
-                /* Copy backup over failed binary (process must be dead first) */
+
+                /* Copy backup over failed binary */
                 char rb[256];
                 snprintf(rb, sizeof(rb), "cp %s %s", BINARY_BACKUP, BINARY_FILE);
                 system(rb);
+
+                /* ALWAYS restart after rollback */
                 if (has_systemd) {
                     system("systemctl start " SERVICE_NAME);
                 } else {
@@ -864,11 +901,27 @@ static void handle(int fd, const char *ip) {
                         execl(BINARY_FILE, BINARY_FILE, port_str, (char *)NULL);
                         _exit(1);
                     }
+                    /* Wait for rollback binary to start, verify it's alive */
+                    sleep(15);
+                    if (health_check(g_port) != 0) {
+                        /* Last resort: try starting again */
+                        fprintf(stderr, "[watchdog] rollback binary not responding, retrying start\n");
+                        pid_t retry = fork();
+                        if (retry == 0) {
+                            setsid();
+                            char port_str[8];
+                            snprintf(port_str, sizeof(port_str), "%d", g_port);
+                            execl(BINARY_FILE, BINARY_FILE, port_str, (char *)NULL);
+                            _exit(1);
+                        }
+                    }
                 }
+                apply_status_write("rolled_back", "reverted to backup, process restarted");
             } else {
-                fprintf(stderr, "[watchdog] health check OK, new firmware confirmed\n");
+                fprintf(stderr, "[watchdog] new firmware confirmed\n");
                 apply_failures_reset();
                 unlink(BINARY_BACKUP);
+                apply_status_write("confirmed", "new firmware is healthy");
             }
             _exit(0);
         }
@@ -878,6 +931,21 @@ static void handle(int fd, const char *ip) {
             snprintf(rb, sizeof(rb), "cp %s %s", BINARY_BACKUP, BINARY_FILE);
             system(rb);
             event_add("apply: fork failed, rolled back");
+        }
+        goto done;
+    }
+
+    /* === GET /firmware/apply/status — watchdog progress for agents === */
+    if (strcmp(req.path, "/firmware/apply/status") == 0
+        && strcmp(req.method, "GET") == 0) {
+        long len = 0;
+        char *data = file_read(APPLY_STATUS_FILE, &len);
+        if (data && len > 0) {
+            json_resp(fd, 200, "OK", data);
+            free(data);
+        } else {
+            json_resp(fd, 200, "OK",
+                "{\"state\":\"idle\",\"detail\":\"no apply in progress\"}");
         }
         goto done;
     }
@@ -953,6 +1021,7 @@ static void handle(int fd, const char *ip) {
             "| POST | /firmware/build | Compile (gcc -O2) |\n"
             "| GET | /firmware/build/logs | Compilation output |\n"
             "| POST | /firmware/apply | Apply + restart (120s watchdog, auto-rollback) |\n"
+            "| GET | /firmware/apply/status | Watchdog progress (restarting/waiting/confirmed/rolled_back) |\n"
             "| POST | /firmware/apply/reset | Unlock apply after 3 consecutive failures |\n"
             "| GET | /skill | This file |\n",
             hostname, my_ip, g_port, g_token, g_token);
@@ -992,6 +1061,8 @@ static void handle(int fd, const char *ip) {
             "Don't regenerate unless the user asks.\n"
             "- **Firmware path: %s.** Build output: %s. "
             "Apply does atomic rename + 120s watchdog.\n"
+            "- **After apply, poll `GET /firmware/apply/status`** every 10s. "
+            "States: restarting → waiting → confirmed (success) or rolled_back (failure).\n"
             "- **If apply fails 3 times**, /firmware/apply locks. "
             "Unlock with POST /firmware/apply/reset.\n\n",
             TOKEN_FILE, BINARY_FILE, BINARY_NEW);
