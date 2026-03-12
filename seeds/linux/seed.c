@@ -1118,10 +1118,9 @@ static void handle(int fd, const char *ip) {
             "## Connection\n\n"
             "```\n"
             "Host: %s:%d\n"
-            "Token: %s\n"
             "```\n\n"
             "All requests (except /health) require:\n"
-            "`Authorization: Bearer %s`\n\n"
+            "`Authorization: Bearer <token>`\n\n"
             "## Endpoints\n\n"
             "| Method | Path | Description |\n"
             "|--------|------|-------------|\n"
@@ -1140,7 +1139,7 @@ static void handle(int fd, const char *ip) {
             "| POST | /firmware/rollback | Manual rollback to backup binary |\n"
             "| POST | /firmware/apply/reset | Unlock apply after 3 consecutive failures |\n"
             "| GET | /skill | This file |\n",
-            hostname, my_ip, g_port, g_token, g_token);
+            hostname, my_ip, g_port);
         /* Append skill endpoints to table */
         for (int si = 0; si < g_skill_count; si++) {
             const skill_endpoint_t *ep = g_skills[si]->endpoints;
@@ -1234,12 +1233,12 @@ static void handle(int fd, const char *ip) {
             "## Quick test\n\n"
             "```bash\n"
             "curl http://%s:%d/health\n"
-            "curl -H 'Authorization: Bearer %s' http://%s:%d/capabilities\n"
-            "curl -H 'Authorization: Bearer %s' http://%s:%d/skill\n"
+            "curl -H 'Authorization: Bearer <token>' http://%s:%d/capabilities\n"
+            "curl -H 'Authorization: Bearer <token>' http://%s:%d/skill\n"
             "```\n",
             my_ip, g_port,
-            g_token, my_ip, g_port,
-            g_token, my_ip, g_port);
+            my_ip, g_port,
+            my_ip, g_port);
         respond(fd, 200, "OK", "text/markdown; charset=utf-8", skill, sk);
         free(skill);
         goto done;
