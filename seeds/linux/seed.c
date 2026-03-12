@@ -45,7 +45,7 @@
 #define DEFAULT_PORT    8080
 #define HTTP_BUF        4096
 #define RESP_BUF        32768
-#define MAX_BODY        65536
+#define MAX_BODY        262144
 #define MAX_EVENTS      128
 #define EVENT_MSG_LEN   128
 #define SOCK_TIMEOUT    5
@@ -537,10 +537,12 @@ static int health_check(int port) {
  */
 /* #include "skills/example.c" */
 #include "skills/sysmon.c"
+#include "skills/serial.c"
 
 static void skills_init(void) {
     /* Call each skill's init function here when included above. */
     sysmon_init();
+    serial_init();
 }
 
 /* ===== Request handler ===== */
