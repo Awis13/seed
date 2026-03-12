@@ -542,6 +542,7 @@ static int health_check(int port) {
 #include "skills/fs.c"
 #include "skills/net.c"
 #include "skills/notes.c"
+#include "skills/gpio.c"
 
 static void skills_init(void) {
     sysmon_init();
@@ -550,6 +551,7 @@ static void skills_init(void) {
     fs_init();
     net_init();
     notes_init();
+    gpio_init();
 }
 
 /* ===== Request handler ===== */
