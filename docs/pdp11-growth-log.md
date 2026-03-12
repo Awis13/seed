@@ -4,6 +4,12 @@ AI-Driven Firmware Evolution on Vintage Hardware
 
 *March 2026 — Nikolaj Awis + Claude (AI Agent)*
 
+<p align="center">
+  <img src="pdp11-40.jpg" width="480" alt="PDP-11/40 — Digital Equipment Corporation, 1975" />
+  <br>
+  <em>PDP-11/40 — the 16-bit minicomputer that runs our seed. Same HTTP API as a Raspberry Pi.</em>
+</p>
+
 ## What is seed.c?
 
 Seed is a single C file (~1000 lines) that compiles on any machine with a C compiler and a TCP/IP stack. It starts an HTTP server with a minimal API that allows an AI agent to connect, read the hardware capabilities, write new firmware in C, compile it on the device, and apply it with an automatic 10-second watchdog rollback.
