@@ -1,42 +1,42 @@
 // Seed Node — ESP32-S3 firmware (grown from seed)
-// HTTP API для управления GPIO, I2C, конфиг, деплой
-// Для Heltec WiFi LoRa 32 V3
+// HTTP API for GPIO, I2C, config, deploy management
+// For Heltec WiFi LoRa 32 V3
 //
-// Совместимый HTTP API с Pi Zero W сервером (pi/server.c)
-// WiFi AP+STA, mDNS, SPIFFS, Bearer auth, OLED статус
+// Compatible HTTP API with Pi Zero W server (pi/server.c)
+// WiFi AP+STA, mDNS, SPIFFS, Bearer auth, OLED status
 //
-// Эндпоинты:
-//   GET  /health            — health check (без auth)
-//   GET  /capabilities      — описание возможностей ноды
-//   GET  /config.md         — прочитать конфиг ноды (SPIFFS)
-//   POST /config.md         — записать конфиг ноды
-//   POST /gpio/{pin}/mode   — задать режим пина
-//   POST /gpio/{pin}/write  — записать значение пина
-//   GET  /gpio/{pin}/read   — прочитать значение пина
-//   GET  /gpio/status       — статус всех сконфигурированных пинов
-//   POST /i2c/scan          — сканировать I2C шины
-//   POST /i2c/{addr}/write  — записать байты на I2C
-//   GET  /i2c/{addr}/read/{count} — прочитать байты с I2C
-//   POST /deploy            — загрузить и запустить скрипт
-//   GET  /deploy            — статус скрипта
-//   DELETE /deploy          — остановить и удалить скрипт
-//   GET  /deploy/logs       — логи задеплоенного скрипта (ring buffer)
+// Endpoints:
+//   GET  /health            — health check (no auth)
+//   GET  /capabilities      — node capabilities description
+//   GET  /config.md         — read node config (SPIFFS)
+//   POST /config.md         — write node config
+//   POST /gpio/{pin}/mode   — set pin mode
+//   POST /gpio/{pin}/write  — write pin value
+//   GET  /gpio/{pin}/read   — read pin value
+//   GET  /gpio/status       — status of all configured pins
+//   POST /i2c/scan          — scan I2C buses
+//   POST /i2c/{addr}/write  — write bytes to I2C
+//   GET  /i2c/{addr}/read/{count} — read bytes from I2C
+//   POST /deploy            — upload and run script
+//   GET  /deploy            — script status
+//   DELETE /deploy          — stop and remove script
+//   GET  /deploy/logs       — deployed script logs (ring buffer)
 //   GET  /live.md           — runtime state markdown (SPIFFS)
-//   POST /live.md           — записать runtime state
-//   GET  /events            — event log с timestamps (?since=<unix_ts>)
-//   GET  /mesh              — mDNS discovery соседних Seed нод
-//   POST /auth/token        — сменить токен авторизации
-//   GET  /firmware/version  — версия прошивки, аптайм, партиция, heap
-//   POST /firmware/upload   — загрузить OTA прошивку (streaming)
-//   POST /firmware/apply    — перезагрузка в новую прошивку
-//   POST /firmware/confirm  — подтвердить прошивку (отмена rollback)
-//   POST /firmware/rollback — откат на предыдущую прошивку
-//   GET  /wg/status         — статус WireGuard туннеля
-//   POST /wg/config         — настроить интерфейс WG (address, private_key)
-//   POST /wg/peer           — настроить WG пир (public_key, endpoint, port)
-//   DELETE /wg/peer         — удалить WG пир
-//   GET  /wg/peers          — список WG пиров (макс 1 на ESP32)
-//   POST /wg/restart        — перезапуск WG туннеля
+//   POST /live.md           — write runtime state
+//   GET  /events            — event log with timestamps (?since=<unix_ts>)
+//   GET  /mesh              — mDNS discovery of neighboring Seed nodes
+//   POST /auth/token        — change auth token
+//   GET  /firmware/version  — firmware version, uptime, partition, heap
+//   POST /firmware/upload   — upload OTA firmware (streaming)
+//   POST /firmware/apply    — reboot into new firmware
+//   POST /firmware/confirm  — confirm firmware (cancel rollback)
+//   POST /firmware/rollback — rollback to previous firmware
+//   GET  /wg/status         — WireGuard tunnel status
+//   POST /wg/config         — configure WG interface (address, private_key)
+//   POST /wg/peer           — configure WG peer (public_key, endpoint, port)
+//   DELETE /wg/peer         — remove WG peer
+//   GET  /wg/peers          — list WG peers (max 1 on ESP32)
+//   POST /wg/restart        — restart WG tunnel
 
 #include <Arduino.h>
 #include <WiFi.h>
@@ -51,8 +51,8 @@
 #include <WireGuard-ESP32.h>
 #include <mbedtls/base64.h>
 
-// Curve25519 — для вычисления публичного ключа из приватного
-// Используем x25519 из библиотеки WireGuard-ESP32 (crypto/refc/x25519.h)
+// Curve25519 — for deriving public key from private key
+// Using x25519 from WireGuard-ESP32 library (crypto/refc/x25519.h)
 extern "C" {
     extern const unsigned char X25519_BASE_POINT[32];
     int x25519(unsigned char out[32], const unsigned char scalar[32],
@@ -74,10 +74,10 @@ extern "C" {
 #define OLED_SDA    17
 #define OLED_SCL    18
 
-// I2C шины
+// I2C buses
 #define I2C_PRIMARY_SDA   17   // Shared with OLED
 #define I2C_PRIMARY_SCL   18
-#define I2C_EXTERNAL_SDA  5    // Для внешних датчиков
+#define I2C_EXTERNAL_SDA  5    // For external sensors
 #define I2C_EXTERNAL_SCL  6
 
 // OLED SSD1306
@@ -85,7 +85,7 @@ extern "C" {
 #define OLED_WIDTH  128
 #define OLED_HEIGHT 64
 
-// ===== Конфигурация =====
+// ===== Configuration =====
 #define FIRMWARE_VERSION    "1.0.0"
 #define HTTP_PORT           8080
 #define AP_PASSWORD         "seed1313"
@@ -100,8 +100,8 @@ extern "C" {
 // ===== Deploy Log Ring Buffer =====
 #define DEPLOY_LOG_SIZE     4096
 static char deploy_log_buf[DEPLOY_LOG_SIZE];
-static int deploy_log_pos = 0;  // Текущая позиция записи
-static bool deploy_log_wrapped = false;  // Буфер переполнился хотя бы раз
+static int deploy_log_pos = 0;  // Current write position
+static bool deploy_log_wrapped = false;  // Buffer has wrapped at least once
 static SemaphoreHandle_t deploy_log_mutex = NULL;
 
 static void deploy_log(const char *fmt, ...) {
@@ -112,7 +112,7 @@ static void deploy_log(const char *fmt, ...) {
     len += vsnprintf(line + len, sizeof(line) - len, fmt, ap);
     va_end(ap);
     if (len >= (int)sizeof(line)) len = (int)sizeof(line) - 1;  // clamp if truncated
-    // Добавляем \n если нет
+    // Append \n if missing
     if (len > 0 && line[len - 1] != '\n' && len < (int)sizeof(line) - 1) {
         line[len++] = '\n';
         line[len] = '\0';
@@ -132,7 +132,7 @@ static void deploy_log(const char *fmt, ...) {
 #define EVENT_MSG_LEN       128
 
 struct EventEntry {
-    unsigned long timestamp;  // millis() или Unix time если NTP доступен
+    unsigned long timestamp;  // millis() or Unix time if NTP available
     char message[EVENT_MSG_LEN];
 };
 
@@ -146,12 +146,12 @@ static void event_add(const char *fmt, ...) {
     va_start(ap, fmt);
     if (events_mutex) xSemaphoreTake(events_mutex, portMAX_DELAY);
     EventEntry *e = &events_buf[events_head];
-    // Используем Unix time если WiFi подключён (NTP), иначе millis()/1000
+    // Use Unix time if WiFi connected (NTP), otherwise millis()/1000
     struct timeval tv;
     if (gettimeofday(&tv, NULL) == 0 && tv.tv_sec > 1700000000) {
         e->timestamp = (unsigned long)tv.tv_sec;
     } else {
-        e->timestamp = millis() / 1000;  // секунды с момента загрузки
+        e->timestamp = millis() / 1000;  // seconds since boot
     }
     vsnprintf(e->message, EVENT_MSG_LEN, fmt, ap);
     events_head = (events_head + 1) % MAX_EVENTS;
@@ -160,7 +160,7 @@ static void event_add(const char *fmt, ...) {
     va_end(ap);
 }
 
-// Безопасные GPIO пины для внешнего использования (Heltec V3)
+// Safe GPIO pins for external use (Heltec V3)
 static const int SAFE_GPIO_PINS[] = {1, 2, 4, 5, 6, 7, 19, 20, 47, 48};
 static const int NUM_SAFE_PINS = sizeof(SAFE_GPIO_PINS) / sizeof(SAFE_GPIO_PINS[0]);
 
@@ -179,11 +179,11 @@ static int gpio_count = 0;
 // ===== Deploy State =====
 static TaskHandle_t deploy_task_handle = NULL;
 static volatile bool deploy_running = false;
-static volatile bool deploy_stop_requested = false;  // Флаг запроса остановки
+static volatile bool deploy_stop_requested = false;  // Stop request flag
 static String deploy_script = "";
-// deploy_mutex защищает: deploy_script, deploy_task_handle, deploy_running.
-// Порядок: берём мьютекс перед чтением/записью этих переменных.
-// deploy_stop_requested — volatile, доступ атомарный, мьютекс не нужен.
+// deploy_mutex protects: deploy_script, deploy_task_handle, deploy_running.
+// Lock mutex before reading/writing these variables.
+// deploy_stop_requested is volatile, atomic access, no mutex needed.
 static SemaphoreHandle_t deploy_mutex = NULL;
 
 // ===== Globals =====
@@ -193,7 +193,7 @@ static String ap_ssid = "";
 static String mdns_name = "";
 static unsigned long boot_time = 0;
 
-// Мьютекс для Wire (I2C primary bus), разделяемый между OLED и HTTP обработчиками
+// Mutex for Wire (I2C primary bus), shared between OLED and HTTP handlers
 static SemaphoreHandle_t wire_mutex = NULL;
 
 // WiFi STA credentials
@@ -201,26 +201,26 @@ static String wifi_ssid = "";
 static String wifi_pass = "";
 
 // ===== OTA Firmware Update State =====
-static bool firmware_confirmed = false;        // Прошивка подтверждена (auto-confirm или ручной)
-static bool firmware_confirm_attempted = false; // Одноразовая попытка auto-confirm
-static bool ota_in_progress = false;           // Блокировка конкурентных загрузок
-static bool ota_upload_started = false;        // Update.begin() вызван успешно
-static bool ota_upload_ok = false;             // OTA загружена и верифицирована
-static bool ota_upload_error = false;          // Ошибка при OTA загрузке
-static char ota_upload_error_msg[128] = "";    // Сообщение об ошибке OTA (fixed buf, не String во время OTA)
-static size_t ota_bytes_written = 0;           // Количество записанных байт
-static volatile bool pending_restart = false;  // Флаг отложенного рестарта (для apply/rollback)
-static volatile bool pending_rollback = false; // Откат вместо обычного рестарта
+static bool firmware_confirmed = false;        // Firmware confirmed (auto-confirm or manual)
+static bool firmware_confirm_attempted = false; // One-time auto-confirm attempt
+static bool ota_in_progress = false;           // Block concurrent uploads
+static bool ota_upload_started = false;        // Update.begin() called successfully
+static bool ota_upload_ok = false;             // OTA uploaded and verified
+static bool ota_upload_error = false;          // Error during OTA upload
+static char ota_upload_error_msg[128] = "";    // OTA error message (fixed buf, not String during OTA)
+static size_t ota_bytes_written = 0;           // Bytes written
+static volatile bool pending_restart = false;  // Deferred restart flag (for apply/rollback)
+static volatile bool pending_rollback = false; // Rollback instead of normal restart
 
 // ===== WireGuard State =====
 static WireGuard wg;
 static bool wg_running = false;
 static bool wg_restart_needed = false;
-static bool wg_init_done = false;  // NTP синхронизирован, WG попытка запуска выполнена
-static char wg_public_key[45] = "";  // Base64-encoded public key (44 символа + \0)
+static bool wg_init_done = false;  // NTP synced, WG start attempted
+static char wg_public_key[45] = "";  // Base64-encoded public key (44 chars + \0)
 
-// OLED framebuffer — простой текстовый дисплей (без тяжёлых библиотек)
-// SSD1306 инициализация и рендеринг через I2C напрямую
+// OLED framebuffer — simple text display (no heavy libraries)
+// SSD1306 init and rendering via raw I2C
 static bool oled_available = false;
 
 // ===== Forward declarations =====
@@ -237,7 +237,7 @@ static void oled_send_cmd(uint8_t cmd);
 static void oled_send_data(const uint8_t *data, size_t len);
 
 // ===== Minimal 5x7 font (ASCII 32-126) =====
-// Каждый символ — 5 байт (5 колонок, 7 строк, LSB=top)
+// Each char is 5 bytes (5 columns, 7 rows, LSB=top)
 static const uint8_t font5x7[] PROGMEM = {
     0x00,0x00,0x00,0x00,0x00, // 32 space
     0x00,0x00,0x5F,0x00,0x00, // 33 !
@@ -336,10 +336,10 @@ static const uint8_t font5x7[] PROGMEM = {
     0x08,0x08,0x2A,0x1C,0x08, // 126 ~
 };
 
-// OLED framebuffer — 8 страниц по 128 байт = 1024 байта
+// OLED framebuffer — 8 pages x 128 bytes = 1024 bytes
 static uint8_t oled_fb[8][128];
 
-// ===== Утилиты =====
+// ===== Utilities =====
 
 static String get_mac_suffix() {
     uint8_t mac[6];
@@ -372,7 +372,7 @@ static void token_load() {
     auth_token.trim();
 
     if (auth_token.length() == 0) {
-        // Генерируем случайный 32-hex токен
+        // Generate random 32-hex token
         char buf[33];
         for (int i = 0; i < 16; i++) {
             snprintf(buf + i * 2, 3, "%02x", (uint8_t)esp_random());
@@ -386,7 +386,7 @@ static void token_load() {
     }
 }
 
-// Constant-time сравнение строк для защиты от timing-атак
+// Constant-time string comparison to prevent timing attacks
 static bool check_token_constant_time(const String &provided) {
     if (provided.length() != auth_token.length()) return false;
     volatile uint8_t result = 0;
@@ -405,7 +405,7 @@ static bool check_auth(AsyncWebServerRequest *request) {
     return check_token_constant_time(token);
 }
 
-// Middleware-подобная проверка auth. Возвращает true если запрос авторизован.
+// Middleware-like auth check. Returns true if request is authorized.
 static bool require_auth(AsyncWebServerRequest *request) {
     if (check_auth(request)) return true;
     request->send(401, "application/json",
@@ -456,7 +456,7 @@ static void i2c_init() {
     Wire1.setClock(400000);
 }
 
-// Сканировать одну шину, добавить найденные адреса в JSON массив
+// Scan one bus, add found addresses to JSON array
 static void i2c_scan_bus(TwoWire &wire, JsonArray &devices, const char *bus_name) {
     for (uint8_t addr = 0x03; addr <= 0x77; addr++) {
         wire.beginTransmission(addr);
@@ -470,38 +470,38 @@ static void i2c_scan_bus(TwoWire &wire, JsonArray &devices, const char *bus_name
     }
 }
 
-// Записать байты. hex_data = "0x00 0x10 0xFF" или "00 10 FF"
+// Write bytes. hex_data = "0x00 0x10 0xFF" or "00 10 FF"
 static bool i2c_parse_hex(const String &hex_data, uint8_t *bytes, int &nbytes, int max_bytes) {
     nbytes = 0;
     const char *p = hex_data.c_str();
     while (*p && nbytes < max_bytes) {
         while (*p == ' ' || *p == '\n' || *p == '\r') p++;
         if (!*p) break;
-        // Пропускаем "0x" или "0X" префикс
+        // Skip "0x" or "0X" prefix
         if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X')) p += 2;
         unsigned int val;
         if (sscanf(p, "%2x", &val) != 1) break;
         bytes[nbytes++] = (uint8_t)val;
-        // Пропускаем обработанные символы
+        // Skip processed characters
         while (*p && *p != ' ' && *p != '\n' && *p != '\r') p++;
     }
     return nbytes > 0;
 }
 
-// Выбрать шину по адресу — primary (Wire) или external (Wire1)
-// OLED на 0x3C — primary шина; всё остальное пробуем обе
+// Select bus by address — primary (Wire) or external (Wire1)
+// OLED at 0x3C uses primary bus; everything else tries both
 static TwoWire& i2c_select_bus(uint8_t addr) {
-    // Проверяем сначала primary
+    // Check primary first
     Wire.beginTransmission(addr);
     if (Wire.endTransmission() == 0) return Wire;
-    // Потом external
+    // Then external
     Wire1.beginTransmission(addr);
     if (Wire1.endTransmission() == 0) return Wire1;
-    // По умолчанию — external (пользовательская)
+    // Default to external (user bus)
     return Wire1;
 }
 
-// ===== OLED Display (SSD1306 128x64 через I2C) =====
+// ===== OLED Display (SSD1306 128x64 via I2C) =====
 
 static void oled_send_cmd(uint8_t cmd) {
     Wire.beginTransmission(OLED_ADDR);
@@ -511,7 +511,7 @@ static void oled_send_cmd(uint8_t cmd) {
 }
 
 static void oled_send_data(const uint8_t *data, size_t len) {
-    // Отправляем данные порциями по 16 байт (ограничение I2C буфера)
+    // Send data in 16-byte chunks (I2C buffer limit)
     size_t offset = 0;
     while (offset < len) {
         size_t chunk = len - offset;
@@ -534,7 +534,7 @@ static void oled_init() {
     digitalWrite(OLED_RST, HIGH);
     delay(10);
 
-    // Проверяем наличие OLED
+    // Check OLED presence
     Wire.beginTransmission(OLED_ADDR);
     if (Wire.endTransmission() != 0) {
         Serial.println("[OLED] Not found at 0x3C");
@@ -578,7 +578,7 @@ static void oled_clear() {
     memset(oled_fb, 0, sizeof(oled_fb));
 }
 
-// Отрисовать один символ в framebuffer
+// Draw one character into framebuffer
 static void oled_draw_char(int x, int page, char c) {
     if (c < 32 || c > 126) c = '?';
     int idx = (c - 32) * 5;
@@ -589,9 +589,9 @@ static void oled_draw_char(int x, int page, char c) {
     }
 }
 
-// Вывести текст в строку (page 0-7)
+// Write text to row (page 0-7)
 static void oled_text(int row, const char *text) {
-    // Очищаем строку
+    // Clear row
     memset(oled_fb[row], 0, OLED_WIDTH);
 
     int x = 0;
@@ -601,11 +601,11 @@ static void oled_text(int row, const char *text) {
     }
 }
 
-// Отправить framebuffer на дисплей
+// Flush framebuffer to display
 static void oled_flush() {
     if (!oled_available) return;
 
-    // Установить адресацию на всю область
+    // Set addressing to full area
     oled_send_cmd(0x21);  // Column address
     oled_send_cmd(0);     // Start
     oled_send_cmd(127);   // End
@@ -620,20 +620,20 @@ static void oled_flush() {
 
 static void oled_update() {
     if (!oled_available) return;
-    // Берём мьютекс Wire, т.к. OLED на primary I2C шине
+    // Take Wire mutex since OLED is on primary I2C bus
     if (xSemaphoreTake(wire_mutex, pdMS_TO_TICKS(100)) != pdTRUE) return;
 
     char line[22];  // 128px / 6px per char = ~21 chars
 
     oled_clear();
 
-    // Строка 0: Seed + имя
+    // Row 0: Seed + name
     snprintf(line, sizeof(line), "Seed %s", ap_ssid.c_str() + 5);  // Skip "Seed-"
     oled_text(0, line);
 
-    // Строка 1: пустая (разделитель)
+    // Row 1: empty (separator)
 
-    // Строка 2: WiFi status
+    // Row 2: WiFi status
     if (WiFi.status() == WL_CONNECTED) {
         snprintf(line, sizeof(line), "WiFi: %s", WiFi.SSID().c_str());
     } else {
@@ -641,7 +641,7 @@ static void oled_update() {
     }
     oled_text(2, line);
 
-    // Строка 3: IP
+    // Row 3: IP
     if (WiFi.status() == WL_CONNECTED) {
         snprintf(line, sizeof(line), "IP: %s", WiFi.localIP().toString().c_str());
     } else {
@@ -649,22 +649,22 @@ static void oled_update() {
     }
     oled_text(3, line);
 
-    // Строка 4: порт
+    // Row 4: port
     snprintf(line, sizeof(line), "Port: %d", HTTP_PORT);
     oled_text(4, line);
 
-    // Строка 5: GPIO configured
+    // Row 5: GPIO configured
     snprintf(line, sizeof(line), "GPIO: %d pins", gpio_count);
     oled_text(5, line);
 
-    // Строка 6: Deploy status
+    // Row 6: Deploy status
     if (deploy_running) {
         oled_text(6, "Deploy: RUNNING");
     } else {
         oled_text(6, "Deploy: idle");
     }
 
-    // Строка 7: Uptime + версия прошивки
+    // Row 7: Uptime + firmware version
     unsigned long uptime = (millis() - boot_time) / 1000;
     snprintf(line, sizeof(line), "v%s Up:%lus", FIRMWARE_VERSION, uptime);
     oled_text(7, line);
@@ -709,13 +709,13 @@ static void wifi_setup() {
     Serial.printf("[WiFi] AP started: %s (password: %s)\n", ap_ssid.c_str(), AP_PASSWORD);
     Serial.printf("[WiFi] AP IP: %s\n", WiFi.softAPIP().toString().c_str());
 
-    // Подключаемся к сохранённой сети
+    // Connect to saved network
     wifi_load_config();
     if (wifi_ssid.length() > 0) {
         Serial.printf("[WiFi] Connecting to: %s\n", wifi_ssid.c_str());
         WiFi.begin(wifi_ssid.c_str(), wifi_pass.c_str());
 
-        // Ждём подключения (макс 10 сек)
+        // Wait for connection (max 10 sec)
         int attempts = 0;
         while (WiFi.status() != WL_CONNECTED && attempts < 20) {
             delay(500);
@@ -725,7 +725,7 @@ static void wifi_setup() {
 
         if (WiFi.status() == WL_CONNECTED) {
             Serial.printf("\n[WiFi] Connected! IP: %s\n", WiFi.localIP().toString().c_str());
-            // NTP для корректных Unix timestamps в events
+            // NTP for correct Unix timestamps in events
             configTime(0, 0, "pool.ntp.org", "time.nist.gov");
             Serial.println("[NTP] Time sync started");
         } else {
@@ -743,7 +743,7 @@ static void wifi_setup() {
 
 // ===== WireGuard =====
 
-// Валидация WG ключа: ровно 44 символа, только [A-Za-z0-9+/=]
+// Validate WG key: exactly 44 chars, only [A-Za-z0-9+/=]
 static bool wg_validate_key(const char *key) {
     if (!key) return false;
     int len = strlen(key);
@@ -757,7 +757,7 @@ static bool wg_validate_key(const char *key) {
     return true;
 }
 
-// Валидация IP адреса: только [0-9.]
+// Validate IP address: only [0-9.]
 static bool wg_validate_ip(const char *ip) {
     if (!ip) return false;
     for (int i = 0; ip[i]; i++) {
@@ -767,7 +767,7 @@ static bool wg_validate_ip(const char *ip) {
     return true;
 }
 
-// Валидация allowed_ips: только [0-9./,]
+// Validate allowed_ips: only [0-9./,]
 static bool wg_validate_allowed_ips(const char *ips) {
     if (!ips) return false;
     for (int i = 0; ips[i]; i++) {
@@ -777,13 +777,13 @@ static bool wg_validate_allowed_ips(const char *ips) {
     return true;
 }
 
-// Вычислить публичный ключ из приватного через Curve25519
-// Приватный ключ — base64, результат в wg_public_key (глобальный)
+// Derive public key from private key via Curve25519
+// Private key is base64, result in wg_public_key (global)
 static bool wg_derive_public_key(const char *private_key_b64) {
     uint8_t privkey[32];
     size_t privkey_len = 0;
 
-    // Декодируем base64 приватный ключ
+    // Decode base64 private key
     int ret = mbedtls_base64_decode(privkey, sizeof(privkey), &privkey_len,
                                      (const unsigned char *)private_key_b64,
                                      strlen(private_key_b64));
@@ -792,14 +792,14 @@ static bool wg_derive_public_key(const char *private_key_b64) {
         return false;
     }
 
-    // Curve25519 scalar multiplication с базовой точкой (clamp=1 для WG совместимости)
+    // Curve25519 scalar multiplication with base point (clamp=1 for WG compatibility)
     uint8_t pubkey[32];
     x25519(pubkey, privkey, X25519_BASE_POINT, 1);
 
-    // Зачищаем приватный ключ со стека
+    // Wipe private key from stack
     memset(privkey, 0, sizeof(privkey));
 
-    // Кодируем в base64
+    // Encode to base64
     size_t pubkey_b64_len = 0;
     ret = mbedtls_base64_encode((unsigned char *)wg_public_key, sizeof(wg_public_key),
                                  &pubkey_b64_len, pubkey, 32);
@@ -812,21 +812,21 @@ static bool wg_derive_public_key(const char *private_key_b64) {
     return true;
 }
 
-// Загрузить WG конфиг из SPIFFS
+// Load WG config from SPIFFS
 static bool wg_load_config(JsonDocument &doc) {
     String json = read_spiffs_file(WG_CONFIG_FILE);
     if (json.length() == 0) return false;
     return deserializeJson(doc, json) == DeserializationError::Ok;
 }
 
-// Сохранить WG конфиг в SPIFFS
+// Save WG config to SPIFFS
 static bool wg_save_config(const JsonDocument &doc) {
     String json;
     serializeJson(doc, json);
     return write_spiffs_file(WG_CONFIG_FILE, json);
 }
 
-// Запустить WG туннель (вызывать после WiFi + NTP)
+// Start WG tunnel (call after WiFi + NTP)
 static void wg_start() {
     JsonDocument doc;
     if (!wg_load_config(doc)) {
@@ -841,7 +841,7 @@ static void wg_start() {
         return;
     }
 
-    // Проверяем наличие пира
+    // Check peer exists
     if (!doc["peer"].is<JsonObject>() || !doc["peer"]["public_key"] || !doc["peer"]["endpoint"]) {
         Serial.println("[WG] No peer configured");
         return;
@@ -851,7 +851,7 @@ static void wg_start() {
     const char *peer_endpoint = doc["peer"]["endpoint"];
     uint16_t peer_port = doc["peer"]["port"] | 51820;
 
-    // Вычисляем публичный ключ
+    // Derive public key
     wg_derive_public_key(private_key);
 
     IPAddress local_ip;
@@ -874,7 +874,7 @@ static void wg_start() {
     }
 }
 
-// Остановить WG туннель
+// Stop WG tunnel
 static void wg_stop() {
     if (wg_running) {
         wg.end();
@@ -885,13 +885,13 @@ static void wg_stop() {
 }
 
 // ===== Deploy Engine =====
-// Простой интерпретатор команд, запускаемый в FreeRTOS task
+// Simple command interpreter running in a FreeRTOS task
 
 static void deploy_execute_line(const String &line) {
     String trimmed = line;
     trimmed.trim();
 
-    // Пропускаем пустые строки и комментарии
+    // Skip empty lines and comments
     if (trimmed.length() == 0 || trimmed.startsWith("#")) return;
 
     // gpio <pin> mode <input|output>
@@ -984,8 +984,8 @@ static void deploy_execute_line(const String &line) {
         return;
     }
 
-    // loop — перезапуск обработается снаружи
-    if (trimmed == "loop") return;  // Обрабатывается в deploy_task_func
+    // loop — restart handled externally
+    if (trimmed == "loop") return;  // Handled in deploy_task_func
 
     Serial.printf("[Deploy] Unknown command: %s\n", trimmed.c_str());
     deploy_log("unknown: %s -> err", trimmed.c_str());
@@ -1000,14 +1000,14 @@ static void deploy_task_func(void *param) {
     event_add("deploy started");
 
     while (!deploy_stop_requested) {
-        // Копируем скрипт под мьютексом
+        // Copy script under mutex
         xSemaphoreTake(deploy_mutex, portMAX_DELAY);
         String script = deploy_script;
         xSemaphoreGive(deploy_mutex);
 
         bool has_loop = false;
 
-        // Парсим строки
+        // Parse lines
         int start = 0;
         int len = script.length();
         while (start < len && !deploy_stop_requested) {
@@ -1019,24 +1019,24 @@ static void deploy_task_func(void *param) {
 
             if (line == "loop") {
                 has_loop = true;
-                break;  // Перезапустить с начала
+                break;  // Restart from beginning
             }
 
             deploy_execute_line(line);
             start = nl + 1;
         }
 
-        if (!has_loop) break;  // Если нет loop — однократное выполнение
+        if (!has_loop) break;  // No loop — single execution
 
-        // Небольшая пауза перед повтором чтобы не грузить CPU
+        // Small delay before repeat to avoid CPU hogging
         vTaskDelay(pdMS_TO_TICKS(10));
     }
 
     Serial.println("[Deploy] Script finished");
     event_add("deploy stopped");
 
-    // Устанавливаем флаги и обнуляем handle ДО vTaskDelete,
-    // чтобы другой код не обращался к freed TCB
+    // Set flags and clear handle BEFORE vTaskDelete,
+    // so other code doesn't access freed TCB
     xSemaphoreTake(deploy_mutex, portMAX_DELAY);
     deploy_running = false;
     deploy_task_handle = NULL;
@@ -1046,9 +1046,9 @@ static void deploy_task_func(void *param) {
 }
 
 static void deploy_start(const String &script) {
-    deploy_stop_and_wait();  // Остановить предыдущий и дождаться завершения
+    deploy_stop_and_wait();  // Stop previous and wait for completion
 
-    // Bug #6: очищаем лог предыдущего деплоя перед новым запуском
+    // Bug #6: clear previous deploy log before new run
     if (deploy_log_mutex) xSemaphoreTake(deploy_log_mutex, portMAX_DELAY);
     deploy_log_pos = 0;
     deploy_log_wrapped = false;
@@ -1066,21 +1066,21 @@ static void deploy_start(const String &script) {
         "deploy",
         4096,
         NULL,
-        1,          // Низкий приоритет
+        1,          // Low priority
         &deploy_task_handle,
         1           // Core 1 (Core 0 = WiFi)
     );
 }
 
-// Неблокирующая остановка — выставляет флаг, task завершится сам
+// Non-blocking stop — sets flag, task will finish on its own
 static void deploy_stop() {
     deploy_stop_requested = true;
 }
 
-// Блокирующая остановка — ждём фактического завершения (для deploy_start)
+// Blocking stop — waits for actual completion (for deploy_start)
 static void deploy_stop_and_wait() {
     deploy_stop_requested = true;
-    // Ждём пока task завершится и обнулит handle (макс 5 сек)
+    // Wait for task to finish and clear handle (max 5 sec)
     int attempts = 0;
     while (attempts < 50) {
         xSemaphoreTake(deploy_mutex, portMAX_DELAY);
@@ -1090,7 +1090,7 @@ static void deploy_stop_and_wait() {
         vTaskDelay(pdMS_TO_TICKS(100));
         attempts++;
     }
-    // Если task завис — принудительно убиваем
+    // If task is stuck — force kill
     xSemaphoreTake(deploy_mutex, portMAX_DELAY);
     if (deploy_task_handle != NULL) {
         vTaskDelete(deploy_task_handle);
@@ -1101,15 +1101,15 @@ static void deploy_stop_and_wait() {
 }
 
 // ===== POST body =====
-// Per-request body буферы через request->_tempObject (malloc/free)
-// Это потокобезопасно: каждый запрос имеет свой буфер
+// Per-request body buffers via request->_tempObject (malloc/free)
+// Thread-safe: each request has its own buffer
 
 // ===== HTTP Handlers =====
 
-// Хелпер — собрать body из async POST и вызвать обработчик
-// ESPAsyncWebServer вызывает body callback по частям, потом onRequest
+// Helper — collect body from async POST and call handler
+// ESPAsyncWebServer calls body callback in chunks, then onRequest
 
-// --- GET /health (без auth) ---
+// --- GET /health (no auth) ---
 static void handle_health(AsyncWebServerRequest *request) {
     unsigned long uptime_sec = (millis() - boot_time) / 1000;
 
@@ -1176,7 +1176,7 @@ static void handle_config_get(AsyncWebServerRequest *request) {
 static void handle_config_post_body(AsyncWebServerRequest *request, uint8_t *data,
                                      size_t len, size_t index, size_t total) {
     if (index == 0) {
-        // Лимит размера тела — защита от OOM
+        // Body size limit — OOM protection
         if (total > 4096) { request->send(413, "application/json", "{\"error\":\"Payload Too Large\"}"); return; }
         char *buf = (char*)malloc(total + 1);
         if (!buf) { request->send(500, "application/json", "{\"error\":\"OOM\"}"); return; }
@@ -1218,7 +1218,7 @@ static void handle_config_post(AsyncWebServerRequest *request) {
 static void handle_auth_body(AsyncWebServerRequest *request, uint8_t *data,
                               size_t len, size_t index, size_t total) {
     if (index == 0) {
-        // Лимит размера тела — защита от OOM
+        // Body size limit — OOM protection
         if (total > 4096) { request->send(413, "application/json", "{\"error\":\"Payload Too Large\"}"); return; }
         char *buf = (char*)malloc(total + 1);
         if (!buf) { request->send(500, "application/json", "{\"error\":\"OOM\"}"); return; }
@@ -1260,7 +1260,7 @@ static void handle_auth_token(AsyncWebServerRequest *request) {
 }
 
 // --- GPIO handlers ---
-// POST /gpio/{pin}/mode и POST /gpio/{pin}/write используют path params
+// POST /gpio/{pin}/mode and POST /gpio/{pin}/write use path params
 
 static void handle_gpio_mode(AsyncWebServerRequest *request, int pin) {
     if (!require_auth(request)) return;
@@ -1326,7 +1326,7 @@ static void handle_gpio_write(AsyncWebServerRequest *request, int pin) {
         return;
     }
 
-    // Bug #1: проверяем что пин сконфигурирован как output перед записью
+    // Bug #1: check pin is configured as output before writing
     if (!gpio_configured[cfg_idx].is_output) {
         char buf[96];
         snprintf(buf, sizeof(buf),
@@ -1426,7 +1426,7 @@ static void handle_i2c_scan(AsyncWebServerRequest *request) {
     JsonDocument doc;
     JsonArray devices = doc["devices"].to<JsonArray>();
 
-    // Сканируем обе шины (под мьютексом, т.к. Wire shared с OLED)
+    // Scan both buses (under mutex since Wire is shared with OLED)
     xSemaphoreTake(wire_mutex, portMAX_DELAY);
     i2c_scan_bus(Wire, devices, "primary");
     i2c_scan_bus(Wire1, devices, "external");
@@ -1508,7 +1508,7 @@ static void handle_i2c_read(AsyncWebServerRequest *request, int addr, int count)
     TwoWire &bus = i2c_select_bus(addr);
     bus.requestFrom((uint8_t)addr, (uint8_t)count);
 
-    // Формируем hex строку как в Pi сервере: "0A FF 01"
+    // Build hex string as in Pi server: "0A FF 01"
     String hex_data = "";
     int nread = 0;
     while (bus.available() && nread < count) {
@@ -1520,7 +1520,7 @@ static void handle_i2c_read(AsyncWebServerRequest *request, int addr, int count)
     }
     xSemaphoreGive(wire_mutex);
 
-    // Устройство не ответило (нет ACK) — возвращаем ошибку вместо пустых данных
+    // Device didn't respond (no ACK) — return error instead of empty data
     if (nread == 0) {
         char err[80];
         snprintf(err, sizeof(err), "{\"error\":\"no ACK from 0x%02X -- device not found or not responding\"}", addr);
@@ -1544,7 +1544,7 @@ static void handle_i2c_read(AsyncWebServerRequest *request, int addr, int count)
 static void handle_deploy_body(AsyncWebServerRequest *request, uint8_t *data,
                                 size_t len, size_t index, size_t total) {
     if (index == 0 && total > MAX_SCRIPT_SIZE) {
-        // Лимит размера скрипта — не усекаем молча, а возвращаем ошибку
+        // Script size limit — return error instead of silent truncation
         request->send(413, "application/json", "{\"error\":\"deploy script too large (max 4KB)\"}");
         return;
     }
@@ -1607,7 +1607,7 @@ static void handle_deploy_get(AsyncWebServerRequest *request) {
     } else {
         doc["status"] = deploy_running ? "running" : "stopped";
         doc["script"] = script;
-        doc["pid"] = 0;  // FreeRTOS не имеет PID
+        doc["pid"] = 0;  // FreeRTOS has no PID
     }
 
     String response;
@@ -1618,7 +1618,7 @@ static void handle_deploy_get(AsyncWebServerRequest *request) {
 static void handle_deploy_delete(AsyncWebServerRequest *request) {
     if (!require_auth(request)) return;
 
-    deploy_stop();  // Неблокирующая — выставляет флаг, task завершится сам
+    deploy_stop();  // Non-blocking — sets flag, task finishes on its own
     SPIFFS.remove(DEPLOY_SCRIPT_FILE);
 
     request->send(200, "application/json", "{\"ok\":true,\"stopping\":true}");
@@ -1633,11 +1633,11 @@ static void handle_deploy_logs(AsyncWebServerRequest *request) {
 
     if (deploy_log_mutex) xSemaphoreTake(deploy_log_mutex, portMAX_DELAY);
 
-    // Собираем строки из кольцевого буфера
+    // Collect lines from ring buffer
     int start = deploy_log_wrapped ? deploy_log_pos : 0;
     int total = deploy_log_wrapped ? DEPLOY_LOG_SIZE : deploy_log_pos;
 
-    // Извлекаем строки
+    // Extract lines
     String current_line = "";
     int line_count = 0;
     for (int i = 0; i < total; i++) {
@@ -1679,7 +1679,7 @@ static void handle_live_get(AsyncWebServerRequest *request) {
 static void handle_live_post_body(AsyncWebServerRequest *request, uint8_t *data,
                                    size_t len, size_t index, size_t total) {
     if (index == 0) {
-        // Лимит размера тела — защита от OOM
+        // Body size limit — OOM protection
         if (total > 4096) { request->send(413, "application/json", "{\"error\":\"Payload Too Large\"}"); return; }
         char *buf = (char*)malloc(total + 1);
         if (!buf) { request->send(500, "application/json", "{\"error\":\"OOM\"}"); return; }
@@ -1725,7 +1725,7 @@ static void handle_events(AsyncWebServerRequest *request) {
         const char *start = request->getParam("since")->value().c_str();
         char *endptr = NULL;
         since = strtoul(start, &endptr, 10);
-        // Проверяем, что строка содержит хотя бы одну цифру
+        // Verify string contains at least one digit
         if (endptr == start) {
             request->send(400, "application/json", "{\"error\":\"since must be a unix timestamp\"}");
             return;
@@ -1745,7 +1745,7 @@ static void handle_events(AsyncWebServerRequest *request) {
         int idx = (start_idx + i) % MAX_EVENTS;
         EventEntry *e = &events_buf[idx];
         if (since > 0 && e->timestamp <= since) continue;
-        // Без since — только последние 100
+        // Without since — only last 100
         if (since == 0 && total - i > 100) continue;
 
         JsonObject obj = events.add<JsonObject>();
@@ -1763,14 +1763,14 @@ static void handle_events(AsyncWebServerRequest *request) {
     request->send(200, "application/json", response);
 }
 
-// --- GET /mesh — mDNS discovery соседних Seed нод ---
+// --- GET /mesh — mDNS discovery of neighboring Seed nodes ---
 static void handle_mesh(AsyncWebServerRequest *request) {
     if (!require_auth(request)) return;
 
     JsonDocument doc;
 
-    // Self info — используем один и тот же IP для отображения и фильтрации.
-    // Если STA подключен — localIP(), иначе softAPIP().
+    // Self info — use same IP for display and filtering.
+    // If STA connected — localIP(), otherwise softAPIP().
     JsonObject self = doc["self"].to<JsonObject>();
     self["name"] = mdns_name;
     String self_ip = (WiFi.status() == WL_CONNECTED)
@@ -1783,11 +1783,11 @@ static void handle_mesh(AsyncWebServerRequest *request) {
     JsonArray nodes = doc["nodes"].to<JsonArray>();
     int count = 0;
 
-    // NB: queryService блокирует ~2s. Приемлемо, т.к. /mesh вызывается редко.
-    // TODO: в будущем можно перейти на async discovery + кэширование результатов.
+    // NB: queryService blocks ~2s. Acceptable since /mesh is called rarely.
+    // TODO: could switch to async discovery + result caching.
     int n = MDNS.queryService("seed", "tcp");
     if (n > 0) {
-        // Текущий Unix timestamp
+        // Current Unix timestamp
         struct timeval tv;
         unsigned long now_ts = 0;
         if (gettimeofday(&tv, NULL) == 0 && tv.tv_sec > 1700000000) {
@@ -1798,7 +1798,7 @@ static void handle_mesh(AsyncWebServerRequest *request) {
 
         for (int i = 0; i < n; i++) {
             String node_ip = MDNS.IP(i).toString();
-            // Фильтруем себя
+            // Filter self
             if (node_ip == self_ip && MDNS.port(i) == HTTP_PORT) continue;
 
             JsonObject node = nodes.add<JsonObject>();
@@ -1840,10 +1840,10 @@ static void handle_firmware_version(AsyncWebServerRequest *request) {
 }
 
 // --- POST /firmware/upload (body handler) ---
-// Стримим бинарник прошивки напрямую в OTA партицию, без буферизации в RAM
+// Stream firmware binary directly to OTA partition, no RAM buffering
 static void handle_firmware_upload_body(AsyncWebServerRequest *request, uint8_t *data,
                                          size_t len, size_t index, size_t total) {
-    // Проверяем auth на первом чанке
+    // Check auth on first chunk
     if (index == 0) {
         if (!check_auth(request)) {
             ota_upload_error = true;
@@ -1852,7 +1852,7 @@ static void handle_firmware_upload_body(AsyncWebServerRequest *request, uint8_t 
             return;
         }
 
-        // Блокировка конкурентных загрузок
+        // Block concurrent uploads
         if (ota_in_progress) {
             ota_upload_error = true;
             snprintf(ota_upload_error_msg, sizeof(ota_upload_error_msg),
@@ -1860,15 +1860,15 @@ static void handle_firmware_upload_body(AsyncWebServerRequest *request, uint8_t 
             return;
         }
 
-        // Минимальная валидация размера прошивки
-        if (total == 0 || total > 0x330000) {  // Макс = размер OTA партиции (3.1875 MB)
+        // Minimal firmware size validation
+        if (total == 0 || total > 0x330000) {  // Max = OTA partition size (3.1875 MB)
             ota_upload_error = true;
             snprintf(ota_upload_error_msg, sizeof(ota_upload_error_msg),
                      "invalid firmware size: %u (max 3342336)", (unsigned)total);
             return;
         }
 
-        // Сброс состояния
+        // Reset state
         ota_in_progress = true;
         ota_upload_started = false;
         ota_upload_ok = false;
@@ -1876,7 +1876,7 @@ static void handle_firmware_upload_body(AsyncWebServerRequest *request, uint8_t 
         ota_upload_error_msg[0] = '\0';
         ota_bytes_written = 0;
 
-        Serial.printf("[OTA] Начало загрузки прошивки, размер: %u байт\n", (unsigned)total);
+        Serial.printf("[OTA] Firmware upload started, size: %u bytes\n", (unsigned)total);
         event_add("ota upload started, size=%u", (unsigned)total);
 
         if (!Update.begin(total, U_FLASH)) {
@@ -1890,10 +1890,10 @@ static void handle_firmware_upload_body(AsyncWebServerRequest *request, uint8_t 
         ota_upload_started = true;
     }
 
-    // Если уже была ошибка — пропускаем остальные чанки
+    // If error already occurred — skip remaining chunks
     if (ota_upload_error) return;
 
-    // Записываем чанк
+    // Write chunk
     if (ota_upload_started && Update.isRunning()) {
         if (Update.write(data, len) != len) {
             ota_upload_error = true;
@@ -1907,7 +1907,7 @@ static void handle_firmware_upload_body(AsyncWebServerRequest *request, uint8_t 
         ota_bytes_written += len;
     }
 
-    // Последний чанк — завершаем OTA (только если Update.begin() был вызван)
+    // Last chunk — finalize OTA (only if Update.begin() was called)
     if (index + len == total && ota_upload_started) {
         if (!Update.end(true)) {
             ota_upload_error = true;
@@ -1916,7 +1916,7 @@ static void handle_firmware_upload_body(AsyncWebServerRequest *request, uint8_t 
             Serial.printf("[OTA] Update.end() failed: %s\n", Update.errorString());
         } else {
             ota_upload_ok = true;
-            Serial.printf("[OTA] Прошивка загружена: %u байт, MD5: %s\n",
+            Serial.printf("[OTA] Firmware uploaded: %u bytes, MD5: %s\n",
                           (unsigned)ota_bytes_written, Update.md5String().c_str());
             event_add("ota upload complete, %u bytes, md5=%s",
                       (unsigned)ota_bytes_written, Update.md5String().c_str());
@@ -1927,7 +1927,7 @@ static void handle_firmware_upload_body(AsyncWebServerRequest *request, uint8_t 
 
 // --- POST /firmware/upload (request handler) ---
 static void handle_firmware_upload(AsyncWebServerRequest *request) {
-    // Auth проверяется в body handler; если ошибка auth — отдаём 401
+    // Auth checked in body handler; if auth error — return 401
     if (ota_upload_error && strstr(ota_upload_error_msg, "Authorization") != NULL) {
         request->send(401, "application/json",
             "{\"error\":\"Authorization: Bearer <token> required\"}");
@@ -1960,11 +1960,11 @@ static void handle_firmware_upload(AsyncWebServerRequest *request) {
 }
 
 // --- POST /firmware/apply ---
-// Рестарт выполняется отложенно в loop(), чтобы HTTP ответ успел уйти
+// Restart is deferred to loop() so HTTP response has time to send
 static void handle_firmware_apply(AsyncWebServerRequest *request) {
     if (!require_auth(request)) return;
 
-    // Проверяем что прошивка была загружена
+    // Check firmware was uploaded
     if (!ota_upload_ok) {
         request->send(400, "application/json",
             "{\"error\":\"no firmware uploaded, use POST /firmware/upload first\"}");
@@ -1972,7 +1972,7 @@ static void handle_firmware_apply(AsyncWebServerRequest *request) {
     }
 
     event_add("ota apply: restarting to new firmware");
-    Serial.println("[OTA] Перезагрузка в новую прошивку...");
+    Serial.println("[OTA] Rebooting into new firmware...");
 
     pending_restart = true;
     request->send(200, "application/json",
@@ -1987,7 +1987,7 @@ static void handle_firmware_confirm(AsyncWebServerRequest *request) {
     firmware_confirmed = (err == ESP_OK);
     if (firmware_confirmed) {
         event_add("ota firmware confirmed manually");
-        Serial.println("[OTA] Прошивка подтверждена вручную");
+        Serial.println("[OTA] Firmware confirmed manually");
     }
 
     JsonDocument doc;
@@ -2003,12 +2003,12 @@ static void handle_firmware_confirm(AsyncWebServerRequest *request) {
 }
 
 // --- POST /firmware/rollback ---
-// Откат выполняется отложенно в loop(), чтобы HTTP ответ успел уйти
+// Rollback is deferred to loop() so HTTP response has time to send
 static void handle_firmware_rollback(AsyncWebServerRequest *request) {
     if (!require_auth(request)) return;
 
     event_add("ota rollback: reverting to previous firmware");
-    Serial.println("[OTA] Откат на предыдущую прошивку...");
+    Serial.println("[OTA] Rolling back to previous firmware...");
 
     pending_restart = true;
     pending_rollback = true;
@@ -2016,7 +2016,7 @@ static void handle_firmware_rollback(AsyncWebServerRequest *request) {
         "{\"ok\":true,\"warning\":\"rolling back and rebooting in ~1 second\"}");
 }
 
-// --- WiFi config page (на AP) ---
+// --- WiFi config page (on AP) ---
 
 static void handle_wifi_config_page(AsyncWebServerRequest *request) {
     String html = "<!DOCTYPE html><html><head><meta charset='utf-8'>"
@@ -2042,7 +2042,7 @@ static void handle_wifi_config_page(AsyncWebServerRequest *request) {
 }
 
 static void handle_wifi_config_post(AsyncWebServerRequest *request) {
-    // Парсим form data
+    // Parse form data
     String ssid = "";
     String pass = "";
 
@@ -2069,15 +2069,15 @@ static void handle_wifi_config_post(AsyncWebServerRequest *request) {
         mdns_name + ".local:" + String(HTTP_PORT) + "</p>"
         "<p><a href='/'>Back</a></p>");
 
-    // Подключаемся к WiFi в следующем loop цикле
-    // (не блокируем HTTP ответ)
+    // Connect to WiFi in next loop cycle
+    // (don't block HTTP response)
     delay(1000);
     WiFi.begin(wifi_ssid.c_str(), wifi_pass.c_str());
 }
 
 // ===== WireGuard HTTP Handlers =====
 
-// Body handler для WG POST эндпоинтов (общий паттерн)
+// Body handler for WG POST endpoints (shared pattern)
 static void handle_wg_body(AsyncWebServerRequest *request, uint8_t *data,
                             size_t len, size_t index, size_t total) {
     if (index == 0) {
@@ -2100,7 +2100,7 @@ static void handle_wg_status(AsyncWebServerRequest *request) {
     doc["up"] = wg_running;
     doc["public_key"] = wg_public_key;
 
-    // Загружаем конфиг для дополнительных полей
+    // Load config for extra fields
     JsonDocument cfg;
     bool has_config = wg_load_config(cfg);
 
@@ -2108,11 +2108,11 @@ static void handle_wg_status(AsyncWebServerRequest *request) {
     doc["listen_port"] = has_config && cfg["listen_port"] ? cfg["listen_port"].as<int>() : 0;
     doc["peer_configured"] = has_config && cfg["peer"].is<JsonObject>() && cfg["peer"]["public_key"];
 
-    // Проверяем статус пира через библиотеку (если WG запущен)
+    // Check peer status via library (if WG running)
     bool peer_connected = false;
     if (wg_running) {
-        // wireguardif_peer_is_up доступен через extern — но WireGuard класс
-        // не экспортирует netif/peer_index напрямую. Считаем "connected" = is_initialized.
+        // wireguardif_peer_is_up available via extern — but WireGuard class
+        // doesn't export netif/peer_index directly. Treat "connected" = is_initialized.
         peer_connected = wg.is_initialized();
     }
     doc["peer_connected"] = peer_connected;
@@ -2143,7 +2143,7 @@ static void handle_wg_config_post(AsyncWebServerRequest *request) {
     free(body);
     request->_tempObject = nullptr;
 
-    // Валидация
+    // Validation
     const char *address = input["address"];
     if (address && !wg_validate_ip(address)) {
         request->send(400, "application/json", "{\"error\":\"invalid address format\"}");
@@ -2162,14 +2162,14 @@ static void handle_wg_config_post(AsyncWebServerRequest *request) {
         return;
     }
 
-    // Загружаем существующий конфиг (если есть) и мержим
+    // Load existing config (if any) and merge
     JsonDocument cfg;
     wg_load_config(cfg);
 
     if (address) cfg["address"] = address;
     if (private_key) {
         cfg["private_key"] = private_key;
-        // Вычисляем и сохраняем публичный ключ
+        // Derive and store public key
         wg_derive_public_key(private_key);
     }
     if (listen_port > 0) cfg["listen_port"] = listen_port;
@@ -2215,7 +2215,7 @@ static void handle_wg_peer_post(AsyncWebServerRequest *request) {
     free(body);
     request->_tempObject = nullptr;
 
-    // Валидация
+    // Validation
     const char *public_key = input["public_key"];
     if (!public_key || !wg_validate_key(public_key)) {
         request->send(400, "application/json", "{\"error\":\"invalid or missing public_key (must be 44 base64 chars)\"}");
@@ -2227,7 +2227,7 @@ static void handle_wg_peer_post(AsyncWebServerRequest *request) {
         request->send(400, "application/json", "{\"error\":\"endpoint required\"}");
         return;
     }
-    // Валидация endpoint — IP или hostname, разрешаем [a-zA-Z0-9.-]
+    // Validate endpoint — IP or hostname, allow [a-zA-Z0-9.-]
     for (int i = 0; endpoint[i]; i++) {
         char c = endpoint[i];
         if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
@@ -2252,7 +2252,7 @@ static void handle_wg_peer_post(AsyncWebServerRequest *request) {
 
     int keepalive = input["persistent_keepalive"] | 0;
 
-    // Загружаем существующий конфиг и обновляем пир
+    // Load existing config and update peer
     JsonDocument cfg;
     wg_load_config(cfg);
 
@@ -2307,7 +2307,7 @@ static void handle_wg_peer_delete(AsyncWebServerRequest *request) {
         return;
     }
 
-    // Если указан ключ — проверяем что совпадает
+    // If key specified — verify it matches
     const char *existing_key = cfg["peer"]["public_key"];
     if (pubkey_to_remove.length() > 0 && existing_key &&
         pubkey_to_remove != String(existing_key)) {
@@ -2323,7 +2323,7 @@ static void handle_wg_peer_delete(AsyncWebServerRequest *request) {
         return;
     }
 
-    // Если WG работает — останавливаем
+    // If WG running — stop it
     if (wg_running) {
         wg_stop();
     }
@@ -2360,7 +2360,7 @@ static void handle_wg_peers(AsyncWebServerRequest *request) {
 
         p["allowed_ips"] = cfg["peer"]["allowed_ips"] | "0.0.0.0/0";
 
-        // Статус подключения
+        // Connection status
         bool connected = false;
         if (wg_running) {
             connected = wg.is_initialized();
@@ -2377,9 +2377,9 @@ static void handle_wg_peers(AsyncWebServerRequest *request) {
     request->send(200, "application/json", response);
 }
 
-// --- POST /wg/restart — запланировать перезапуск WG туннеля ---
-// wg.begin() может блокировать до 10 секунд (DNS resolve) — нельзя вызывать
-// из async HTTP handler. Ставим флаг, перезапуск происходит в loop().
+// --- POST /wg/restart — schedule WG tunnel restart ---
+// wg.begin() can block up to 10 seconds (DNS resolve) — cannot call
+// from async HTTP handler. Set flag, restart happens in loop().
 static void handle_wg_restart(AsyncWebServerRequest *request) {
     if (!require_auth(request)) return;
 
@@ -2390,11 +2390,11 @@ static void handle_wg_restart(AsyncWebServerRequest *request) {
 }
 
 // ===== URL Router =====
-// ESPAsyncWebServer не поддерживает path params в стиле /gpio/<pin>/read
-// напрямую, поэтому используем catch-all + парсинг URL
+// ESPAsyncWebServer doesn't support path params like /gpio/<pin>/read
+// natively, so we use catch-all + URL parsing
 
 static void setup_routes() {
-    // --- GET /health (без auth) ---
+    // --- GET /health (no auth) ---
     server.on("/health", HTTP_GET, handle_health);
 
     // --- GET /capabilities ---
@@ -2447,16 +2447,16 @@ static void setup_routes() {
     server.on("/wifi/config", HTTP_POST, handle_wifi_config_post);
 
     // --- GPIO dynamic routes: /gpio/{pin}/mode, /gpio/{pin}/write, /gpio/{pin}/read ---
-    // Используем onRequestBody + onRequest для POST routes с dynamic path
+    // Use onRequestBody + onRequest for POST routes with dynamic path
 
     // POST /gpio/*/mode, POST /gpio/*/write, POST /i2c/*/write
-    // Per-request body буферы через _tempObject
+    // Per-request body buffers via _tempObject
     server.onRequestBody([](AsyncWebServerRequest *request, uint8_t *data,
                             size_t len, size_t index, size_t total) {
         String url = request->url();
         if (url.startsWith("/gpio/") || url.startsWith("/i2c/")) {
             if (index == 0) {
-                // Лимит размера тела — защита от OOM
+                // Body size limit — OOM protection
                 if (total > 4096) { request->send(413, "application/json", "{\"error\":\"Payload Too Large\"}"); return; }
                 char *buf = (char*)malloc(total + 1);
                 if (!buf) { request->send(500, "application/json", "{\"error\":\"OOM\"}"); return; }
@@ -2468,14 +2468,14 @@ static void setup_routes() {
         }
     });
 
-    // Catch-all handler для динамических маршрутов
+    // Catch-all handler for dynamic routes
     server.onNotFound([](AsyncWebServerRequest *request) {
         String url = request->url();
         String method = request->methodToString();
 
         // --- GPIO routes ---
         if (url.startsWith("/gpio/") && url != "/gpio/status") {
-            // Парсим /gpio/{pin}/{action}
+            // Parse /gpio/{pin}/{action}
             int pin = 0;
             char action[16] = "";
             if (sscanf(url.c_str(), "/gpio/%d/%15s", &pin, action) < 1) {
@@ -2552,7 +2552,7 @@ static void board_init() {
     pinMode(VEXT_PIN, OUTPUT);
     digitalWrite(VEXT_PIN, LOW);  // Enable Vext (LOW = on for Heltec V3)
 
-    // LoRa SX1262 — переводим в sleep чтобы не жрал ток
+    // LoRa SX1262 — put to sleep to save power
     pinMode(LORA_NSS, OUTPUT);
     digitalWrite(LORA_NSS, HIGH);
     pinMode(LORA_RST, OUTPUT);
@@ -2563,7 +2563,7 @@ static void board_init() {
     pinMode(LORA_BUSY, INPUT);
     pinMode(LORA_DIO1, INPUT);
 
-    // SPI sleep command для SX1262
+    // SPI sleep command for SX1262
     SPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_NSS);
     digitalWrite(LORA_NSS, LOW);
     SPI.transfer(0x84);  // SetSleep
@@ -2597,13 +2597,13 @@ void setup() {
         Serial.println("[SPIFFS] Mounted");
     }
 
-    // Мьютексы (до I2C/OLED, т.к. oled_update использует wire_mutex)
+    // Mutexes (before I2C/OLED since oled_update uses wire_mutex)
     deploy_mutex = xSemaphoreCreateMutex();
     wire_mutex = xSemaphoreCreateMutex();
     deploy_log_mutex = xSemaphoreCreateMutex();
     events_mutex = xSemaphoreCreateMutex();
 
-    // I2C init (до OLED)
+    // I2C init (before OLED)
     i2c_init();
 
     // OLED init
@@ -2616,7 +2616,7 @@ void setup() {
     // WiFi
     wifi_setup();
 
-    // WireGuard — вычислить публичный ключ из конфига (до NTP, чтобы /wg/status показывал)
+    // WireGuard — derive public key from config (before NTP so /wg/status shows it)
     {
         JsonDocument wg_doc;
         if (wg_load_config(wg_doc)) {
@@ -2630,7 +2630,7 @@ void setup() {
     server.begin();
     Serial.printf("[HTTP] Server started on port %d\n", HTTP_PORT);
 
-    // Начальное обновление OLED
+    // Initial OLED update
     oled_update();
 
     Serial.println("=== Ready ===");
@@ -2640,15 +2640,15 @@ void setup() {
 }
 
 void loop() {
-    // OLED обновление каждые 2 секунды
+    // OLED update every 2 seconds
     static unsigned long last_oled_update = 0;
     if (millis() - last_oled_update > 2000) {
         oled_update();
         last_oled_update = millis();
     }
 
-    // WireGuard auto-start после NTP синхронизации
-    // NTP нужен для handshake (timestamp-based anti-replay)
+    // WireGuard auto-start after NTP sync
+    // NTP needed for handshake (timestamp-based anti-replay)
     if (!wg_init_done && WiFi.status() == WL_CONNECTED) {
         struct timeval tv;
         if (gettimeofday(&tv, NULL) == 0 && tv.tv_sec > 1700000000) {
@@ -2657,15 +2657,15 @@ void loop() {
         }
     }
 
-    // WireGuard отложенный рестарт (из /wg/restart, /wg/config, /wg/peer)
-    // wg.begin() блокирует до 10s — нельзя вызывать из async HTTP handler
+    // WireGuard deferred restart (from /wg/restart, /wg/config, /wg/peer)
+    // wg.begin() blocks up to 10s — cannot call from async HTTP handler
     if (wg_restart_needed) {
         wg_restart_needed = false;
         wg_stop();
         wg_start();
     }
 
-    // Отложенный рестарт (из apply/rollback) — ждём чтобы HTTP ответ ушёл
+    // Deferred restart (from apply/rollback) — wait for HTTP response to send
     static unsigned long restart_requested_at = 0;
     if (pending_restart && restart_requested_at == 0) {
         restart_requested_at = millis();
@@ -2678,7 +2678,7 @@ void loop() {
         ESP.restart();
     }
 
-    // Auto-confirm прошивки через 60 секунд стабильной работы (одна попытка)
+    // Auto-confirm firmware after 60 seconds of stable operation (one attempt)
     if (!firmware_confirmed && !firmware_confirm_attempted &&
         (millis() - boot_time) > 60000 && WiFi.status() == WL_CONNECTED) {
         firmware_confirm_attempted = true;
@@ -2686,14 +2686,14 @@ void loop() {
         if (err == ESP_OK) {
             firmware_confirmed = true;
             event_add("ota firmware auto-confirmed after 60s uptime");
-            Serial.println("[OTA] Прошивка auto-confirmed (60s uptime + WiFi)");
+            Serial.println("[OTA] Firmware auto-confirmed (60s uptime + WiFi)");
         } else {
             Serial.printf("[OTA] Auto-confirm failed: %d (not an OTA boot?)\n", err);
-            firmware_confirmed = true;  // Не OTA загрузка — считаем подтверждённой
+            firmware_confirmed = true;  // Not an OTA boot — consider confirmed
         }
     }
 
-    // WiFi reconnect если отвалился
+    // WiFi reconnect if disconnected
     static unsigned long last_wifi_check = 0;
     static bool was_connected = false;
     bool is_connected = (WiFi.status() == WL_CONNECTED);
