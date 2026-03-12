@@ -536,11 +536,11 @@ static int health_check(int port) {
  * Example: #include "skills/sysmon.c"
  */
 /* #include "skills/example.c" */
+#include "skills/sysmon.c"
 
 static void skills_init(void) {
-    /* Call each skill's init function here when included above.
-     * Example: example_init();
-     */
+    /* Call each skill's init function here when included above. */
+    sysmon_init();
 }
 
 /* ===== Request handler ===== */
