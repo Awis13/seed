@@ -801,7 +801,7 @@ static void handle(int fd, const char *ip) {
         event_add("firmware apply: new binary installed, restarting");
 
         json_resp(fd, 200, "OK",
-            "{\"ok\":true,\"warning\":\"restarting with watchdog, 10s grace period\"}");
+            "{\"ok\":true,\"warning\":\"restarting with watchdog, 30s grace period\"}");
 
         /* Fork watchdog */
         pid_t pid = fork();
@@ -830,7 +830,7 @@ static void handle(int fd, const char *ip) {
                 }
             }
 
-            sleep(10);
+            sleep(30);
 
             /* Health check (raw socket, no curl dependency) */
             int check = health_check(g_port);
@@ -839,15 +839,19 @@ static void handle(int fd, const char *ip) {
                 int fails = apply_failures_read() + 1;
                 apply_failures_write(fails);
                 fprintf(stderr, "[watchdog] health check FAILED (%d/3), rolling back\n", fails);
+                if (has_systemd) {
+                    system("systemctl stop " SERVICE_NAME);
+                } else {
+                    system("pkill -f " BINARY_FILE);
+                }
+                sleep(2);
+                /* Copy backup over failed binary (process must be dead first) */
                 char rb[256];
                 snprintf(rb, sizeof(rb), "cp %s %s", BINARY_BACKUP, BINARY_FILE);
                 system(rb);
                 if (has_systemd) {
-                    system("systemctl restart " SERVICE_NAME);
+                    system("systemctl start " SERVICE_NAME);
                 } else {
-                    /* Kill failed firmware, restart from backup */
-                    system("pkill -f " BINARY_FILE);
-                    sleep(1);
                     pid_t child = fork();
                     if (child == 0) {
                         setsid();

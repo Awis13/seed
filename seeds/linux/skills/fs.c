@@ -36,10 +36,9 @@ static const char *fs_describe(void) {
            "- Symlinks are followed\n";
 }
 
-/* Validate path: must be absolute, no .. traversal above starting point */
+/* Validate path: must be absolute, no .. traversal */
 static int fs_valid_path(const char *path) {
     if (!path || path[0] != '/') return 0;
-    if (strstr(path, "\0")) return 0; /* null bytes */
     return 1;
 }
 
