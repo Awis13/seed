@@ -167,6 +167,32 @@ typedef struct {
     int  content_length;
 } http_req_t;
 
+/* ===== Skill/plugin interface ===== */
+typedef struct {
+    const char *method;      /* "GET", "POST", etc. */
+    const char *path;        /* "/myendpoint" */
+    const char *description; /* Human-readable description */
+} skill_endpoint_t;
+
+typedef struct {
+    const char *name;                          /* Short name: "sysmon", "gpio" */
+    const char *version;                       /* Semver: "0.1.0" */
+    const char *(*describe)(void);             /* Returns markdown description */
+    const skill_endpoint_t *endpoints;         /* NULL-terminated array */
+    int (*handle)(int fd, http_req_t *req);    /* Returns 1 if handled, 0 if not */
+} skill_t;
+
+#define MAX_SKILLS 16
+static const skill_t *g_skills[MAX_SKILLS];
+static int g_skill_count = 0;
+
+__attribute__((unused))
+static int skill_register(const skill_t *skill) {
+    if (g_skill_count >= MAX_SKILLS) return -1;
+    g_skills[g_skill_count++] = skill;
+    return 0;
+}
+
 static int parse_request(int fd, http_req_t *req) {
     memset(req, 0, sizeof(*req));
     req->body = NULL;
@@ -504,6 +530,19 @@ static int health_check(int port) {
     return strstr(buf, "\"ok\":true") ? 0 : -1;
 }
 
+/* ===== Skills ===== */
+/* Skills are loaded by #include. Each skill file defines a static skill_t
+ * and calls skill_register() in an init function.
+ * Example: #include "skills/sysmon.c"
+ */
+/* #include "skills/example.c" */
+
+static void skills_init(void) {
+    /* Call each skill's init function here when included above.
+     * Example: example_init();
+     */
+}
+
 /* ===== Request handler ===== */
 static void handle(int fd, const char *ip) {
     http_req_t req;
@@ -552,8 +591,15 @@ static void handle(int fd, const char *ip) {
             "\"/health\",\"/capabilities\",\"/config.md\",\"/events\","
             "\"/firmware/version\",\"/firmware/source\",\"/firmware/build\","
             "\"/firmware/build/logs\",\"/firmware/apply\","
-            "\"/firmware/apply/reset\",\"/skill\""
-            "]}");
+            "\"/firmware/apply/reset\",\"/skill\"");
+        /* Append skill endpoints */
+        for (int si = 0; si < g_skill_count; si++) {
+            const skill_endpoint_t *ep = g_skills[si]->endpoints;
+            if (!ep) continue;
+            for (; ep->path; ep++)
+                o += snprintf(resp + o, sizeof(resp) - o, ",\"%s\"", ep->path);
+        }
+        o += snprintf(resp + o, sizeof(resp) - o, "]}");
         json_resp(fd, 200, "OK", resp);
         goto done;
     }
@@ -891,8 +937,24 @@ static void handle(int fd, const char *ip) {
             "| GET | /firmware/build/logs | Compilation output |\n"
             "| POST | /firmware/apply | Apply + restart (10s watchdog, auto-rollback) |\n"
             "| POST | /firmware/apply/reset | Unlock apply after 3 consecutive failures |\n"
-            "| GET | /skill | This file |\n\n",
+            "| GET | /skill | This file |\n",
             hostname, my_ip, g_port, g_token, g_token);
+        /* Append skill endpoints to table */
+        for (int si = 0; si < g_skill_count; si++) {
+            const skill_endpoint_t *ep = g_skills[si]->endpoints;
+            if (!ep) continue;
+            for (; ep->path; ep++)
+                sk += snprintf(skill + sk, skill_sz - sk,
+                    "| %s | %s | %s |\n", ep->method, ep->path, ep->description);
+        }
+        sk += snprintf(skill + sk, skill_sz - sk, "\n");
+        /* Append skill descriptions */
+        for (int si = 0; si < g_skill_count; si++) {
+            if (!g_skills[si]->describe) continue;
+            const char *desc = g_skills[si]->describe();
+            if (desc)
+                sk += snprintf(skill + sk, skill_sz - sk, "%s\n", desc);
+        }
         sk += snprintf(skill + sk, skill_sz - sk,
             "## Growing the node\n\n"
             "This seed knows only the basics. To add capabilities:\n\n"
@@ -979,6 +1041,12 @@ static void handle(int fd, const char *ip) {
         goto done;
     }
 
+    /* === Skill handlers === */
+    for (int si = 0; si < g_skill_count; si++) {
+        if (g_skills[si]->handle && g_skills[si]->handle(fd, &req))
+            goto done;
+    }
+
     /* === 404 === */
     snprintf(resp, sizeof(resp),
         "{\"error\":\"not found\",\"path\":\"%s\",\"hint\":\"GET /capabilities for API list\"}",
@@ -1002,6 +1070,7 @@ int main(int argc, char **argv) {
 
     mkdir(INSTALL_DIR, 0755);
     token_load();
+    skills_init();
 
     /* Socket */
     int srv = socket(AF_INET, SOCK_STREAM, 0);
