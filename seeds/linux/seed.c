@@ -64,6 +64,7 @@
 /* ===== Globals ===== */
 static time_t g_start_time;
 static char   g_token[65];
+static int    g_port = DEFAULT_PORT;
 
 /* Apply failure counter — persisted to file (survives fork + restart) */
 static int apply_failures_read(void) {
@@ -297,11 +298,13 @@ static int discover_devices(char *buf, int maxlen, const char *key,
     int first = 1;
     if (fp) {
         char line[128];
-        while (fgets(line, sizeof(line), fp) && o < maxlen - 32) {
+        while (fgets(line, sizeof(line), fp) && o < maxlen - 64) {
             int l = strlen(line);
             while (l > 0 && (line[l-1] == '\n' || line[l-1] == '\r')) line[--l] = '\0';
             if (l == 0) continue;
-            o += snprintf(buf + o, maxlen - o, "%s\"%s\"", first ? "" : ",", line);
+            char esc[256];
+            json_escape(line, esc, sizeof(esc));
+            o += snprintf(buf + o, maxlen - o, "%s\"%s\"", first ? "" : ",", esc);
             first = 0;
         }
         pclose(fp);
@@ -359,8 +362,11 @@ static int hw_discover(char *buf, int maxlen) {
     }
     if (!cpus) cpus = 1; /* fallback */
     o += snprintf(buf + o, maxlen - o, ",\"cpus\":%d", cpus);
-    if (cpu_model[0])
-        o += snprintf(buf + o, maxlen - o, ",\"cpu_model\":\"%s\"", cpu_model);
+    if (cpu_model[0]) {
+        char esc_cpu[256];
+        json_escape(cpu_model, esc_cpu, sizeof(esc_cpu));
+        o += snprintf(buf + o, maxlen - o, ",\"cpu_model\":\"%s\"", esc_cpu);
+    }
 
     /* Memory */
     long mem_kb = 0;
@@ -398,8 +404,11 @@ static int hw_discover(char *buf, int maxlen) {
             int l = strlen(model);
             while (l > 0 && (model[l-1] == '\n' || model[l-1] == '\0')) l--;
             model[l] = '\0';
-            if (model[0])
-                o += snprintf(buf + o, maxlen - o, ",\"board_model\":\"%s\"", model);
+            if (model[0]) {
+                char esc_model[256];
+                json_escape(model, esc_model, sizeof(esc_model));
+                o += snprintf(buf + o, maxlen - o, ",\"board_model\":\"%s\"", esc_model);
+            }
         }
         fclose(fp);
     }
@@ -470,6 +479,29 @@ static int hw_discover(char *buf, int maxlen) {
     o += snprintf(buf + o, maxlen - o, ",\"has_wireguard\":%s", has_wg ? "true" : "false");
 
     return o;
+}
+
+/* ===== Raw socket health check (no curl dependency) ===== */
+static int health_check(int port) {
+    int s = socket(AF_INET, SOCK_STREAM, 0);
+    if (s < 0) return -1;
+    struct sockaddr_in a = {
+        .sin_family = AF_INET,
+        .sin_port = htons(port),
+        .sin_addr.s_addr = htonl(INADDR_LOOPBACK)
+    };
+    struct timeval tv = { .tv_sec = 5 };
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    if (connect(s, (struct sockaddr *)&a, sizeof(a)) < 0) { close(s); return -1; }
+    const char *req = "GET /health HTTP/1.0\r\n\r\n";
+    write(s, req, strlen(req));
+    char buf[512];
+    int n = read(s, buf, sizeof(buf) - 1);
+    close(s);
+    if (n <= 0) return -1;
+    buf[n] = '\0';
+    return strstr(buf, "\"ok\":true") ? 0 : -1;
 }
 
 /* ===== Request handler ===== */
@@ -725,23 +757,30 @@ static void handle(int fd, const char *ip) {
             for (int i = 3; i < 1024; i++) close(i);
             sleep(1);
 
-            /* Try systemctl first, fall back to direct exec */
+            /* Try systemctl first, fall back to fork+exec */
             int has_systemd = (system("systemctl is-active " SERVICE_NAME " >/dev/null 2>&1") == 0);
             if (has_systemd) {
                 system("systemctl restart " SERVICE_NAME);
             } else {
-                /* Direct: kill parent, new binary will be started by init/supervisor */
-                kill(getppid(), SIGTERM);
+                /* No systemd: kill parent, fork+exec new binary ourselves */
+                pid_t ppid = getppid();
+                kill(ppid, SIGTERM);
+                sleep(1);
+                /* Start new binary */
+                pid_t child = fork();
+                if (child == 0) {
+                    setsid();
+                    char port_str[8];
+                    snprintf(port_str, sizeof(port_str), "%d", g_port);
+                    execl(BINARY_FILE, BINARY_FILE, port_str, (char *)NULL);
+                    _exit(1);
+                }
             }
 
             sleep(10);
 
-            /* Health check */
-            char hc[256];
-            snprintf(hc, sizeof(hc),
-                "curl -sf --max-time 5 http://127.0.0.1:%d/health >/dev/null 2>&1",
-                DEFAULT_PORT);
-            int check = system(hc);
+            /* Health check (raw socket, no curl dependency) */
+            int check = health_check(g_port);
             if (check != 0) {
                 /* ROLLBACK */
                 int fails = apply_failures_read() + 1;
@@ -750,8 +789,21 @@ static void handle(int fd, const char *ip) {
                 char rb[256];
                 snprintf(rb, sizeof(rb), "cp %s %s", BINARY_BACKUP, BINARY_FILE);
                 system(rb);
-                if (has_systemd)
+                if (has_systemd) {
                     system("systemctl restart " SERVICE_NAME);
+                } else {
+                    /* Kill failed firmware, restart from backup */
+                    system("pkill -f " BINARY_FILE);
+                    sleep(1);
+                    pid_t child = fork();
+                    if (child == 0) {
+                        setsid();
+                        char port_str[8];
+                        snprintf(port_str, sizeof(port_str), "%d", g_port);
+                        execl(BINARY_FILE, BINARY_FILE, port_str, (char *)NULL);
+                        _exit(1);
+                    }
+                }
             } else {
                 fprintf(stderr, "[watchdog] health check OK, new firmware confirmed\n");
                 apply_failures_reset();
@@ -789,13 +841,17 @@ static void handle(int fd, const char *ip) {
         char hostname[64] = "unknown";
         gethostname(hostname, sizeof(hostname));
 
-        /* Find first non-loopback IP */
+        /* Find first real network IP (skip loopback, docker, veth) */
         char my_ip[INET_ADDRSTRLEN] = "localhost";
         struct ifaddrs *ifa_list, *ifa;
         if (getifaddrs(&ifa_list) == 0) {
             for (ifa = ifa_list; ifa; ifa = ifa->ifa_next) {
                 if (!ifa->ifa_addr || ifa->ifa_addr->sa_family != AF_INET) continue;
+                if (!(ifa->ifa_flags & IFF_UP) || !(ifa->ifa_flags & IFF_RUNNING)) continue;
                 if (strcmp(ifa->ifa_name, "lo") == 0) continue;
+                if (strncmp(ifa->ifa_name, "docker", 6) == 0) continue;
+                if (strncmp(ifa->ifa_name, "veth", 4) == 0) continue;
+                if (strncmp(ifa->ifa_name, "br-", 3) == 0) continue;
                 inet_ntop(AF_INET,
                     &((struct sockaddr_in *)ifa->ifa_addr)->sin_addr,
                     my_ip, sizeof(my_ip));
@@ -836,7 +892,7 @@ static void handle(int fd, const char *ip) {
             "| POST | /firmware/apply | Apply + restart (10s watchdog, auto-rollback) |\n"
             "| POST | /firmware/apply/reset | Unlock apply after 3 consecutive failures |\n"
             "| GET | /skill | This file |\n\n",
-            hostname, my_ip, DEFAULT_PORT, g_token, g_token);
+            hostname, my_ip, g_port, g_token, g_token);
         sk += snprintf(skill + sk, skill_sz - sk,
             "## Growing the node\n\n"
             "This seed knows only the basics. To add capabilities:\n\n"
@@ -915,9 +971,9 @@ static void handle(int fd, const char *ip) {
             "curl -H 'Authorization: Bearer %s' http://%s:%d/capabilities\n"
             "curl -H 'Authorization: Bearer %s' http://%s:%d/skill\n"
             "```\n",
-            my_ip, DEFAULT_PORT,
-            g_token, my_ip, DEFAULT_PORT,
-            g_token, my_ip, DEFAULT_PORT);
+            my_ip, g_port,
+            g_token, my_ip, g_port,
+            g_token, my_ip, g_port);
         respond(fd, 200, "OK", "text/markdown; charset=utf-8", skill, sk);
         free(skill);
         goto done;
@@ -938,6 +994,7 @@ int main(int argc, char **argv) {
     int port = DEFAULT_PORT;
     if (argc > 1) port = atoi(argv[1]);
     if (port <= 0 || port > 65535) port = DEFAULT_PORT;
+    g_port = port;
 
     signal(SIGPIPE, SIG_IGN);
     signal(SIGCHLD, SIG_IGN);
