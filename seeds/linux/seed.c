@@ -41,7 +41,7 @@
 #include <sys/utsname.h>
 
 /* ===== Config ===== */
-#define VERSION         "0.1.0"
+#define VERSION         "0.2.0"
 #define DEFAULT_PORT    8080
 #define HTTP_BUF        4096
 #define RESP_BUF        32768

@@ -30,7 +30,7 @@
 #include <esp_ota_ops.h>
 
 // ===== Configuration =====
-#define SEED_VERSION        "0.1.0"
+#define SEED_VERSION        "0.2.0"
 #define HTTP_PORT           8080
 #define AP_PASSWORD         "seed1313"
 #define TOKEN_FILE          "/auth_token.txt"
