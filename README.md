@@ -1,20 +1,16 @@
 # seed.c
 
-AI-growable firmware. One C file. Any hardware.
+A bootloader for AI. Firmware management over HTTP. One C file. Any hardware.
 
-```
+```bash
 gcc -O2 -o seed seed.c && ./seed
-```
-```
-Seed v0.1.0
-Token: <generated on first run>
 
-Connect:
-  http://192.168.1.x:8080/health
-  http://localhost:8080/health
-
-Skill file: GET /skill
-API list:   GET /capabilities
+#  Seed v0.1.0
+#  Token: 7e54b046...
+#
+#  Connect:
+#    http://192.168.1.x:8080/health
+#    http://localhost:8080/health
 ```
 
 An AI agent connects, reads the hardware, writes new firmware,
@@ -48,7 +44,7 @@ Full node (whatever the AI wrote)
 ## Project structure
 
 ```
-seeds/                          <- minimal bootstraps
+seeds/                          <- bootloaders
   linux/seed.c                     1000 lines, gcc, any Linux
   esp32/                           1250 lines, PlatformIO, Heltec V3
   pdp11/seed.c                      550 lines, K&R C, 2.11BSD
@@ -59,11 +55,12 @@ firmware/                       <- grown from seeds
 
 docs/
   pdp11-growth-log.md              How we grew a PDP-11 from 1975
+  pdp11-console-log.md             Raw console output from the session
 
 SKILL.md                        <- AI agent skill file
 ```
 
-Seeds are the starting point. Firmware is what they become.
+Seeds are bootloaders. Firmware is what gets loaded.
 Every firmware preserves the `/firmware/*` API — so it can be grown again.
 
 ## Quick start
@@ -152,9 +149,9 @@ An AI agent connected, wrote new firmware respecting 16-bit integer limits
 and pre-ANSI C syntax, compiled it on the node, and applied it
 with automatic watchdog rollback.
 
-Three generations. Each compiled the next through the same API.
-The node evolved from a 550-line seed into a system monitor
-with process listing, disk stats, and syslog access.
+The node evolved from a 550-line seed through two bootstraps
+into a system monitor with process listing, disk stats, and syslog access.
+Two failed Gen 2 attempts were caught by the watchdog and auto-rolled back.
 
 If it works on hardware from 1975, it works on everything.
 
@@ -168,8 +165,11 @@ Seed runs on your hardware, on your network. No cloud, no phone-home.
 - **No shell injection** — all inputs validated
 - **Audit log** — every action logged to `/events` with timestamps
 
-**This is remote code execution by design.** An AI agent compiles and runs
-C code on your device. The watchdog ensures bad code is killed in 10 seconds.
+**This is a firmware management API.** The same `source → build → apply` cycle
+works whether the caller is an AI agent, a human with curl, or a CI/CD pipeline.
+Think OTA updates without the cloud — like balena, but 40KB and self-hosted.
+
+The watchdog ensures bad firmware is killed in 10 seconds.
 Run seed on hardware you control, on networks you trust.
 
 ## Hardware
@@ -185,28 +185,10 @@ Run seed on hardware you control, on networks you trust.
 
 ## Writing firmware
 
-C only. libc only. No external libraries.
-Single-threaded. One request at a time.
+C only. libc only. No external libraries. Single file. `gcc -O2 -o seed seed.c` must work.
 
-Handler pattern:
-```c
-if (strcmp(req.path, "/myendpoint") == 0
-    && strcmp(req.method, "GET") == 0) {
-    char resp[4096];
-    snprintf(resp, sizeof(resp), "{\"key\":\"value\"}");
-    json_resp(fd, 200, "OK", resp);
-    goto done;
-}
-```
-
-Available helpers: `json_resp()`, `text_resp()`, `respond()`,
-`file_read()`, `file_write()`, `cmd_out()`, `event_add()`.
-
-Request fields: `req.method`, `req.path`, `req.body`,
-`req.body_len`, `req.content_length`.
-
-Auth is checked before your handler runs.
-`/health` is always public.
+See [SKILL.md](SKILL.md) for the full API reference, handler patterns, and constraints.
+AI agents get this automatically from `GET /skill` on any running node.
 
 ## License
 

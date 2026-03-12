@@ -1,7 +1,33 @@
-# seed.c — Self-Growing Firmware
+---
+name: seed
+description: Bootloader for AI — upload C to any hardware through HTTP, compile on device, apply with watchdog rollback
+homepage: https://github.com/Awis13/seed
+user-invocable: true
+metadata: {"openclaw":{"emoji":"🌱","os":["darwin","linux"],"requires":{"bins":["curl","gcc"]}}}
+---
 
-You have access to a seed node — a minimal C firmware with an HTTP API
+# seed.c — Bootloader for AI
+
+**Source:** https://github.com/Awis13/seed
+
+You have access to a seed node — a bootloader, a minimal C binary with an HTTP API
 that you can grow by writing and compiling new firmware on the device.
+
+## First steps
+
+If the user hasn't given you a node address and token, ask them:
+- Do they already have a seed node running? If so, get the IP and token.
+- If not, offer to deploy one. All they need is a Linux machine with gcc:
+
+```bash
+# On the target machine (Pi, VPS, any Linux box):
+curl -fsSL https://raw.githubusercontent.com/Awis13/seed/main/seeds/linux/seed.c -o seed.c
+gcc -O2 -o seed seed.c
+./seed 8080
+# Token will be printed — give it to the agent
+```
+
+The seed binary is ~70KB, zero dependencies beyond libc.
 
 ## Connecting
 

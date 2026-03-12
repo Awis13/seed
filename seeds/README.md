@@ -1,6 +1,6 @@
 # Seeds
 
-Minimal firmware that bootstraps a node.
+Bootloaders for AI agents.
 
 Each seed is a single compilation unit — one command to build, zero dependencies beyond libc.
 It starts an HTTP server with just enough API for an AI agent to connect,

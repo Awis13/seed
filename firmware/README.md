@@ -1,6 +1,6 @@
 # Firmware
 
-Grown firmware — what seeds become after an AI agent evolves them.
+Grown firmware — what AI agents load through the seed bootloader.
 
 Each firmware started as a seed and was grown through the `/firmware/*` API.
 The growth process is preserved: every firmware still has the seed API,
