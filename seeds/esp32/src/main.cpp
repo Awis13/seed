@@ -1087,14 +1087,15 @@ static void handle_lora_recv(AsyncWebServerRequest *request) {
 // --- GET /skill ---
 
 static void handle_skill(AsyncWebServerRequest *request) {
+    if (!require_auth(request)) return;
+
     String ip = WiFi.status() == WL_CONNECTED
         ? WiFi.localIP().toString() : WiFi.softAPIP().toString();
 
     String s = "# ESP32 Seed\n\n";
     s += "Host: " + ip + ":" + String(HTTP_PORT) + "\n";
-    s += "Token: " + auth_token + "\n";
     s += "mDNS: " + mdns_name + ".local\n";
-    s += "AP: " + ap_ssid + " (pass: " AP_PASSWORD ")\n\n";
+    s += "AP: " + ap_ssid + "\n\n";
     s += "Auth: `Authorization: Bearer <token>` (except /health)\n\n";
     s += "## Grow cycle\n\n";
     s += "ESP32 has no compiler. Build on host, upload binary:\n\n";
@@ -1144,7 +1145,14 @@ static void handle_wifi_page(AsyncWebServerRequest *request) {
         "</form>";
     if (WiFi.status() == WL_CONNECTED)
         html += "<p>Connected: " + WiFi.SSID() + " (" + WiFi.localIP().toString() + ")</p>";
-    html += "<p>Token: " + auth_token + "</p></body></html>";
+    // Only show token to clients on the AP subnet (initial setup)
+    IPAddress client_ip;
+    client_ip.fromString(request->client()->remoteIP().toString());
+    IPAddress ap_ip = WiFi.softAPIP();
+    if (client_ip[0] == ap_ip[0] && client_ip[1] == ap_ip[1] && client_ip[2] == ap_ip[2]) {
+        html += "<p>Token: " + auth_token + "</p>";
+    }
+    html += "</body></html>";
     request->send(200, "text/html", html);
 }
 
