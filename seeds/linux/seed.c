@@ -538,11 +538,16 @@ static int health_check(int port) {
 /* #include "skills/example.c" */
 #include "skills/sysmon.c"
 #include "skills/serial.c"
+#include "skills/exec.c"
+#include "skills/fs.c"
+#include "skills/net.c"
 
 static void skills_init(void) {
-    /* Call each skill's init function here when included above. */
     sysmon_init();
     serial_init();
+    exec_init();
+    fs_init();
+    net_init();
 }
 
 /* ===== Request handler ===== */
