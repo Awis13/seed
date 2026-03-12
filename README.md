@@ -48,15 +48,15 @@ They don't share memory — they communicate through the node itself using `/not
 
 **Agent 1: Recon** — inspects hardware, finds issues, leaves notes for the next agent.
 
-[![Agent 1: Recon](https://asciinema.org/a/AysDKw4K49qMS8Sw.svg)](https://asciinema.org/a/AysDKw4K49qMS8Sw)
+![Agent 1: Recon](demos/01_recon.gif)
 
 **Agent 2: Fix** — reads notes, fixes every issue (killed Bluetooth crash loop, hardened firewall, fixed WiFi latency).
 
-[![Agent 2: Fix](https://asciinema.org/a/ueQlcpxAJXw9eZ6I.svg)](https://asciinema.org/a/ueQlcpxAJXw9eZ6I)
+![Agent 2: Fix](demos/02_fix.gif)
 
 **Agent 3: Grow** — reads notes, writes a GPIO skill in C, deploys new firmware with watchdog.
 
-[![Agent 3: Grow](https://asciinema.org/a/BYKE3ODQn6VmA142.svg)](https://asciinema.org/a/BYKE3ODQn6VmA142)
+![Agent 3: Grow](demos/03_grow.gif)
 
 ## Project structure
 
