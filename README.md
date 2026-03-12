@@ -5,7 +5,7 @@ A bootloader for AI. Firmware management over HTTP. One C file. Any hardware.
 ```bash
 gcc -O2 -o seed seed.c && ./seed
 
-#  Seed v0.1.0
+#  Seed v0.2.0
 #  Token: 7e54b046...
 #
 #  Connect:
@@ -45,8 +45,13 @@ Full node (whatever the AI wrote)
 
 ```
 seeds/                          <- bootloaders
-  linux/seed.c                     1000 lines, gcc, any Linux
-  esp32/                           1250 lines, PlatformIO, Heltec V3
+  linux/
+    seed.c                           1135 lines, gcc, any Linux
+    skills/sysmon.c                  system monitoring skill
+    skills/example.c                 reference skill template
+  esp32/
+    src/main.cpp                     1252 lines, PlatformIO, Heltec V3
+    src/skills/gpio.cpp              GPIO control skill (360 lines)
   pdp11/seed.c                      550 lines, K&R C, 2.11BSD
 
 firmware/                       <- grown from seeds
@@ -63,6 +68,48 @@ SKILL.md                        <- AI agent skill file
 
 Seeds are bootloaders. Firmware is what gets loaded.
 Every firmware preserves the `/firmware/*` API — so it can be grown again.
+
+## Skills
+
+Skills are modular capabilities — drop a `.c` file into `skills/`, include it, and the node
+gains new endpoints. Skills auto-register in `/capabilities` and `/skill`.
+
+```
+skills/
+  sysmon.c      — /system/info, /system/processes, /system/disk, /system/logs
+  gpio.cpp      — /gpio/list, /gpio/read, /gpio/write, /gpio/mode, /gpio/adc
+  example.c     — reference template for writing new skills
+```
+
+Each skill is one file that exports: name, version, `describe()` (markdown docs),
+endpoint list, and a handler. The seed dispatches requests to registered skills automatically.
+
+**Writing a skill:**
+```c
+static const skill_endpoint_t my_endpoints[] = {
+    { "GET", "/my/endpoint", "What it does" },
+    { NULL, NULL, NULL }
+};
+
+static const char *my_describe(void) {
+    return "## Skill: myskill\n\nMarkdown documentation.\n";
+}
+
+static int my_handle(int fd, http_req_t *req) {
+    if (strcmp(req->path, "/my/endpoint") == 0) {
+        json_resp(fd, 200, "OK", "{\"ok\":true}");
+        return 1;  // handled
+    }
+    return 0;  // pass to next skill
+}
+
+static const skill_t my_skill = {
+    .name = "myskill", .version = "0.1.0",
+    .describe = my_describe, .endpoints = my_endpoints, .handle = my_handle
+};
+```
+
+`GET /skill` on any node returns full documentation for all installed skills.
 
 ## Quick start
 
