@@ -186,6 +186,7 @@ Token is generated on first run, printed in the banner, saved to disk.
 | GET | `/firmware/build/logs` | Compiler output |
 | POST | `/firmware/apply` | Hot-swap binary + watchdog rollback |
 | GET | `/firmware/apply/status` | Watchdog progress (poll after apply) |
+| POST | `/firmware/rollback` | Manual rollback to backup binary |
 | POST | `/firmware/apply/reset` | Unlock apply after 3 consecutive failures |
 | GET | `/skill` | Generate AI agent skill file |
 

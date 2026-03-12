@@ -80,6 +80,66 @@ static void apply_failures_write(int n) {
 }
 static void apply_failures_reset(void) { unlink(FAIL_COUNT_FILE); }
 
+/* Constant-time token comparison — prevents timing side-channel */
+static int token_compare(const char *a, const char *b) {
+    size_t la = strlen(a), lb = strlen(b);
+    size_t len = la < lb ? la : lb;
+    volatile unsigned char result = (la != lb);
+    for (size_t i = 0; i < len; i++)
+        result |= (unsigned char)a[i] ^ (unsigned char)b[i];
+    return result == 0;
+}
+
+/* Auth rate limiting — per-IP brute-force protection */
+#define RATE_LIMIT_IPS     32
+#define RATE_LIMIT_MAX     5      /* max failures before lockout */
+#define RATE_LIMIT_WINDOW  60     /* seconds */
+static struct {
+    char ip[64];
+    int  count;
+    time_t first_fail;
+} g_rate_limit[RATE_LIMIT_IPS];
+
+static int rate_limit_check(const char *ip) {
+    time_t now = time(NULL);
+    for (int i = 0; i < RATE_LIMIT_IPS; i++) {
+        if (strcmp(g_rate_limit[i].ip, ip) == 0) {
+            if (now - g_rate_limit[i].first_fail > RATE_LIMIT_WINDOW) {
+                g_rate_limit[i].count = 0;
+                return 1; /* window expired, allow */
+            }
+            return g_rate_limit[i].count < RATE_LIMIT_MAX;
+        }
+    }
+    return 1; /* unknown IP, allow */
+}
+
+static void rate_limit_fail(const char *ip) {
+    time_t now = time(NULL);
+    int oldest = 0;
+    time_t oldest_time = now + 1;
+    for (int i = 0; i < RATE_LIMIT_IPS; i++) {
+        if (strcmp(g_rate_limit[i].ip, ip) == 0) {
+            if (g_rate_limit[i].count == 0 || now - g_rate_limit[i].first_fail > RATE_LIMIT_WINDOW) {
+                g_rate_limit[i].first_fail = now;
+                g_rate_limit[i].count = 1;
+            } else {
+                g_rate_limit[i].count++;
+            }
+            return;
+        }
+        if (g_rate_limit[i].first_fail < oldest_time) {
+            oldest_time = g_rate_limit[i].first_fail;
+            oldest = i;
+        }
+    }
+    /* Evict oldest entry */
+    strncpy(g_rate_limit[oldest].ip, ip, 63);
+    g_rate_limit[oldest].ip[63] = '\0';
+    g_rate_limit[oldest].first_fail = now;
+    g_rate_limit[oldest].count = 1;
+}
+
 /* Apply status: written by watchdog, read by /firmware/apply/status */
 static void apply_status_write(const char *status, const char *detail) {
     FILE *fp = fopen(APPLY_STATUS_FILE, "w");
@@ -595,10 +655,18 @@ static void handle(int fd, const char *ip) {
     }
 
     /* === Auth check === */
-    if (!is_trusted(ip) && g_token[0] && strcmp(req.auth, g_token) != 0) {
+    if (!is_trusted(ip) && g_token[0] && !token_compare(req.auth, g_token)) {
+        if (!rate_limit_check(ip)) {
+            json_resp(fd, 429, "Too Many Requests",
+                "{\"error\":\"rate limited — too many auth failures\"}");
+            event_add("auth rate-limited %s", ip);
+            goto done;
+        }
+        rate_limit_fail(ip);
         json_resp(fd, 401, "Unauthorized",
             "{\"error\":\"Authorization: Bearer <token> required\"}");
-        event_add("auth fail from %s", ip);
+        event_add("auth fail from %s (%d/%d)", ip,
+            g_rate_limit[0].count, RATE_LIMIT_MAX);
         goto done;
     }
 
@@ -613,7 +681,7 @@ static void handle(int fd, const char *ip) {
             "\"/health\",\"/capabilities\",\"/config.md\",\"/events\","
             "\"/firmware/version\",\"/firmware/source\",\"/firmware/build\","
             "\"/firmware/build/logs\",\"/firmware/apply\","
-            "\"/firmware/apply/reset\",\"/skill\"");
+            "\"/firmware/rollback\",\"/firmware/apply/reset\",\"/skill\"");
         /* Append skill endpoints */
         for (int si = 0; si < g_skill_count; si++) {
             const skill_endpoint_t *ep = g_skills[si]->endpoints;
@@ -950,6 +1018,30 @@ static void handle(int fd, const char *ip) {
         goto done;
     }
 
+    /* === POST /firmware/rollback — manual rollback to backup === */
+    if (strcmp(req.path, "/firmware/rollback") == 0
+        && strcmp(req.method, "POST") == 0) {
+        struct stat st;
+        if (stat(BINARY_BACKUP, &st) != 0) {
+            json_resp(fd, 404, "Not Found",
+                "{\"ok\":false,\"error\":\"no backup binary found\"}");
+            goto done;
+        }
+        /* Copy backup over current binary */
+        char cmd[256];
+        snprintf(cmd, sizeof(cmd), "cp %s %s", BINARY_BACKUP, BINARY_FILE);
+        if (system(cmd) != 0) {
+            json_resp(fd, 500, "Error",
+                "{\"ok\":false,\"error\":\"rollback copy failed\"}");
+            goto done;
+        }
+        event_add("manual rollback to backup firmware");
+        apply_status_write("rolled_back", "manual rollback by agent");
+        json_resp(fd, 200, "OK",
+            "{\"ok\":true,\"message\":\"rolled back to backup, restart to activate\"}");
+        goto done;
+    }
+
     /* === POST /firmware/apply/reset — unlock after 3 failures === */
     if (strcmp(req.path, "/firmware/apply/reset") == 0
         && strcmp(req.method, "POST") == 0) {
@@ -989,7 +1081,7 @@ static void handle(int fd, const char *ip) {
             freeifaddrs(ifa_list);
         }
 
-        int skill_sz = 16384;
+        int skill_sz = 65536;
         char *skill = malloc(skill_sz);
         if (!skill) { json_resp(fd, 500, "Error", "{\"error\":\"alloc\"}"); goto done; }
         int sk = 0;
@@ -1022,6 +1114,7 @@ static void handle(int fd, const char *ip) {
             "| GET | /firmware/build/logs | Compilation output |\n"
             "| POST | /firmware/apply | Apply + restart (120s watchdog, auto-rollback) |\n"
             "| GET | /firmware/apply/status | Watchdog progress (restarting/waiting/confirmed/rolled_back) |\n"
+            "| POST | /firmware/rollback | Manual rollback to backup binary |\n"
             "| POST | /firmware/apply/reset | Unlock apply after 3 consecutive failures |\n"
             "| GET | /skill | This file |\n",
             hostname, my_ip, g_port, g_token, g_token);

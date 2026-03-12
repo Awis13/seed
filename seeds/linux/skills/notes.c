@@ -15,7 +15,7 @@
 #define NOTES_FILE    INSTALL_DIR "/notes.json"
 #define NOTES_MAX     64
 #define NOTE_TITLE    128
-#define NOTE_BODY     2048
+#define NOTE_BODY     4096
 #define NOTE_AGENT    64
 #define NOTE_TAGS     256
 
