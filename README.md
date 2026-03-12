@@ -54,6 +54,7 @@ firmware/                       <- grown from seeds
   esp32-node/                      2700 lines — GPIO, I2C, WireGuard, LoRa, deploy
 
 docs/
+  capabilities-spec.md             Standard /capabilities contract
   pdp11-growth-log.md              How we grew a PDP-11 from 1975
   pdp11-console-log.md             Raw console output from the session
 
@@ -110,7 +111,7 @@ Token is generated on first run, printed in the banner, saved to disk.
 | Method | Path | What it does |
 |--------|------|-------------|
 | GET | `/health` | Alive check, no auth |
-| GET | `/capabilities` | Hardware fingerprint — CPU, RAM, GPIO, I2C, serial, USB, WiFi, BT |
+| GET | `/capabilities` | Hardware fingerprint ([spec](docs/capabilities-spec.md)) |
 | GET | `/config.md` | Node description (markdown) |
 | POST | `/config.md` | Update description |
 | GET | `/events` | Event log (`?since=<unix_ts>`) |
