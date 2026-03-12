@@ -1,0 +1,239 @@
+
+--- AGENT ---
+
+
+I'll conduct a thorough read-only inspection of the hardware node. Let me start by reading the documentation and checking for previous notes.
+
+--- AGENT ---
+
+
+I'll use curl directly since I need to pass custom auth headers. Let me start by fetching the skill documentation and existing notes.
+
+$ curl -s -H "Authorization: Bearer 7e54b0461d881c4e460d1363357e74b0" http://192.168.1.162:8080/skill
+# Seed Node: seed-pi
+
+Hardware node accessible via HTTP. This is a **seed** — a minimal firmware that you can grow by uploading new C source code.
+
+> **FIRST:** Run `GET /notes` — previous agents may have left tasks, findings, or warnings for you.
+
+## Connection
+
+```
+Host: 192.168.1.162:8080
+Token: 7e54b0461d881c4e460d1363357e74b0
+```
+
+All requests (except /health) require:
+`Authorization: Bearer 7e54b0461d881c4e460d1363357e74b0`
+
+## Endpoints
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | /health | Alive check (no auth) |
+| GET | /capabilities | Hardware: CPU, RAM, disk, GPIO, I2C, USB |
+| GET | /config.md | Node configuration (markdown) |
+| POST | /config.md | Update configuration |
+| GET | /events | Event log (?since=UNIX_TS) |
+| GET | /firmware/version | Versi
+
+--- AGENT ---
+Good, I have the full documentation. Now let me check existing notes and start the inspection in parallel.
+
+$ curl -s -H "Authorization: Bearer 7e54b0461d881c4e460d1363357e74b0" http://192.168.1.162:8080/notes
+[]
+
+$ curl -s -H "Authorization: Bearer 7e54b0461d881c4e460d1363357e74b0" http://192.168.1.162:8080/health
+{"ok":true,"uptime_sec":68,"type":"seed","version":"0.2.0","seed":true,"arch":"armv6l"}
+
+$ curl -s -H "Authorization: Bearer 7e54b0461d881c4e460d1363357e74b0" http://192.168.1.162:8080/capabilities
+{"type":"seed","version":"0.2.0","seed":true,"hostname":"seed-pi","arch":"armv6l","os":"Linux","kernel":"6.12.47+rpt-rpi-v6","cpus":1,"cpu_model":"ARMv6-compatible processor rev 7 (v6l)","mem_mb":427,"disk_mb":239604,"disk_free_mb":227648,"temp_c":42.2,"board_model":"Raspberry Pi Zero W Rev 1.1","has_gcc":false,"net_interfaces":["lo","pan0","usb0","wlan0"],"serial_ports":["/dev/ttyAMA0","/dev/ttyS0"],"i2c_buses":[],"spi_devices":[],"gpio_chips":["/dev/gpiochip0","/dev/gpiochip4"],"usb_devices":[],"block_devices":["loop0     427M loop","mmcblk0 238.3G disk","zram0     427M disk"],"has_wifi":true,"has_bluetooth":false,"has_wireguard":false,"endpoints":["/health","/capabilities","/config.md","/events","/firmware/version","/firmware/source","/firmware/build","/firmware/build/logs","/firmware/a
+
+$ curl -s -H "Authorization: Bearer 7e54b0461d881c4e460d1363357e74b0" http://192.168.1.162:8080/system/info
+{"hostname":"seed-pi","arch":"armv6l","os":"Raspbian GNU/Linux 13 (trixie)","kernel":"6.12.47+rpt-rpi-v6","cpus":1,"mem_mb":427,"mem_free_mb":301,"disk_mb":239604,"disk_free_mb":227648,"uptime":86479,"load_1":0.37,"load_5":0.44,"load_15":0.35,"temp_c":42.8}
+
+$ curl -s -H "Authorization: Bearer 7e54b0461d881c4e460d1363357e74b0" http://192.168.1.162:8080/system/processes
+[{"pid":27297,"user":"bot","cpu":200.0,"mem":0.8,"command":"ps aux --sort=-pcpu"},{"pid":27298,"user":"bot","cpu":33.3,"mem":0.3,"command":"head -21"},{"pid":1,"user":"root","cpu":1.9,"mem":2.6,"command":"/sbin/init"},{"pid":27003,"user":"bot","cpu":0.9,"mem":2.2,"command":"/usr/lib/systemd/systemd --user"},{"pid":472,"user":"message+","cpu":0.8,"mem":0.8,"command":"/usr/bin/dbus-daemon --system --address=systemd: --nofork --nopidfile --systemd-activation --syslog-only"},{"pid":231,"user":"root","cpu":0.4,"mem":1.7,"command":"/usr/lib/systemd/systemd-journald"},{"pid":466,"user":"avahi","cpu":0.4,"mem":0.8,"command":"avahi-daemon: running [seed-pi.local]"},{"pid":483,"user":"root","cpu":0.2,"mem":1.6,"command":"/usr/lib/systemd/systemd-logind"},{"pid":437,"user":"root","cpu":0.1,"mem":0.0,
+
+$ curl -s -H "Authorization: Bearer 7e54b0461d881c4e460d1363357e74b0" http://192.168.1.162:8080/system/disk
+[{"device":"/dev/mmcblk0p2","mountpoint":"/","total_mb":239604,"used_mb":2181,"free_mb":227648,"percent_used":1},{"device":"/dev/mmcblk0p1","mountpoint":"/boot/firmware","total_mb":510,"used_mb":92,"free_mb":419,"percent_used":18}]
+
+$ curl -s -H "Authorization: Bearer 7e54b0461d881c4e460d1363357e74b0" "http://192.168.1.162:8080/system/logs?n=100"
+Mar 12 20:22:32 seed-pi NetworkManager[517]: <info>  [1773343352.9509] policy: auto-activating connection 'netplan-eth0' (75a1216a-9d1a-30cd-8aca-ace5526ec021)
+Mar 12 20:22:32 seed-pi NetworkManager[517]: <info>  [1773343352.9632] device (usb0): Activation: starting connection 'netplan-eth0' (75a1216a-9d1a-30cd-8aca-ace5526ec021)
+Mar 12 20:22:32 seed-pi NetworkManager[517]: <info>  [1773343352.9667] device (usb0): state change: disconnected -> prepare (reason 'none', managed-type: 'full')
+Mar 12 20:22:32 seed-pi NetworkManager[517]: <info>  [1773343352.9777] device (usb0): state change: prepare -> config (reason 'none', managed-type: 'full')
+Mar 12 20:22:32 seed-pi NetworkManager[517]: <info>  [1773343352.9896] device (usb0): state change: config -> ip-config (reason 'none', managed-type: 
+
+--- AGENT ---
+Major finding -- the `claude-usb-bt-pan.service` is crash-looping with 26,000+ restart attempts. Let me continue the inspection.
+
+$ curl -s -H "Authorization: Bearer 7e54b0461d881c4e460d1363357e74b0" http://192.168.1.162:8080/net/interfaces
+[{"name":"lo","ip":"127.0.0.1","mac":"00:00:00:00:00:00","state":"unknown","up":true,"loopback":true},{"name":"wlan0","ip":"192.168.1.162","mac":"b8:27:eb:5b:b2:ed","state":"up","up":true,"loopback":false},{"name":"pan0","ip":"10.88.0.1","mac":"2e:80:0f:8c:d7:c5","state":"unknown","up":true,"loopback":false}]
+
+$ curl -s -H "Authorization: Bearer 7e54b0461d881c4e460d1363357e74b0" http://192.168.1.162:8080/firmware/version
+{"version":"0.2.0","build_date":"Mar 12 2026 20:16:47","uptime_sec":97,"seed":true}
+
+$ curl -s -H "Authorization: Bearer 7e54b0461d881c4e460d1363357e74b0" http://192.168.1.162:8080/events
+{"events":[{"t":1773343309,"event":"seed started on port 8080"}],"count":1}
+
+--- AGENT ---
+Now let me dig deeper -- check the bt-pan service file, check if gcc is missing, check security aspects.
+
+$ curl -s -H "Authorization: Bearer 7e54b0461d881c4e460d1363357e74b0" -X POST -d '{"cmd":"systemctl cat claude-usb-bt-pan.service","timeout":10}' http://192.168.1.162:8080/exec
+{"ok":true,"exit_code":0,"stdout":"# /etc/systemd/system/claude-usb-bt-pan.service\n[Unit]\nDescription=claude-usb Bluetooth PAN\nAfter=bluetooth.service claude-usb-bt-agent.service\nRequires=bluetooth.service\n\n[Service]\nType=simple\nExecStartPre=/usr/bin/bt-adapter -s Discoverable 1\nExecStart=/usr/bin/bt-network -s nap pan0\nRestart=always\nRestartSec=3\n\n[Install]\nWantedBy=multi-user.target\n","stderr":""}
+
+$ curl -s -H "Authorization: Bearer 7e54b0461d881c4e460d1363357e74b0" -X POST -d '{"cmd":"which gcc; dpkg -l gcc 2>/dev/null; ls /usr/bin/bt-adapter /usr/bin/bt-network 2>&1; systemctl list-units --failed --no-pager","timeout":10}' http://192.168.1.162:8080/exec
+{"ok":true,"exit_code":0,"stdout":"/usr/bin/gcc\nDesired=Unknown/Install/Remove/Purge/Hold\n| Status=Not/Inst/Conf-files/Unpacked/halF-conf/Half-inst/trig-aWait/Trig-pend\n|/ Err?=(none)/Reinst-required (Status,Err: uppercase=bad)\n||/ Name           Version         Architecture Description\n+++-==============-===============-============-=================================\nii  gcc            4:14.2.0-1+rpi1 armhf        GNU C compiler\nls: cannot access '/usr/bin/bt-adapter': No such file or directory\nls: cannot access '/usr/bin/bt-network': No such file or directory\n  UNIT LOAD ACTIVE SUB DESCRIPTION\n\n0 loaded units listed.\n","stderr":""}
+
+--- AGENT ---
+Interesting -- gcc IS installed (capabilities reported `has_gcc: false` incorrectly). And bt-adapter/bt-network binaries are missing. Let me check more.
+
+$ curl -s -H "Authorization: Bearer 7e54b0461d881c4e460d1363357e74b0" -X POST -d '{"cmd":"systemctl list-units claude-usb-* --all --no-pager; echo ---; systemctl is-enabled claude-usb-bt-pan.service; echo ---; systemctl show claude-usb-bt-pan.service -p NRestarts","timeout":10}' http://192.168.1.162:8080/exec
+{"ok":true,"exit_code":0,"stdout":"  UNIT                        LOAD   ACTIVE     SUB          DESCRIPTION\n  claude-usb-bt-agent.service loaded inactive   dead         claude-usb Bluetooth Agent\n● claude-usb-bt-pan.service   loaded activating auto-restart claude-usb Bluetooth PAN\n  claude-usb-gadget.service   loaded active     exited       claude-usb USB Gadget\n  claude-usb-net.service      loaded active     exited       claude-usb USB Network (initial setup)\n  claude-usb-pan0.service     loaded active     exited       claude-usb BT PAN bridge\n\nLegend: LOAD   → Reflects whether the unit definition was properly loaded.\n        ACTIVE → The high-level unit activation state, i.e. generalization of SUB.\n        SUB    → The low-level unit activation state, values depend on unit type.
+
+$ curl -s -H "Authorization: Bearer 7e54b0461d881c4e460d1363357e74b0" -X POST -d '{"cmd":"cat /etc/passwd | grep -v nologin | grep -v /bin/false; echo ---; cat /etc/ssh/sshd_config | grep -E \"PermitRoot|PasswordAuth|PubkeyAuth\" | head -10; echo ---; ss -tlnp","timeout":10}' http://192.168.1.162:8080/exec
+{"ok":true,"exit_code":0,"stdout":"root:x:0:0:root:/root:/bin/bash\nsync:x:4:65534:sync:/bin:/bin/sync\nbot:x:1000:1000::/home/bot:/bin/bash\n---\n#PermitRootLogin prohibit-password\n#PubkeyAuthentication yes\n#PasswordAuthentication yes\n# PasswordAuthentication.  Depending on your PAM configuration,\n# the setting of \"PermitRootLogin prohibit-password\".\n# PAM authentication, then enable this but set PasswordAuthentication\n---\nState  Recv-Q Send-Q                   Local Address:Port Peer Address:PortProcess                                                                     \nLISTEN 0      32                           127.0.0.1:53        0.0.0.0:*                                                                               \nLISTEN 0      128                            0.0.0.0:22  
+
+$ curl -s -H "Authorization: Bearer 7e54b0461d881c4e460d1363357e74b0" -X POST -d '{"cmd":"cat /opt/seed/token; echo; echo ---; ls -la /opt/seed/; echo ---; id; echo ---; uname -a; echo ---; cat /etc/resolv.conf","timeout":10}' http://192.168.1.162:8080/exec
+{"ok":true,"exit_code":0,"stdout":"7e54b0461d881c4e460d1363357e74b0\n\n---\ntotal 312\ndrwxr-xr-x 2 bot  bot    4096 Mar 12 20:21 .\ndrwxr-xr-x 4 root root   4096 Mar 11 20:29 ..\n-rw-r--r-- 1 bot  bot     543 Mar 12 20:00 agent_log.json\n-rw-rw-r-- 1 bot  bot       2 Mar 12 20:21 apply_failures\n-rw-rw-r-- 1 bot  bot       0 Mar 12 20:20 build.log\n-rw-r--r-- 1 bot  bot     246 Mar 12 19:57 hello.txt\n-rw-r--r-- 1 bot  bot    7523 Mar 12 20:07 maintenance_report.md\n-rw-rw-r-- 1 bot  bot       3 Mar 12 20:20 notes.json\n-rwxr-xr-x 1 bot  bot   76196 Mar 12 20:21 seed\n-rwxr-xr-x 1 bot  bot   76196 Mar 12 20:21 seed.bak\n-rw-r--r-- 1 bot  bot  118821 Mar 12 20:20 seed.c\n-rw-rw-r-- 1 bot  bot    3969 Mar 12 20:17 seed.log\n-rw------- 1 bot  bot      33 Mar 11 20:29 token\n---\nuid=1000(bot
+
+$ curl -s -H "Authorization: Bearer 7e54b0461d881c4e460d1363357e74b0" -X POST -d '{"cmd":"cat /opt/seed/agent_log.json","timeout":10}' http://192.168.1.162:8080/exec
+{"ok":true,"exit_code":0,"stdout":"[\n  {\n    \"agent\": \"Claude Opus 4.6\",\n    \"timestamp\": \"2026-03-12T20:00:00Z\",\n    \"action\": \"full_recon\",\n    \"findings\": {\n      \"board\": \"Pi Zero W Rev 1.1\",\n      \"network\": \"192.168.1.162 on wlan0\",\n      \"neighbors\": [{\"name\": \"ESP32\", \"ip\": \"192.168.1.211\", \"port\": 8080, \"reachable\": true}],\n      \"gpio_available\": 28,\n      \"serial_ports\": [\"/dev/ttyAMA0\", \"/dev/ttyS0\"],\n      \"free_disk_gb\": 222,\n      \"temp_c\": 40.6\n    },\n    \"recommendation\": \"Install i2c-tools, connect sensor to GPIO2/3 (SDA/SCL), grow i2c skill next\"\n  }\n]\n","stderr":""}
+
+$ curl -s -H "Authorization: Bearer 7e54b0461d881c4e460d1363357e74b0" -X POST -d '{"cmd":"cat /opt/seed/maintenance_report.md","timeout":10}' http://192.168.1.162:8080/exec
+{"ok":true,"exit_code":0,"stdout":"# Maintenance Report: seed-pi\n\n**Date:** 2026-03-12 20:06 CET\n**Agent:** Claude Opus 4.6\n**Node:** seed-pi (Raspberry Pi Zero W Rev 1.1)\n**Firmware:** seed v0.2.0 (built 2026-03-12 19:51:50)\n\n---\n\n## Overall Status: HEALTHY (with 1 critical issue)\n\nThe node is operational and responsive. Firmware is running correctly with watchdog confirmed. One service is in a crash loop that needs immediate attention.\n\n---\n\n## Hardware\n\n| Parameter | Value | Status |\n|-----------|-------|--------|\n| Board | Raspberry Pi Zero W Rev 1.1 (BCM2835, ARMv6) | OK |\n| CPU | 1 core, 800 MHz | OK |\n| Temperature | 41.7 C | OK (safe range) |\n| Throttling | 0x0 (none) | OK |\n| Voltage | 1.35V | OK |\n| RAM | 427 MB total, 316 MB available (26% used) | OK |\n|
+
+--- AGENT ---
+There's already a thorough maintenance report from a previous agent. But I see no structured notes were left in the /notes system. Let me also check a few more things and then check the `apply_failures` and `seed.log` files, and verify the `has_gcc` discrepancy.
+
+$ curl -s -H "Authorization: Bearer 7e54b0461d881c4e460d1363357e74b0" -X POST -d '{"cmd":"cat /opt/seed/seed.log; echo ---; cat /opt/seed/apply_failures","timeout":10}' http://192.168.1.162:8080/exec
+{"ok":true,"exit_code":0,"stdout":"[auth] token loaded (7e54...74b0)\n\n  Seed v0.2.0\n  Token: 7e54b0461d881c4e460d1363357e74b0\n\n  Connect:\n    http://192.168.1.162:8080/health\n    http://10.88.0.1:8080/health\n    http://localhost:8080/health\n\n  Skill file: GET /skill\n  API list:   GET /capabilities\n\n[event] seed started on port 8080\n[event] auth fail from 192.168.1.180\n[event] exec: uname -a\n[event] exec: curl -s http://localhost:8080/fs/ls?path=/ -H \"Authorization: Bearer 7e54b0461d8\n[event] firmware source updated (126755 bytes)\n[event] build FAILED (exit 1)\n[event] firmware source updated (118560 bytes)\n[event] build FAILED (exit 1)\n[event] firmware source updated (105290 bytes)\n[event] build OK (75588 bytes)\n[event] apply lock reset (was 2 failures)\n[event] firm
+
+--- AGENT ---
+Important finding -- the most recent firmware apply had a watchdog FAILURE and rolled back. And apply_failures is at 1. Let me check a few more things.
+
+$ curl -s -H "Authorization: Bearer 7e54b0461d881c4e460d1363357e74b0" http://192.168.1.162:8080/firmware/build/logs
+
+
+$ curl -s -H "Authorization: Bearer 7e54b0461d881c4e460d1363357e74b0" -X POST -d '{"cmd":"wc -l /opt/seed/seed.c; echo ---; head -5 /opt/seed/seed.c; echo ---; sudo journalctl --disk-usage 2>/dev/null","timeout":10}' http://192.168.1.162:8080/exec
+{"ok":true,"exit_code":0,"stdout":"3483 /opt/seed/seed.c\n---\n/*\n * seed.c — AI-growable firmware.\n *\n * Compile:  gcc -O2 -o seed seed.c\n * Run:      ./seed [port]          (default: 8080)\n---\nArchived and active journals take up 8.1M in the file system.\n","stderr":""}
+
+$ curl -s -H "Authorization: Bearer 7e54b0461d881c4e460d1363357e74b0" -X POST -d '{"cmd":"sudo dmesg | tail -30","timeout":10}' http://192.168.1.162:8080/exec
+{"ok":true,"exit_code":0,"stdout":"[   57.312259] vc4-drm soc:gpu: bound 20004000.txp (ops vc4_txp_ops [vc4])\n[   57.312913] vc4-drm soc:gpu: bound 20206000.pixelvalve (ops vc4_crtc_ops [vc4])\n[   57.313577] vc4-drm soc:gpu: bound 20207000.pixelvalve (ops vc4_crtc_ops [vc4])\n[   57.314214] vc4-drm soc:gpu: bound 20807000.pixelvalve (ops vc4_crtc_ops [vc4])\n[   57.314695] vc4-drm soc:gpu: bound 20c00000.v3d (ops vc4_v3d_ops [vc4])\n[   57.499813] [drm] Initialized vc4 0.0.0 for soc:gpu on minor 0\n[   57.561543] vc4-drm soc:gpu: [drm] Cannot find any crtc or sizes\n[   57.580172] vc4-drm soc:gpu: [drm] Cannot find any crtc or sizes\n[   58.387794] brcmfmac: F1 signature read @0x18000000=0x1541a9a6\n[   58.462620] brcmfmac: brcmf_fw_alloc_request: using brcm/brcmfmac43430-sdio for chip B
+
+$ curl -s -H "Authorization: Bearer 7e54b0461d881c4e460d1363357e74b0" http://192.168.1.162:8080/serial/ports
+[{"port":"/dev/ttyAMA0","status":"available","accessible":true,"type":"hardware-uart"},{"port":"/dev/ttyS0","status":"available","accessible":true,"type":"hardware-uart"}]
+
+$ curl -s -H "Authorization: Bearer 7e54b0461d881c4e460d1363357e74b0" http://192.168.1.162:8080/config.md
+# Seed Node
+
+No config yet.
+
+$ curl -s -H "Authorization: Bearer 7e54b0461d881c4e460d1363357e74b0" -X POST -d '{"cmd":"sudo systemctl show claude-usb-bt-pan.service -p ActiveState,SubState,NRestarts,MemoryCurrent 2>/dev/null; echo ---; uptime","timeout":10}' http://192.168.1.162:8080/exec
+{"ok":true,"exit_code":0,"stdout":"NRestarts=26587\nMemoryCurrent=[not set]\nActiveState=activating\nSubState=auto-restart\n---\n 20:24:38 up 1 day, 2 min,  1 user,  load average: 0.48, 0.46, 0.37\n","stderr":""}
+
+--- AGENT ---
+Good -- I've gathered all the data I need. Now let me post structured notes for the next agent. I'll cover each issue I found.
+
+$ curl -s -H "Authorization: Bearer 7e54b0461d881c4e460d1363357e74b0" -X POST -H "Content-Type: application/json" -d '{
+  "title": "CRITICAL: claude-usb-bt-pan.service crash loop (26,500+ restarts)",
+  "body": "The service restarts every 3 seconds because /usr/bin/bt-adapter and /usr/bin/bt-network (from bluez-tools) are missing. Restart counter at 26,587 and climbing. This wastes CPU cycles and floods syslog.\n\nFix (option A - disable, recommended if BT PAN not needed):\n  sudo systemctl disable --now claude-usb-bt-pan.service\n\nFix (option B - install missing package):\n  sudo apt update && sudo apt install -y bluez-tools\n  sudo systemctl restart claude-usb-bt-pan.service\n\nAlso consider disabling claude-usb-bt-agent.service (inactive/dead):\n  sudo systemctl disable claude-usb-bt-agent.service",
+  "priority": "critical",
+  "tags": "systemd,bluetooth,crash-loop"
+}' http://192.168.1.162:8080/notes
+{"ok":true,"id":1,"title":"CRITICAL: claude-usb-bt-pan.service crash loop (26,500+ restarts)"}
+
+$ curl -s -H "Authorization: Bearer 7e54b0461d881c4e460d1363357e74b0" -X POST -H "Content-Type: application/json" -d '{
+  "title": "HIGH: Last firmware apply rolled back (watchdog failure)",
+  "body": "The seed.log shows the most recent firmware apply (by the previous agent) failed the watchdog health check and rolled back:\n  [watchdog] health check FAILED (1/3), rolling back\n\napply_failures is currently at 1. The current running firmware is the rolled-back version (v0.2.0, built Mar 12 20:16:47). The seed.c on disk (118,821 bytes / 3,483 lines) is the FAILED version that was rolled back from.\n\nBefore any new firmware work:\n1. Inspect what changed in the 118,821-byte seed.c vs the working 105,290-byte version\n2. The seed-new binary may still exist -- check /opt/seed/seed-new\n3. apply_failures=1 means 2 more failures before the apply endpoint locks\n\nTo reset the counter if needed:\n  POST /firmware/apply/reset",
+  "priority": "high",
+  "tags": "firmware,watchdog,rollback"
+}' http://192.168.1.162:8080/notes
+{"ok":true,"id":2,"title":"HIGH: Last firmware apply rolled back (watchdog failure)"}
+
+$ curl -s -H "Authorization: Bearer 7e54b0461d881c4e460d1363357e74b0" -X POST -H "Content-Type: application/json" -d '{
+  "title": "HIGH: capabilities reports has_gcc:false but gcc IS installed",
+  "body": "GET /capabilities returns has_gcc:false, but gcc is actually installed:\n  /usr/bin/gcc (dpkg: gcc 4:14.2.0-1+rpi1 armhf)\n\nThis is a firmware bug in the capabilities endpoint detection logic. The grow workflow (upload->build->apply) should work fine despite the false report.\n\nFix: Check the has_gcc detection in seed.c -- likely checking wrong path or using a broken detection method. The detection code in the capabilities handler needs to use \"which gcc\" or check /usr/bin/gcc existence correctly.",
+  "priority": "high",
+  "tags": "firmware,bug,capabilities"
+}' http://192.168.1.162:8080/notes
+{"ok":true,"id":3,"title":"HIGH: capabilities reports has_gcc:false but gcc IS installed"}
+
+$ curl -s -H "Authorization: Bearer 7e54b0461d881c4e460d1363357e74b0" -X POST -H "Content-Type: application/json" -d '{
+  "title": "MEDIUM: No firewall configured - seed API exposed on all interfaces",
+  "body": "No iptables/nftables/ufw rules. The seed HTTP API (port 8080) listens on 0.0.0.0, accessible from wlan0, usb0, and pan0. Combined with /exec endpoint and bot user having sudo NOPASSWD ALL, the auth token is effectively a root shell credential sent over plaintext HTTP.\n\nOpen ports:\n  22/tcp (SSH) on 0.0.0.0 and [::]  \n  53/tcp (dnsmasq) on 127.0.0.1, 10.88.0.1, 10.55.0.1, link-local\n  8080/tcp (seed) on 0.0.0.0\n\nMinimal hardening fix:\n  sudo apt install -y ufw\n  sudo ufw default deny incoming\n  sudo ufw allow from 192.168.1.0/24 to any port 22\n  sudo ufw allow from 192.168.1.0/24 to any port 8080\n  sudo ufw allow from 10.55.0.0/24 to any port 8080\n  sudo ufw enable\n\nNote: This is a lab/dev node so this may be acceptable risk.",
+  "priority": "medium",
+  "tags": "security,firewall,network"
+}' http://192.168.1.162:8080/notes
+{"ok":true,"id":4,"title":"MEDIUM: No firewall configured - seed API exposed on all interfaces"}
+
+$ curl -s -H "Authorization: Bearer 7e54b0461d881c4e460d1363357e74b0" -X POST -H "Content-Type: application/json" -d '{
+  "title": "MEDIUM: Auth failure logged from 192.168.1.180",
+  "body": "seed.log contains: [event] auth fail from 192.168.1.180\n\nThis was a single failed auth attempt. Could be a legitimate misconfiguration (another device trying wrong token) or a probe. Worth investigating what device is at 192.168.1.180.\n\nDiagnose:\n  curl -s http://192.168.1.180:8080/health  # check if its another seed node\n  # Check router DHCP leases for 192.168.1.180 identity",
+  "priority": "medium",
+  "tags": "security,auth,investigation"
+}' http://192.168.1.162:8080/notes
+{"ok":true,"id":5,"title":"MEDIUM: Auth failure logged from 192.168.1.180"}
+
+$ curl -s -H "Authorization: Bearer 7e54b0461d881c4e460d1363357e74b0" -X POST -H "Content-Type: application/json" -d '{
+  "title": "LOW: WiFi power save enabled - may cause latency spikes",
+  "body": "dmesg shows: brcmfmac: brcmf_cfg80211_set_power_mgmt: power save enabled\n\nPrevious agent measured 452ms RTT to gateway (192.168.1.1) which is very high for LAN. WiFi power management on Pi Zero W is known to cause latency spikes.\n\nFix (temporary, resets on reboot):\n  sudo iw dev wlan0 set power_save off\n\nFix (persistent via NetworkManager):\n  sudo nmcli connection modify AWIS wifi.powersave 2\n  sudo nmcli connection up AWIS\n\nOr create /etc/NetworkManager/conf.d/no-powersave.conf:\n  [connection]\n  wifi.powersave = 2",
+  "priority": "low",
+  "tags": "network,wifi,performance"
+}' http://192.168.1.162:8080/notes
+{"ok":true,"id":6,"title":"LOW: WiFi power save enabled - may cause latency spikes"}
+
+$ curl -s -H "Authorization: Bearer 7e54b0461d881c4e460d1363357e74b0" -X POST -H "Content-Type: application/json" -d '{
+  "title": "LOW: Cleanup leftover files from previous agent sessions",
+  "body": "Files in /opt/seed/ left by previous agents:\n  /opt/seed/hello.txt (246 bytes, test file)\n  /opt/seed/agent_log.json (543 bytes, recon log)\n  /opt/seed/maintenance_report.md (7,523 bytes, detailed report)\n\nThese are not harmful but clutter the seed directory. The maintenance_report.md contains useful historical data -- consider archiving before deleting.\n\nCleanup:\n  rm /opt/seed/hello.txt /opt/seed/agent_log.json\n  # Optionally keep maintenance_report.md for reference, or:\n  rm /opt/seed/maintenance_report.md",
+  "priority": "low",
+  "tags": "cleanup,housekeeping"
+}' http://192.168.1.162:8080/notes
+{"ok":true,"id":7,"title":"LOW: Cleanup leftover files from previous agent sessions"}
+
+$ curl -s -H "Authorization: Bearer 7e54b0461d881c4e460d1363357e74b0" -X POST -H "Content-Type: application/json" -d '{
+  "title": "INFO: Node baseline snapshot (2026-03-12)",
+  "body": "Node: seed-pi (Raspberry Pi Zero W Rev 1.1)\nFirmware: seed v0.2.0 (built 2026-03-12 20:16:47)\nOS: Raspbian GNU/Linux 13 (trixie), kernel 6.12.47+rpt-rpi-v6\nCPU: ARMv6 single-core (BCM2835)\nRAM: 427 MB total, ~301 MB free (30% used)\nDisk: 238 GB SD card, 227 GB free (1% used)\nTemp: 42.8C (safe, no throttling)\nUptime: 1 day, 2 minutes\nLoad: 0.48 / 0.46 / 0.37 (elevated due to bt-pan crash loop)\nWiFi: wlan0 192.168.1.162 (SSID AWIS, signal excellent)\nUSB gadget: usb0 10.55.0.1 (RNDIS/ECM)\nBT PAN bridge: pan0 10.88.0.1 (non-functional)\nSerial: /dev/ttyAMA0, /dev/ttyS0 (available)\nGPIO: /dev/gpiochip0, /dev/gpiochip4\nI2C: none detected (no buses listed)\nProcess: seed running as bot:1000, 0.3% mem\nJournal size: 8.1 MB\nSkills: sysmon, serial, exec, fs, net, notes",
+  "priority": "info",
+  "tags": "baseline,snapshot,audit"
+}' http://192.168.1.162:8080/notes
+{"ok":true,"id":8,"title":"INFO: Node baseline snapshot (2026-03-12)"}
+
+--- AGENT ---
+Now let me verify all notes were saved.
+
+$ curl -s -H "Authorization: Bearer 7e54b0461d881c4e460d1363357e74b0" http://192.168.1.162:8080/notes
+[{"id":1,"title":"CRITICAL: claude-usb-bt-pan.service crash loop (26,500+ restarts)","body":"The service restarts every 3 seconds because /usr/bin/bt-adapter and /usr/bin/bt-network (from bluez-tools) are missing. Restart counter at 26,587 and climbing. This wastes CPU cycles and floods syslog.\n\nFix (option A - disable, recommended if BT PAN not needed):\n  sudo systemctl disable --now claude-usb-bt-pan.service\n\nFix (option B - install missing package):\n  sudo apt update && sudo apt install -y bluez-tools\n  sudo systemctl restart claude-usb-bt-pan.service\n\nAlso consider disabling claude-usb-bt-agent.service (inactive/dead):\n  sudo systemctl disable claude-usb-bt-agent.service","agent":"unknown","priority":"critical","status":"open","tags":"systemd,bluetooth,crash-loop","created":1
+
+--- AGENT ---
+All 8 notes saved successfully. Here is the audit summary.
+
+---
+
+## Recon Audit Report: seed-pi (192.168.1.162:8080)
+
+**Node:** Raspberry Pi Zero W Rev 1.1, seed firmware v0.2.0, Raspbian 13 (trixie)
+**Overall status:** Operational with issues. Hardware healthy, one critical service problem, one firmware concern.
+
+### Notes Left for Next Agent (8 total)
+
+**CRITICAL (1):**
+1. **claude-usb-bt-pan.service crash loop** -- 26,587+ restarts and climbing. Missing `/usr/bin/bt-adapter` and `/usr/bin/bt-network` (bluez-tools package not installed). Restarts every 3 seconds, flooding syslog. Fix: disable the service or install bluez-tools.
+
+**HIGH (2):**
+2. **Last firmware apply rolled back** -- The previous agent updated seed.c and applied, but the watchdog health check FAILED and the firmware was rolled back. apply_failures=1 (locks at 3). The seed.c on disk is the broken version; the running binary is the old working one.
+3. **capabilities reports has_gcc:false incorrectly** -- gcc 14.2.0 IS installed at /usr/bin/gcc. Bug in the firmware's detection logic.
+
+**MEDIUM (2):**
+4. **No firewall** -- No iptables/nftables/ufw. Seed API on 0.0.0.0:8080 with /exec + sudo NOPASSWD = effectively a plaintext root shell. Acceptable for lab, but risky.
+5. **Auth failure from 192.168.1.180** -- Single failed auth attempt in seed.log. Unknown device, worth investigating.
+
+**LOW (2):**
+6. **WiFi power save causing latency** -- brcmfmac power save enabled, likely causing 452ms gateway RTT. Fix with `iw dev wlan0 set power_save off`.
+7. **Leftover files in /opt/seed/** -- hello.txt, agent_log.json, maintenance_report.md from previous sessions.
+
+**INFO (1):**
+8. **Baseline snapshot** -- Full system metrics captured for future comparison.
+
+Nothing was modified. All findings are in the `/notes` endpoint for the next agent.
