@@ -1,5 +1,7 @@
 # seed.c
 
+[![CI](https://github.com/Awis13/seed/actions/workflows/ci.yml/badge.svg)](https://github.com/Awis13/seed/actions/workflows/ci.yml)
+
 A bootloader for AI. Firmware management over HTTP. One C file. Any hardware.
 
 ```bash
