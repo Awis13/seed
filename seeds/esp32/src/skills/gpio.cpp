@@ -16,13 +16,13 @@
  *   ADC1: 1-10; ADC2: 11-20 (ADC2 unavailable with WiFi)
  */
 
-// Трекинг сконфигурированных пинов
+// Tracking of configured pins
 #define GPIO_MAX_TRACKED 49
 
 static uint8_t gpio_configured[GPIO_MAX_TRACKED]; // 0=unconfigured, 1=input, 2=output, 3=input_pullup, 4=input_pulldown
 
 static bool gpio_pin_exists(int pin) {
-    // ESP32-S3: GPIO 0-48, но 26-32 не существуют
+    // ESP32-S3: GPIO 0-48, but 26-32 do not exist
     if (pin < 0 || pin > 48) return false;
     if (pin >= 26 && pin <= 32) return false;
     return true;
@@ -60,7 +60,7 @@ static const char *gpio_mode_str(int pin) {
     }
 }
 
-// Список всех доступных пинов ESP32-S3
+// List of all available ESP32-S3 pins
 static const int gpio_all_pins[] = {
     0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14,
     15, 16, 17, 18, 19, 20, 21, 33, 34, 35, 36, 37, 38,
@@ -68,7 +68,7 @@ static const int gpio_all_pins[] = {
 };
 static const int gpio_all_pins_count = sizeof(gpio_all_pins) / sizeof(gpio_all_pins[0]);
 
-// Предупреждения для пина (возвращает NULL если нет)
+// Warning for a pin (returns NULL if none)
 static const char *gpio_warning(int pin) {
     if (gpio_is_strapping(pin)) return "strapping pin — may affect boot";
     if (gpio_is_i2c(pin)) {
@@ -129,11 +129,11 @@ static void gpio_register_routes(AsyncWebServer &server) {
             const char *warn = gpio_warning(pin);
             if (warn) obj["warning"] = warn;
 
-            // Отмечаем ADC-способность
+            // Mark ADC capability
             if (gpio_is_adc1(pin)) obj["adc"] = "ADC1";
             else if (gpio_is_adc2(pin)) obj["adc"] = "ADC2";
 
-            // Безопасный ли пин (не занят системой)
+            // Whether the pin is safe (not used by the system)
             bool safe = !gpio_is_strapping(pin) && !gpio_is_i2c(pin) &&
                         !(gpio_is_lora(pin) && lora_ready);
             obj["safe"] = safe;
@@ -208,7 +208,7 @@ static void gpio_register_routes(AsyncWebServer &server) {
             return;
         }
 
-        // Автоконфигурация как OUTPUT если ещё не сконфигурирован
+        // Auto-configure as OUTPUT if not yet configured
         if (gpio_configured[pin] != 2) {
             pinMode(pin, OUTPUT);
             gpio_configured[pin] = 2;
@@ -266,7 +266,7 @@ static void gpio_register_routes(AsyncWebServer &server) {
             return;
         }
 
-        // Маппинг строки в Arduino mode
+        // Map the string to an Arduino mode
         int arduino_mode;
         uint8_t track_mode;
         if (strcmp(mode, "input") == 0) {
@@ -324,7 +324,7 @@ static void gpio_register_routes(AsyncWebServer &server) {
             return;
         }
 
-        // ADC2 недоступен при активном WiFi
+        // ADC2 is unavailable while WiFi is active
         if (gpio_is_adc2(pin) && WiFi.status() == WL_CONNECTED) {
             req->send(400, "application/json",
                 "{\"error\":\"ADC2 pins (11-20) unavailable while WiFi is active\"}");
