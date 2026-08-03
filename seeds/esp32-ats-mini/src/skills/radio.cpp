@@ -2,8 +2,9 @@
  * skills/radio.cpp — SI4732 radio skill for the ATS-Mini seed (C1 + C2)
  *
  * Drives the SI4732 receiver that hangs off the I2C bus (SDA=18, SCL=17) with
- * its RESET on GPIO16. This cut does FM + AM + SSB (LSB/USB) tuning and a
- * signal-quality status readout — no display, no scan/RDS (those grow later).
+ * its RESET on GPIO16. This cut does FM + AM + SSB (LSB/USB) tuning, a
+ * signal-quality status readout and a blocking single-shot band scan — no band
+ * presets, no live background scan, no RDS (those grow later).
  *
  * The receiver is brought up once, at boot, from skill_radio_init(). Wire and
  * board power are already up by then (hw_probe() runs first in setup()), so this
@@ -17,6 +18,7 @@
  *
  * Endpoints:
  *   POST /radio/tune    — tune: {mode:"FM"|"AM"|"LSB"|"USB", freq:<int>, bfo?:<int>}
+ *   POST /radio/scan    — blocking band sweep in the current mode: {from,to,step,min_rssi?}
  *   GET  /radio/status  — current freq/mode/RSSI/SNR (+bfo in SSB)
  */
 
@@ -46,6 +48,14 @@
 /* SSB fine-tuning (BFO) limit in Hz, applied symmetrically (-MAX..+MAX) */
 #define RADIO_BFO_MAX 14000
 
+/*
+ * Scan step ceiling. A blocking sweep re-tunes the receiver on every step; each
+ * setFrequency() + signal-quality read settles in ~33 ms, so 64 steps take
+ * ~2.1 s — safely under the async task's 3 s ACK timeout. Larger sweeps must use
+ * a coarser step or be paginated across several requests.
+ */
+#define RADIO_SCAN_MAX_STEPS 64
+
 /* --- Receiver + state (file-local) --- */
 static SI4735 rx;
 static uint16_t radio_freq;              /* current frequency (FM: 10 kHz units, AM/SSB: kHz) */
@@ -58,6 +68,7 @@ static int      radio_bfo = 0;           /* current BFO offset in Hz (SSB only) 
 /* --- Endpoints --- */
 static const SkillEndpoint radio_endpoints[] = {
     {"POST", "/radio/tune",   "Tune: {mode:\"FM\"|\"AM\"|\"LSB\"|\"USB\", freq:<int>, bfo?:<int>}"},
+    {"POST", "/radio/scan",   "Sweep current-mode band: {from,to,step,min_rssi?} -> RSSI/SNR per step"},
     {"GET",  "/radio/status", "Current freq/mode/RSSI/SNR (+bfo in SSB)"},
     {NULL, NULL, NULL}
 };
@@ -69,6 +80,7 @@ static const char *radio_describe() {
            "| Method | Path | Description |\n"
            "|--------|------|-------------|\n"
            "| POST | /radio/tune | Tune: `{\"mode\":\"FM|AM|LSB|USB\",\"freq\":<int>,\"bfo\":<int>}` |\n"
+           "| POST | /radio/scan | Blocking band sweep in the current mode: `{\"from\":<int>,\"to\":<int>,\"step\":<int>,\"min_rssi\":<int>}` |\n"
            "| GET | /radio/status | Current freq, mode, RSSI, SNR (+bfo in SSB) |\n\n"
            "### Frequency units\n\n"
            "- FM: 10 kHz steps, so `10000` = 100.0 MHz (range 6400..10800)\n"
@@ -76,6 +88,17 @@ static const char *radio_describe() {
            "- LSB/USB: kHz, so `14074` = 14074 kHz (range 1800..30000)\n\n"
            "### SSB fine-tuning\n\n"
            "- `bfo` (optional, SSB only): BFO offset in Hz, range -14000..14000, default 0\n\n"
+           "### Scan\n\n"
+           "`POST /radio/scan` sweeps `from`..`to` (inclusive) with the given `step`,\n"
+           "measuring RSSI/SNR at each point. It stays in the current mode and does\n"
+           "not change it; `from`/`to`/`step` use that mode's frequency units and\n"
+           "must fall inside its band limits. The sweep is blocking (~33 ms/step) and\n"
+           "restores the prior frequency when done.\n\n"
+           "- `from`, `to`, `step` (required): `step > 0`, `from < to`\n"
+           "- `min_rssi` (optional, default 0): only points with `rssi >= min_rssi` are returned\n"
+           "- Step ceiling: `(to - from) / step + 1` must be <= 64 (a sweep runs under\n"
+           "  the 3 s request ACK timeout); use a coarser step or paginate otherwise\n"
+           "- Response: `{\"mode\",\"from\",\"to\",\"step\",\"count\",\"points\":[{\"freq\",\"rssi\",\"snr\"}]}`\n\n"
            "### Examples\n\n"
            "```\n"
            "curl -H 'Authorization: Bearer <token>' -X POST \\\n"
@@ -87,8 +110,11 @@ static const char *radio_describe() {
            "curl -H 'Authorization: Bearer <token>' -X POST \\\n"
            "  -d '{\"mode\":\"LSB\",\"freq\":3750,\"bfo\":500}' http://<host>:8080/radio/tune\n"
            "curl -H 'Authorization: Bearer <token>' http://<host>:8080/radio/status\n"
+           "# Sweep the FM broadcast band (in the current FM mode) in 200 kHz steps\n"
+           "curl -H 'Authorization: Bearer <token>' -X POST \\\n"
+           "  -d '{\"from\":8700,\"to\":9000,\"step\":20,\"min_rssi\":20}' http://<host>:8080/radio/scan\n"
            "```\n\n"
-           "The display and scan/RDS are not driven yet.\n";
+           "Band presets, live background scan and RDS are not driven yet.\n";
 }
 
 /* Return true when the mode is one of the two SSB sidebands. */
@@ -134,7 +160,11 @@ static void radio_register_routes(AsyncWebServer &server) {
 
     /* POST /radio/tune */
     server.on("/radio/tune", HTTP_POST, [](AsyncWebServerRequest *req) {
-        if (!require_auth(req)) return;
+        if (!require_auth(req)) {
+            /* Body callback already ran; free the collected buffer before bailing. */
+            if (req->_tempObject) { free(req->_tempObject); req->_tempObject = nullptr; }
+            return;
+        }
 
         if (!radio_ok) {
             req->send(503, "application/json", "{\"error\":\"SI4732 not detected\"}");
@@ -226,6 +256,113 @@ static void radio_register_routes(AsyncWebServer &server) {
         doc["mode"] = mode_str;
         doc["freq"] = radio_freq;
         if (radio_is_ssb(mode)) doc["bfo"] = radio_bfo;
+        String response;
+        serializeJson(doc, response);
+        req->send(200, "application/json", response);
+    }, NULL, handle_body_collect);
+
+    /* POST /radio/scan — blocking sweep of the current-mode band. */
+    server.on("/radio/scan", HTTP_POST, [](AsyncWebServerRequest *req) {
+        if (!require_auth(req)) {
+            /* Body callback already ran; free the collected buffer before bailing. */
+            if (req->_tempObject) { free(req->_tempObject); req->_tempObject = nullptr; }
+            return;
+        }
+
+        if (!radio_ok) {
+            req->send(503, "application/json", "{\"error\":\"SI4732 not detected\"}");
+            return;
+        }
+
+        char *body = (char*)req->_tempObject;
+        if (!body) { req->send(400, "application/json", "{\"error\":\"no body\"}"); return; }
+
+        JsonDocument input;
+        if (deserializeJson(input, body) != DeserializationError::Ok) {
+            free(body); req->_tempObject = nullptr;
+            req->send(400, "application/json", "{\"error\":\"invalid JSON\"}");
+            return;
+        }
+
+        /* Absent numeric keys default to a sentinel we reject below. */
+        int from = input["from"] | INT32_MIN;
+        int to = input["to"] | INT32_MIN;
+        int step = input["step"] | 0;
+        int min_rssi = input["min_rssi"] | 0;
+
+        free(body); req->_tempObject = nullptr;
+
+        if (from == INT32_MIN || to == INT32_MIN) {
+            req->send(400, "application/json", "{\"error\":\"from and to required\"}");
+            return;
+        }
+        if (step <= 0) {
+            req->send(400, "application/json", "{\"error\":\"step must be > 0\"}");
+            return;
+        }
+        if (from >= to) {
+            req->send(400, "application/json", "{\"error\":\"from must be < to\"}");
+            return;
+        }
+
+        /* Sweep runs in whatever mode we are already in; pick that band's limits. */
+        int band_min, band_max;
+        if (radio_mode == RADIO_MODE_FM) {
+            band_min = RADIO_FM_MIN; band_max = RADIO_FM_MAX;
+        } else if (radio_is_ssb(radio_mode)) {
+            band_min = RADIO_SSB_MIN; band_max = RADIO_SSB_MAX;
+        } else {
+            band_min = RADIO_AM_MIN; band_max = RADIO_AM_MAX;
+        }
+        if (from < band_min || to > band_max) {
+            char err[96];
+            snprintf(err, sizeof(err),
+                "{\"error\":\"from/to out of range for %s (%d..%d)\"}",
+                radio_mode_str(radio_mode), band_min, band_max);
+            req->send(400, "application/json", err);
+            return;
+        }
+
+        int n = (to - from) / step + 1;
+        if (n > RADIO_SCAN_MAX_STEPS) {
+            req->send(400, "application/json",
+                "{\"error\":\"too many steps (max 64) — use a coarser step or paginate\"}");
+            return;
+        }
+
+        /* Remember where we were: the sweep leaves the receiver retuned. */
+        uint16_t saved_freq = radio_freq;
+
+        JsonDocument doc;
+        doc["mode"] = radio_mode_str(radio_mode);
+        doc["from"] = from;
+        doc["to"] = to;
+        doc["step"] = step;
+        JsonArray points = doc["points"].to<JsonArray>();
+
+        for (int f = from; f <= to; f += step) {
+            rx.setFrequency((uint16_t)f);
+            rx.getCurrentReceivedSignalQuality();
+            uint8_t rssi = rx.getCurrentRSSI();
+            uint8_t snr = rx.getCurrentSNR();
+            if (rssi >= min_rssi) {
+                JsonObject p = points.add<JsonObject>();
+                p["freq"] = f;
+                p["rssi"] = rssi;
+                p["snr"] = snr;
+            }
+        }
+
+        /* Restore the pre-scan tuning. Mode never changed, so freq is enough;
+         * radio_freq was left untouched and already holds saved_freq. */
+        rx.setFrequency(saved_freq);
+        display_show_status();
+
+        doc["count"] = points.size();
+
+        event_add("radio: scan %s %d..%d/%d -> %u", radio_mode_str(radio_mode),
+                  from, to, step, (unsigned)points.size());
+
         String response;
         serializeJson(doc, response);
         req->send(200, "application/json", response);
