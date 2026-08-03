@@ -55,7 +55,7 @@
 #include <TFT_eSPI.h>
 
 // ===== Configuration =====
-#define SEED_VERSION        "0.4.0"
+#define SEED_VERSION        "0.4.1"
 #define HTTP_PORT           8080
 #define TOKEN_FILE          "/auth_token.txt"
 #define WIFI_CONFIG_FILE    "/wifi.json"
@@ -454,6 +454,22 @@ static bool write_spiffs_file(const char *path, const String &content) {
     return true;
 }
 
+// Same, for a file whose previous contents are worth more than the write.
+//
+// FILE_WRITE truncates on open, so an ordinary write spends its whole duration
+// with the file empty: power lost in there takes the old snapshot with the new
+// one. Writing beside it and renaming afterwards narrows that to the remove
+// plus the rename, and even in there the complete new snapshot is still on
+// flash under the temp name — which is why the reader falls back to it.
+//
+// SPIFFS.rename() will not clobber an existing name, hence the remove.
+static bool write_spiffs_file_atomic(const char *path, const char *tmp_path,
+                                     const String &content) {
+    if (!write_spiffs_file(tmp_path, content)) return false;
+    SPIFFS.remove(path);
+    return SPIFFS.rename(tmp_path, path);
+}
+
 // ===== Timezone =====
 //
 // The seed knows no city. It stores a raw POSIX TZ string in SPIFFS and hands
@@ -495,7 +511,7 @@ static bool clock_local_time(struct tm &out) {
 
 // Clock-first status screen on the 320x170 panel:
 //
-//   SEED v0.3.0              BAT 87%              192.168.1.42     <- font 2
+//   v0.4.1                   BAT 87%              192.168.1.42     <- font 2
 //   ------------------------------------------------------------
 //                     12:34   07                                   <- font 8 + 4
 //                    Sun 03 Aug 2026                               <- font 4
@@ -533,9 +549,16 @@ static bool clock_local_time(struct tm &out) {
 #define ROW2_Y      150
 
 // Unread badge on the clock face: an amber dot and a count, sitting in the gap
-// between the version string (which ends at x=88 in font 2) and the battery
+// between the version string (which ends at x=50 in font 2) and the battery
 // field's erase rectangle (which starts at x=125). Both numbers are measured
 // against TFT_eSPI's own width tables, not estimated.
+//
+// The header carries the version alone rather than "SEED v...", because the
+// badge is what the version grows into and the collision would be silent:
+// "SEED v0.3.10" measures 88px and would have ended at x=96, through a dot
+// sitting at 93-99, so the first two-digit component in any position broke the
+// row. "v0.4.1" is 42px, which leaves 43px of growth before the dot instead of
+// 5 — room for "v10.10.10" and then some.
 #define BADGE_CX    96
 #define BADGE_R      3
 #define BADGE_TEXT_X 103
@@ -728,7 +751,7 @@ static void display_status() {
     tft.setTextPadding(0);
     tft.setTextDatum(TL_DATUM);
     tft.setTextColor(COL_DIM, COL_BG);
-    tft.drawString("SEED v" SEED_VERSION, 8, HDR_Y, 2);
+    tft.drawString("v" SEED_VERSION, 8, HDR_Y, 2);
     tft.drawFastHLine(8, 20, tft.width() - 16, COL_RULE);
     display_force = true;  // the wipe took every field with it
     clock_badge_drawn = -1;

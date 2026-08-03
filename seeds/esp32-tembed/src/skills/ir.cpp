@@ -232,28 +232,31 @@ static uint8_t ir_entry_sends(int i) {
  * capture pair that differs in the third decimal place and not in what a
  * receiver reads off it.
  *
- * Decoding the table on a host found 14 commands appearing more than once
- * across the 279 entries, covering 33 of them. This is that result: an entry's
+ * Decoding the table on a host found 15 commands appearing more than once
+ * across the 279 entries, covering 36 of them. This is that result: an entry's
  * group, or 0 when its command is unique or its frame was not decoded. A blast
  * sends the first entry of each group and skips the rest, so every receiver
  * sees every command exactly once and ends up off rather than back on.
  *
  * Scope, so nobody reads this table as exhaustive. It covers the three
  * pulse-distance families whose frames carry an address and command in the
- * clear: NEC (9ms/4.5ms header), Samsung (4.5ms/4.5ms) and Kaseikyo (3.4ms/
- * 1.7ms, 48 bits). It does NOT cover Sony SIRC, Philips RC-5 or RC-6, and 160
- * of the 270 upstream entries decode as none of the three and are therefore
- * ungrouped whatever they carry. A duplicate in those protocols is still
+ * clear — NEC (9ms/4.5ms header), Samsung (4.5ms/4.5ms) and Kaseikyo (3.4ms/
+ * 1.7ms, 48 bits) — and Sony SIRC, whose 2.4ms header and value-carrying mark
+ * widths read just as plainly. It does NOT cover Philips RC-5 or RC-6, and 160
+ * of the 270 upstream entries decode as none of the four and are therefore
+ * ungrouped whatever they carry. A duplicate in those two protocols is still
  * possible and would still toggle a set back on.
  *
- * One such duplicate is already known and is deliberately left ungrouped:
- * SIRC 12-bit 0xA90 is the hand-written Sony 12-bit entry, na000 (entry 9) and
- * na041 (entry 50). Grouping it needs a hardware check first. The reason is
- * not that the table entries are inert — each packs two frames into its index
- * stream, so they do transmit twice — but that a SIRC receiver wants about
- * three frames before it acts, which is why the hand-written entry uses
- * sends = 3. Whether two is enough decides whether skipping them changes
- * coverage, and that is a question for a Sony set, not for this file.
+ * Group 15 is the SIRC one, and it is why the decode was extended to that
+ * protocol. 12-bit 0xA90 is the hand-written Sony 12-bit entry, na000 (entry
+ * 9) and na041 (entry 50), and because na000 carries both region bits the
+ * command landed twice in eu — an even count, which is the case that ends with
+ * the set back on. Entry 3 sorts first and so is the one that survives, which
+ * costs no coverage: it sends three frames, and each of the two it displaces
+ * packs two into its index stream, so neither delivered more than it does. A
+ * SIRC receiver wants about three frames before it acts, which is what
+ * sends = 3 on that entry is for. na041 is a 76.9kHz capture besides, well
+ * outside what a receiver tuned for SIRC's 40kHz can hear.
  *
  * Derived here rather than in ir_codes_tvbgone.h on purpose: this is analysis
  * of the data, not the data, so it stays MIT and the table stays untouched.
@@ -266,11 +269,13 @@ struct IrDupGroup {
     uint8_t group;
 };
 
-static const IrDupGroup ir_dup_groups[] = {
+static constexpr IrDupGroup ir_dup_groups[] = {
     {  0,  1},  /* LG/Zenith/Vizio  NEC 0x20DF10EF */
     {  1,  2},  /* Toshiba          NEC 0x02FD48B7 */
     {  2,  3},  /* Samsung      SAMSUNG 0xE0E040BF */
+    {  3, 15},  /* Sony 12-bit     SIRC 0xA90 */
     {  8, 14},  /* Panasonic   KASEIKYO 0x40040100BCBD */
+    {  9, 15},  /* na000 */
     { 11, 14},  /* na002 */
     { 13,  2},  /* na004 */
     { 15,  3},  /* na006 */
@@ -278,6 +283,7 @@ static const IrDupGroup ir_dup_groups[] = {
     { 26,  5},  /* na017            NEC 0x1CE348B7 */
     { 27,  6},  /* na018            NEC 0x55AA38C7 */
     { 29,  1},  /* na020 */
+    { 50, 15},  /* na041 */
     { 51,  7},  /* na042            NEC 0xC15E10EF */
     { 96,  8},  /* na087            NEC 0x18E710EF */
     {101,  9},  /* na092        SAMSUNG 0xA0A040BF */
@@ -304,10 +310,18 @@ static const IrDupGroup ir_dup_groups[] = {
 static const int ir_dup_group_count =
     (int)(sizeof(ir_dup_groups) / sizeof(ir_dup_groups[0]));
 
-/* 14 groups, so the "already sent" set is a uint16_t bitmask. A 17th group
-   would shift off the top of it and silently stop de-duplicating. */
-#define IR_DUP_GROUP_MAX 14
-static_assert(IR_DUP_GROUP_MAX <= 16,
+/* 15 groups, so the "already sent" set is a uint16_t bitmask. A 17th group
+   would shift off the top of it and silently stop de-duplicating.
+
+   Read out of the table rather than written down beside it: a number kept by
+   hand only catches whoever raises the number, and the way this breaks is
+   somebody adding a group and touching nothing else. */
+static constexpr uint8_t ir_dup_group_max() {
+    uint8_t max = 0;
+    for (const IrDupGroup &g : ir_dup_groups) if (g.group > max) max = g.group;
+    return max;
+}
+static_assert(ir_dup_group_max() <= 16,
               "ir_state.groups_sent is a uint16_t: more groups need a wider mask");
 
 static uint8_t ir_entry_group(int i) {
@@ -917,9 +931,9 @@ static const char *ir_describe() {
            "Duration, on the default `repeat` of 1:\n\n"
            "| Region | Codes | Frames | Airtime | Gaps | Total |\n"
            "|--------|-------|--------|---------|------|-------|\n"
-           "| na | 140 | 146 | 23.8s | 14.3s | **38.0s** |\n"
-           "| eu | 142 | 148 | 23.3s | 14.5s | **37.7s** |\n"
-           "| all | 260 | 266 | 43.9s | 26.3s | **70.2s** |\n\n"
+           "| na | 138 | 144 | 23.6s | 14.1s | **37.7s** |\n"
+           "| eu | 141 | 147 | 23.2s | 14.4s | **37.5s** |\n"
+           "| all | 258 | 264 | 43.7s | 26.1s | **69.8s** |\n\n"
            "Those code counts are lower than the table size because a blast\n"
            "sends each distinct command once: see \"Duplicate commands\" below.\n\n"
            "Airtime is fixed by the codes themselves. The rest is two gaps:\n"
@@ -943,20 +957,20 @@ static const char *ir_describe() {
            "whose decoded content does not. The NA and EU lists overlap by more\n"
            "than the five entries upstream merged, because that merge compared\n"
            "byte streams rather than what a receiver reads off them.\n\n"
-           "Decoding the table found 14 commands appearing more than once among\n"
-           "the 279 entries, covering 33 of them — including Samsung\n"
+           "Decoding the table found 15 commands appearing more than once among\n"
+           "the 279 entries, covering 36 of them — including Samsung\n"
            "`0xE0E040BF` and Panasonic `0x40040100BCBD`, each of which is in\n"
-           "the NA list, the EU list *and* the hand-written set. A blast now\n"
-           "sends the first entry of each group and skips the rest, so `all`\n"
-           "drops 19 redundant entries and no receiver is toggled twice.\n"
+           "the NA list, the EU list *and* the hand-written set, and Sony SIRC\n"
+           "`0xA90`, which is in the NA list twice and hand-written besides. A\n"
+           "blast now sends the first entry of each group and skips the rest, so\n"
+           "`all` drops 21 redundant entries and no receiver is toggled twice.\n"
            "Single-code sends are never filtered.\n\n"
            "The decode covers the three pulse-distance families that carry an\n"
-           "address and command in the clear — NEC, Samsung and Kaseikyo — and\n"
-           "not Sony SIRC, RC-5 or RC-6; 160 of the 270 upstream entries decode\n"
-           "as none of the three. So this is not a proof that nothing repeats,\n"
-           "only that nothing repeats in the protocols that can be read. One\n"
-           "known SIRC duplicate is left ungrouped on purpose, pending a check\n"
-           "against a Sony receiver.\n\n"
+           "address and command in the clear — NEC, Samsung and Kaseikyo — plus\n"
+           "Sony SIRC, and not RC-5 or RC-6; 160 of the 270 upstream entries\n"
+           "decode as none of the four. So this is not a proof that nothing\n"
+           "repeats, only that nothing repeats in the protocols that can be\n"
+           "read.\n\n"
            "### One code at a time\n\n"
            "`{\"code\":\"<name>\"}` sends that code and nothing else, through the\n"
            "same encoder and the same job the blast uses. It exists because\n"
@@ -1001,7 +1015,7 @@ static const char *ir_describe() {
            "North America, Asia and everywhere `eu` does not reach; `eu` covers\n"
            "Europe, the Middle East, Australia, New Zealand, parts of Africa\n"
            "and South America. After duplicate commands are dropped they select\n"
-           "140, 142 and 260 codes. Note that upstream never sends both lists\n"
+           "138, 141 and 258 codes. Note that upstream never sends both lists\n"
            "in one run — the original reads a region switch and the Bruce port\n"
            "asks — so `all` is this port's own option, and the de-duplication\n"
            "above is what makes it safe.\n\n"

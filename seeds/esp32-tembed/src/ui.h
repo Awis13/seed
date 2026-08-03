@@ -510,6 +510,7 @@ static void ui_draw_msg_counter(int pos, int total) {
     char buf[16];
     if (pos < 0) pos = 0;
     if (pos > 99) pos = 99;
+    if (total < 0) total = 0;
     if (total > 99) total = 99;
     snprintf(buf, sizeof(buf), "MSG %02d/%02d", pos, total);
     draw_field(ui_row[UI_ROW_COUNT - 1], sizeof(ui_row[0]), buf,
@@ -699,13 +700,15 @@ static void ui_draw_msglist() {
  */
 static void ui_draw_card() {
     NotifyView v;
-    int idx = notify_index_of(ui_msg_id);
-    /* Gone — expired or evicted while it was on screen. ui_poll() leaves for
-       the list on this same pass, so there is nothing to draw. */
-    if (idx < 0 || !notify_view(idx, v)) return;
+    int idx = 0, total = 0;
+    /* Entry, position and depth of the stack in one acquisition: an arrival
+       between two of them would draw one card's text under another card's
+       counter. Gone — expired or evicted while it was on screen — is the false
+       return; ui_poll() leaves for the list on this same pass, so there is
+       nothing to draw. */
+    if (!notify_view_by_id(ui_msg_id, v, &idx, &total)) return;
 
     uint16_t level = ui_level_color(v.level);
-    int total = notify_count();
 
     bool fading = (ui_card_fade < MSG_FADE_STEPS);
     uint8_t step = fading ? (uint8_t)(ui_card_fade + 1) : (uint8_t)MSG_FADE_STEPS;

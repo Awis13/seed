@@ -62,6 +62,11 @@
  * notify_load() drops the duplicate by id rather than paying for a longer
  * critical section on every save.
  *
+ * The write goes to a temp name and is renamed over the real one. Opening the
+ * real file for writing would empty it first, which spends the whole write
+ * with no snapshot on flash at all — and the message worth keeping across a
+ * power loss is exactly the kind that arrives just before one.
+ *
  * Ages survive the reboot through the stored epoch: millis() restarts at zero,
  * so an entry whose creation time was known is aged against the wall clock and
  * only falls back to millis() when one of the two is unset. An entry restored
@@ -82,6 +87,8 @@
 #define NOTIFY_BODY_LEN     97   /* 96 chars, two ellipsised lines on screen */
 #define NOTIFY_KEY_LEN      25   /* 24 chars of client-supplied dedup key */
 #define NOTIFY_FILE         "/notify.json"
+/* The snapshot is written here and renamed into place; see notify_save(). */
+#define NOTIFY_FILE_TMP     "/notify.tmp"
 /* A month. Longer than this is indistinguishable from "no expiry", which is
    what ttl_s 0 already means. */
 #define NOTIFY_TTL_MAX      (30UL * 24UL * 3600UL)
@@ -127,6 +134,31 @@ static volatile uint32_t notify_arrived_id = 0;
 static volatile bool notify_dirty = false;
 static unsigned long notify_save_at = 0;
 
+/*
+ * Ask for the flash mirror to be rewritten, no sooner than `delay_ms` from now.
+ *
+ * Every path that changes the store goes through here, because the deadline
+ * and the flag are one decision. Setting the flag without the deadline leaves
+ * whatever the last POST wrote — which is in the past, and after 24.8 days of
+ * uptime with no POST since boot is far enough in the past for the millis()
+ * subtraction to read as negative, deferring an acknowledged critical until
+ * the counter wraps.
+ *
+ * The earliest asked-for deadline wins: a crit POST pulls the write onto the
+ * next loop() pass, and an ack or an expiry arriving after it must not push
+ * that back out into a coalescing window it never asked for.
+ *
+ * Both fields are touched from the web server task and from loop() without the
+ * store lock, as they were before this became a function. Losing that race
+ * costs a coalescing window either way, never a write: the flag stays raised
+ * until a save actually runs.
+ */
+static void notify_mark_dirty(unsigned long delay_ms) {
+    unsigned long at = millis() + delay_ms;
+    if (!notify_dirty || (long)(at - notify_save_at) < 0) notify_save_at = at;
+    notify_dirty = true;
+}
+
 /* --- Levels --- */
 
 static const char *notify_level_name(uint8_t level) {
@@ -142,6 +174,39 @@ static bool notify_level_parse(const char *s, uint8_t &out) {
     if (strcmp(s, "warn") == 0) { out = NOTIFY_WARN; return true; }
     if (strcmp(s, "crit") == 0) { out = NOTIFY_CRIT; return true; }
     return false;
+}
+
+/* --- Text ---
+ *
+ * Copy into a bounded field, cutting on a character rather than on a byte.
+ *
+ * snprintf() alone cuts at whatever byte the limit lands on, and a byte in the
+ * middle of a UTF-8 sequence is half a character: the field then ends in a
+ * fragment that GET /notify hands to its caller verbatim and that a strict
+ * JSON reader is entitled to reject. The screen is indifferent — it measures
+ * in pixels and ellipsises — so this is about the wire and the snapshot file.
+ *
+ * Input that was not valid UTF-8 to begin with is not repaired, only left no
+ * worse than it arrived.
+ */
+static void notify_copy_text(char *dst, size_t size, const char *src) {
+    snprintf(dst, size, "%s", src);
+    size_t len = strlen(dst);
+    if (len == 0 || strlen(src) <= len) return;  /* nothing was cut */
+
+    /* Back off over the continuation bytes (10xxxxxx) to the byte that opened
+       the last sequence, and drop it when what it announces did not fit. */
+    size_t start = len;
+    while (start > 0 && ((unsigned char)dst[start - 1] & 0xC0) == 0x80) start--;
+    if (start == 0) return;
+    start--;
+    unsigned char lead = (unsigned char)dst[start];
+    size_t need = (lead & 0x80) == 0x00 ? 1
+                : (lead & 0xE0) == 0xC0 ? 2
+                : (lead & 0xF0) == 0xE0 ? 3
+                : (lead & 0xF8) == 0xF0 ? 4
+                : 1;
+    if (start + need > len) dst[start] = '\0';
 }
 
 /* --- Age ---
@@ -277,6 +342,19 @@ static int notify_count() {
     return n;
 }
 
+/* The copy itself, with the lock already held: three memcpys and the age
+   arithmetic, both clocks having been read before the caller took it. */
+static void notify_fill_view(const Notification &e, NotifyView &out, time_t now,
+                             unsigned long now_ms) {
+    out.id = e.id;
+    out.level = e.level;
+    out.unread = e.unread;
+    out.age_s = notify_age_of(e, now, now_ms);
+    memcpy(out.source, e.source, sizeof(out.source));
+    memcpy(out.title, e.title, sizeof(out.title));
+    memcpy(out.body, e.body, sizeof(out.body));
+}
+
 /* Copy entry `index` out, 0 being the newest. False when the index is past the
    end — which is also how a caller finds out that the entry it was looking at
    expired or was evicted while it was on screen. */
@@ -289,16 +367,41 @@ static bool notify_view(int index, NotifyView &out) {
         portEXIT_CRITICAL(&notify_mux);
         return false;
     }
-    const Notification &e = notify_slot[notify_order[index]];
-    out.id = e.id;
-    out.level = e.level;
-    out.unread = e.unread;
-    out.age_s = notify_age_of(e, now, now_ms);
-    memcpy(out.source, e.source, sizeof(out.source));
-    memcpy(out.title, e.title, sizeof(out.title));
-    memcpy(out.body, e.body, sizeof(out.body));
+    notify_fill_view(notify_slot[notify_order[index]], out, now, now_ms);
     portEXIT_CRITICAL(&notify_mux);
     return true;
+}
+
+/*
+ * The entry carrying this id, together with where it currently sits and how
+ * many entries there are, all out of one acquisition.
+ *
+ * The card screen knows an id, not an index, precisely because the list moves
+ * under it. Resolving that id to an index and then copying the entry at that
+ * index is two acquisitions with a gap in between, and a notification arriving
+ * in the gap shifts the list by one — so the card would draw its neighbour,
+ * under the neighbour's counter, for a frame. Doing the whole lookup once is
+ * what makes "an arrival cannot change which message you are reading" true of
+ * the drawing and not only of the navigation.
+ */
+static bool notify_view_by_id(uint32_t id, NotifyView &out, int *index_out,
+                              int *count_out) {
+    time_t now = time(NULL);
+    unsigned long now_ms = millis();
+    bool found = false;
+
+    portENTER_CRITICAL(&notify_mux);
+    for (int i = 0; i < notify_len; i++) {
+        const Notification &e = notify_slot[notify_order[i]];
+        if (e.id != id) continue;
+        notify_fill_view(e, out, now, now_ms);
+        if (index_out) *index_out = i;
+        found = true;
+        break;
+    }
+    if (count_out) *count_out = notify_len;
+    portEXIT_CRITICAL(&notify_mux);
+    return found;
 }
 
 /* Position of an id in the list, or -1. The screen holds an id rather than an
@@ -327,7 +430,7 @@ static bool notify_ack_id(uint32_t id) {
         break;
     }
     portEXIT_CRITICAL(&notify_mux);
-    if (changed) { notify_dirty = true; display_force = true; }
+    if (changed) { notify_mark_dirty(NOTIFY_COALESCE_MS); display_force = true; }
     return found;
 }
 
@@ -339,7 +442,7 @@ static int notify_ack_all() {
         if (e.unread) { e.unread = false; n++; }
     }
     portEXIT_CRITICAL(&notify_mux);
-    if (n > 0) { notify_dirty = true; display_force = true; }
+    if (n > 0) { notify_mark_dirty(NOTIFY_COALESCE_MS); display_force = true; }
     return n;
 }
 
@@ -412,11 +515,21 @@ static void notify_save() {
 
     String out;
     serializeJson(doc, out);
-    if (!write_spiffs_file(NOTIFY_FILE, out)) event_add("notify: save failed");
+    /* Not a plain write: that truncates the file first, and the entries this
+       skill exists to protect are the ones a power loss during the write would
+       take. The new snapshot is complete on flash before the old one goes. */
+    if (!write_spiffs_file_atomic(NOTIFY_FILE, NOTIFY_FILE_TMP, out))
+        event_add("notify: save failed");
 }
 
 static void notify_load() {
     String json = read_spiffs_file(NOTIFY_FILE);
+    /* Nothing under the real name means the last save was interrupted between
+       its remove and its rename. What is under the temp name is then the whole
+       snapshot, so take it; a save interrupted earlier than that leaves a
+       partial file there instead, which fails to parse and is discarded like
+       any other unreadable one. */
+    if (json.length() == 0) json = read_spiffs_file(NOTIFY_FILE_TMP);
     if (json.length() == 0) return;
 
     JsonDocument doc;
@@ -451,7 +564,12 @@ static void notify_load() {
         e.level = (uint8_t)(o["lv"] | 0);
         if (e.level > NOTIFY_CRIT) e.level = NOTIFY_INFO;
         e.unread = o["ur"] | false;
+        /* The same ceiling the API enforces. A restored entry is not more
+           trusted than a posted one — this file can be replaced wholesale with
+           a filesystem image — and a ttl past the cap says "never expires",
+           which is what ttl_s 0 already spells. */
         e.ttl_s = o["tt"] | 0u;
+        if (e.ttl_s > NOTIFY_TTL_MAX) e.ttl_s = NOTIFY_TTL_MAX;
         e.created_epoch = (time_t)(uint32_t)(o["ts"] | 0u);
         /* Wind millis() back by however long the entry has really been alive.
            The subtraction is meant to go negative and wrap: notify_age_of()
@@ -460,10 +578,13 @@ static void notify_load() {
         if (e.created_epoch > TIME_VALID_EPOCH && now > e.created_epoch)
             elapsed = (unsigned long)(now - e.created_epoch) * 1000UL;
         e.created_ms = now_ms - elapsed;
-        snprintf(e.source, sizeof(e.source), "%s", o["sr"] | "");
-        snprintf(e.title, sizeof(e.title), "%s", o["ti"] | "");
-        snprintf(e.body, sizeof(e.body), "%s", o["bd"] | "");
-        snprintf(e.key, sizeof(e.key), "%s", o["ky"] | "");
+        /* Through the same copy the API path uses, for the same reason: these
+           strings go back out over GET /notify, and a stored file is not a
+           more trustworthy source of UTF-8 than a POST body. */
+        notify_copy_text(e.source, sizeof(e.source), o["sr"] | "");
+        notify_copy_text(e.title, sizeof(e.title), o["ti"] | "");
+        notify_copy_text(e.body, sizeof(e.body), o["bd"] | "");
+        notify_copy_text(e.key, sizeof(e.key), o["ky"] | "");
 
         notify_order[notify_len++] = (uint8_t)slot;
         if (id >= notify_next_id) notify_next_id = id + 1;
@@ -487,7 +608,7 @@ static void notify_poll() {
     if (now_ms - last_expire >= 1000) {
         last_expire = now_ms;
         if (notify_expire() > 0) {
-            notify_dirty = true;
+            notify_mark_dirty(NOTIFY_COALESCE_MS);
             display_force = true;
         }
     }
@@ -527,7 +648,10 @@ static const char *notify_describe() {
            "the earlier message instead of queueing a second one, so a job that\n"
            "reports progress leaves one entry rather than fifty.\n\n"
            "Lengths are capped and longer values are truncated, not rejected:\n"
-           "title 40, body 96, source 16, id 24 characters.\n\n"
+           "title 40, body 96, source 16, id 24 — bytes, which is characters\n"
+           "for ASCII and fewer for anything else. The cut lands on a character\n"
+           "boundary, so a multi-byte one is dropped whole rather than left\n"
+           "half-written in the JSON.\n\n"
            "### Behaviour\n\n"
            "Twenty entries are held in RAM and the newest six survive a reboot.\n"
            "A full queue drops the oldest read entry first, and only ever drops\n"
@@ -607,17 +731,17 @@ static void notify_register_routes(AsyncWebServer &server) {
             notify_send_error(req, 400, "title is required and must be a string");
             return;
         }
-        snprintf(e.title, sizeof(e.title), "%s", input["title"].as<const char*>());
+        notify_copy_text(e.title, sizeof(e.title), input["title"].as<const char*>());
         if (e.title[0] == '\0') {
             notify_send_error(req, 400, "title must not be empty");
             return;
         }
         if (input["body"].is<const char*>())
-            snprintf(e.body, sizeof(e.body), "%s", input["body"].as<const char*>());
+            notify_copy_text(e.body, sizeof(e.body), input["body"].as<const char*>());
         if (input["source"].is<const char*>())
-            snprintf(e.source, sizeof(e.source), "%s", input["source"].as<const char*>());
+            notify_copy_text(e.source, sizeof(e.source), input["source"].as<const char*>());
         if (input["id"].is<const char*>())
-            snprintf(e.key, sizeof(e.key), "%s", input["id"].as<const char*>());
+            notify_copy_text(e.key, sizeof(e.key), input["id"].as<const char*>());
         if (!input["ttl_s"].isNull()) {
             /* is<unsigned long>() is false for a negative number as well as
                for a string, which is exactly the set that should be rejected
@@ -650,8 +774,7 @@ static void notify_register_routes(AsyncWebServer &server) {
            is reporting may not wait. */
         notify_arrived_id = id;
         notify_arrived = true;
-        notify_dirty = true;
-        notify_save_at = millis() + (e.level == NOTIFY_CRIT ? 0 : NOTIFY_COALESCE_MS);
+        notify_mark_dirty(e.level == NOTIFY_CRIT ? 0 : NOTIFY_COALESCE_MS);
         display_force = true;
 
         event_add("notify %s: %s%s%s", notify_level_name(e.level),
