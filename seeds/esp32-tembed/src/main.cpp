@@ -47,7 +47,7 @@
 #include <TFT_eSPI.h>
 
 // ===== Configuration =====
-#define SEED_VERSION        "0.2.1"
+#define SEED_VERSION        "0.2.2"
 #define HTTP_PORT           8080
 #define TOKEN_FILE          "/auth_token.txt"
 #define WIFI_CONFIG_FILE    "/wifi.json"
@@ -481,7 +481,7 @@ static bool clock_local_time(struct tm &out) {
 
 // Clock-first status screen on the 320x170 panel:
 //
-//   SEED v0.2.1              BAT 87%              192.168.1.42     <- font 2
+//   SEED v0.2.2              BAT 87%              192.168.1.42     <- font 2
 //   ------------------------------------------------------------
 //                     12:34   07                                   <- font 8 + 4
 //                    Sun 03 Aug 2026                               <- font 4
@@ -505,6 +505,10 @@ static bool clock_local_time(struct tm &out) {
 #define DATE_Y      102
 #define ROW1_Y      130
 #define ROW2_Y      150
+
+// Defined in skills/ir.cpp, which is included further down: one line of blast
+// progress for the bottom row. The skill never touches TFT_eSPI itself.
+static bool ir_status_line(char *out, size_t n);
 
 static bool display_ready = false;
 // Set from the web server task, consumed by the clock tick in loop(): TFT_eSPI
@@ -626,6 +630,9 @@ static void display_tick() {
         row1r[0] = '\0';
         snprintf(row2, sizeof(row2), "hold KEY 3s for setup AP");
     }
+    // An IR blast borrows the note row, but only when it is otherwise empty:
+    // the token and the setup gesture have nowhere else to be displayed.
+    if (row2[0] == '\0') ir_status_line(row2, sizeof(row2));
     draw_field(fld_left, sizeof(fld_left), row1l, 8, ROW1_Y, 2,
                COL_DIM, TL_DATUM, 150);
     draw_field(fld_right, sizeof(fld_right), row1r, tft.width() - 8, ROW1_Y, 2,
@@ -1405,10 +1412,12 @@ static void handle_wifi_post(AsyncWebServerRequest *request) {
 // ===== Skills =====
 #include "skills/gpio.cpp"
 #include "skills/serial.cpp"
+#include "skills/ir.cpp"
 
 static void skills_init() {
     skill_gpio_init();
     skill_serial_init();
+    skill_ir_init();
 }
 
 // ===== Routes =====
@@ -1515,6 +1524,10 @@ void loop() {
     // key for the gesture that brings it back. Both polls are non-blocking.
     ap_poll();
     ap_key_poll();
+
+    // One IR frame per pass at most: the transmission itself runs in the RMT
+    // peripheral, so this only starts frames and collects completions.
+    ir_poll();
 
     // Clock tick: at most once a second, and each field only repaints when its
     // text actually changed. The screen is only wiped when connectivity flips.
