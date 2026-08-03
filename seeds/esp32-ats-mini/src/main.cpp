@@ -44,7 +44,6 @@
 // ===== Configuration =====
 #define SEED_VERSION        "0.2.0"
 #define HTTP_PORT           8080
-#define AP_PASSWORD         "seed1313"
 #define TOKEN_FILE          "/auth_token.txt"
 #define WIFI_CONFIG_FILE    "/wifi.json"
 #define CONFIG_MD_FILE      "/config.md"
@@ -284,6 +283,13 @@ static String ap_ssid = "";
 static String mdns_name = "";
 static unsigned long boot_time = 0;
 
+// Provisioning AP state. The password is rolled on every raise and lives only
+// in this variable and on the device screen — never persisted, never sent over
+// the wire. ap_active is true only while the softAP is genuinely up; from_setup_ap()
+// keys off it so a gashed AP (softAPIP()==0.0.0.0) can never match a LAN client.
+static bool ap_active = false;
+static String ap_password = "";
+
 static String wifi_ssid = "";
 static String wifi_pass = "";
 
@@ -387,15 +393,87 @@ static bool wifi_save_config(const String &ssid, const String &pass) {
     return write_spiffs_file(WIFI_CONFIG_FILE, json);
 }
 
+// ===== Provisioning AP =====
+//
+// The softAP is up only while somebody is actually provisioning the node, and
+// its password is random per raise. It used to run permanently in WIFI_AP_STA
+// with the password hardcoded as a #define in a public repo. Combined with
+// handle_wifi_page(), which handed the auth token to any client on the AP
+// subnet, that gave anyone within radio range of a seed sitting inside the
+// owner's LAN a token — and the token is POST /firmware/upload, i.e. arbitrary
+// code on a box behind the firewall.
+
+// The AP subnet is pinned rather than left on the ESP-IDF default of
+// 192.168.4.1/24. from_setup_ap() decides "this client came in over the setup
+// AP" by matching the first three octets, so an AP subnet that a STA network
+// might also use turns that test into a false positive reachable from the LAN.
+// 172.31.157.0/24 sits clear of the common consumer-router defaults and of the
+// 192.168.1.0/24 this node's owner runs at home.
+#define AP_IP_A 172
+#define AP_IP_B  31
+#define AP_IP_C 157
+#define AP_IP_D   1
+
+// One session's password. No lookalike glyphs — this gets typed off the device
+// screen; 12 chars out of a 32-symbol alphabet is 60 bits. Runs after RF is up
+// (wifi_setup() has switched WiFi on), which is what makes esp_random() a
+// hardware RNG rather than a seeded PRNG.
+static void ap_generate_password() {
+    static const char charset[] = "abcdefghijkmnpqrstuvwxyz23456789";
+    const uint32_t n = sizeof(charset) - 1;
+    ap_password = "";
+    for (int i = 0; i < 12; i++) {
+        ap_password += charset[esp_random() % n];
+    }
+}
+
+// Raise the provisioning softAP. `manual` is reserved for a future press-to-raise
+// gesture; today it is always false (called only from wifi_setup() when STA fails).
+static void ap_start(bool manual) {
+    if (ap_active) return;  // idempotent: a re-raise must not re-roll the password
+    (void)manual;
+    ap_generate_password();  // esp_random after RF is up
+    // Pin the subnet before the AP comes up, clear of the owner's LAN, so a LAN
+    // client can never land in it and pass from_setup_ap()'s /24 test. If the pin
+    // fails the AP would fall back to the default 192.168.4.1/24, where a LAN
+    // client could share that subnet and slip past from_setup_ap() — so refuse to
+    // raise the AP at all rather than expose the token-skipping path over the LAN.
+    if (!WiFi.softAPConfig(IPAddress(AP_IP_A, AP_IP_B, AP_IP_C, AP_IP_D),
+                           IPAddress(AP_IP_A, AP_IP_B, AP_IP_C, AP_IP_D),
+                           IPAddress(255, 255, 255, 0))) {
+        event_add("setup AP: subnet pin failed, not raising AP");
+        return;
+    }
+    WiFi.softAP(ap_ssid.c_str(), ap_password.c_str());
+    ap_active = true;
+    event_add("setup AP up: %s", ap_ssid.c_str());  // SSID only, never the password
+}
+
+// True only for a request that arrived over the provisioning AP while that AP is
+// actually up. Both halves matter: once the AP is down softAPIP() is 0.0.0.0 and
+// the subnet test is meaningless, and belonging to some subnet proves nothing on
+// its own. Reaching the node this way costs physical presence plus the per-boot
+// password shown on the screen, which is why this is the one path allowed to
+// skip the token.
+static bool from_setup_ap(AsyncWebServerRequest *request) {
+    if (!ap_active) return false;
+    IPAddress client_ip;
+    client_ip.fromString(request->client()->remoteIP().toString());
+    IPAddress ap_ip = WiFi.softAPIP();
+    return client_ip[0] == ap_ip[0] && client_ip[1] == ap_ip[1] &&
+           client_ip[2] == ap_ip[2];
+}
+
 static void wifi_setup() {
     String suffix = get_mac_suffix();
     ap_ssid = "Seed-" + suffix;
     mdns_name = "seed-" + suffix;
     mdns_name.toLowerCase();
 
-    WiFi.mode(WIFI_AP_STA);
-    WiFi.softAP(ap_ssid.c_str(), AP_PASSWORD);
-    delay(100);
+    // STA-only: the AP is not started up-front. It comes up only if the stored
+    // credentials fail to get us on the network (see below), so a provisioned
+    // node running on WiFi never offers a way in.
+    WiFi.mode(WIFI_STA);
 
     wifi_load_config();
     if (wifi_ssid.length() > 0) {
@@ -409,6 +487,10 @@ static void wifi_setup() {
             configTime(0, 0, "pool.ntp.org", "time.nist.gov");
         }
     }
+
+    // Nothing to provision if the stored credentials already got us online: in
+    // that case the AP is never started at all.
+    if (WiFi.status() != WL_CONNECTED) ap_start(false);
 
     if (MDNS.begin(mdns_name.c_str())) {
         MDNS.addService("http", "tcp", HTTP_PORT);
@@ -659,10 +741,11 @@ static void handle_firmware_upload_body(AsyncWebServerRequest *request, uint8_t 
 }
 
 static void handle_firmware_upload(AsyncWebServerRequest *request) {
-    if (ota_upload_error && strstr(ota_upload_error_msg, "auth") != NULL) {
-        request->send(401, "application/json", "{\"error\":\"auth required\"}");
-        return;
-    }
+    // The body handler authenticates the upload itself, but a POST with no body
+    // never reaches it and would otherwise report the md5 and size of whatever
+    // was last flashed. Checking here gates every path through, and makes the
+    // body handler's own "auth required" unreachable from this side.
+    if (!require_auth(request)) return;
     if (ota_upload_error) {
         JsonDocument doc;
         doc["error"] = ota_upload_error_msg;
@@ -798,11 +881,9 @@ static void handle_wifi_page(AsyncWebServerRequest *request) {
         "</form>";
     if (WiFi.status() == WL_CONNECTED)
         html += "<p>Connected: " + WiFi.SSID() + " (" + WiFi.localIP().toString() + ")</p>";
-    // Only show token to clients on the AP subnet (initial setup)
-    IPAddress client_ip;
-    client_ip.fromString(request->client()->remoteIP().toString());
-    IPAddress ap_ip = WiFi.softAPIP();
-    if (client_ip[0] == ap_ip[0] && client_ip[1] == ap_ip[1] && client_ip[2] == ap_ip[2]) {
+    // The token is handed out only over the provisioning AP (initial setup) —
+    // never to a client on the LAN, even one that happens to share our subnet.
+    if (from_setup_ap(request)) {
         html += "<p>Token: " + auth_token + "</p>";
     }
     html += "</body></html>";
@@ -810,6 +891,11 @@ static void handle_wifi_page(AsyncWebServerRequest *request) {
 }
 
 static void handle_wifi_post(AsyncWebServerRequest *request) {
+    // Rewriting the credentials moves the node to a different network, so off the
+    // provisioning AP this needs the token like any other mutating call —
+    // otherwise anyone on the LAN could repoint the device at their own AP.
+    if (!from_setup_ap(request) && !require_auth(request)) return;
+
     String ssid = "", pass = "";
     if (request->hasParam("ssid", true)) ssid = request->getParam("ssid", true)->value();
     if (request->hasParam("pass", true)) pass = request->getParam("pass", true)->value();
@@ -830,6 +916,9 @@ static void handle_wifi_post(AsyncWebServerRequest *request) {
 // Forward-declared here so radio.cpp can repaint the status screen on tune;
 // the definition lives in display.cpp, included after radio.cpp (same TU).
 void display_show_status();
+// Setup screen: AP SSID + one-boot password + token. The password lives only
+// here and on the screen, so this is the only channel that carries it.
+void display_show_ap(const char *ssid, const char *pass, const char *token);
 
 #include "skills/gpio.cpp"
 #include "skills/serial.cpp"
@@ -882,14 +971,15 @@ void setup() {
     }
 
     hw_probe();       // I2C scan + battery ADC
-    token_load();
-    wifi_setup();
-    skills_init();
+    wifi_setup();     // RF up first; also raises the setup AP if STA fails
+    token_load();     // after wifi_setup(): needs RF up for a real hardware RNG
+    skills_init();    // display can now show the token / AP password on screen
     setup_routes();
     server.begin();
 
     Serial.printf("\nESP32 Seed v%s (ATS-Mini)\n", SEED_VERSION);
-    Serial.printf("Token: %s\n", auth_token.c_str());
+    // The token is deliberately never printed to Serial: it lives only in flash
+    // and on the device screen. A serial log would leak it to anyone with a cable.
     if (WiFi.status() == WL_CONNECTED)
         Serial.printf("http://%s:%d/health\n", WiFi.localIP().toString().c_str(), HTTP_PORT);
     Serial.printf("http://%s:%d/health  (AP: %s)\n",
