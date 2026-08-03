@@ -117,6 +117,19 @@ static void radio_format_freq(uint16_t freq, uint8_t mode, char *out, size_t len
     }
 }
 
+/* --- State accessors for the display skill (avoids reaching into rx/state) ---
+ * All three are only ever called from the HTTP task (tune handler / display
+ * routes), so the RSSI snapshot below races with nothing. */
+uint16_t radio_get_freq() { return radio_freq; }
+
+const char *radio_get_mode_str() { return radio_mode_str(radio_mode); }
+
+uint8_t radio_get_rssi() {
+    if (!radio_ok) return 0;
+    rx.getCurrentReceivedSignalQuality();
+    return rx.getCurrentRSSI();
+}
+
 static void radio_register_routes(AsyncWebServer &server) {
 
     /* POST /radio/tune */
@@ -203,6 +216,10 @@ static void radio_register_routes(AsyncWebServer &server) {
         radio_freq = (uint16_t)freq;
 
         event_add("radio: tuned %s %d", mode_str, freq);
+
+        /* Reflect the new tune on the status screen (defined in display.cpp,
+         * forward-declared in main.cpp before this file is included). */
+        display_show_status();
 
         JsonDocument doc;
         doc["ok"] = true;
