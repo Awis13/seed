@@ -72,7 +72,7 @@
  * non-blocking rmtWriteAsync() and never waited on. loop() spends only the
  * encode — 192 iterations of two bitfield stores — and ring_poll() runs at most
  * once every RING_FRAME_MS, so the ring costs a bounded fraction of a
- * millisecond twenty-five times a second and cannot delay ir_poll().
+ * millisecond forty times a second and cannot delay ir_poll().
  *
  * Two guards keep the stream itself intact:
  *
@@ -90,7 +90,7 @@
  * be had the init falls back to one rather than leaving the ring dark, and says
  * which it got.
  *
- * A glitched WS2812 frame is a wrong colour for 40ms and self-corrects on the
+ * A glitched WS2812 frame is a wrong colour for 25ms and self-corrects on the
  * next one. That asymmetry is the point of the arrangement above: the failure
  * that must not happen is a glitched IR blast, and IR is on its own channel,
  * with its own memory, its own mutex and its own interrupt, untouched by any of
@@ -592,7 +592,7 @@ static const char *ring_describe() {
            "### Endpoints\n\n"
            "| Method | Path | Description |\n"
            "|--------|------|-------------|\n"
-           "| GET | /ring | `{\"enabled\":true,\"brightness\":50,\"night_from\":\"00:00\",\"night_to\":\"08:00\",\"night_now\":false,\"effect\":\"breathe\",\"level\":\"warn\",\"unread\":2}` |\n"
+           "| GET | /ring | `{\"enabled\":true,\"brightness\":50,\"night_from\":\"00:00\",\"night_to\":\"08:00\",\"night_now\":false,\"clock_set\":true,\"effect\":\"breathe\",\"level\":\"warn\",\"unread\":2}` |\n"
            "| POST | /ring | `{\"enabled\":true,\"brightness\":35,\"night_from\":\"23:30\",\"night_to\":\"07:00\"}` — every field optional |\n"
            "| POST | /ring/test | `{\"effect\":\"levels\"\\|\"breathe\"\\|\"comet\"\\|\"wipe\"\\|\"off\",\"level\":\"warn\",\"seconds\":8}` |\n\n"
            "A POST that names a setting it cannot parse changes nothing at all,\n"
@@ -629,7 +629,9 @@ static const char *ring_describe() {
            "If the clock has never been set the ring stays lit: a node that has\n"
            "not reached NTP is usually a freshly booted one, and going dark\n"
            "because the time is unknown fails in the direction that loses\n"
-           "messages.\n\n"
+           "messages. `clock_set` in `GET /ring` says which of the two a\n"
+           "`night_now` of false means — window open, or no window yet — so a\n"
+           "ring lit at 3am can be diagnosed over the API.\n\n"
            "### Example\n\n"
            "```\n"
            "curl -H \"Authorization: Bearer $TOKEN\" -H 'Content-Type: application/json' \\\n"
@@ -688,6 +690,13 @@ static void ring_state_json(JsonDocument &doc) {
     doc["night_from"] = from;
     doc["night_to"] = to;
     doc["night_now"] = ring_night_now();
+    /* Without this, `night_now: false` covers two different situations — the
+       window is open, or the clock has never been set and there is no window at
+       all. We deliberately stay lit in the second case, so a ring breathing at
+       3am is correct behaviour rather than a bug, and this is what makes that
+       diagnosable without standing in front of the device. */
+    struct tm probe;
+    doc["clock_set"] = clock_local_time(probe);
     doc["effect"] = ring_effect_name();
     doc["unread"] = notify_unread_count();
     uint8_t top;

@@ -145,6 +145,19 @@ static volatile bool notify_ring_arrived = false;
 static volatile uint8_t notify_ring_level = NOTIFY_INFO;
 static volatile bool notify_ring_acked = false;
 
+/* And a third, for the speaker, for the same reason there is a second: three
+   consumers of one arrival, and whichever read a shared flag first would
+   swallow it for the others.
+ *
+ * Unlike the screen's and the ring's, this one carries a string. The source is
+ * what decides which cue plays, so it is copied under the store lock rather
+ * than left to be read a byte at a time while a second notification overwrites
+ * it — a 17-byte memcpy, which is the same shape as every other critical
+ * section in this file. */
+static volatile bool notify_snd_arrived = false;
+static uint8_t notify_snd_level = NOTIFY_INFO;
+static char notify_snd_source[NOTIFY_SOURCE_LEN];
+
 /*
  * Ask for the flash mirror to be rewritten, no sooner than `delay_ms` from now.
  *
@@ -528,6 +541,39 @@ static bool notify_take_ring_ack() {
     return true;
 }
 
+/* Stage a cue. Raised by POST /notify with a real arrival's level and source,
+   and by POST /sound/test with an invented one — the endpoints never touch the
+   I2S channel any more than they touch the panel. The flag is set last, so a
+   consumer that sees it raised sees a complete source string behind it. */
+static void notify_request_sound(uint8_t level, const char *source) {
+    /* Formatted outside the lock, copied inside it: the critical section is
+       one memcpy of a fixed size, like every other one here. */
+    char staged[NOTIFY_SOURCE_LEN];
+    snprintf(staged, sizeof(staged), "%s", source ? source : "");
+
+    portENTER_CRITICAL(&notify_mux);
+    notify_snd_level = level;
+    memcpy(notify_snd_source, staged, sizeof(notify_snd_source));
+    portEXIT_CRITICAL(&notify_mux);
+    notify_snd_arrived = true;
+}
+
+static bool notify_take_sound_arrival(uint8_t *level, char *source, size_t n) {
+    if (!notify_snd_arrived) return false;
+    notify_snd_arrived = false;
+
+    char staged[NOTIFY_SOURCE_LEN];
+    uint8_t lv;
+    portENTER_CRITICAL(&notify_mux);
+    lv = notify_snd_level;
+    memcpy(staged, notify_snd_source, sizeof(staged));
+    portEXIT_CRITICAL(&notify_mux);
+
+    if (level) *level = lv;
+    if (source && n) snprintf(source, n, "%s", staged);
+    return true;
+}
+
 /* --- Persistence --- */
 
 static void notify_save() {
@@ -828,6 +874,7 @@ static void notify_register_routes(AsyncWebServer &server) {
         notify_arrived = true;
         notify_ring_level = e.level;
         notify_ring_arrived = true;
+        notify_request_sound(e.level, e.source);
         notify_mark_dirty(e.level == NOTIFY_CRIT ? 0 : NOTIFY_COALESCE_MS);
         display_force = true;
 

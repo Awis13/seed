@@ -22,6 +22,10 @@
 //   - POST /notify makes the device a pager: anything that can run curl puts a
 //     message on the screen, and the knob acknowledges it. The queue lives in
 //     skills/notify.cpp; the clock face carries the unread count.
+//   - A MAX98357A drives the speaker over I2S, so a notification is audible as
+//     well as visible (skills/sound.cpp). The amplifier has no enable pin — it
+//     is released by stopping the clock — and the firmware ships only
+//     synthesised beeps; real cues are uploaded to SPIFFS at runtime.
 //
 // Endpoints:
 //   GET  /health            — alive check (no auth)
@@ -55,7 +59,7 @@
 #include <TFT_eSPI.h>
 
 // ===== Configuration =====
-#define SEED_VERSION        "0.5.0"
+#define SEED_VERSION        "0.6.0"
 #define HTTP_PORT           8080
 #define TOKEN_FILE          "/auth_token.txt"
 #define WIFI_CONFIG_FILE    "/wifi.json"
@@ -1101,6 +1105,13 @@ static void handle_capabilities(AsyncWebServerRequest *request) {
     doc["ws2812"] = "8 LEDs on pin 14 (RMT, driven by the ring skill)";
     doc["ir_pins"] = "TX=2,RX=1";
     doc["mic_pins"] = "DATA=42,CLK=39";
+    // No SD_MODE line reaches the ESP32: the amplifier's enable pin is strapped
+    // to its own supply through 1M, which also selects (L+R)/2 mode. It is
+    // powered from the switched rail behind the power-hold pin and is released
+    // by stopping the I2S clock, not by a GPIO. See skills/sound.cpp.
+    doc["audio"] = "MAX98357A I2S class-D amplifier, speaker on header J4";
+    doc["audio_pins"] = "BCLK=46,LRCLK=40,DIN=7 (no amp enable pin; standby via clock stop)";
+    doc["audio_rates"] = "8000,16000,32000,44100,48000 (amplifier cannot clock 11025/12000/22050/24000)";
     doc["power_hold_pin"] = 15;
 
     // Battery
@@ -1476,7 +1487,16 @@ static void handle_skill(AsyncWebServerRequest *request) {
     s += "  GET /ir/tvbgone/status like any other\n";
     s += "- POST /notify makes this a pager: the message appears on the screen at once\n";
     s += "  if the device is idle, and the clock face carries an unread count until\n";
-    s += "  somebody acknowledges it with the knob or POST /notify/ack\n\n";
+    s += "  somebody acknowledges it with the knob or POST /notify/ack\n";
+    s += "- Audio is a MAX98357A on I2S (BCLK=46, LRCLK=40, DIN=7) with NO enable pin:\n";
+    s += "  SD_MODE is strapped to its own rail through 1M, which also puts the part in\n";
+    s += "  (L+R)/2 mode, so both slots must carry the same sample. It is powered from\n";
+    s += "  the switched rail behind GPIO15 and returns to its 340uA standby only when\n";
+    s += "  BCLK stops — never stop LRCLK while BCLK runs, that is a DC output\n";
+    s += "- The amplifier clocks only 8k/16k/32k/44.1k/48k/88.2k/96k. A 22.05kHz WAV\n";
+    s += "  produces silence, not an error, which is why POST /sound/upload rejects it\n";
+    s += "- arduino-esp32 3.x deprecated `driver/i2s.h`; this builds on driver/i2s_std.h\n";
+    s += "  (the ESP_I2S library's I2SClass wraps the same calls with a blocking write)\n\n";
     s += "## API\n\n";
     s += "| Method | Path | Description |\n";
     s += "|--------|------|-------------|\n";
@@ -1584,6 +1604,9 @@ static void handle_wifi_post(AsyncWebServerRequest *request) {
 /* After notify.cpp, which it reads for the unread level it breathes, and before
    ui.h, which hands it every encoder detent. */
 #include "skills/ring.cpp"
+/* After ring.cpp, whose night window it shares: one device, one idea of night,
+   so POST /ring sets the hours for both the light and the sound. */
+#include "skills/sound.cpp"
 
 static void skills_init() {
     skill_gpio_init();
@@ -1594,6 +1617,9 @@ static void skills_init() {
        TX memory blocks this chip has, IR takes two of them, and whichever runs
        first gets what it asks for. */
     skill_ring_init();
+    /* No such contention here: the I2S channel comes from a different
+       peripheral entirely, and the ESP32-S3 has two ports for one consumer. */
+    skill_sound_init();
 }
 
 // ===== On-device UI =====
@@ -1783,6 +1809,14 @@ void loop() {
     // Composes a frame at most every 25ms, sends one only when it differs from
     // the last, and hands the bit stream to the RMT peripheral without waiting.
     ring_poll();
+
+    // The speaker, on the same terms again: loop() owns the I2S channel and any
+    // open cue file, the endpoints only stage a request. Feeds the DMA with
+    // zero-timeout writes and does bounded work per pass, so a cue cannot delay
+    // ir_poll() or the ring's frame — and when nothing is playing this is one
+    // comparison. See skills/sound.cpp for why the amplifier's clock is stopped
+    // between cues rather than left running.
+    snd_poll();
 
     // Clock tick: at most once a second, and each field only repaints when its
     // text actually changed. The screen is only wiped when connectivity flips.
