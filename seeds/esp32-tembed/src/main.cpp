@@ -52,7 +52,7 @@
 #include <TFT_eSPI.h>
 
 // ===== Configuration =====
-#define SEED_VERSION        "0.3.2"
+#define SEED_VERSION        "0.3.3"
 #define HTTP_PORT           8080
 #define TOKEN_FILE          "/auth_token.txt"
 #define WIFI_CONFIG_FILE    "/wifi.json"
@@ -62,6 +62,9 @@
 #define TZ_DEFAULT          "UTC0"
 // Anything older than this is the pre-NTP epoch, not a real wall clock.
 #define TIME_VALID_EPOCH    1700000000
+// How long an OTA upload may go without a body chunk before loop() tears it
+// down. See the watchdog in loop() for why this number.
+#define OTA_STALL_TIMEOUT_MS 30000
 
 // ===== T-Embed CC1101 pin map =====
 #define PIN_PWR_EN      15  // power hold — HIGH before anything else, LOW = off
@@ -416,6 +419,9 @@ static bool ota_upload_ok = false;
 static bool ota_upload_error = false;
 static char ota_upload_error_msg[128] = "";
 static size_t ota_bytes_written = 0;
+// millis() of the last body chunk received, for the abandoned-upload watchdog
+// in loop(). Only meaningful while ota_in_progress.
+static unsigned long ota_last_chunk_ms = 0;
 static volatile bool pending_restart = false;
 static volatile bool pending_rollback = false;
 
@@ -1186,6 +1192,7 @@ static void handle_firmware_upload_body(AsyncWebServerRequest *request, uint8_t 
         ota_upload_error = false;
         ota_upload_error_msg[0] = '\0';
         ota_bytes_written = 0;
+        ota_last_chunk_ms = millis();
 
         event_add("ota upload started, size=%u", (unsigned)total);
 
@@ -1200,6 +1207,10 @@ static void handle_firmware_upload_body(AsyncWebServerRequest *request, uint8_t 
     }
 
     if (ota_upload_error) return;
+
+    // Every chunk, including ones that then fail to write: this stamp is what
+    // tells the watchdog in loop() that the transfer is still alive.
+    ota_last_chunk_ms = millis();
 
     if (ota_upload_started && Update.isRunning()) {
         if (Update.write(data, len) != len) {
@@ -1321,6 +1332,12 @@ static void handle_skill(AsyncWebServerRequest *request) {
     s += "  raise it, with a fresh random password shown on the device screen. A\n";
     s += "  gesture-raised AP closes itself after 10 minutes if nothing reprovisions\n";
     s += "- POST /wifi/config needs the token unless the request comes over that AP\n";
+    s += "- Paths match exactly: `/health/` is not `/health` and returns 404. Nothing\n";
+    s += "  here generates a trailing slash, but a client that appends one will break.\n";
+    s += "  This replaced prefix matching, under which `/ir/tvbgone` also answered\n";
+    s += "  `/ir/tvbgone/stop` and started a blast instead of aborting one\n";
+    s += "- An OTA upload whose connection dies is torn down after 30s without data,\n";
+    s += "  so a dropped transfer no longer blocks every later one until reboot\n";
     s += "- The encoder button opens an on-device menu (TV-B-Gone, setup AP, info).\n";
     s += "  TV-B-Gone holds the three region blasts and a by-brand list of the nine\n";
     s += "  named codes. It drives the same code paths as the API and has no endpoints\n";
@@ -1544,6 +1561,39 @@ void loop() {
         esp_err_t err = esp_ota_mark_app_valid_cancel_rollback();
         firmware_confirmed = true;
         if (err == ESP_OK) event_add("firmware auto-confirmed");
+    }
+
+    // Abandoned OTA upload.
+    //
+    // handle_firmware_upload_body() clears ota_in_progress on exactly three
+    // paths: a failed Update.begin(), a failed write, and the final chunk. A
+    // connection that dies mid-body reaches none of them, so the flag stays
+    // set for the life of the boot and every later upload is refused with
+    // "already in progress" — recoverable until now only by rebooting the
+    // node, which on a half-flashed slot means a rollback.
+    //
+    // Clearing the flag alone would not be enough. UpdateClass::begin()
+    // refuses to start while _size is non-zero and answers "already running",
+    // so the abandoned Update object has to be torn down too. abort() calls
+    // _reset(), which zeroes _size and releases the partition handle, and the
+    // next upload then starts clean.
+    //
+    // 30s: a struggling-but-alive TCP transfer retries with exponential
+    // backoff — roughly 1+2+4+8s before a stack gives up on a segment — so
+    // this is about double the worst gap a slow link can produce, while a
+    // genuinely dead upload frees the flash long before anyone retries by
+    // hand. A healthy upload puts chunks milliseconds apart and never comes
+    // near it.
+    if (ota_in_progress && millis() - ota_last_chunk_ms > OTA_STALL_TIMEOUT_MS) {
+        Update.abort();
+        ota_in_progress = false;
+        ota_upload_started = false;
+        ota_upload_error = true;
+        snprintf(ota_upload_error_msg, sizeof(ota_upload_error_msg),
+                 "upload abandoned after %lus without data",
+                 (unsigned long)(OTA_STALL_TIMEOUT_MS / 1000));
+        event_add("ota upload abandoned after %u bytes, partition released",
+                  (unsigned)ota_bytes_written);
     }
 
     // WiFi reconnect
