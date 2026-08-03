@@ -194,10 +194,12 @@ static const char *gpio_describe() {
            "- ADC2 (pins 11-20): unavailable when WiFi is active\n";
 }
 
+/* Exact matching, like every route in the seed — see setup_routes() in
+   main.cpp for what the library's default does to a path with children. */
 static void gpio_register_routes(AsyncWebServer &server) {
 
     // GET /gpio/list
-    server.on("/gpio/list", HTTP_GET, [](AsyncWebServerRequest *req) {
+    server.on(AsyncURIMatcher::exact("/gpio/list"), HTTP_GET, [](AsyncWebServerRequest *req) {
         if (!require_auth(req)) return;
 
         JsonDocument doc;
@@ -230,7 +232,7 @@ static void gpio_register_routes(AsyncWebServer &server) {
     });
 
     // GET /gpio/read?pin=N
-    server.on("/gpio/read", HTTP_GET, [](AsyncWebServerRequest *req) {
+    server.on(AsyncURIMatcher::exact("/gpio/read"), HTTP_GET, [](AsyncWebServerRequest *req) {
         if (!require_auth(req)) return;
 
         if (!req->hasParam("pin")) {
@@ -253,7 +255,7 @@ static void gpio_register_routes(AsyncWebServer &server) {
     });
 
     // POST /gpio/write — body: {"pin":N,"value":0|1}
-    server.on("/gpio/write", HTTP_POST, [](AsyncWebServerRequest *req) {
+    server.on(AsyncURIMatcher::exact("/gpio/write"), HTTP_POST, [](AsyncWebServerRequest *req) {
         if (!require_auth(req)) return;
 
         char *body = (char*)req->_tempObject;
@@ -326,7 +328,7 @@ static void gpio_register_routes(AsyncWebServer &server) {
     }, NULL, handle_body_collect);
 
     // POST /gpio/mode — body: {"pin":N,"mode":"input"|"output"|"input_pullup"|"input_pulldown"}
-    server.on("/gpio/mode", HTTP_POST, [](AsyncWebServerRequest *req) {
+    server.on(AsyncURIMatcher::exact("/gpio/mode"), HTTP_POST, [](AsyncWebServerRequest *req) {
         if (!require_auth(req)) return;
 
         char *body = (char*)req->_tempObject;
@@ -410,7 +412,7 @@ static void gpio_register_routes(AsyncWebServer &server) {
     }, NULL, handle_body_collect);
 
     // GET /gpio/adc?pin=N
-    server.on("/gpio/adc", HTTP_GET, [](AsyncWebServerRequest *req) {
+    server.on(AsyncURIMatcher::exact("/gpio/adc"), HTTP_GET, [](AsyncWebServerRequest *req) {
         if (!require_auth(req)) return;
 
         if (!req->hasParam("pin")) {

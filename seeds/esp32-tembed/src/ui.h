@@ -8,12 +8,17 @@
  * Screen state machine
  * --------------------
  *
- *      CLOCK  --click-->  MENU  --click on item-->  BLAST | AP | INFO
- *        ^                 | |                        |     |    |
- *        |                 | +--click on Back---------|-----|----+
- *        +--15s idle-------+                          |     |
- *        ^                                            |     |
- *        +--15s idle on any screen but a running blast-+-----+
+ *      CLOCK  --click-->  MENU  --+-->  TVMENU  --+-->  BLAST
+ *        ^                        |               |
+ *        |                        |               +-->  BRAND  -->  BLAST
+ *        |                        +-->  AP
+ *        |                        +-->  INFO
+ *        |
+ *        +--15s idle on any screen but a running blast
+ *
+ * Back leaves a screen for the one above it — BRAND to TVMENU, TVMENU to MENU,
+ * MENU to CLOCK — whether it comes from the Back item or the user key, so the
+ * knob alone is enough to get anywhere and out again.
  *
  * CLOCK is the home screen and is drawn exactly as before by display_tick();
  * this file does not touch it beyond handing control back. Every other screen
@@ -33,28 +38,52 @@
  * Relationship to the API
  * -----------------------
  * The UI is a second front-end over the same state, never a second copy of it.
- * TV-B-Gone goes through ir_start_tvbgone()/ir_stop_job(), the same functions
- * POST /ir/tvbgone and /ir/tvbgone/stop call, and the progress screen renders
- * ir_progress() whoever started the job. Opening the menu item while a blast
- * started over HTTP is running shows that blast instead of trying to start a
- * second one. Setup AP calls ap_start(), the same path as the hold gesture.
+ * TV-B-Gone goes through ir_start_tvbgone()/ir_start_code()/ir_stop_job(), the
+ * same functions POST /ir/tvbgone and /ir/tvbgone/stop call, the by-brand list
+ * is ir_codes[] itself rather than a copy of the names, and the progress screen
+ * renders ir_progress() whoever started the job. Opening the menu item while a
+ * blast started over HTTP is running shows that blast instead of trying to
+ * start a second one. Setup AP calls ap_start(), the same path as the gesture.
  *
  * Drawing discipline
  * ------------------
  * fillScreen only on a screen transition. Within a screen every field goes
  * through draw_field(), so a redraw that changes nothing costs no SPI: the
- * live screens are repainted at UI_TICK_MS and the menu only when the
- * selection actually moves. Input is polled every loop() pass (~10ms), which
- * is what makes the knob feel attached to the screen.
+ * live screens are repainted at UI_TICK_MS and a list only when the selection
+ * actually moves. Input is polled every loop() pass (~10ms), which is what
+ * makes the knob feel attached to the screen.
  */
 
 #include <ESP32Encoder.h>
 
 /* ===== Input ===== */
 
-/* A detented encoder produces one quadrature cycle per detent, and
-   attachFullQuad counts all four edges of it. */
-#define UI_COUNTS_PER_DETENT 4
+/*
+ * Quadrature counts one physical click of this knob produces.
+ *
+ * attachFullQuad() counts all four edges of a quadrature cycle, and the
+ * obvious reading is that a detent spans all four. On this board it spans two.
+ * The BOM names the part only as "ENCODER1" and there is no datasheet, so this
+ * is a hardware measurement, not a derivation: the sibling pager firmware for
+ * this same T-Embed CC1101 checked it on the device — 27 consecutive selection
+ * moves, none skipped, a raw delta of exactly 2 for the majority — and records
+ * that four would move the selection two rows per click.
+ *
+ * Which is exactly the symptom this replaces: at 4, half of every click was
+ * left in the accumulator and the highlight moved on every second detent.
+ *
+ * Changing this is a hardware claim and has to be re-checked on a board. The
+ * Info screen shows the raw count for that purpose.
+ */
+#define UI_COUNTS_PER_DETENT 2
+
+/*
+ * Which way the count runs against the direction a hand calls "down the list".
+ * The counter runs the other way round on this board, so the delta is negated
+ * once, here, rather than by flipping the A/B pins in ui_init() — swapping
+ * those would also invert the raw count the Info screen reports.
+ */
+#define UI_ENCODER_DIRECTION (-1)
 #define UI_DEBOUNCE_MS       30
 #define UI_IDLE_MS           15000
 /* Live screens (blast, AP, info) repaint at this rate; the fields are all
@@ -71,9 +100,10 @@ static ESP32Encoder ui_encoder;
  * because the two were entangled: the accumulator's baseline advanced on a
  * pass whose delta the button branch had already discarded, so movement
  * during a hold evaporated. The invariant that prevents it here is that every
- * count read out of the hardware is folded into ui_enc_accum and nothing else
- * ever writes ui_enc_raw or ui_enc_accum — in particular UiButton does not,
- * and no button state can skip the fold.
+ * count read out of the hardware is folded into ui_enc_accum, and the only
+ * other writer is ui_encoder_reset() — which re-baselines onto the current
+ * hardware count, so it cannot lose a count either. In particular UiButton
+ * writes neither, and no button state can skip the fold.
  */
 static int64_t ui_enc_raw = 0;   /* last hardware count seen */
 static int32_t ui_enc_accum = 0; /* counts not yet worth a detent, sign-carrying */
@@ -96,7 +126,22 @@ static int ui_encoder_steps() {
         ui_enc_accum += UI_COUNTS_PER_DETENT;
         steps--;
     }
-    return steps;
+    return steps * UI_ENCODER_DIRECTION;
+}
+
+/*
+ * Re-baseline onto the current hardware count and drop the partial detent.
+ *
+ * Called on every screen transition. Carrying a remainder is right within a
+ * screen — half a click forwards then half back should net out — but across a
+ * transition it is a click the user spent somewhere else, and letting it land
+ * on the new screen is a selection that moves on its own before the knob is
+ * touched. Note this only ever discards less than one detent: a whole one has
+ * already been returned to the caller.
+ */
+static void ui_encoder_reset() {
+    ui_enc_raw = ui_encoder.getCount();
+    ui_enc_accum = 0;
 }
 
 /* Active-low button with a settling filter. A click is a completed
@@ -140,13 +185,19 @@ static void ui_button_poll(UiButton &b) {
 enum {
     UI_CLOCK = 0,
     UI_MENU,
+    UI_TVMENU,
+    UI_BRAND,
     UI_BLAST,
     UI_AP,
     UI_INFO
 };
 
-static const char *ui_titles[] = {"", "MENU", "TV-B-GONE", "SETUP AP", "INFO"};
+static const char *ui_titles[] = {
+    "", "MENU", "TV-B-GONE", "BY BRAND", "TV-B-GONE", "SETUP AP", "INFO"
+};
 
+/* Top level. The marker on a selected row is also ">", so a submenu is spelled
+   out with a trailing one rather than by a different marker. */
 enum {
     UI_ITEM_TVBGONE = 0,
     UI_ITEM_AP,
@@ -156,28 +207,54 @@ enum {
 };
 
 static const char *ui_items[UI_ITEM_COUNT] = {
-    "TV-B-Gone",
+    "TV-B-Gone >",
     "Setup AP",
     "Info",
+    "Back"
+};
+
+/* TV-B-Gone. The three blasts are the three regions POST /ir/tvbgone takes;
+   By brand opens the named codes. */
+enum {
+    UI_TV_ALL = 0,
+    UI_TV_NA,
+    UI_TV_EU,
+    UI_TV_BRAND,
+    UI_TV_BACK,
+    UI_TV_COUNT
+};
+
+static const char *ui_tv_items[UI_TV_COUNT] = {
+    "Blast all",
+    "Blast NA",
+    "Blast EU",
+    "By brand >",
     "Back"
 };
 
 static uint8_t ui_screen = UI_CLOCK;
 static int ui_sel = 0;
 static int ui_sel_drawn = -1;
+/* First list entry on screen: the by-brand list is longer than the panel. */
+static int ui_first = 0;
 static unsigned long ui_last_input = 0;
 static unsigned long ui_last_draw = 0;
 /* When the blast being watched stopped running, 0 while it still is. */
 static unsigned long ui_blast_done_at = 0;
 /* False when the menu could not start a blast and none was already running. */
 static bool ui_blast_ok = true;
+/* The list the blast was started from, so that finishing goes back to it. */
+static uint8_t ui_blast_back = UI_TVMENU;
+static int ui_blast_back_sel = 0;
 
 #define UI_MENU_Y0   30
 #define UI_MENU_DY   32
+/* Rows of font 4 at that pitch that fit above the bottom of a 170px panel. */
+#define UI_MENU_ROWS 4
 #define UI_ROW_COUNT 8
 
-/* One cache line per drawn row, shared by the three live screens: only one of
-   them is on screen at a time, and entering any screen wipes the panel and
+/* One cache line per drawn row, shared by every screen in this file: only one
+   of them is on screen at a time, and entering any screen wipes the panel and
    raises display_force, which makes draw_field ignore whatever the previous
    screen left in here. */
 static char ui_row[UI_ROW_COUNT][40];
@@ -188,16 +265,64 @@ static void ui_draw_row(int i, const char *text, int32_t y, uint8_t font,
                TL_DATUM, 296);
 }
 
-/* Menu: the marker is part of the string, so a moved selection changes the
-   text of exactly two rows and only those two are repainted. */
-static void ui_draw_menu() {
+/* The three list screens differ only in what they list, so they share one
+   renderer and one set of input rules. Both accessors read the live tables —
+   the by-brand list is ir_codes[] itself, not a copy of the names. */
+static int ui_list_count() {
+    switch (ui_screen) {
+        case UI_MENU:   return UI_ITEM_COUNT;
+        case UI_TVMENU: return UI_TV_COUNT;
+        case UI_BRAND:  return ir_code_count + 1;  /* the codes, then Back */
+    }
+    return 0;
+}
+
+static const char *ui_list_label(int i) {
+    switch (ui_screen) {
+        case UI_MENU:   return ui_items[i];
+        case UI_TVMENU: return ui_tv_items[i];
+        case UI_BRAND:  return (i < ir_code_count) ? ir_codes[i].brand : "Back";
+    }
+    return "";
+}
+
+/* List: the marker is part of the string, so a moved selection changes the
+   text of exactly two rows and only those two are repainted. A list longer
+   than the panel scrolls a window over it, and the window moves only when the
+   selection would otherwise leave it — which keeps the same two-row repaint
+   for every step that stays inside it. */
+static void ui_draw_list() {
+    int count = ui_list_count();
+
+    if (ui_sel < ui_first) ui_first = ui_sel;
+    if (ui_sel >= ui_first + UI_MENU_ROWS) ui_first = ui_sel - UI_MENU_ROWS + 1;
+    if (ui_first > count - UI_MENU_ROWS) ui_first = count - UI_MENU_ROWS;
+    if (ui_first < 0) ui_first = 0;
+
     if (ui_sel == ui_sel_drawn && !display_force) return;
-    for (int i = 0; i < UI_ITEM_COUNT; i++) {
+
+    for (int r = 0; r < UI_MENU_ROWS; r++) {
+        int i = ui_first + r;
         char line[40];
-        snprintf(line, sizeof(line), "%s %s", i == ui_sel ? ">" : " ", ui_items[i]);
-        ui_draw_row(i, line, UI_MENU_Y0 + i * UI_MENU_DY, 4,
+        if (i < count) {
+            snprintf(line, sizeof(line), "%s %s",
+                     i == ui_sel ? ">" : " ", ui_list_label(i));
+        } else {
+            line[0] = '\0';  /* a short list leaves the rest of the panel blank */
+        }
+        ui_draw_row(r, line, UI_MENU_Y0 + r * UI_MENU_DY, 4,
                     i == ui_sel ? COL_ACCENT : COL_DIM);
     }
+
+    /* Only a scrolling list says where in itself you are, and it goes in the
+       header where there is room for it. */
+    if (count > UI_MENU_ROWS) {
+        char pos[16];
+        snprintf(pos, sizeof(pos), "%d/%d", ui_sel + 1, count);
+        draw_field(ui_row[UI_ROW_COUNT - 1], sizeof(ui_row[0]), pos,
+                   tft.width() - 8, HDR_Y, 2, COL_DIM, TR_DATUM, 60);
+    }
+
     ui_sel_drawn = ui_sel;
     display_force = false;
 }
@@ -265,7 +390,11 @@ static void ui_draw_info() {
     int row = 0;
     const int32_t y0 = 26, dy = 18;
 
-    snprintf(buf, sizeof(buf), "VER    %s", SEED_VERSION);
+    /* The raw quadrature count rides along with the version because it is the
+       only way to measure UI_COUNTS_PER_DETENT on a real board: turn the knob
+       one click and read the difference. */
+    snprintf(buf, sizeof(buf), "VER    %s   ENC %ld", SEED_VERSION,
+             (long)ui_enc_raw);
     ui_draw_row(row, buf, y0 + dy * row, 2, COL_DIM); row++;
 
     if (WiFi.status() == WL_CONNECTED) {
@@ -311,9 +440,16 @@ static void ui_draw_info() {
     display_force = false;
 }
 
+/* Screens that are a list of things to pick, and so only redraw on input. */
+static bool ui_is_list(uint8_t screen) {
+    return screen == UI_MENU || screen == UI_TVMENU || screen == UI_BRAND;
+}
+
 static void ui_draw() {
     switch (ui_screen) {
-        case UI_MENU:  ui_draw_menu();  break;
+        case UI_MENU:
+        case UI_TVMENU:
+        case UI_BRAND: ui_draw_list();  break;
         case UI_BLAST: ui_draw_blast(); break;
         case UI_AP:    ui_draw_ap();    break;
         case UI_INFO:  ui_draw_info();  break;
@@ -327,6 +463,7 @@ static void ui_enter(uint8_t screen) {
     ui_screen = screen;
     ui_last_input = millis();
     ui_last_draw = millis();
+    ui_encoder_reset();
 
     if (screen == UI_CLOCK) {
         display_status();  /* repaints the clock chrome and every clock field */
@@ -349,19 +486,56 @@ static void ui_enter(uint8_t screen) {
     ui_draw();
 }
 
+/* Entering a list places the selection as well as the screen: ui_sel is shared
+   by all three, so a brand index left over from one would be out of range in
+   another. Callers use it to land on the item that leads back where they came
+   from. */
+static void ui_enter_list(uint8_t screen, int sel) {
+    ui_sel = sel;
+    ui_first = 0;
+    ui_enter(screen);
+}
+
+/* Watch a job the list just asked for. `job` is 0 when nothing started, which
+   is either a blast already in flight — watched rather than restarted — or a
+   transmitter that is not there. */
+static void ui_enter_blast(uint16_t job, int back_sel) {
+    ui_blast_ok = (job != 0) || ir_busy();
+    ui_blast_done_at = 0;
+    ui_blast_back = ui_screen;
+    ui_blast_back_sel = back_sel;
+    if (job != 0) event_add("ir: job %u started from the menu", (unsigned)job);
+    ui_enter(UI_BLAST);
+}
+
 static void ui_activate(int item) {
-    switch (item) {
-        case UI_ITEM_TVBGONE: {
-            /* Region "all" and repeat 1, the same defaults POST /ir/tvbgone
-               applies to a body-less request. A blast already running (started
-               over HTTP, or by an earlier click) is watched, not restarted. */
-            uint16_t job = ir_start_tvbgone(IR_REGION_ALL, 1);
-            ui_blast_ok = (job != 0) || ir_busy();
-            ui_blast_done_at = 0;
-            if (job != 0) event_add("ir: job %u started from the menu", (unsigned)job);
-            ui_enter(UI_BLAST);
-            break;
+    if (ui_screen == UI_BRAND) {
+        /* One named code, repeat 1 — which still means three frames for a Sony
+           entry, because that is what SIRC needs. This is the point of the
+           screen: the codes are power toggles, so blasting a set that holds
+           several a television answers to turns it off, on and off again. */
+        if (item < ir_code_count) ui_enter_blast(ir_start_code(item, 1), item);
+        else ui_enter_list(UI_TVMENU, UI_TV_BRAND);
+        return;
+    }
+
+    if (ui_screen == UI_TVMENU) {
+        switch (item) {
+            /* Repeat 1, the same default POST /ir/tvbgone applies to a
+               body-less request. */
+            case UI_TV_ALL: ui_enter_blast(ir_start_tvbgone(IR_REGION_ALL, 1), item); break;
+            case UI_TV_NA:  ui_enter_blast(ir_start_tvbgone(IR_REGION_NA, 1), item);  break;
+            case UI_TV_EU:  ui_enter_blast(ir_start_tvbgone(IR_REGION_EU, 1), item);  break;
+            case UI_TV_BRAND: ui_enter_list(UI_BRAND, 0); break;
+            default: ui_enter_list(UI_MENU, UI_ITEM_TVBGONE); break;
         }
+        return;
+    }
+
+    switch (item) {
+        case UI_ITEM_TVBGONE:
+            ui_enter_list(UI_TVMENU, UI_TV_ALL);
+            break;
         case UI_ITEM_AP:
             /* Same entry point as the hold gesture, and time-boxed the same
                way. Raising it from the menu is the reliable route in. */
@@ -377,15 +551,32 @@ static void ui_activate(int item) {
     }
 }
 
+/* One level up, landing on the item that leads back down. */
+static void ui_back() {
+    switch (ui_screen) {
+        case UI_BRAND:  ui_enter_list(UI_TVMENU, UI_TV_BRAND);   break;
+        case UI_TVMENU: ui_enter_list(UI_MENU, UI_ITEM_TVBGONE); break;
+        default:        ui_enter(UI_CLOCK);                      break;
+    }
+}
+
 static void ui_init() {
     /* GPIO0 is a strapping pin: it is only ever read, never driven. */
     pinMode(PIN_ENC_KEY, INPUT_PULLUP);
+    /* Pull-ups before attaching: the library defaults to pull-DOWN, which
+       leaves both channels floating against the encoder's common ground and
+       makes the count wander with no error of any kind. */
     ESP32Encoder::useInternalWeakPullResistors = puType::up;
-    /* Swap these two arguments if the knob scrolls the wrong way. */
+    /* Direction belongs to UI_ENCODER_DIRECTION, not to the pin order here. */
     ui_encoder.attachFullQuad(PIN_ENC_A, PIN_ENC_B);
-    ui_encoder.setCount(0);
-    ui_enc_raw = 0;
-    ui_enc_accum = 0;
+    /* Hardware glitch filter, in APB (80MHz) cycles, 10 bits wide. attach()
+       leaves it at 250 (~3.1us); 1023 is the register maximum and about
+       12.8us, far below the shortest edge a hand can produce and well above
+       contact bounce. The quadrature channels get this instead of a software
+       time filter, which would drop real detents during a fast spin. */
+    ui_encoder.setFilter(1023);
+    ui_encoder.clearCount();
+    ui_encoder_reset();
     ui_last_input = millis();
 }
 
@@ -405,33 +596,42 @@ static void ui_poll() {
 
     switch (ui_screen) {
         case UI_CLOCK:
-            if (click) ui_enter(UI_MENU);
+            if (click) ui_enter_list(UI_MENU, 0);
             return;
 
         case UI_MENU:
-            if (back) { ui_enter(UI_CLOCK); return; }
+        case UI_TVMENU:
+        case UI_BRAND: {
+            if (back) { ui_back(); return; }
             if (steps != 0) {
+                int count = ui_list_count();
                 ui_sel += steps;
-                /* Wrap rather than clamp: four items on a knob with no end
-                   stops, so running off one end should arrive at the other. */
-                ui_sel %= UI_ITEM_COUNT;
-                if (ui_sel < 0) ui_sel += UI_ITEM_COUNT;
-                ui_draw_menu();
+                /* Wrap rather than clamp: a knob with no end stops, so running
+                   off one end should arrive at the other. */
+                ui_sel %= count;
+                if (ui_sel < 0) ui_sel += count;
+                ui_draw_list();
             }
             if (click) { ui_activate(ui_sel); return; }
             break;
+        }
 
         case UI_BLAST: {
             /* A click stops the job; the screen stays until it has actually
-               wound down, then shows how it ended for a moment. */
+               wound down, then shows how it ended for a moment. Either way it
+               goes back to the list the job was started from. */
             if (click) ir_stop_job();
-            if (back) { ir_stop_job(); ui_enter(UI_MENU); return; }
+            if (back) {
+                ir_stop_job();
+                ui_enter_list(ui_blast_back, ui_blast_back_sel);
+                return;
+            }
             if (ir_busy()) {
                 ui_blast_done_at = 0;
             } else if (ui_blast_done_at == 0) {
                 ui_blast_done_at = millis();
             } else if (millis() - ui_blast_done_at >= UI_RESULT_MS) {
-                ui_enter(UI_MENU);
+                ui_enter_list(ui_blast_back, ui_blast_back_sel);
                 return;
             }
             break;
@@ -439,7 +639,11 @@ static void ui_poll() {
 
         case UI_AP:
         case UI_INFO:
-            if (click || back) { ui_enter(UI_MENU); return; }
+            if (click || back) {
+                ui_enter_list(UI_MENU,
+                              ui_screen == UI_AP ? UI_ITEM_AP : UI_ITEM_INFO);
+                return;
+            }
             break;
     }
 
@@ -453,6 +657,6 @@ static void ui_poll() {
 
     if (millis() - ui_last_draw >= UI_TICK_MS) {
         ui_last_draw = millis();
-        if (ui_screen != UI_MENU) ui_draw();
+        if (!ui_is_list(ui_screen)) ui_draw();
     }
 }

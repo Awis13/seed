@@ -15,9 +15,10 @@
 //     is self-describing without a serial console. The provisioning AP password
 //     and the auth token appear there only while the setup AP is up.
 //   - The rotary encoder drives an on-device menu over that clock (src/ui.h):
-//     TV-B-Gone, the setup AP and an info page, so nothing needs a network
-//     client to be used. It is a front-end over the same state the API drives,
-//     not a second implementation of it.
+//     TV-B-Gone (whole-region blasts and single codes by brand), the setup AP
+//     and an info page, so nothing needs a network client to be used. It is a
+//     front-end over the same state the API drives, not a second
+//     implementation of it.
 //
 // Endpoints:
 //   GET  /health            — alive check (no auth)
@@ -51,7 +52,7 @@
 #include <TFT_eSPI.h>
 
 // ===== Configuration =====
-#define SEED_VERSION        "0.3.1"
+#define SEED_VERSION        "0.3.2"
 #define HTTP_PORT           8080
 #define TOKEN_FILE          "/auth_token.txt"
 #define WIFI_CONFIG_FILE    "/wifi.json"
@@ -1321,8 +1322,10 @@ static void handle_skill(AsyncWebServerRequest *request) {
     s += "  gesture-raised AP closes itself after 10 minutes if nothing reprovisions\n";
     s += "- POST /wifi/config needs the token unless the request comes over that AP\n";
     s += "- The encoder button opens an on-device menu (TV-B-Gone, setup AP, info).\n";
-    s += "  It drives the same code paths as the API and has no endpoints of its own,\n";
-    s += "  so a blast started here shows up in GET /ir/tvbgone/status like any other\n\n";
+    s += "  TV-B-Gone holds the three region blasts and a by-brand list of the nine\n";
+    s += "  named codes. It drives the same code paths as the API and has no endpoints\n";
+    s += "  of its own, so a job started here shows up in GET /ir/tvbgone/status like\n";
+    s += "  any other\n\n";
     s += "## API\n\n";
     s += "| Method | Path | Description |\n";
     s += "|--------|------|-------------|\n";
@@ -1442,22 +1445,32 @@ static void skills_init() {
 
 // ===== Routes =====
 
+// Every route is registered with AsyncURIMatcher::exact(), and any route added
+// later must be too.
+//
+// The library's default is AsyncURIMatcher BackwardCompatible, which matches
+// the regex ^{uri}(/.*)?$ — so a handler for /clock also answers /clock/tz, and
+// whichever of the two is registered first wins. That cost this firmware a
+// working POST /ir/tvbgone/stop: the stop request landed on /ir/tvbgone and
+// started a blast instead of aborting one. Nothing here serves a subtree, so
+// exact matching is what every route in the seed actually wants; registration
+// order then stops being load-bearing.
 static void setup_routes() {
-    server.on("/health", HTTP_GET, handle_health);
-    server.on("/capabilities", HTTP_GET, handle_capabilities);
-    server.on("/config.md", HTTP_GET, handle_config_get);
-    server.on("/config.md", HTTP_POST, handle_config_post, NULL, handle_body_collect);
-    server.on("/events", HTTP_GET, handle_events);
-    server.on("/clock", HTTP_GET, handle_clock_get);
-    server.on("/clock/tz", HTTP_POST, handle_clock_tz, NULL, handle_body_collect);
-    server.on("/firmware/version", HTTP_GET, handle_firmware_version);
-    server.on("/firmware/upload", HTTP_POST, handle_firmware_upload, NULL, handle_firmware_upload_body);
-    server.on("/firmware/apply", HTTP_POST, handle_firmware_apply);
-    server.on("/firmware/confirm", HTTP_POST, handle_firmware_confirm);
-    server.on("/firmware/rollback", HTTP_POST, handle_firmware_rollback);
-    server.on("/skill", HTTP_GET, handle_skill);
-    server.on("/", HTTP_GET, handle_wifi_page);
-    server.on("/wifi/config", HTTP_POST, handle_wifi_post);
+    server.on(AsyncURIMatcher::exact("/health"), HTTP_GET, handle_health);
+    server.on(AsyncURIMatcher::exact("/capabilities"), HTTP_GET, handle_capabilities);
+    server.on(AsyncURIMatcher::exact("/config.md"), HTTP_GET, handle_config_get);
+    server.on(AsyncURIMatcher::exact("/config.md"), HTTP_POST, handle_config_post, NULL, handle_body_collect);
+    server.on(AsyncURIMatcher::exact("/events"), HTTP_GET, handle_events);
+    server.on(AsyncURIMatcher::exact("/clock"), HTTP_GET, handle_clock_get);
+    server.on(AsyncURIMatcher::exact("/clock/tz"), HTTP_POST, handle_clock_tz, NULL, handle_body_collect);
+    server.on(AsyncURIMatcher::exact("/firmware/version"), HTTP_GET, handle_firmware_version);
+    server.on(AsyncURIMatcher::exact("/firmware/upload"), HTTP_POST, handle_firmware_upload, NULL, handle_firmware_upload_body);
+    server.on(AsyncURIMatcher::exact("/firmware/apply"), HTTP_POST, handle_firmware_apply);
+    server.on(AsyncURIMatcher::exact("/firmware/confirm"), HTTP_POST, handle_firmware_confirm);
+    server.on(AsyncURIMatcher::exact("/firmware/rollback"), HTTP_POST, handle_firmware_rollback);
+    server.on(AsyncURIMatcher::exact("/skill"), HTTP_GET, handle_skill);
+    server.on(AsyncURIMatcher::exact("/"), HTTP_GET, handle_wifi_page);
+    server.on(AsyncURIMatcher::exact("/wifi/config"), HTTP_POST, handle_wifi_post);
 
     // Register skill routes
     for (int i = 0; i < g_skill_count; i++) {

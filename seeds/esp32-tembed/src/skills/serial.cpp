@@ -102,10 +102,12 @@ static const char *serial_describe() {
            "Open the UART, then read/write over HTTP. The device sees normal serial.\n";
 }
 
+/* Exact matching, like every route in the seed — see setup_routes() in
+   main.cpp for what the library's default does to a path with children. */
 static void serial_register_routes(AsyncWebServer &server) {
 
     /* GET /serial/ports */
-    server.on("/serial/ports", HTTP_GET, [](AsyncWebServerRequest *req) {
+    server.on(AsyncURIMatcher::exact("/serial/ports"), HTTP_GET, [](AsyncWebServerRequest *req) {
         if (!require_auth(req)) return;
 
         JsonDocument doc;
@@ -141,7 +143,7 @@ static void serial_register_routes(AsyncWebServer &server) {
     });
 
     /* POST /serial/open */
-    server.on("/serial/open", HTTP_POST, [](AsyncWebServerRequest *req) {
+    server.on(AsyncURIMatcher::exact("/serial/open"), HTTP_POST, [](AsyncWebServerRequest *req) {
         if (!require_auth(req)) return;
 
         char *body = (char*)req->_tempObject;
@@ -211,7 +213,7 @@ static void serial_register_routes(AsyncWebServer &server) {
     }, NULL, handle_body_collect);
 
     /* POST /serial/write */
-    server.on("/serial/write", HTTP_POST, [](AsyncWebServerRequest *req) {
+    server.on(AsyncURIMatcher::exact("/serial/write"), HTTP_POST, [](AsyncWebServerRequest *req) {
         if (!require_auth(req)) return;
 
         char *body = (char*)req->_tempObject;
@@ -258,7 +260,7 @@ static void serial_register_routes(AsyncWebServer &server) {
     }, NULL, handle_body_collect);
 
     /* GET /serial/read?uart=N&timeout=ms */
-    server.on("/serial/read", HTTP_GET, [](AsyncWebServerRequest *req) {
+    server.on(AsyncURIMatcher::exact("/serial/read"), HTTP_GET, [](AsyncWebServerRequest *req) {
         if (!require_auth(req)) return;
 
         if (!req->hasParam("uart")) {
@@ -307,7 +309,7 @@ static void serial_register_routes(AsyncWebServer &server) {
     });
 
     /* POST /serial/close */
-    server.on("/serial/close", HTTP_POST, [](AsyncWebServerRequest *req) {
+    server.on(AsyncURIMatcher::exact("/serial/close"), HTTP_POST, [](AsyncWebServerRequest *req) {
         if (!require_auth(req)) return;
 
         char *body = (char*)req->_tempObject;

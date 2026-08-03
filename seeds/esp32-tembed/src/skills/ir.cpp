@@ -5,10 +5,14 @@
  * the onboard IR LED on GPIO2.
  *
  * Endpoints:
- *   POST /ir/tvbgone        — start a blast {region, repeat}
+ *   POST /ir/tvbgone        — start a blast {region, repeat} or one code {code}
  *   GET  /ir/tvbgone/status — progress of the running (or last) job
  *   POST /ir/tvbgone/stop   — abort mid-run
  *   POST /ir/send           — send one raw frame {khz, duty, raw[], repeat}
+ *
+ * All four are registered with AsyncURIMatcher::exact(). The library's default
+ * is BackwardCompatible, which matches ^{uri}(/.*)?$ — under it /ir/tvbgone
+ * also answers /ir/tvbgone/stop, and being registered first it wins.
  *
  * Code table provenance
  * ---------------------
@@ -72,6 +76,17 @@
  * here: it is long enough to be a gap and it keeps a region under 40 seconds,
  * which is the only budget that matters for something used while standing in
  * front of a television.
+ *
+ * This gap is not what makes a television toggle back on, and shortening it
+ * would not help. A receiver ignores IR for something like 0.5-2s after
+ * accepting a power command, but the duplicate commands that were causing
+ * toggling sit seconds apart in the run — 3.9s and 38.0s for the Samsung pair
+ * at this gap, and still 2.4s and 27.2s at the ~20ms a NOP loop really
+ * produces — so no gap in this range hides them inside a lockout. The AVR
+ * original settles it: its delay_ten_us(25000) is 250ms on the part it was
+ * written for, slower than this, and it does not toggle, because within one
+ * region it sends each command once. Duplicate suppression is the fix; see
+ * ir_dup_groups below.
  */
 #define IR_CODE_GAP_MS    100
 #define IR_REPEAT_GAP_MS  45
@@ -113,6 +128,11 @@ struct IrCode {
  * sent first, ahead of the TV-B-Gone table, so that the one frame confirmed
  * against real hardware goes out while the user is still pointing the thing.
  *
+ * Three of them — LG, Toshiba and Samsung — are commands the upstream table
+ * also carries. Going first means they win their duplicate group and the
+ * table's copies are skipped, which is the right way round: the frame that has
+ * been verified is the one that gets sent.
+ *
  * `sends` is a property of the protocol, not a preference. A Sony receiver
  * discards a SIRC frame it has seen fewer than about three times, so the three
  * Sony entries are worth nothing sent once. Nothing else here needs repeating,
@@ -130,6 +150,36 @@ static const IrCode ir_codes[] = {
     {"Panasonic",       0x40040100BCBDULL, IR_KASEIKYO, 48, 37, 33, 1, IR_REGION_ALL},
 };
 static const int ir_code_count = (int)(sizeof(ir_codes) / sizeof(ir_codes[0]));
+
+/* ir_describe() lists these by name, and the on-device by-brand menu is sized
+   from this count. A tenth entry needs the markdown updated with it. */
+static_assert(ir_code_count == 9, "ir_describe() lists the named codes by hand");
+
+/*
+ * Index of the named code, or -1. Comparison is case-insensitive, against the
+ * whole brand and against each of its slash-separated alternatives, so an
+ * entry covering three vendors answers to any one of them: "lg", "Zenith" and
+ * "LG/Zenith/Vizio" all select the same code.
+ *
+ * Only the hand-written table is addressable this way. The TV-B-Gone entries
+ * are numbered captures, not brands — their names are "NA 0031", and picking
+ * one by hand is not a thing anybody standing in front of a television can do.
+ */
+static int ir_find_code(const char *name) {
+    if (!name || !*name) return -1;
+    size_t len = strlen(name);
+    for (int i = 0; i < ir_code_count; i++) {
+        const char *brand = ir_codes[i].brand;
+        if (strcasecmp(name, brand) == 0) return i;
+        for (const char *p = brand; p; ) {
+            const char *sep = strchr(p, '/');
+            size_t n = sep ? (size_t)(sep - p) : strlen(p);
+            if (n == len && strncasecmp(name, p, n) == 0) return i;
+            p = sep ? sep + 1 : NULL;
+        }
+    }
+    return -1;
+}
 
 /* The TV-B-Gone database. Data only, and under a different licence from the
    rest of the seed — see the file header there. It needs IR_REGION_NA and
@@ -161,11 +211,101 @@ static uint8_t ir_entry_sends(int i) {
     return (i < ir_code_count) ? ir_codes[i].sends : 1;
 }
 
-/* Next entry after `after` that the region mask selects, or -1 at the end.
-   Pass -1 to get the first. */
-static int ir_next_entry(int after, uint8_t regions) {
+/*
+ * Entries that carry the same command as another entry.
+ *
+ * These codes are power TOGGLES. Sending one command twice in a run therefore
+ * turns a television off and back on, and the database does contain the same
+ * command more than once: it is a set of captures, so one command captured
+ * from two remotes is two entries with slightly different timings that decode
+ * identically. The NA and EU lists also overlap by more than the five entries
+ * upstream merged — that merge was by identical byte stream, which misses a
+ * capture pair that differs in the third decimal place and not in what a
+ * receiver reads off it.
+ *
+ * Decoding the table on a host (NEC and Samsung pulse-distance frames, the two
+ * protocols that carry an address and command in the clear) found 13 commands
+ * appearing more than once across the 279 entries, covering 30 of them. This
+ * is that result: an entry's group, or 0 when its command is unique or the
+ * frame is not one of the two decodable protocols. A blast sends the first
+ * entry of each group and skips the rest, so every receiver sees every command
+ * exactly once and ends up off rather than back on.
+ *
+ * Derived here rather than in ir_codes_tvbgone.h on purpose: this is analysis
+ * of the data, not the data, so it stays MIT and the table stays untouched.
+ *
+ * By-brand sends are not filtered — an explicit request for one code is not a
+ * blast, and asking for the same code twice is the caller's business.
+ */
+struct IrDupGroup {
+    uint16_t entry;
+    uint8_t group;
+};
+
+static const IrDupGroup ir_dup_groups[] = {
+    {  0,  1},  /* LG/Zenith/Vizio  NEC 0x20DF10EF */
+    {  1,  2},  /* Toshiba          NEC 0x02FD48B7 */
+    {  2,  3},  /* Samsung      SAMSUNG 0xE0E040BF */
+    { 13,  2},  /* na004 */
+    { 15,  3},  /* na006 */
+    { 20,  4},  /* na011            NEC 0x0AF5E817 */
+    { 26,  5},  /* na017            NEC 0x1CE348B7 */
+    { 27,  6},  /* na018            NEC 0x55AA38C7 */
+    { 29,  1},  /* na020 */
+    { 51,  7},  /* na042            NEC 0xC15E10EF */
+    { 96,  8},  /* na087            NEC 0x18E710EF */
+    {101,  9},  /* na092        SAMSUNG 0xA0A040BF */
+    {112, 10},  /* na103        SAMSUNG 0x1010F00F */
+    {113, 11},  /* na104            NEC 0x8E7110EF */
+    {128,  1},  /* na119 */
+    {132, 12},  /* na123            NEC 0x1CE338C7 */
+    {134,  5},  /* na125 */
+    {145, 13},  /* na136            NEC 0xDE010FC0 */
+    {151,  3},  /* eu006 */
+    {153,  4},  /* eu008 */
+    {156, 13},  /* eu013 */
+    {157,  6},  /* eu015 */
+    {160, 12},  /* eu018 */
+    {163,  7},  /* eu021 */
+    {171,  1},  /* eu030 */
+    {175,  8},  /* eu034 */
+    {176, 11},  /* eu036 */
+    {249,  9},  /* eu110 */
+    {251, 10},  /* eu112 */
+    {264,  7},  /* eu125 */
+};
+static const int ir_dup_group_count =
+    (int)(sizeof(ir_dup_groups) / sizeof(ir_dup_groups[0]));
+
+/* 13 groups, so the "already sent" set is a uint16_t bitmask. */
+#define IR_DUP_GROUP_MAX 13
+
+static uint8_t ir_entry_group(int i) {
+    for (int k = 0; k < ir_dup_group_count; k++) {
+        if (ir_dup_groups[k].entry == (uint16_t)i) return ir_dup_groups[k].group;
+        if (ir_dup_groups[k].entry > (uint16_t)i) break;  /* sorted by entry */
+    }
+    return 0;
+}
+
+/*
+ * Next entry after `after` that this job should send, or -1 at the end. Pass
+ * -1 to get the first.
+ *
+ * `seen` carries the duplicate groups the job has already used and is updated
+ * when an entry is taken, so the walk itself does the de-duplication and
+ * counting the job is the same walk as running it.
+ */
+static int ir_next_entry(int after, uint8_t regions, uint16_t *seen) {
     for (int i = after + 1; i < IR_ENTRY_COUNT; i++) {
-        if (ir_entry_regions(i) & regions) return i;
+        if (!(ir_entry_regions(i) & regions)) continue;
+        uint8_t g = ir_entry_group(i);
+        if (g) {
+            uint16_t bit = (uint16_t)(1u << (g - 1));
+            if (*seen & bit) continue;
+            *seen |= bit;
+        }
+        return i;
     }
     return -1;
 }
@@ -359,11 +499,13 @@ static struct {
     uint16_t job_id;
     uint8_t regions;
     uint8_t repeat;
+    int16_t only;           /* entry this job sends, or -1 for the whole region */
     int codes;              /* distinct codes in this job */
     int total;              /* transmissions in this job */
     int step;               /* transmissions started */
     int sent;               /* transmissions completed */
     int cursor;             /* entry being sent, -1 once the region runs out */
+    uint16_t groups_sent;   /* duplicate groups this blast has already used */
     uint8_t rep;            /* frames of the entry at cursor already sent */
     uint8_t rep_target;     /* frames that entry needs: sends * repeat */
     unsigned long started_ms;
@@ -376,6 +518,7 @@ static struct {
     uint8_t kind;
     uint8_t regions;
     uint8_t repeat;
+    int16_t only;
     uint16_t job_id;
 } ir_request;
 
@@ -397,23 +540,32 @@ static uint32_t ir_carrier_hz = 0;
 static uint8_t ir_carrier_duty = 0;
 static bool ir_carrier_set = false;
 
-static int ir_count_region(uint8_t regions) {
-    int n = 0;
-    for (int i = 0; i < IR_ENTRY_COUNT; i++) {
-        if (ir_entry_regions(i) & regions) n++;
+/*
+ * What a blast over this region will actually do. It walks with ir_next_entry()
+ * rather than counting the region mask directly, so the duplicate groups it
+ * skips are exactly the ones the run will skip and the reported totals cannot
+ * drift from the job.
+ *
+ * Frames are the per-entry protocol requirement times whatever multiplier the
+ * caller asked for. Not codes * repeat — almost every entry needs exactly one
+ * frame, and pretending otherwise is what made this slow.
+ */
+static void ir_count_job(uint8_t regions, uint8_t repeat, int *codes, int *frames) {
+    uint16_t seen = 0;
+    int c = 0, f = 0;
+    for (int i = ir_next_entry(-1, regions, &seen); i >= 0;
+         i = ir_next_entry(i, regions, &seen)) {
+        c++;
+        f += ir_entry_sends(i) * repeat;
     }
-    return n;
+    if (codes) *codes = c;
+    if (frames) *frames = f;
 }
 
-/* Frames the job will send: the per-entry protocol requirement, times whatever
-   multiplier the caller asked for. Not codes * repeat — almost every entry
-   needs exactly one frame, and pretending otherwise is what made this slow. */
-static int ir_count_frames(uint8_t regions, uint8_t repeat) {
-    int n = 0;
-    for (int i = 0; i < IR_ENTRY_COUNT; i++) {
-        if (ir_entry_regions(i) & regions) n += ir_entry_sends(i) * repeat;
-    }
-    return n;
+static int ir_count_region(uint8_t regions) {
+    int codes = 0;
+    ir_count_job(regions, 1, &codes, NULL);
+    return codes;
 }
 
 static const char *ir_region_name(uint8_t regions) {
@@ -473,7 +625,8 @@ static bool ir_start_step() {
         snprintf(ir_state.label, sizeof(ir_state.label), "raw");
     } else {
         if (ir_state.rep >= ir_state.rep_target) {
-            ir_state.cursor = ir_next_entry(ir_state.cursor, ir_state.regions);
+            ir_state.cursor = ir_next_entry(ir_state.cursor, ir_state.regions,
+                                            &ir_state.groups_sent);
             if (ir_state.cursor < 0) return false;
             ir_state.rep = 0;
             ir_state.rep_target =
@@ -516,6 +669,7 @@ static void ir_begin_request() {
     ir_state.job_id = ir_request.job_id;
     ir_state.repeat = ir_request.repeat;
     ir_state.regions = ir_request.regions;
+    ir_state.only = ir_request.only;
     ir_state.started_ms = millis();
     ir_state.next_at = millis();
 
@@ -524,14 +678,31 @@ static void ir_begin_request() {
         ir_state.total = ir_state.repeat;
         event_add("ir: job %u raw, %d entries at %ukHz",
                   (unsigned)ir_state.job_id, ir_raw_count, (unsigned)ir_raw_khz);
+    } else if (ir_state.only >= 0) {
+        /* One code, so the cursor is parked on it from the start and never
+           advances: total is exactly the frames that entry needs, and ir_poll()
+           ends the job on reaching it before ir_start_step() looks for a next
+           entry. Everything downstream — encoder, carrier, gaps, stop — is the
+           blast's, unchanged. */
+        ir_state.cursor = ir_state.only;
+        ir_state.rep = 0;
+        ir_state.rep_target =
+            (uint8_t)(ir_entry_sends(ir_state.only) * ir_state.repeat);
+        ir_state.codes = 1;
+        ir_state.total = ir_state.rep_target;
+        event_add("ir: job %u code %s x%u", (unsigned)ir_state.job_id,
+                  ir_entry_label(ir_state.only), (unsigned)ir_state.repeat);
     } else {
         /* cursor sits before the first match with its repeat quota spent, so
-           that the first ir_start_step() advances onto it like any other. */
+           that the first ir_start_step() advances onto it like any other, and
+           groups_sent starts empty so the walk skips the same duplicates the
+           count below just simulated. */
         ir_state.cursor = -1;
         ir_state.rep = 0;
         ir_state.rep_target = 0;
-        ir_state.codes = ir_count_region(ir_state.regions);
-        ir_state.total = ir_count_frames(ir_state.regions, ir_state.repeat);
+        ir_state.groups_sent = 0;
+        ir_count_job(ir_state.regions, ir_state.repeat,
+                     &ir_state.codes, &ir_state.total);
         event_add("ir: job %u tvbgone region=%s, %d codes x%u",
                   (unsigned)ir_state.job_id, ir_region_name(ir_state.regions),
                   ir_state.codes, (unsigned)ir_state.repeat);
@@ -626,6 +797,31 @@ static uint16_t ir_start_tvbgone(uint8_t regions, uint8_t repeat) {
     ir_request.kind = IR_JOB_TVBGONE;
     ir_request.regions = regions;
     ir_request.repeat = repeat;
+    ir_request.only = -1;
+    ir_request.job_id = ++ir_job_seq;
+    ir_request_pending = true;
+    return ir_request.job_id;
+}
+
+/*
+ * One named code, same machinery. It exists because the database is mostly
+ * POWER TOGGLE rather than a discrete off: a full blast hits a given
+ * television with every code it answers to, and each one flips it again, so a
+ * set that contains three codes a Samsung recognises leaves it off, on, off.
+ * Upstream behaves the same way — it is the data, not the port. Sending one
+ * code is what "turn off the thing in front of me" actually needs.
+ *
+ * The frame is built by the same encoder from the same table entry as it is
+ * inside a blast; only the walk over the table is skipped.
+ */
+static uint16_t ir_start_code(int index, uint8_t repeat) {
+    if (!ir_ready || ir_busy()) return 0;
+    if (index < 0 || index >= ir_code_count) return 0;
+
+    ir_request.kind = IR_JOB_TVBGONE;
+    ir_request.regions = ir_codes[index].regions;
+    ir_request.repeat = repeat;
+    ir_request.only = (int16_t)index;
     ir_request.job_id = ++ir_job_seq;
     ir_request_pending = true;
     return ir_request.job_id;
@@ -664,7 +860,7 @@ static IrProgress ir_progress() {
 /* --- Endpoints --- */
 
 static const SkillEndpoint ir_endpoints[] = {
-    {"POST", "/ir/tvbgone",        "Start a TV power-off blast {region, repeat}"},
+    {"POST", "/ir/tvbgone",        "Start a TV power-off blast {region, repeat} or one code {code}"},
     {"GET",  "/ir/tvbgone/status", "Blast progress: running, index/total, last code"},
     {"POST", "/ir/tvbgone/stop",   "Abort a running blast"},
     {"POST", "/ir/send",           "Send one raw frame {khz, duty, raw[], repeat}"},
@@ -678,7 +874,7 @@ static const char *ir_describe() {
            "### Endpoints\n\n"
            "| Method | Path | Description |\n"
            "|--------|------|-------------|\n"
-           "| POST | /ir/tvbgone | Start a blast: `{\"region\":\"eu\"\\|\"na\"\\|\"all\",\"repeat\":1-10}` (defaults `all`, 1) |\n"
+           "| POST | /ir/tvbgone | Start a blast: `{\"region\":\"eu\"\\|\"na\"\\|\"all\",\"repeat\":1-10}` (defaults `all`, 1), or one code: `{\"code\":\"samsung\"}` |\n"
            "| GET | /ir/tvbgone/status | Running/idle, frames sent, elapsed, last code |\n"
            "| POST | /ir/tvbgone/stop | Abort the running job |\n"
            "| POST | /ir/send | One raw frame: `{\"khz\":38,\"duty\":33,\"raw\":[9000,4500,...],\"repeat\":1}` |\n\n"
@@ -691,9 +887,11 @@ static const char *ir_describe() {
            "Duration, on the default `repeat` of 1:\n\n"
            "| Region | Codes | Frames | Airtime | Gaps | Total |\n"
            "|--------|-------|--------|---------|------|-------|\n"
-           "| na | 146 | 152 | 25.0s | 14.9s | **39.9s** |\n"
-           "| eu | 147 | 153 | 24.3s | 15.0s | **39.2s** |\n"
-           "| all | 279 | 285 | 48.0s | 28.2s | **76.2s** |\n\n"
+           "| na | 141 | 147 | 24.0s | 14.4s | **38.3s** |\n"
+           "| eu | 143 | 149 | 23.5s | 14.6s | **38.0s** |\n"
+           "| all | 262 | 268 | 44.3s | 26.5s | **70.7s** |\n\n"
+           "Those code counts are lower than the table size because a blast\n"
+           "sends each distinct command once: see \"Duplicate commands\" below.\n\n"
            "Airtime is fixed by the codes themselves. The rest is two gaps:\n"
            "100ms between two different codes, so the receiver's AGC settles\n"
            "before a frame it has not seen, and 45ms between repeats of one\n"
@@ -707,6 +905,47 @@ static const char *ir_describe() {
            "whole job and is rarely what you want.\n\n"
            "Progress appears on the device screen whenever the bottom line is\n"
            "not already carrying setup information.\n\n"
+           "### Duplicate commands\n\n"
+           "Every code here is a power *toggle*, so a receiver that is sent the\n"
+           "same command twice in one run ends up back on. The database does\n"
+           "hold repeats: it is a set of captures, and one command captured\n"
+           "from two remotes is two entries whose timings differ slightly and\n"
+           "whose decoded content does not. The NA and EU lists overlap by more\n"
+           "than the five entries upstream merged, because that merge compared\n"
+           "byte streams rather than what a receiver reads off them.\n\n"
+           "Decoding the table found 13 commands appearing more than once among\n"
+           "the 279 entries, covering 30 of them — including Samsung\n"
+           "`0xE0E040BF`, which is in the NA list, the EU list *and* the\n"
+           "hand-written set. A blast now sends the first entry of each group\n"
+           "and skips the rest, so `all` drops 17 redundant entries and no\n"
+           "receiver is toggled twice. Single-code sends are never filtered.\n\n"
+           "### One code at a time\n\n"
+           "`{\"code\":\"<name>\"}` sends that code and nothing else, through the\n"
+           "same encoder and the same job the blast uses. It exists because\n"
+           "these are power *toggles*, not discrete off commands: a blast hits\n"
+           "a given television with every code it answers to, and each one\n"
+           "flips it again, so a set holding three codes one receiver knows\n"
+           "leaves it off, on, off. To turn off the device in front of you,\n"
+           "name it.\n\n"
+           "`code` and `region` cannot be combined. `repeat` still applies, and\n"
+           "the per-code requirement still holds — a Sony entry sends three\n"
+           "frames at `repeat` 1. Only the nine hand-written codes have names;\n"
+           "the TV-B-Gone entries are captures numbered `NA 0031`, not brands.\n\n"
+           "| Name | Protocol | Frames |\n"
+           "|------|----------|--------|\n"
+           "| LG/Zenith/Vizio | NEC | 1 |\n"
+           "| Toshiba | NEC | 1 |\n"
+           "| Samsung | Samsung | 1 |\n"
+           "| Sony 12-bit | SIRC | 3 |\n"
+           "| Sony 15-bit | SIRC | 3 |\n"
+           "| Sony 20-bit | SIRC | 3 |\n"
+           "| Philips RC-5 | RC-5 | 1 |\n"
+           "| Philips RC-6 | RC-6 mode 0 | 1 |\n"
+           "| Panasonic | Kaseikyo | 1 |\n\n"
+           "Matching is case-insensitive, and an entry naming several vendors\n"
+           "answers to each of them alone: `lg`, `Zenith` and `LG/Zenith/Vizio`\n"
+           "all select the first row. The same nine are on the device under\n"
+           "TV-B-Gone > By brand.\n\n"
            "### Code table\n\n"
            "279 codes, in two parts.\n\n"
            "Nine are encoded here from the published descriptions of six\n"
@@ -718,11 +957,14 @@ static const char *ir_describe() {
            "`ir_codes_tvbgone.h` under Creative Commons Attribution-ShareAlike\n"
            "— the one file in this repository that is not MIT. Its licence is\n"
            "bundled as `LICENSE-CC-BY-SA`.\n\n"
-           "The region filter is real, and it is upstream's split: `na` selects\n"
-           "146 codes (North America, Asia, everywhere `eu` does not reach),\n"
-           "`eu` selects 147 (Europe, the Middle East, Australia, New Zealand,\n"
-           "parts of Africa and South America), `all` selects 279. Five of the\n"
-           "upstream codes belong to both lists and are sent once.\n\n"
+           "The region filter is real, and it is upstream's split: `na` covers\n"
+           "North America, Asia and everywhere `eu` does not reach; `eu` covers\n"
+           "Europe, the Middle East, Australia, New Zealand, parts of Africa\n"
+           "and South America. After duplicate commands are dropped they select\n"
+           "141, 143 and 262 codes. Note that upstream never sends both lists\n"
+           "in one run — the original reads a region switch and the Bruce port\n"
+           "asks — so `all` is this port's own option, and the de-duplication\n"
+           "above is what makes it safe.\n\n"
            "### Raw frames\n\n"
            "`raw` is alternating mark/space durations in microseconds, starting\n"
            "with a mark. 3 to 512 entries, each 1-32767us (the RMT duration\n"
@@ -753,8 +995,12 @@ static void ir_send_error(AsyncWebServerRequest *req, int code, const char *msg)
 
 static void ir_register_routes(AsyncWebServer &server) {
 
-    /* POST /ir/tvbgone — body optional: {"region":"eu"|"na"|"all","repeat":N} */
-    server.on("/ir/tvbgone", HTTP_POST, [](AsyncWebServerRequest *req) {
+    /* POST /ir/tvbgone — body optional:
+       {"region":"eu"|"na"|"all","repeat":N} or {"code":"samsung","repeat":N}
+
+       Exact matching, or this route would swallow its own children: see the
+       note at the top of this file. */
+    server.on(AsyncURIMatcher::exact("/ir/tvbgone"), HTTP_POST, [](AsyncWebServerRequest *req) {
         char *body = ir_take_body(req);
         if (!check_auth(req)) {
             free(body);
@@ -772,6 +1018,9 @@ static void ir_register_routes(AsyncWebServer &server) {
            the Sony entries still go out three times. Anything higher is a
            multiplier on top, for the rare receiver that wants more. */
         int repeat = 1;
+        /* -1 is the blast; anything else is the one named code to send. */
+        int only = -1;
+        bool has_region = false;
 
         if (body) {
             JsonDocument input;
@@ -790,6 +1039,20 @@ static void ir_register_routes(AsyncWebServer &server) {
                     ir_send_error(req, 400, "region must be na, eu or all");
                     return;
                 }
+                has_region = true;
+            }
+            if (input["code"].is<const char*>()) {
+                only = ir_find_code(input["code"].as<const char*>());
+                if (only < 0) {
+                    ir_send_error(req, 400, "unknown code; GET /skill lists the names");
+                    return;
+                }
+                /* A region selects a set and a code selects one entry, so a
+                   request carrying both is asking for two different jobs. */
+                if (has_region) {
+                    ir_send_error(req, 400, "code and region cannot be combined");
+                    return;
+                }
             }
             if (input["repeat"].is<int>()) {
                 repeat = input["repeat"].as<int>();
@@ -805,7 +1068,8 @@ static void ir_register_routes(AsyncWebServer &server) {
             return;
         }
 
-        int codes = ir_count_region(regions);
+        int codes = 1, frames = ir_entry_sends(only >= 0 ? only : 0) * repeat;
+        if (only < 0) ir_count_job(regions, (uint8_t)repeat, &codes, &frames);
         if (codes == 0) {
             ir_send_error(req, 400, "no codes for that region");
             return;
@@ -813,10 +1077,11 @@ static void ir_register_routes(AsyncWebServer &server) {
 
         /* Hand the job to loop(): the transmission itself must not happen on
            the web server task. The two rejections above are tested here as
-           well as inside ir_start_tvbgone() because they answer with different
-           status codes; the call can still come back empty if a request from
-           the knob won the race, which is the same 409. */
-        uint16_t job = ir_start_tvbgone(regions, (uint8_t)repeat);
+           well as inside the start functions because they answer with
+           different status codes; the call can still come back empty if a
+           request from the knob won the race, which is the same 409. */
+        uint16_t job = (only >= 0) ? ir_start_code(only, (uint8_t)repeat)
+                                   : ir_start_tvbgone(regions, (uint8_t)repeat);
         if (job == 0) {
             ir_send_error(req, 409, "a job is already running");
             return;
@@ -825,15 +1090,16 @@ static void ir_register_routes(AsyncWebServer &server) {
         JsonDocument doc;
         doc["ok"] = true;
         doc["job"] = job;
-        doc["region"] = ir_region_name(regions);
+        if (only >= 0) doc["code"] = ir_codes[only].brand;
+        else           doc["region"] = ir_region_name(regions);
         doc["repeat"] = repeat;
         doc["codes"] = codes;
-        doc["transmissions"] = ir_count_frames(regions, (uint8_t)repeat);
+        doc["transmissions"] = frames;
         ir_send_json(req, 200, doc);
     }, NULL, handle_body_collect);
 
     /* GET /ir/tvbgone/status */
-    server.on("/ir/tvbgone/status", HTTP_GET, [](AsyncWebServerRequest *req) {
+    server.on(AsyncURIMatcher::exact("/ir/tvbgone/status"), HTTP_GET, [](AsyncWebServerRequest *req) {
         if (!require_auth(req)) return;
 
         JsonDocument doc;
@@ -847,7 +1113,8 @@ static void ir_register_routes(AsyncWebServer &server) {
         doc["total"] = ir_state.total;
         doc["codes"] = ir_state.codes;
         doc["repeat"] = ir_state.repeat;
-        doc["region"] = ir_region_name(ir_state.regions);
+        if (ir_state.only >= 0) doc["code"] = ir_entry_label(ir_state.only);
+        else                    doc["region"] = ir_region_name(ir_state.regions);
         doc["elapsed_ms"] = (unsigned long)(millis() - ir_state.started_ms);
         if (ir_state.label[0]) doc["last"] = ir_state.label;
         if (!running && ir_state.result[0]) doc["result"] = ir_state.result;
@@ -855,7 +1122,7 @@ static void ir_register_routes(AsyncWebServer &server) {
     });
 
     /* POST /ir/tvbgone/stop */
-    server.on("/ir/tvbgone/stop", HTTP_POST, [](AsyncWebServerRequest *req) {
+    server.on(AsyncURIMatcher::exact("/ir/tvbgone/stop"), HTTP_POST, [](AsyncWebServerRequest *req) {
         if (!require_auth(req)) return;
 
         bool running = ir_stop_job();
@@ -869,7 +1136,7 @@ static void ir_register_routes(AsyncWebServer &server) {
     });
 
     /* POST /ir/send — body: {"khz":38,"duty":33,"raw":[...],"repeat":1} */
-    server.on("/ir/send", HTTP_POST, [](AsyncWebServerRequest *req) {
+    server.on(AsyncURIMatcher::exact("/ir/send"), HTTP_POST, [](AsyncWebServerRequest *req) {
         char *body = ir_take_body(req);
         if (!check_auth(req)) {
             free(body);
@@ -949,6 +1216,7 @@ static void ir_register_routes(AsyncWebServer &server) {
         ir_request.kind = IR_JOB_RAW;
         ir_request.regions = 0;
         ir_request.repeat = (uint8_t)repeat;
+        ir_request.only = -1;
         ir_request.job_id = ++ir_job_seq;
         ir_request_pending = true;
 
@@ -966,7 +1234,7 @@ static void ir_register_routes(AsyncWebServer &server) {
 
 static const Skill ir_skill = {
     .name = "ir",
-    .version = "0.2.0",
+    .version = "0.3.0",
     .describe = ir_describe,
     .endpoints = ir_endpoints,
     .register_routes = ir_register_routes
@@ -974,6 +1242,9 @@ static const Skill ir_skill = {
 
 static void skill_ir_init() {
     memset(&ir_state, 0, sizeof(ir_state));
+    /* 0 is a valid entry index, so idle has to be spelled out rather than left
+       to the memset. */
+    ir_state.only = -1;
 
     /* 1MHz tick, so a duration count is microseconds. Two memory blocks rather
        than one: the copy encoder refills from an interrupt, and WiFi plus
