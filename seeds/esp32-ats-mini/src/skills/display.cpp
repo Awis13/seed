@@ -107,6 +107,36 @@ void display_show_status() {
     tft.drawString(status_line, DISPLAY_CX, 145, 4);
 }
 
+/*
+ * Provisioning screen: the setup AP's SSID and one-boot password, plus the auth
+ * token. Painted at boot instead of the status screen when the node came up on
+ * its setup AP (no stored WiFi, or the stored credentials failed). The password
+ * exists only in RAM and on this screen — it is never persisted or sent over the
+ * wire, so this panel is the only place a human can read it.
+ *
+ * Non-static: forward-declared in main.cpp, called from skill_display_init().
+ */
+void display_show_ap(const char *ssid, const char *pass, const char *token) {
+    tft.fillScreen(TFT_BLACK);
+    tft.setTextDatum(MC_DATUM);
+
+    char line[64];
+
+    tft.setTextColor(TFT_CYAN, TFT_BLACK);
+    snprintf(line, sizeof(line), "AP: %s", ssid);
+    tft.drawString(line, DISPLAY_CX, 30, 4);
+
+    tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+    snprintf(line, sizeof(line), "PW: %s", pass);
+    tft.drawString(line, DISPLAY_CX, 70, 4);
+
+    /* Token in a small font: 32 hex chars is too wide for font 4. */
+    tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+    tft.drawString("TOKEN", DISPLAY_CX, 108, 2);
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.drawString(token, DISPLAY_CX, 130, 2);
+}
+
 static void display_register_routes(AsyncWebServer &server) {
 
     /* POST /display — take over the screen with custom text. */
@@ -168,7 +198,13 @@ static void skill_display_init() {
     tft.setRotation(3);
     tft.fillScreen(TFT_BLACK);
 
-    display_show_status();
+    // On the setup AP (no working WiFi) the provisioning screen carries the AP
+    // password and token; otherwise show the receiver status readout.
+    if (ap_active) {
+        display_show_ap(ap_ssid.c_str(), ap_password.c_str(), auth_token.c_str());
+    } else {
+        display_show_status();
+    }
 
     Serial.println("[display] ST7789 up");
     skill_register(&display_skill);
