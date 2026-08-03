@@ -442,6 +442,59 @@ static bool ir_status_line(char *out, size_t n) {
     return true;
 }
 
+/* --- Job control, independent of the transport ---
+ *
+ * The on-device menu and POST /ir/tvbgone start the same job through these two
+ * functions. Neither knows about HTTP; both are called from the loop() task
+ * (the UI) and from the web server task (the endpoints), which is safe for the
+ * same reason the endpoints were already safe — they only stage a request that
+ * ir_poll() picks up.
+ */
+
+/* Returns the job id, or 0 if a job is already running or the region is
+   empty. */
+static uint16_t ir_start_tvbgone(uint8_t regions, uint8_t repeat) {
+    if (!ir_ready || ir_busy()) return 0;
+    if (ir_count_region(regions) == 0) return 0;
+
+    ir_request.kind = IR_JOB_TVBGONE;
+    ir_request.regions = regions;
+    ir_request.repeat = repeat;
+    ir_request.job_id = ++ir_job_seq;
+    ir_request_pending = true;
+    return ir_request.job_id;
+}
+
+/* Returns whether there was anything to stop. loop() ends the job on its next
+   pass; a frame already handed to the peripheral finishes first. */
+static bool ir_stop_job() {
+    if (ir_state.kind == IR_JOB_IDLE) return false;
+    ir_stop_requested = true;
+    return true;
+}
+
+/* Snapshot of the running (or last finished) job, for the on-device progress
+   screen. Copied out rather than exposing ir_state, which ir_poll() owns. */
+struct IrProgress {
+    bool running;
+    int sent;
+    int total;
+    unsigned long elapsed_ms;
+    const char *label;   /* code being sent, "" before the first frame */
+    const char *result;  /* how the last job ended, "" if none has */
+};
+
+static IrProgress ir_progress() {
+    IrProgress p;
+    p.running = (ir_state.kind != IR_JOB_IDLE);
+    p.sent = ir_state.sent;
+    p.total = ir_state.total;
+    p.elapsed_ms = millis() - ir_state.started_ms;
+    p.label = ir_state.label;
+    p.result = ir_state.result;
+    return p;
+}
+
 /* --- Endpoints --- */
 
 static const SkillEndpoint ir_endpoints[] = {
@@ -568,16 +621,19 @@ static void ir_register_routes(AsyncWebServer &server) {
         }
 
         /* Hand the job to loop(): the transmission itself must not happen on
-           the web server task. */
-        ir_request.kind = IR_JOB_TVBGONE;
-        ir_request.regions = regions;
-        ir_request.repeat = (uint8_t)repeat;
-        ir_request.job_id = ++ir_job_seq;
-        ir_request_pending = true;
+           the web server task. The two rejections above are tested here as
+           well as inside ir_start_tvbgone() because they answer with different
+           status codes; the call can still come back empty if a request from
+           the knob won the race, which is the same 409. */
+        uint16_t job = ir_start_tvbgone(regions, (uint8_t)repeat);
+        if (job == 0) {
+            ir_send_error(req, 409, "a job is already running");
+            return;
+        }
 
         JsonDocument doc;
         doc["ok"] = true;
-        doc["job"] = ir_request.job_id;
+        doc["job"] = job;
         doc["region"] = ir_region_name(regions);
         doc["repeat"] = repeat;
         doc["codes"] = codes;
@@ -611,10 +667,7 @@ static void ir_register_routes(AsyncWebServer &server) {
     server.on("/ir/tvbgone/stop", HTTP_POST, [](AsyncWebServerRequest *req) {
         if (!require_auth(req)) return;
 
-        bool running = (ir_state.kind != IR_JOB_IDLE);
-        /* loop() ends the job on its next pass; a frame already handed to the
-           peripheral finishes, which is under 100ms. */
-        if (running) ir_stop_requested = true;
+        bool running = ir_stop_job();
 
         JsonDocument doc;
         doc["ok"] = true;

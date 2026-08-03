@@ -14,6 +14,10 @@
 //   - ST7789 170x320 display shows a clock plus address/battery so the device
 //     is self-describing without a serial console. The provisioning AP password
 //     and the auth token appear there only while the setup AP is up.
+//   - The rotary encoder drives an on-device menu over that clock (src/ui.h):
+//     TV-B-Gone, the setup AP and an info page, so nothing needs a network
+//     client to be used. It is a front-end over the same state the API drives,
+//     not a second implementation of it.
 //
 // Endpoints:
 //   GET  /health            — alive check (no auth)
@@ -47,7 +51,7 @@
 #include <TFT_eSPI.h>
 
 // ===== Configuration =====
-#define SEED_VERSION        "0.2.2"
+#define SEED_VERSION        "0.3.0"
 #define HTTP_PORT           8080
 #define TOKEN_FILE          "/auth_token.txt"
 #define WIFI_CONFIG_FILE    "/wifi.json"
@@ -481,7 +485,7 @@ static bool clock_local_time(struct tm &out) {
 
 // Clock-first status screen on the 320x170 panel:
 //
-//   SEED v0.2.2              BAT 87%              192.168.1.42     <- font 2
+//   SEED v0.3.0              BAT 87%              192.168.1.42     <- font 2
 //   ------------------------------------------------------------
 //                     12:34   07                                   <- font 8 + 4
 //                    Sun 03 Aug 2026                               <- font 4
@@ -642,6 +646,12 @@ static void display_tick() {
 
     display_force = false;
 }
+
+// Connectivity the clock face was last drawn for. A change here is what earns
+// a full repaint, and it lives at file scope so that returning from a menu —
+// which repaints everything anyway — can adopt the current status instead of
+// wiping the screen a second time one tick later.
+static wl_status_t clock_last_status = WL_NO_SHIELD;
 
 // Full repaint — only worth doing when the static chrome has to change.
 static void display_status() {
@@ -1309,7 +1319,10 @@ static void handle_skill(AsyncWebServerRequest *request) {
     s += "- The setup AP is only up during provisioning: hold the user key (GPIO6) 3s to\n";
     s += "  raise it, with a fresh random password shown on the device screen. A\n";
     s += "  gesture-raised AP closes itself after 10 minutes if nothing reprovisions\n";
-    s += "- POST /wifi/config needs the token unless the request comes over that AP\n\n";
+    s += "- POST /wifi/config needs the token unless the request comes over that AP\n";
+    s += "- The encoder button opens an on-device menu (TV-B-Gone, setup AP, info).\n";
+    s += "  It drives the same code paths as the API and has no endpoints of its own,\n";
+    s += "  so a blast started here shows up in GET /ir/tvbgone/status like any other\n\n";
     s += "## API\n\n";
     s += "| Method | Path | Description |\n";
     s += "|--------|------|-------------|\n";
@@ -1420,6 +1433,13 @@ static void skills_init() {
     skill_ir_init();
 }
 
+// ===== On-device UI =====
+//
+// Included after the skills because it drives them: the menu starts an IR
+// blast through the skill's own entry point. It is not a skill itself — it
+// registers no routes and it owns screens rather than endpoints.
+#include "ui.h"
+
 // ===== Routes =====
 
 static void setup_routes() {
@@ -1477,6 +1497,7 @@ void setup() {
     wifi_setup();
     token_load();     // after wifi_setup(): needs RF up for a real RNG
     skills_init();
+    ui_init();        // after skills_init(): the menu drives the IR skill
     setup_routes();
     server.begin();
     display_status();
@@ -1529,15 +1550,21 @@ void loop() {
     // peripheral, so this only starts frames and collects completions.
     ir_poll();
 
+    // Encoder and buttons, every pass: input latency is what makes the knob
+    // feel attached to the screen. This owns the panel whenever the UI is on a
+    // screen other than the clock, and draws only on an actual change.
+    ui_poll();
+
     // Clock tick: at most once a second, and each field only repaints when its
     // text actually changed. The screen is only wiped when connectivity flips.
-    static wl_status_t last_status = WL_NO_SHIELD;
+    // Skipped entirely while a menu is up — ui_enter(UI_CLOCK) repaints the
+    // whole clock on the way back, so nothing here has to catch up.
     static unsigned long last_tick = 0;
-    if (display_force || millis() - last_tick >= 1000) {
+    if (ui_screen == UI_CLOCK && (display_force || millis() - last_tick >= 1000)) {
         last_tick = millis();
         wl_status_t st = WiFi.status();
-        if (st != last_status) {
-            last_status = st;
+        if (st != clock_last_status) {
+            clock_last_status = st;
             display_status();
         } else {
             display_tick();
