@@ -15,10 +15,13 @@
 //     is self-describing without a serial console. The provisioning AP password
 //     and the auth token appear there only while the setup AP is up.
 //   - The rotary encoder drives an on-device menu over that clock (src/ui.h):
-//     TV-B-Gone (whole-region blasts and single codes by brand), the setup AP
-//     and an info page, so nothing needs a network client to be used. It is a
-//     front-end over the same state the API drives, not a second
+//     messages, TV-B-Gone (whole-region blasts and single codes by brand), the
+//     setup AP and an info page, so nothing needs a network client to be used.
+//     It is a front-end over the same state the API drives, not a second
 //     implementation of it.
+//   - POST /notify makes the device a pager: anything that can run curl puts a
+//     message on the screen, and the knob acknowledges it. The queue lives in
+//     skills/notify.cpp; the clock face carries the unread count.
 //
 // Endpoints:
 //   GET  /health            — alive check (no auth)
@@ -52,7 +55,7 @@
 #include <TFT_eSPI.h>
 
 // ===== Configuration =====
-#define SEED_VERSION        "0.3.3"
+#define SEED_VERSION        "0.4.0"
 #define HTTP_PORT           8080
 #define TOKEN_FILE          "/auth_token.txt"
 #define WIFI_CONFIG_FILE    "/wifi.json"
@@ -505,21 +508,47 @@ static bool clock_local_time(struct tm &out) {
 //
 // Three colours only: warm white for the digits, slate for everything
 // secondary, one amber accent (seconds, and the AP password in setup mode).
+//
+// Notifications add exactly two more, and they are states rather than decoration
+// — teal for informational, red for critical, with warn reusing the amber accent
+// that is already the alert colour on this face. The rule the whole UI keeps is
+// that no single screen shows more than three of them at once over the ground:
+// the notification card spends its three on warm white, slate and one level
+// colour, and the message list spends them on warm white, slate and amber.
 #define COL_BG      TFT_BLACK
 #define COL_TIME    0xFFBC  // warm white
 #define COL_DIM     0x7BD0  // slate grey
 #define COL_ACCENT  0xFD05  // amber
 #define COL_RULE    0x2945  // hairline under the header
+#define COL_INFO    0x2DD5  // teal   — info level
+#define COL_CRIT    0xE1C5  // red    — crit level
 
 #define HDR_Y       2
+// Height of the inverse header bar the menu screens draw. The clock face keeps
+// its plain header and the hairline rule below it.
+#define HDR_BAR_H   18
 #define CLOCK_Y     24
 #define DATE_Y      102
 #define ROW1_Y      130
 #define ROW2_Y      150
 
+// Unread badge on the clock face: an amber dot and a count, sitting in the gap
+// between the version string (which ends at x=88 in font 2) and the battery
+// field's erase rectangle (which starts at x=125). Both numbers are measured
+// against TFT_eSPI's own width tables, not estimated.
+#define BADGE_CX    96
+#define BADGE_R      3
+#define BADGE_TEXT_X 103
+#define BADGE_PAD    20
+
 // Defined in skills/ir.cpp, which is included further down: one line of blast
 // progress for the bottom row. The skill never touches TFT_eSPI itself.
 static bool ir_status_line(char *out, size_t n);
+
+// Defined in skills/notify.cpp, same arrangement: the notification store never
+// touches TFT_eSPI, it only answers questions the clock face asks of it.
+static int notify_unread_count();
+static bool notify_crit_unread();
 
 static bool display_ready = false;
 // Set from the web server task, consumed by the clock tick in loop(): TFT_eSPI
@@ -539,17 +568,28 @@ static char fld_date[24]  = "";
 static char fld_left[32]  = "";
 static char fld_right[32] = "";
 static char fld_note[48]  = "";
+// Unread count the badge currently shows, or -1 for "nothing drawn yet". 10
+// stands for "9+", so that going from 12 unread to 11 costs no SPI.
+static int clock_badge_drawn = -1;
 
 // Repaint a field only when its content changed. An opaque text background plus
 // a fixed padding width erases the previous value, so per-second updates never
 // need fillScreen and never flicker.
+//
+// `bg` is that opaque background, and defaults to the ground because almost
+// every field sits on it. The exceptions are fields drawn on something already
+// painted — text inside a tinted notification card, or on an inverse bar —
+// where erasing to black would punch a hole through what is underneath. The
+// cache keys on the text alone, so a field whose background changes but whose
+// text does not needs display_force; every caller that moves a field onto or
+// off a coloured ground is a screen transition and already sets it.
 static void draw_field(char *cache, size_t cache_size, const char *text,
                        int32_t x, int32_t y, uint8_t font, uint16_t color,
-                       uint8_t datum, uint16_t padding) {
+                       uint8_t datum, uint16_t padding, uint16_t bg = COL_BG) {
     if (!display_force && strncmp(cache, text, cache_size - 1) == 0) return;
     snprintf(cache, cache_size, "%s", text);
     tft.setTextDatum(datum);
-    tft.setTextColor(color, COL_BG);
+    tft.setTextColor(color, bg);
     tft.setTextPadding(padding);
     tft.drawString(text, x, y, font);
     tft.setTextPadding(0);
@@ -598,6 +638,28 @@ static void display_tick() {
     }
     draw_field(fld_addr, sizeof(fld_addr), buf, tft.width() - 8, HDR_Y, 2,
                COL_DIM, TR_DATUM, 117);
+
+    // Unread messages: a dot and a count, and nothing at all when the queue is
+    // read. The dot is not a field, so it is drawn from an explicit change test
+    // rather than through draw_field; both halves move together so one test
+    // covers them. Counts above nine become "9+" — the exact number is on the
+    // Messages screen, and the header has 20px for this.
+    int unread = notify_unread_count();
+    int badge = unread > 9 ? 10 : unread;
+    if (display_force || badge != clock_badge_drawn) {
+        clock_badge_drawn = badge;
+        tft.fillCircle(BADGE_CX, HDR_Y + 8, BADGE_R, badge ? COL_ACCENT : COL_BG);
+        if (badge == 0)      buf[0] = '\0';
+        else if (badge > 9)  snprintf(buf, sizeof(buf), "9+");
+        else                 snprintf(buf, sizeof(buf), "%d", badge);
+        // Deliberately not cached: the test above already decided, and the
+        // cache would skip the erase on the way back to zero.
+        tft.setTextDatum(TL_DATUM);
+        tft.setTextColor(COL_ACCENT, COL_BG);
+        tft.setTextPadding(BADGE_PAD);
+        tft.drawString(buf, BADGE_TEXT_X, HDR_Y, 2);
+        tft.setTextPadding(0);
+    }
 
     struct tm now;
     char hhmm[8], ss[4], date[24];
@@ -669,7 +731,53 @@ static void display_status() {
     tft.drawString("SEED v" SEED_VERSION, 8, HDR_Y, 2);
     tft.drawFastHLine(8, 20, tft.width() - 16, COL_RULE);
     display_force = true;  // the wipe took every field with it
+    clock_badge_drawn = -1;
     display_tick();
+}
+
+// An unacknowledged critical message makes the hairline under the header
+// breathe: its colour ramps from the ordinary rule to a dim red and back, one
+// cycle every two seconds.
+//
+// Breathing rather than blinking is the whole point. A blink is a hard edge
+// that the eye keeps re-detecting, which is right for an alarm demanding an
+// action in the next second and wrong for a device sitting on a shelf saying
+// "there is something here for you". The ramp reads as present rather than
+// urgent, and it never goes dark, so the rule never looks broken.
+//
+// Cost is one drawFastHLine of 304 pixels per step — about 0.25ms of SPI at
+// 40MHz, twelve times a second, and nothing at all when no critical is
+// outstanding. It draws over the clock face only; every other screen owns its
+// own header.
+#define RULE_BREATHE_MS   80    // one step
+#define RULE_BREATHE_CYCLE 2000 // full ramp up and back down
+#define RULE_BREATHE_MAX  160   // peak blend of COL_CRIT over COL_RULE
+
+static void clock_rule_tick() {
+    static unsigned long last_step = 0;
+    static bool was_breathing = false;
+
+    // The step gate comes first so that the notification store is asked once
+    // every 80ms rather than on every one of loop()'s hundred passes a second.
+    if (millis() - last_step < RULE_BREATHE_MS) return;
+    last_step = millis();
+
+    if (!notify_crit_unread()) {
+        // Put the plain rule back exactly once, on the edge.
+        if (was_breathing) {
+            was_breathing = false;
+            tft.drawFastHLine(8, 20, tft.width() - 16, COL_RULE);
+        }
+        return;
+    }
+    was_breathing = true;
+
+    unsigned long pos = millis() % RULE_BREATHE_CYCLE;
+    unsigned long half = RULE_BREATHE_CYCLE / 2;
+    unsigned long up = (pos < half) ? pos : (RULE_BREATHE_CYCLE - pos);
+    uint8_t alpha = (uint8_t)(up * RULE_BREATHE_MAX / half);
+    tft.drawFastHLine(8, 20, tft.width() - 16,
+                      tft.alphaBlend(alpha, COL_CRIT, COL_RULE));
 }
 
 // ===== Auth =====
@@ -1338,11 +1446,14 @@ static void handle_skill(AsyncWebServerRequest *request) {
     s += "  `/ir/tvbgone/stop` and started a blast instead of aborting one\n";
     s += "- An OTA upload whose connection dies is torn down after 30s without data,\n";
     s += "  so a dropped transfer no longer blocks every later one until reboot\n";
-    s += "- The encoder button opens an on-device menu (TV-B-Gone, setup AP, info).\n";
-    s += "  TV-B-Gone holds the three region blasts and a by-brand list of the nine\n";
-    s += "  named codes. It drives the same code paths as the API and has no endpoints\n";
-    s += "  of its own, so a job started here shows up in GET /ir/tvbgone/status like\n";
-    s += "  any other\n\n";
+    s += "- The encoder button opens an on-device menu (messages, TV-B-Gone, setup AP,\n";
+    s += "  info). TV-B-Gone holds the three region blasts and a by-brand list of the\n";
+    s += "  nine named codes. It drives the same code paths as the API and has no\n";
+    s += "  endpoints of its own, so a job started here shows up in\n";
+    s += "  GET /ir/tvbgone/status like any other\n";
+    s += "- POST /notify makes this a pager: the message appears on the screen at once\n";
+    s += "  if the device is idle, and the clock face carries an unread count until\n";
+    s += "  somebody acknowledges it with the knob or POST /notify/ack\n\n";
     s += "## API\n\n";
     s += "| Method | Path | Description |\n";
     s += "|--------|------|-------------|\n";
@@ -1446,11 +1557,13 @@ static void handle_wifi_post(AsyncWebServerRequest *request) {
 #include "skills/gpio.cpp"
 #include "skills/serial.cpp"
 #include "skills/ir.cpp"
+#include "skills/notify.cpp"
 
 static void skills_init() {
     skill_gpio_init();
     skill_serial_init();
     skill_ir_init();
+    skill_notify_init();
 }
 
 // ===== On-device UI =====
@@ -1613,6 +1726,11 @@ void loop() {
     // the RMT peripheral. Advances as far as it can each pass and never blocks.
     ir_poll();
 
+    // Expires notifications whose ttl has run out and mirrors the newest few to
+    // SPIFFS. The endpoints only ever touch RAM; the flash write is here, on the
+    // one task that is allowed to spend milliseconds.
+    notify_poll();
+
     // Encoder and buttons, every pass: input latency is what makes the knob
     // feel attached to the screen. This owns the panel whenever the UI is on a
     // screen other than the clock, and draws only on an actual change.
@@ -1633,6 +1751,11 @@ void loop() {
             display_tick();
         }
     }
+
+    // The one thing on the clock face that moves faster than once a second, and
+    // it only moves while a critical message is unacknowledged. One horizontal
+    // line, so it does not need the tick above and must not wait for it.
+    if (ui_screen == UI_CLOCK) clock_rule_tick();
 
     // Keep the fuel gauge reading current — probe_battery() only ran at boot.
     static unsigned long last_battery = 0;
