@@ -108,7 +108,10 @@ static const char *display_describe() {
            "- `POST /display` takes over the screen with custom text until the "
            "next tune repaints the status screen.\n"
            "- `line` (optional, default 0) shifts the text vertically: each unit "
-           "is one row down from centre, negative moves up.\n\n"
+           "is one row down from centre, negative moves up. Clamped to -2..2 so "
+           "the text stays on the visible panel.\n"
+           "- `text` is truncated at 40 chars; longer strings would run off the "
+           "screen edges.\n\n"
            "### Example\n\n"
            "```\n"
            "curl -H 'Authorization: Bearer <token>' -X POST \\\n"
@@ -318,6 +321,21 @@ static void display_register_routes(AsyncWebServer &server) {
             return;
         }
 
+        /* Clamp `line` to the rows that actually fit the 170 px-tall panel. y is
+         * the MC_DATUM vertical centre = 85 + line*30 and a font-4 glyph box is
+         * ~26 px tall, so line -2..2 (y 25..145) keeps every row fully on-screen.
+         * Out-of-range lines used to draw silently off-screen and still return
+         * 200 — clamp so the text stays visible instead of vanishing. */
+        if (line < -2) line = -2;
+        else if (line > 2) line = 2;
+
+        /* Cap the text length into a bounded buffer: a very long string spilled
+         * off both screen edges (and pushed an unbounded pointer through the draw
+         * path). 40 chars is well past what fits on one row; truncate rather than
+         * crash or overflow. */
+        char text_buf[41];
+        snprintf(text_buf, sizeof(text_buf), "%s", text);
+
         /* Take over the screen under display_mtx so the drawing can't interleave
          * with a tick-driven status repaint on loopTask. */
         xSemaphoreTake(display_mtx, portMAX_DELAY);
@@ -327,7 +345,7 @@ static void display_register_routes(AsyncWebServer &server) {
         gfx->setTextDatum(MC_DATUM);
         /* line shifts vertically from centre: 30 px per row. */
         int y = 85 + line * 30;
-        gfx->drawString(text, DISPLAY_CX, y, 4);
+        gfx->drawString(text_buf, DISPLAY_CX, y, 4);
         display_flush();
         xSemaphoreGive(display_mtx);
 

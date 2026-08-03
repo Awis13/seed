@@ -632,7 +632,15 @@ static void handle_body_collect(AsyncWebServerRequest *request, uint8_t *data,
 
 static void handle_config_get(AsyncWebServerRequest *request) {
     if (!require_auth(request)) return;
-    request->send(200, "text/markdown; charset=utf-8", read_spiffs_file(CONFIG_MD_FILE));
+    String content = read_spiffs_file(CONFIG_MD_FILE);
+    /* No config stored yet: return an empty JSON object instead of a bare 200
+     * with an empty body, so a caller always gets valid, parseable content.
+     * Config is optional (empty = no settings), so this is not a 404. */
+    if (content.length() == 0) {
+        request->send(200, "application/json", "{}");
+        return;
+    }
+    request->send(200, "text/markdown; charset=utf-8", content);
 }
 
 static void handle_config_post(AsyncWebServerRequest *request) {

@@ -183,6 +183,7 @@ static uint8_t ui_mode = UI_VFO;
 /* --- Endpoints --- */
 static const SkillEndpoint radio_endpoints[] = {
     {"POST", "/radio/tune",   "Tune: {mode:\"FM\"|\"AM\"|\"LSB\"|\"USB\", freq:<int>, bfo?:<int>}"},
+    {"POST", "/radio/volume", "Set volume: {volume:0-63}"},
     {"POST", "/radio/scan",   "Sweep current-mode band: {from,to,step,min_rssi?} -> RSSI/SNR per step"},
     {"GET",  "/radio/status", "Current freq/mode/RSSI/SNR (+bfo in SSB)"},
     {NULL, NULL, NULL}
@@ -195,6 +196,7 @@ static const char *radio_describe() {
            "| Method | Path | Description |\n"
            "|--------|------|-------------|\n"
            "| POST | /radio/tune | Tune: `{\"mode\":\"FM|AM|LSB|USB\",\"freq\":<int>,\"bfo\":<int>}` |\n"
+           "| POST | /radio/volume | Set volume: `{\"volume\":<0..63>}` |\n"
            "| POST | /radio/scan | Blocking band sweep in the current mode: `{\"from\":<int>,\"to\":<int>,\"step\":<int>,\"min_rssi\":<int>}` |\n"
            "| GET | /radio/status | Current freq, mode, RSSI, SNR (+bfo in SSB) |\n\n"
            "### Frequency units\n\n"
@@ -202,7 +204,11 @@ static const char *radio_describe() {
            "- AM: kHz, so `1000` = 1000 kHz (range 520..1710)\n"
            "- LSB/USB: kHz, so `14074` = 14074 kHz (range 1800..30000)\n\n"
            "### SSB fine-tuning\n\n"
-           "- `bfo` (optional, SSB only): BFO offset in Hz, range -14000..14000, default 0\n\n"
+           "- `bfo` (optional, SSB only): BFO offset in Hz, range -14000..14000, default 0.\n"
+           "  Sending `bfo` in FM or AM is a 400 — it only applies in LSB/USB.\n\n"
+           "### Volume\n\n"
+           "- `POST /radio/volume` `{\"volume\":<0..63>}` sets the receiver volume\n"
+           "  (same value reported by `/radio/status` and driven by the encoder).\n\n"
            "### Scan\n\n"
            "`POST /radio/scan` sweeps `from`..`to` (inclusive) with the given `step`,\n"
            "measuring RSSI/SNR at each point. It stays in the current mode and does\n"
@@ -324,6 +330,9 @@ static void radio_register_routes(AsyncWebServer &server) {
         const char *mode_str = input["mode"] | (const char*)nullptr;
         int freq = input["freq"] | -1;
         int req_bfo = input["bfo"] | 0;
+        /* bfo is meaningful only in SSB; flag its presence so the FM/AM branches
+         * can reject it instead of silently swallowing an offset that never applies. */
+        bool has_bfo = !input["bfo"].isNull();
 
         free(body); req->_tempObject = nullptr;
 
@@ -339,6 +348,11 @@ static void radio_register_routes(AsyncWebServer &server) {
         uint8_t mode;
         if (strcmp(mode_str, "FM") == 0) {
             mode = RADIO_MODE_FM;
+            if (has_bfo) {
+                req->send(400, "application/json",
+                    "{\"error\":\"bfo is only valid in SSB (LSB/USB)\"}");
+                return;
+            }
             if (freq < RADIO_FM_MIN || freq > RADIO_FM_MAX) {
                 req->send(400, "application/json",
                     "{\"error\":\"FM freq out of range (6400..10800)\"}");
@@ -350,6 +364,11 @@ static void radio_register_routes(AsyncWebServer &server) {
             radio_ssb_loaded = false;  /* SSB patch is dropped when we leave SSB */
         } else if (strcmp(mode_str, "AM") == 0) {
             mode = RADIO_MODE_AM;
+            if (has_bfo) {
+                req->send(400, "application/json",
+                    "{\"error\":\"bfo is only valid in SSB (LSB/USB)\"}");
+                return;
+            }
             if (freq < RADIO_AM_MIN || freq > RADIO_AM_MAX) {
                 req->send(400, "application/json",
                     "{\"error\":\"AM freq out of range (520..1710)\"}");
@@ -406,6 +425,58 @@ static void radio_register_routes(AsyncWebServer &server) {
         doc["mode"] = mode_str;
         doc["freq"] = radio_freq;
         if (radio_is_ssb(mode)) doc["bfo"] = radio_bfo;
+        String response;
+        serializeJson(doc, response);
+        req->send(200, "application/json", response);
+    }, NULL, handle_body_collect);
+
+    /* POST /radio/volume — set the receiver volume (0..63) over HTTP. The encoder
+     * can already drive volume from the handheld; this exposes the same control to
+     * an agent, mirroring the volume field reported by /radio/status. */
+    server.on("/radio/volume", HTTP_POST, [](AsyncWebServerRequest *req) {
+        if (!require_auth(req)) {
+            /* Body callback already ran; free the collected buffer before bailing. */
+            if (req->_tempObject) { free(req->_tempObject); req->_tempObject = nullptr; }
+            return;
+        }
+
+        if (!radio_ok) {
+            req->send(503, "application/json", "{\"error\":\"SI4732 not detected\"}");
+            return;
+        }
+
+        char *body = (char*)req->_tempObject;
+        if (!body) { req->send(400, "application/json", "{\"error\":\"no body\"}"); return; }
+
+        JsonDocument input;
+        if (deserializeJson(input, body) != DeserializationError::Ok) {
+            free(body); req->_tempObject = nullptr;
+            req->send(400, "application/json", "{\"error\":\"invalid JSON\"}");
+            return;
+        }
+
+        int v = input["volume"] | -1;
+
+        free(body); req->_tempObject = nullptr;
+
+        if (v < 0 || v > 63) {
+            req->send(400, "application/json", "{\"error\":\"volume out of range (0..63)\"}");
+            return;
+        }
+
+        /* radio_volume is also written from radio_tick(); take radio_mtx so the
+         * write and the setVolume() can't interleave with an encoder step. */
+        xSemaphoreTake(radio_mtx, portMAX_DELAY);
+        radio_volume = (uint8_t)v;
+        rx.setVolume(radio_volume);
+        xSemaphoreGive(radio_mtx);
+
+        event_add("radio: volume %d", v);
+        display_show_status();
+
+        JsonDocument doc;
+        doc["ok"] = true;
+        doc["volume"] = v;
         String response;
         serializeJson(doc, response);
         req->send(200, "application/json", response);

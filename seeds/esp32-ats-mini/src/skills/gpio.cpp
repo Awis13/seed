@@ -393,6 +393,7 @@ static void gpio_register_routes(AsyncWebServer &server) {
         doc["pin"] = pin;
         doc["raw"] = raw;
         doc["voltage"] = serialized(String(voltage, 3));
+        doc["note"] = "raw pin voltage after the on-board divider; see capabilities.battery_v for the scaled battery voltage";
         if (gpio_is_adc2(pin)) doc["warning"] = "ADC2 — may be inaccurate with WiFi";
 
         String response;
