@@ -119,9 +119,9 @@
  * So: driver/i2s_std.h directly — i2s_new_channel(),
  * i2s_channel_init_std_mode(), i2s_channel_reconfig_std_clock(),
  * i2s_channel_preload_data(), i2s_channel_enable()/disable() and
- * i2s_channel_write() with a zero timeout. One TX channel; the ESP32-S3 has
- * two I2S ports (SOC_I2S_NUM 2), so the PDM microphone on GPIO42/39 can still
- * have one if anything ever grows into it.
+ * i2s_channel_write() with a zero timeout. One TX channel, pinned to I2S1 —
+ * see skill_sound_init() for why the port is named rather than left to the
+ * driver.
  *
  *
  * Why nothing here can block
@@ -1788,7 +1788,18 @@ static void skill_sound_init() {
     snd_playing[0] = '\0';
     snd_cfg_load();
 
-    i2s_chan_config_t chan = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_AUTO, I2S_ROLE_MASTER);
+    /* I2S1, named rather than I2S_NUM_AUTO. The ESP32-S3 has two controllers
+       (SOC_I2S_NUM 2) and the board's PDM microphone can only use one of them:
+       the driver rejects a PDM channel that did not land on I2S0 outright —
+       "This channel handle is registered on I2S1, but PDM is only supported on
+       I2S0". AUTO takes the first free controller, which for the only I2S user
+       in the firmware means I2S0, i.e. exactly the one the microphone needs.
+       It is also not a promise: what AUTO returns depends on allocation order,
+       so leaving it would make the microphone's port a function of skill init
+       order. Taking I2S1 here keeps I2S0 free for the microphone. The two
+       controllers have independent clock dividers, so the speaker's clock is
+       unaffected by anything the RX side later does. */
+    i2s_chan_config_t chan = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_1, I2S_ROLE_MASTER);
     chan.dma_desc_num = SND_DMA_DESCS;
     chan.dma_frame_num = SND_DMA_FRAMES;
     /* An underrun then transmits zeros instead of replaying the stale
