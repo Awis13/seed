@@ -251,6 +251,14 @@ static const int snd_rates_ok_count =
 #define SND_HEAD_MS    24
 #define SND_LINGER_MS 400
 
+/* How long a cue may make no progress into the DMA before it is written off as
+   wedged. Generous on purpose: the DMA hands a descriptor back roughly every
+   SND_DMA_FRAMES/rate seconds (16ms at 16kHz), so a healthy cue never goes
+   more than a few tens of milliseconds without a successful write, and this is
+   two orders of magnitude above that. It exists to catch a channel that
+   refuses every write, not to police timing. */
+#define SND_STALL_MS 3000
+
 /* --- Synthesised cues --- */
 
 #define SND_TONE_AMP   9000   /* of 32767, before volume */
@@ -327,9 +335,23 @@ static uint8_t snd_play_i = 0;
 static int16_t snd_mono[SND_CHUNK_FRAMES];
 
 /* Counters, so a cue that does not come out of the speaker can still be
-   diagnosed over the API. */
+   diagnosed over the API.
+ *
+ * snd_played on its own was not enough, and 0.6.0 proved it: it counted four
+ * cues started while the amplifier was being disabled before it had clocked
+ * more than a fraction of the first one, and nothing in the API contradicted
+ * "four cues played". What distinguishes a working device from a silent one is
+ * how many bytes actually reached the DMA, so that is counted too — both for
+ * the current cue and for the life of the boot. A cue at 16kHz costs 4 bytes
+ * per frame, so a 150ms beep is about 9600 bytes and anything far below that
+ * means the audio never left the chip, whatever `played` says. */
 static uint32_t snd_played = 0;
 static uint32_t snd_suppressed = 0;
+static uint32_t snd_dma_bytes = 0;    /* accepted by i2s_channel_write, total */
+static uint32_t snd_cue_bytes = 0;    /* the same, for the current cue */
+static uint32_t snd_zero_writes = 0;  /* writes the DMA had no room for */
+static uint32_t snd_stalls = 0;
+static int snd_last_err = 0;          /* last non-OK esp_err from a write */
 
 /* --- Upload staging ---
  *
@@ -671,8 +693,10 @@ static uint16_t snd_fill_file(int16_t *mono, uint16_t max_frames) {
     return (uint16_t)(got / 2);
 }
 
-/* Returns frames written, 0 when the cue is over. */
-static uint16_t snd_fill(int16_t *dst, uint16_t max_frames) {
+/* Returns frames written, 0 when the cue is over. May return short at a source
+   boundary — the head-silence handover, or the end of the audio — which is why
+   snd_fill() below loops over it. */
+static uint16_t snd_fill_once(int16_t *dst, uint16_t max_frames) {
     /* Silence first, always: the amplifier has just left standby and the file
        is not trusted to start at zero. */
     if (snd_head_frames > 0) {
@@ -693,6 +717,30 @@ static uint16_t snd_fill(int16_t *dst, uint16_t max_frames) {
     }
     snd_expand(dst, snd_mono, frames);
     return frames;
+}
+
+/*
+ * Fill the staging buffer as completely as the source allows.
+ *
+ * This matters more than it looks. A staging buffer is exactly one DMA
+ * descriptor (SND_CHUNK_FRAMES == SND_DMA_FRAMES), and i2s_channel_write()
+ * holds a partly-filled descriptor open across calls — but it also drops that
+ * descriptor and fetches a fresh one as soon as its queue runs close to full
+ * (esp-idf v5.5.4, i2s_common.c: the `uxQueueSpacesAvailable(...) <= 1` arm of
+ * the acquire condition). So handing it a short buffer risks committing a
+ * half-written descriptor, whose remainder transmits as the silence auto_clear
+ * left there. Filling completely keeps every write descriptor-sized, and short
+ * buffers then only happen at the very end of a cue, where the tail is silence
+ * anyway.
+ */
+static uint16_t snd_fill(int16_t *dst, uint16_t max_frames) {
+    uint16_t made = 0;
+    while (made < max_frames) {
+        uint16_t got = snd_fill_once(dst + (size_t)made * 2, (uint16_t)(max_frames - made));
+        if (got == 0) break;   /* source exhausted; snd_fill_once cleared snd_src */
+        made = (uint16_t)(made + got);
+    }
+    return made;
 }
 
 /* --- Transport --- */
@@ -792,8 +840,19 @@ static void snd_pump() {
            `wrote` and returns ESP_ERR_TIMEOUT rather than waiting for more. A
            short write is the normal case, not an error — the rest goes on the
            next pass, and there is no retry loop anywhere. */
-        i2s_channel_write(snd_tx, &b.s[(size_t)b.pos * 2], want, &wrote, 0);
-        if (wrote > 0) snd_progress_ms = millis();
+        esp_err_t err = i2s_channel_write(snd_tx, &b.s[(size_t)b.pos * 2], want, &wrote, 0);
+        /* ESP_ERR_TIMEOUT is the ordinary "the DMA is full right now" answer at
+           this timeout and says nothing is wrong; anything else is worth
+           keeping, because a channel that refuses every write is the one
+           failure that is otherwise indistinguishable from a dead speaker. */
+        if (err != ESP_OK && err != ESP_ERR_TIMEOUT) snd_last_err = (int)err;
+        if (wrote > 0) {
+            snd_progress_ms = millis();
+            snd_dma_bytes += (uint32_t)wrote;
+            snd_cue_bytes += (uint32_t)wrote;
+        } else {
+            snd_zero_writes++;
+        }
         b.pos = (uint16_t)(b.pos + wrote / SND_FRAME_BYTES);
 
         if (b.pos >= b.frames) {
@@ -851,6 +910,7 @@ static bool snd_play(uint8_t level, const char *source) {
         return false;
     }
     snd_progress_ms = millis();
+    snd_cue_bytes = 0;
     snd_played++;
     return true;
 }
@@ -1019,14 +1079,28 @@ static void snd_poll() {
         /* Still busy: push the release out. */
         if (snd_src != SND_SRC_NONE || snd_buf[0].frames || snd_buf[1].frames) {
             snd_off_at = now + SND_LINGER_MS;
-            /* A cue that has staged audio but has not managed to hand a single
-               byte to the DMA for three seconds is not playing, it is wedged —
-               a channel that ended up in a state i2s_channel_write() refuses,
-               say. Without this the amplifier would keep its clock and the API
-               would keep reporting `playing` for the rest of the boot. Three
-               seconds is longer than the longest cue this accepts. */
-            if (now - snd_progress_ms > 3000) {
-                event_add("sound: playback stalled, releasing the amplifier");
+            /* A cue that has staged audio but has not handed a single byte to
+               the DMA for SND_STALL_MS is not playing, it is wedged — a channel
+               left in a state i2s_channel_write() refuses, say. Without this
+               the amplifier would keep its clock and the API would keep
+               reporting `playing` for the rest of the boot.
+             *
+             * Read against a FRESH millis() and compared as a signed value, and
+             * both halves of that are load-bearing. `now` was sampled at the
+             * top of this function, before snd_play() and snd_pump() ran, and
+             * both of those stamp snd_progress_ms with a LATER millis(). The
+             * first version of this compared `now - snd_progress_ms > 3000` in
+             * unsigned arithmetic, so a progress stamp one millisecond in the
+             * future underflowed to about 4.29 billion, cleared the threshold
+             * instantly and disabled the amplifier on the first pass of every
+             * cue — which is exactly what shipped in 0.6.0 and made the device
+             * silent. A signed difference reads a future stamp as a small
+             * negative number, which is not a stall, and it stays correct
+             * across the millis() rollover as well. */
+            if ((long)(millis() - snd_progress_ms) > (long)SND_STALL_MS) {
+                snd_stalls++;
+                event_add("sound: playback stalled after %lu DMA bytes, releasing the amplifier",
+                          (unsigned long)snd_cue_bytes);
                 snd_stop();
             }
         }
@@ -1061,7 +1135,7 @@ static const char *sound_describe() {
            "### Endpoints\n\n"
            "| Method | Path | Description |\n"
            "|--------|------|-------------|\n"
-           "| GET | /sound | `{\"enabled\":true,\"volume\":60,\"night_sound\":false,\"night_now\":false,\"playing\":false,\"cues\":{...}}` |\n"
+           "| GET | /sound | `{\"enabled\":true,\"volume\":60,\"night_sound\":false,\"night_now\":false,\"playing\":false,\"dma_bytes\":9600,\"cues\":{...}}` |\n"
            "| POST | /sound | `{\"enabled\":true,\"volume\":45,\"night_sound\":false,\"assign\":{\"level\":\"warn\",\"file\":\"uhoh\"}}` — every field optional |\n"
            "| POST | /sound/test | `{\"level\":\"crit\",\"source\":\"k1c\"}` |\n"
            "| POST | /sound/upload | raw WAV body, `?name=uhoh&level=warn` or `?name=uhoh&source=k1c` |\n"
@@ -1095,6 +1169,20 @@ static const char *sound_describe() {
            "Names are 1-16 characters of `a-z`, `0-9`, `_` and `-`. Uploading\n"
            "over an existing name replaces it. The store lands on flash on the\n"
            "next main-loop pass, a few milliseconds after the response.\n\n"
+           "### Telling silence from failure\n\n"
+           "`GET /sound` reports `dma_bytes` and `cue_bytes` beside `played`,\n"
+           "and the difference between them is the whole diagnostic. `played`\n"
+           "counts cues **started**; `dma_bytes` counts audio the I2S\n"
+           "peripheral actually **accepted**. A cue costs `rate * 4` bytes per\n"
+           "second, so a 150ms beep at 16kHz is about 9600 bytes. If `played`\n"
+           "climbs while `dma_bytes` barely moves, the audio never left the\n"
+           "chip and the speaker is not the thing to check. If `dma_bytes`\n"
+           "grows correctly and there is still no sound, the fault is after\n"
+           "the pins: the speaker on J4, or the amplifier itself.\n\n"
+           "`zero_writes` counts writes the DMA had no room for, which is\n"
+           "ordinary backpressure and not an error. `stalls` counts cues\n"
+           "abandoned because nothing reached the DMA for three seconds, and\n"
+           "`last_err` holds the last unexpected `esp_err_t` from a write.\n\n"
            "### Volume and mute\n\n"
            "`volume` is 0-100, applied in software to every sample, and it is\n"
            "meant to be dialled in live against the actual room rather than\n"
@@ -1138,6 +1226,16 @@ static void snd_state_json(JsonDocument &doc) {
     doc["rate"] = snd_enabled_hw ? snd_hw_rate : snd_rate;
     doc["played"] = snd_played;
     doc["suppressed"] = snd_suppressed;
+    /* The counters that tell "playing" apart from "audible". `played` counts
+       cues started; `dma_bytes` counts audio the peripheral actually accepted.
+       If the second is not growing by roughly rate*4 bytes per second of cue
+       while the first climbs, the sound never left the chip and the speaker is
+       not the thing to check. */
+    doc["dma_bytes"] = snd_dma_bytes;
+    doc["cue_bytes"] = snd_cue_bytes;
+    doc["zero_writes"] = snd_zero_writes;
+    doc["stalls"] = snd_stalls;
+    doc["last_err"] = snd_last_err;
 
     JsonObject cues = doc["cues"].to<JsonObject>();
     for (int i = 0; i <= NOTIFY_CRIT; i++)
