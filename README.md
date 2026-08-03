@@ -69,6 +69,10 @@ seeds/                          <- bootloaders
   esp32/
     src/main.cpp                     1252 lines, PlatformIO, Heltec V3
     src/skills/gpio.cpp              GPIO control skill (360 lines)
+  esp32-tembed/
+    src/main.cpp                     1082 lines, PlatformIO, LilyGO T-Embed CC1101
+    src/skills/gpio.cpp              GPIO control skill (465 lines)
+    src/skills/serial.cpp            UART bridge skill (363 lines)
   pdp11/seed.c                      550 lines, K&R C, 2.11BSD
 
 firmware/                       <- grown from seeds
