@@ -55,7 +55,7 @@
 #include <TFT_eSPI.h>
 
 // ===== Configuration =====
-#define SEED_VERSION        "0.4.1"
+#define SEED_VERSION        "0.5.0"
 #define HTTP_PORT           8080
 #define TOKEN_FILE          "/auth_token.txt"
 #define WIFI_CONFIG_FILE    "/wifi.json"
@@ -1098,7 +1098,7 @@ static void handle_capabilities(AsyncWebServerRequest *request) {
     doc["display"] = "ST7789 170x320 IPS (TFT_eSPI, rotation 3)";
     doc["display_pins"] = "CS=41,DC=16,BL=21,SCK=11,MISO=10,MOSI=9";
     doc["encoder_pins"] = "A=4,B=5,KEY=0,USER_KEY=6";
-    doc["ws2812"] = "8 LEDs on pin 14";
+    doc["ws2812"] = "8 LEDs on pin 14 (RMT, driven by the ring skill)";
     doc["ir_pins"] = "TX=2,RX=1";
     doc["mic_pins"] = "DATA=42,CLK=39";
     doc["power_hold_pin"] = 15;
@@ -1581,12 +1581,19 @@ static void handle_wifi_post(AsyncWebServerRequest *request) {
 #include "skills/serial.cpp"
 #include "skills/ir.cpp"
 #include "skills/notify.cpp"
+/* After notify.cpp, which it reads for the unread level it breathes, and before
+   ui.h, which hands it every encoder detent. */
+#include "skills/ring.cpp"
 
 static void skills_init() {
     skill_gpio_init();
     skill_serial_init();
     skill_ir_init();
     skill_notify_init();
+    /* Last, and after skill_ir_init() in particular: the two share the four RMT
+       TX memory blocks this chip has, IR takes two of them, and whichever runs
+       first gets what it asks for. */
+    skill_ring_init();
 }
 
 // ===== On-device UI =====
@@ -1749,6 +1756,17 @@ void loop() {
     // the RMT peripheral. Advances as far as it can each pass and never blocks.
     ir_poll();
 
+    // A blast lights the ring as a progress arc without ir.cpp knowing a ring
+    // exists: loop() reads the same snapshot the on-device progress screen
+    // reads and hands over the percentage. A blast is the only job long enough
+    // to be worth showing today, which is why this clears the arc rather than
+    // arbitrating — a second source would have to be merged in here.
+    {
+        IrProgress p = ir_progress();
+        if (p.running && p.total > 0) ring_progress_set(p.sent * 100 / p.total);
+        else ring_progress_clear();
+    }
+
     // Expires notifications whose ttl has run out and mirrors the newest few to
     // SPIFFS. The endpoints only ever touch RAM; the flash write is here, on the
     // one task that is allowed to spend milliseconds.
@@ -1758,6 +1776,13 @@ void loop() {
     // feel attached to the screen. This owns the panel whenever the UI is on a
     // screen other than the clock, and draws only on an actual change.
     ui_poll();
+
+    // The ring, on the same terms as the panel: loop() owns the pixels, the
+    // skills only answer questions about what should be on them. After
+    // ui_poll(), so a detent turned on this pass moves the dot on this pass.
+    // Composes a frame at most every 25ms, sends one only when it differs from
+    // the last, and hands the bit stream to the RMT peripheral without waiting.
+    ring_poll();
 
     // Clock tick: at most once a second, and each field only repaints when its
     // text actually changed. The screen is only wiped when connectivity flips.

@@ -40,10 +40,17 @@
  * Transmission
  * ------------
  * The ESP32-S3 RMT peripheral generates the carrier and clocks out the
- * mark/space stream in hardware. Nothing on this board uses RMT otherwise
- * (the WS2812 ring is unused by the seed), so one TX channel is claimed at
- * boot and kept. Bit-banging was rejected: a blast is minutes of microsecond
- * timing, and holding the CPU for that starves the WiFi and AsyncTCP tasks.
+ * mark/space stream in hardware: one TX channel is claimed at boot and kept.
+ * Bit-banging was rejected: a blast is minutes of microsecond timing, and
+ * holding the CPU for that starves the WiFi and AsyncTCP tasks.
+ *
+ * The WS2812 ring (ring.cpp) is the other RMT TX consumer on this board, and
+ * the two share the peripheral rather than compete for it: the Arduino core's
+ * wrapper allocates one channel, one copy encoder and one mutex per *pin*, so
+ * neither can stall or corrupt the other's stream. What they do share is the
+ * chip's four TX memory blocks, of which this file takes two — so it is
+ * initialised first, and ring.cpp takes what is left. See the header comment
+ * in ring.cpp for the arithmetic.
  *
  * Carrier frequency and duty are per code, not global. The hand-written codes
  * use 38 kHz for NEC and Samsung, 40 kHz for Sony, 36 kHz at 25% duty for the

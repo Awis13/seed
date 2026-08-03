@@ -1084,6 +1084,11 @@ static void ui_poll() {
 
     if (steps != 0 || click || back) ui_last_input = millis();
 
+    /* The knob's own feedback on the ring, which outranks whatever the ring was
+       saying by itself: a hand is on the control. The screen and the ring get
+       the same detents, and neither is told what the other did with them. */
+    ring_knob(steps);
+
     /*
      * A message that arrives while the device is sitting on its clock puts
      * itself in front — that is the whole job. It does not take a screen away

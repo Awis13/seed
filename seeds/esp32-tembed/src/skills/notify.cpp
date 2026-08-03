@@ -134,6 +134,17 @@ static volatile uint32_t notify_arrived_id = 0;
 static volatile bool notify_dirty = false;
 static unsigned long notify_save_at = 0;
 
+/* A second, independent set of one-shots for the LED ring. The screen and the
+   ring both want to hear about the same arrival, and a single flag would let
+   whichever read it first swallow it — the screen consumes arrivals only on a
+   pass with no user input, so sharing would silently cost the ring a comet
+   whenever a hand was on the knob. Acknowledgement gets a flag rather than a
+   count comparison so that a ttl expiry, which also lowers the unread count,
+   cannot be mistaken for a human clearing the queue. */
+static volatile bool notify_ring_arrived = false;
+static volatile uint8_t notify_ring_level = NOTIFY_INFO;
+static volatile bool notify_ring_acked = false;
+
 /*
  * Ask for the flash mirror to be rewritten, no sooner than `delay_ms` from now.
  *
@@ -335,6 +346,25 @@ static bool notify_crit_unread() {
     return found;
 }
 
+/* The most severe level still unacknowledged, or false if nothing is. The LED
+   ring breathes in this colour, so it is asked for once per ring frame — hence
+   one pass under the lock rather than three calls to notify_crit_unread() and
+   friends. */
+static bool notify_top_unread_level(uint8_t &out) {
+    bool found = false;
+    uint8_t top = NOTIFY_INFO;
+    portENTER_CRITICAL(&notify_mux);
+    for (int i = 0; i < notify_len; i++) {
+        const Notification &e = notify_slot[notify_order[i]];
+        if (!e.unread) continue;
+        if (!found || e.level > top) top = e.level;
+        found = true;
+    }
+    portEXIT_CRITICAL(&notify_mux);
+    if (found) out = top;
+    return found;
+}
+
 static int notify_count() {
     portENTER_CRITICAL(&notify_mux);
     int n = notify_len;
@@ -430,7 +460,11 @@ static bool notify_ack_id(uint32_t id) {
         break;
     }
     portEXIT_CRITICAL(&notify_mux);
-    if (changed) { notify_mark_dirty(NOTIFY_COALESCE_MS); display_force = true; }
+    if (changed) {
+        notify_mark_dirty(NOTIFY_COALESCE_MS);
+        display_force = true;
+        notify_ring_acked = true;
+    }
     return found;
 }
 
@@ -442,7 +476,11 @@ static int notify_ack_all() {
         if (e.unread) { e.unread = false; n++; }
     }
     portEXIT_CRITICAL(&notify_mux);
-    if (n > 0) { notify_mark_dirty(NOTIFY_COALESCE_MS); display_force = true; }
+    if (n > 0) {
+        notify_mark_dirty(NOTIFY_COALESCE_MS);
+        display_force = true;
+        notify_ring_acked = true;
+    }
     return n;
 }
 
@@ -473,6 +511,20 @@ static bool notify_take_arrival(uint32_t *id) {
     if (!notify_arrived) return false;
     notify_arrived = false;
     if (id) *id = notify_arrived_id;
+    return true;
+}
+
+/* The same handoff for the LED ring, which loop() polls on its own cadence. */
+static bool notify_take_ring_arrival(uint8_t *level) {
+    if (!notify_ring_arrived) return false;
+    notify_ring_arrived = false;
+    if (level) *level = notify_ring_level;
+    return true;
+}
+
+static bool notify_take_ring_ack() {
+    if (!notify_ring_acked) return false;
+    notify_ring_acked = false;
     return true;
 }
 
@@ -774,6 +826,8 @@ static void notify_register_routes(AsyncWebServer &server) {
            is reporting may not wait. */
         notify_arrived_id = id;
         notify_arrived = true;
+        notify_ring_level = e.level;
+        notify_ring_arrived = true;
         notify_mark_dirty(e.level == NOTIFY_CRIT ? 0 : NOTIFY_COALESCE_MS);
         display_force = true;
 
