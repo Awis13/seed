@@ -12,30 +12,41 @@
  *
  * Code table provenance
  * ---------------------
- * Nothing here is copied from an existing TV-B-Gone code table. Mitch Altman's
- * original firmware and the Arduino ports derived from it carry Creative
- * Commons Attribution-ShareAlike terms, and IRremoteESP8266 is LGPL; both are
- * awkward to fold into an MIT-licensed firmware image, so neither was used.
+ * The blast draws on two tables, and they do not have the same licence.
  *
- * What this file carries instead is its own encoders for six published
- * consumer IR protocols — NEC, Samsung, Sony SIRC, Philips RC-5, Philips RC-6
- * mode 0 and Panasonic/Kaseikyo — written from the public protocol
- * descriptions, plus a short table of the address/command values those vendors
- * use for the power key. The table is deliberately small and vendor-broad
- * rather than long and of murky origin; POST /ir/send is the extension point
- * for everything it does not cover.
+ * The bulk of it is the TV-B-Gone power-code database by Mitch Altman and
+ * Limor Fried — 270 captured codes, split into the NA and EU sets the original
+ * device ships — copied from Arduino-TV-B-Gone and kept in ir_codes_tvbgone.h.
+ * That file is under Creative Commons Attribution-ShareAlike, the licence its
+ * upstream carries, with the text bundled as LICENSE-CC-BY-SA; the rest of
+ * this repository is MIT. Keeping the data in a file of its own, with no logic
+ * in it, is what bounds the share-alike obligation to the table. See the
+ * header of ir_codes_tvbgone.h for the full attribution and for which licence
+ * version applies, and seeds/README.md for the same note at repository level.
+ *
+ * The other table is nine codes this file encodes itself, from the published
+ * descriptions of six consumer protocols — NEC, Samsung, Sony SIRC, Philips
+ * RC-5, Philips RC-6 mode 0 and Panasonic/Kaseikyo. They are MIT like the rest
+ * of the seed, and they go out at the head of every blast. They earn that on
+ * two counts: the Samsung entry is the one frame in this file confirmed
+ * against a real television, and they are the only path here that can build a
+ * frame from an address and a command rather than replay a capture — the
+ * TV-B-Gone table is packed timings, and POST /ir/send is raw microseconds.
  *
  * Transmission
  * ------------
  * The ESP32-S3 RMT peripheral generates the carrier and clocks out the
  * mark/space stream in hardware. Nothing on this board uses RMT otherwise
  * (the WS2812 ring is unused by the seed), so one TX channel is claimed at
- * boot and kept. Bit-banging was rejected: a blast is seconds of microsecond
+ * boot and kept. Bit-banging was rejected: a blast is minutes of microsecond
  * timing, and holding the CPU for that starves the WiFi and AsyncTCP tasks.
  *
- * Carrier frequency and duty are per code, not global: 38 kHz for NEC and
- * Samsung, 40 kHz for Sony, 36 kHz at 25% duty for the two Philips protocols,
- * 37 kHz for Kaseikyo.
+ * Carrier frequency and duty are per code, not global. The hand-written codes
+ * use 38 kHz for NEC and Samsung, 40 kHz for Sony, 36 kHz at 25% duty for the
+ * two Philips protocols and 37 kHz for Kaseikyo; the TV-B-Gone codes carry a
+ * frequency each, anywhere from 25.6 to 83.3 kHz, at the 33% duty upstream
+ * uses. Eighteen of them are baseband — the mark is the LED on with no carrier
+ * under it — which is why the carrier can be switched off entirely.
  */
 
 /* --- Limits --- */
@@ -43,8 +54,27 @@
 #define IR_MAX_SYMBOLS 320    /* rmt_data_t holds two runs, so 640 mark/space runs */
 #define IR_MAX_TICKS   32767  /* the duration field is 15 bits, and a tick is 1us */
 #define IR_MAX_RAW     512    /* mark/space entries accepted by /ir/send */
-#define IR_GAP_MS      45     /* quiet time between frames, one SIRC frame period */
 #define IR_REPEAT_MAX  10
+#define IR_TVB_DUTY    33     /* upstream's carrier duty: OCR2B = OCR2A / 3 */
+
+/*
+ * Two gaps, because they do two different jobs.
+ *
+ * Between repeats of one code, the silence only has to be long enough for the
+ * receiver to see two frames rather than one held key. One SIRC frame period
+ * is the tightest thing that satisfies every protocol here.
+ *
+ * Between two different codes, the receiver's AGC has to settle before it will
+ * lock onto a frame it has never seen. Upstream nominally asks for 205ms, but
+ * it asks with delay_ten_us() — an uncalibrated AVR NOP loop that ports carry
+ * over verbatim and that lands nowhere near 205ms on a 240MHz part, so the
+ * number is not evidence of a requirement. 100ms is a real number, chosen
+ * here: it is long enough to be a gap and it keeps a region under 40 seconds,
+ * which is the only budget that matters for something used while standing in
+ * front of a television.
+ */
+#define IR_CODE_GAP_MS    100
+#define IR_REPEAT_GAP_MS  45
 
 /* --- Protocols --- */
 
@@ -69,6 +99,7 @@ struct IrCode {
     uint8_t bits;     /* payload bits; unused for RC-5/RC-6 */
     uint8_t khz;      /* carrier frequency */
     uint8_t duty;     /* carrier duty, percent */
+    uint8_t sends;    /* frames the protocol needs before a receiver acts */
     uint8_t regions;
 };
 
@@ -78,22 +109,66 @@ struct IrCode {
  * lengths, worked out from the protocol's LSB-first bit order; the Philips
  * entries are address 0x00, command 0x0C (standby).
  *
- * Every code here is sold worldwide, so "na" and "eu" currently select the
- * same set. The region field is not decoration: it is what keeps the filter
- * meaningful as market-specific codes get added.
+ * Every code here is sold worldwide, so all nine are in both regions. They are
+ * sent first, ahead of the TV-B-Gone table, so that the one frame confirmed
+ * against real hardware goes out while the user is still pointing the thing.
+ *
+ * `sends` is a property of the protocol, not a preference. A Sony receiver
+ * discards a SIRC frame it has seen fewer than about three times, so the three
+ * Sony entries are worth nothing sent once. Nothing else here needs repeating,
+ * and repeating it anyway is how a blast turns into minutes.
  */
 static const IrCode ir_codes[] = {
-    {"LG/Zenith/Vizio", 0x20DF10EFULL,     IR_NEC,      32, 38, 33, IR_REGION_ALL},
-    {"Toshiba",         0x02FD48B7ULL,     IR_NEC,      32, 38, 33, IR_REGION_ALL},
-    {"Samsung",         0xE0E040BFULL,     IR_SAMSUNG,  32, 38, 33, IR_REGION_ALL},
-    {"Sony 12-bit",     0x00000A90ULL,     IR_SONY,     12, 40, 33, IR_REGION_ALL},
-    {"Sony 15-bit",     0x00005480ULL,     IR_SONY,     15, 40, 33, IR_REGION_ALL},
-    {"Sony 20-bit",     0x000A9000ULL,     IR_SONY,     20, 40, 33, IR_REGION_ALL},
-    {"Philips RC-5",    0x0000000CULL,     IR_RC5,       0, 36, 25, IR_REGION_ALL},
-    {"Philips RC-6",    0x0000000CULL,     IR_RC6,       0, 36, 25, IR_REGION_ALL},
-    {"Panasonic",       0x40040100BCBDULL, IR_KASEIKYO, 48, 37, 33, IR_REGION_ALL},
+    {"LG/Zenith/Vizio", 0x20DF10EFULL,     IR_NEC,      32, 38, 33, 1, IR_REGION_ALL},
+    {"Toshiba",         0x02FD48B7ULL,     IR_NEC,      32, 38, 33, 1, IR_REGION_ALL},
+    {"Samsung",         0xE0E040BFULL,     IR_SAMSUNG,  32, 38, 33, 1, IR_REGION_ALL},
+    {"Sony 12-bit",     0x00000A90ULL,     IR_SONY,     12, 40, 33, 3, IR_REGION_ALL},
+    {"Sony 15-bit",     0x00005480ULL,     IR_SONY,     15, 40, 33, 3, IR_REGION_ALL},
+    {"Sony 20-bit",     0x000A9000ULL,     IR_SONY,     20, 40, 33, 3, IR_REGION_ALL},
+    {"Philips RC-5",    0x0000000CULL,     IR_RC5,       0, 36, 25, 1, IR_REGION_ALL},
+    {"Philips RC-6",    0x0000000CULL,     IR_RC6,       0, 36, 25, 1, IR_REGION_ALL},
+    {"Panasonic",       0x40040100BCBDULL, IR_KASEIKYO, 48, 37, 33, 1, IR_REGION_ALL},
 };
-static const int ir_code_count = sizeof(ir_codes) / sizeof(ir_codes[0]);
+static const int ir_code_count = (int)(sizeof(ir_codes) / sizeof(ir_codes[0]));
+
+/* The TV-B-Gone database. Data only, and under a different licence from the
+   rest of the seed — see the file header there. It needs IR_REGION_NA and
+   IR_REGION_EU, hence the include sitting here rather than at the top. */
+#include "ir_codes_tvbgone.h"
+
+/*
+ * The blast walks one address space: 0..ir_code_count-1 are the hand-written
+ * codes above, the rest are ir_tvb_codes[]. Nothing materialises the filtered
+ * list — with 279 entries that would be a few hundred bytes of RAM to say what
+ * a comparison already says.
+ */
+#define IR_ENTRY_COUNT (ir_code_count + IR_TVB_COUNT)
+
+static uint8_t ir_entry_regions(int i) {
+    return (i < ir_code_count) ? ir_codes[i].regions
+                               : ir_tvb_codes[i - ir_code_count].regions;
+}
+
+static const char *ir_entry_label(int i) {
+    return (i < ir_code_count) ? ir_codes[i].brand
+                               : ir_tvb_names[i - ir_code_count];
+}
+
+/* Frames this entry needs before a receiver will act on it. The TV-B-Gone
+   codes are always 1: whatever repetition their protocol wants is already
+   inside the index stream, which is why some of them run to 136 pairs. */
+static uint8_t ir_entry_sends(int i) {
+    return (i < ir_code_count) ? ir_codes[i].sends : 1;
+}
+
+/* Next entry after `after` that the region mask selects, or -1 at the end.
+   Pass -1 to get the first. */
+static int ir_next_entry(int after, uint8_t regions) {
+    for (int i = after + 1; i < IR_ENTRY_COUNT; i++) {
+        if (ir_entry_regions(i) & regions) return i;
+    }
+    return -1;
+}
 
 /* --- Symbol builder --- */
 
@@ -107,35 +182,43 @@ static void ir_build_reset() {
 /* Append one run of the carrier being on (level 1) or off (level 0). */
 static bool ir_add(uint8_t level, uint32_t us) {
     if (us == 0) return true;
-    if (us > IR_MAX_TICKS) return false;
 
     if (ir_run_count > 0) {
         rmt_data_t *s = &ir_sym[(ir_run_count - 1) / 2];
         bool second = ((ir_run_count - 1) & 1) != 0;
         uint32_t prev_us = second ? s->duration1 : s->duration0;
         uint8_t prev_level = second ? s->level1 : s->level0;
-        if (prev_level == level) {
+        if (prev_level == level && prev_us < IR_MAX_TICKS) {
             /* Biphase codes put two same-level half-bits back to back; the
                RMT stream wants one longer run, not two adjacent ones. */
-            if (prev_us + us > IR_MAX_TICKS) return false;
-            if (second) s->duration1 = prev_us + us;
-            else        s->duration0 = prev_us + us;
-            return true;
+            uint32_t room = IR_MAX_TICKS - prev_us;
+            uint32_t take = (us < room) ? us : room;
+            if (second) s->duration1 = prev_us + take;
+            else        s->duration0 = prev_us + take;
+            us -= take;
         }
     }
 
-    if (ir_run_count / 2 >= IR_MAX_SYMBOLS) return false;
-    rmt_data_t *s = &ir_sym[ir_run_count / 2];
-    if (ir_run_count & 1) {
-        s->duration1 = us;
-        s->level1 = level;
-    } else {
-        s->duration0 = us;
-        s->level0 = level;
-        s->duration1 = 0;
-        s->level1 = 0;
+    /* Anything left over spills into further runs at the same level, which the
+       peripheral clocks out back to back and so are indistinguishable from one
+       long run. The TV-B-Gone table needs this: its trailing gaps reach 128ms,
+       four times what the 15-bit duration field can hold. */
+    while (us > 0) {
+        uint32_t take = (us > IR_MAX_TICKS) ? IR_MAX_TICKS : us;
+        if (ir_run_count / 2 >= IR_MAX_SYMBOLS) return false;
+        rmt_data_t *s = &ir_sym[ir_run_count / 2];
+        if (ir_run_count & 1) {
+            s->duration1 = take;
+            s->level1 = level;
+        } else {
+            s->duration0 = take;
+            s->level0 = level;
+            s->duration1 = 0;
+            s->level1 = 0;
+        }
+        ir_run_count++;
+        us -= take;
     }
-    ir_run_count++;
     return true;
 }
 
@@ -234,6 +317,33 @@ static bool ir_encode(const IrCode *c, bool toggle) {
     return false;
 }
 
+/*
+ * A TV-B-Gone code is not a protocol, it is a capture: a small table of on/off
+ * duration pairs plus a stream of fixed-width indices into it, MSB first. It
+ * expands here, one frame at a time, rather than being stored expanded — 270
+ * codes as microsecond arrays would be roughly ten times the flash and buy
+ * nothing, since only one frame is ever in the symbol buffer.
+ *
+ * Durations are in units of 10us. The longest single run in the table is 128ms,
+ * which ir_add() splits; the longest frame is 136 pairs, so 272 runs against
+ * the 640 the buffer holds.
+ */
+static bool ir_encode_tvb(const IrTvbCode *c) {
+    uint16_t bitpos = 0;
+
+    for (uint8_t i = 0; i < c->count; i++) {
+        uint8_t idx = 0;
+        for (uint8_t b = 0; b < c->index_bits; b++) {
+            idx = (uint8_t)((idx << 1) |
+                            ((c->bits[bitpos >> 3] >> (7 - (bitpos & 7))) & 1u));
+            bitpos++;
+        }
+        if (!ir_add(1, (uint32_t)c->pairs[idx * 2] * 10)) return false;
+        if (!ir_add(0, (uint32_t)c->pairs[idx * 2 + 1] * 10)) return false;
+    }
+    return true;
+}
+
 /* --- Job state ---
  *
  * Ownership: only loop() (through ir_poll) writes ir_state and touches the RMT
@@ -253,6 +363,9 @@ static struct {
     int total;              /* transmissions in this job */
     int step;               /* transmissions started */
     int sent;               /* transmissions completed */
+    int cursor;             /* entry being sent, -1 once the region runs out */
+    uint8_t rep;            /* frames of the entry at cursor already sent */
+    uint8_t rep_target;     /* frames that entry needs: sends * repeat */
     unsigned long started_ms;
     unsigned long next_at;  /* earliest millis() for the next frame */
     char label[24];         /* code being sent, or the last one sent */
@@ -272,24 +385,33 @@ static bool ir_tx_busy = false;
 static bool ir_ready = false;
 static uint16_t ir_job_seq = 0;
 
-/* Filtered code list for the running job */
-static uint8_t ir_list[sizeof(ir_codes) / sizeof(ir_codes[0])];
-static int ir_list_count = 0;
-
 /* Raw frame staged by POST /ir/send */
 static uint16_t ir_raw_us[IR_MAX_RAW];
 static int ir_raw_count = 0;
 static uint8_t ir_raw_khz = 38;
 static uint8_t ir_raw_duty = 33;
 
-/* Carrier currently programmed into the channel */
-static uint8_t ir_carrier_khz = 0;
+/* Carrier currently programmed into the channel. 0 Hz means it is switched
+   off, which is a state a baseband code can legitimately leave it in. */
+static uint32_t ir_carrier_hz = 0;
 static uint8_t ir_carrier_duty = 0;
+static bool ir_carrier_set = false;
 
 static int ir_count_region(uint8_t regions) {
     int n = 0;
-    for (int i = 0; i < ir_code_count; i++) {
-        if (ir_codes[i].regions & regions) n++;
+    for (int i = 0; i < IR_ENTRY_COUNT; i++) {
+        if (ir_entry_regions(i) & regions) n++;
+    }
+    return n;
+}
+
+/* Frames the job will send: the per-entry protocol requirement, times whatever
+   multiplier the caller asked for. Not codes * repeat — almost every entry
+   needs exactly one frame, and pretending otherwise is what made this slow. */
+static int ir_count_frames(uint8_t regions, uint8_t repeat) {
+    int n = 0;
+    for (int i = 0; i < IR_ENTRY_COUNT; i++) {
+        if (ir_entry_regions(i) & regions) n += ir_entry_sends(i) * repeat;
     }
     return n;
 }
@@ -305,18 +427,25 @@ static bool ir_busy() {
     return ir_state.kind != IR_JOB_IDLE || ir_request_pending || ir_tx_busy;
 }
 
-static bool ir_set_carrier(uint8_t khz, uint8_t duty) {
-    if (khz == ir_carrier_khz && duty == ir_carrier_duty) return true;
+/* hz == 0 sends the frame baseband: the mark is the LED held on with nothing
+   modulating it, which is what eighteen of the TV-B-Gone codes want. */
+static bool ir_set_carrier(uint32_t hz, uint8_t duty) {
+    if (ir_carrier_set && hz == ir_carrier_hz && duty == ir_carrier_duty) return true;
     /* carrier_level goes straight into rmt_carrier_config_t.flags.
        polarity_active_low (esp32-hal-rmt.c), so false is what puts the burst
        on the mark. The header comment above rmtSetCarrier() describes this
        argument the other way round from what its own implementation does —
-       do not "correct" this to true. */
-    if (!rmtSetCarrier(PIN_IR_TX, true, false, (uint32_t)khz * 1000, duty / 100.0f)) {
+       do not "correct" this to true.
+
+       The frequency still has to be a sane number when the carrier is off: the
+       driver divides by it either way. */
+    if (!rmtSetCarrier(PIN_IR_TX, hz != 0, false,
+                       hz != 0 ? hz : 38000, duty / 100.0f)) {
         return false;
     }
-    ir_carrier_khz = khz;
+    ir_carrier_hz = hz;
     ir_carrier_duty = duty;
+    ir_carrier_set = true;
     return true;
 }
 
@@ -331,30 +460,47 @@ static void ir_finish(const char *result) {
 /* Build and hand off one frame. Returns false if it could not be encoded or
    the channel refused the write. */
 static bool ir_start_step() {
-    uint8_t khz, duty;
+    uint32_t hz;
+    uint8_t duty;
 
     ir_build_reset();
     if (ir_state.kind == IR_JOB_RAW) {
-        khz = ir_raw_khz;
+        hz = (uint32_t)ir_raw_khz * 1000;
         duty = ir_raw_duty;
         for (int i = 0; i < ir_raw_count; i++) {
             if (!ir_add((i & 1) ? 0 : 1, ir_raw_us[i])) return false;
         }
         snprintf(ir_state.label, sizeof(ir_state.label), "raw");
     } else {
-        const IrCode *c = &ir_codes[ir_list[ir_state.step / ir_state.repeat]];
-        /* RC-5 and RC-6 flip a toggle bit between key presses; a receiver that
-           sees two identical frames reads the second as a held key. */
-        bool toggle = ((ir_state.step % ir_state.repeat) & 1) != 0;
-        if (!ir_encode(c, toggle)) return false;
-        khz = c->khz;
-        duty = c->duty;
-        snprintf(ir_state.label, sizeof(ir_state.label), "%s", c->brand);
+        if (ir_state.rep >= ir_state.rep_target) {
+            ir_state.cursor = ir_next_entry(ir_state.cursor, ir_state.regions);
+            if (ir_state.cursor < 0) return false;
+            ir_state.rep = 0;
+            ir_state.rep_target =
+                (uint8_t)(ir_entry_sends(ir_state.cursor) * ir_state.repeat);
+        }
+
+        if (ir_state.cursor < ir_code_count) {
+            const IrCode *c = &ir_codes[ir_state.cursor];
+            /* RC-5 and RC-6 flip a toggle bit between key presses; a receiver
+               that sees two identical frames reads the second as a held key. */
+            if (!ir_encode(c, (ir_state.rep & 1) != 0)) return false;
+            hz = (uint32_t)c->khz * 1000;
+            duty = c->duty;
+        } else {
+            const IrTvbCode *c = &ir_tvb_codes[ir_state.cursor - ir_code_count];
+            if (!ir_encode_tvb(c)) return false;
+            hz = c->hz;
+            duty = IR_TVB_DUTY;
+        }
+        snprintf(ir_state.label, sizeof(ir_state.label), "%s",
+                 ir_entry_label(ir_state.cursor));
     }
 
-    if (!ir_set_carrier(khz, duty)) return false;
+    if (!ir_set_carrier(hz, duty)) return false;
     if (!rmtWriteAsync(PIN_IR_TX, ir_sym, ir_symbol_count())) return false;
 
+    if (ir_state.kind == IR_JOB_TVBGONE) ir_state.rep++;
     ir_state.step++;
     ir_tx_busy = true;
     return true;
@@ -379,58 +525,78 @@ static void ir_begin_request() {
         event_add("ir: job %u raw, %d entries at %ukHz",
                   (unsigned)ir_state.job_id, ir_raw_count, (unsigned)ir_raw_khz);
     } else {
-        ir_list_count = 0;
-        for (int i = 0; i < ir_code_count; i++) {
-            if (ir_codes[i].regions & ir_state.regions) {
-                ir_list[ir_list_count++] = (uint8_t)i;
-            }
-        }
-        ir_state.codes = ir_list_count;
-        ir_state.total = ir_list_count * ir_state.repeat;
+        /* cursor sits before the first match with its repeat quota spent, so
+           that the first ir_start_step() advances onto it like any other. */
+        ir_state.cursor = -1;
+        ir_state.rep = 0;
+        ir_state.rep_target = 0;
+        ir_state.codes = ir_count_region(ir_state.regions);
+        ir_state.total = ir_count_frames(ir_state.regions, ir_state.repeat);
         event_add("ir: job %u tvbgone region=%s, %d codes x%u",
                   (unsigned)ir_state.job_id, ir_region_name(ir_state.regions),
-                  ir_list_count, (unsigned)ir_state.repeat);
+                  ir_state.codes, (unsigned)ir_state.repeat);
     }
 
     if (ir_state.total == 0) ir_finish("empty");
 }
 
 /*
- * Called from loop(). Every pass either polls the peripheral, waits out the
- * inter-frame gap or queues exactly one frame — none of which blocks.
+ * Called from loop(). Runs until the job is waiting on something real — the
+ * peripheral, the gap clock, or a request that has not arrived — and then
+ * hands the CPU back. Nothing here blocks or spins: every iteration either
+ * makes progress or returns.
+ *
+ * The loop matters. Collecting a completion and queueing the next frame used
+ * to be two passes of loop(), which meant the cadence of a 300-frame blast was
+ * set by unrelated work elsewhere in the pass. Now a completion that lands with
+ * its gap already elapsed starts the next frame immediately.
  */
 static void ir_poll() {
     if (!ir_ready) return;
 
-    /* A frame in flight owns the channel and the symbol buffer until the
-       peripheral says it is done. */
-    if (ir_tx_busy) {
-        if (!rmtTransmitCompleted(PIN_IR_TX)) return;
-        ir_tx_busy = false;
-        ir_state.sent++;
-        ir_state.next_at = millis() + IR_GAP_MS;
-        return;
-    }
-
-    if (ir_state.kind == IR_JOB_IDLE) {
-        if (ir_request_pending) {
-            ir_begin_request();
-            ir_request_pending = false;
+    for (;;) {
+        /* A frame in flight owns the channel and the symbol buffer until the
+           peripheral says it is done. */
+        if (ir_tx_busy) {
+            if (!rmtTransmitCompleted(PIN_IR_TX)) return;
+            ir_tx_busy = false;
+            ir_state.sent++;
+            /* More frames of the same code need only enough silence to be
+               counted separately; moving to a different code needs the
+               receiver's AGC to settle first. A raw job is one frame repeated,
+               so it is always the former. */
+            bool same_code = (ir_state.kind == IR_JOB_RAW) ||
+                             (ir_state.rep < ir_state.rep_target);
+            ir_state.next_at =
+                millis() + (same_code ? IR_REPEAT_GAP_MS : IR_CODE_GAP_MS);
+            continue;
         }
-        return;
-    }
 
-    if (ir_stop_requested) {
-        ir_finish("stopped");
+        if (ir_state.kind == IR_JOB_IDLE) {
+            if (ir_request_pending) {
+                ir_begin_request();
+                ir_request_pending = false;
+                continue;
+            }
+            return;
+        }
+
+        if (ir_stop_requested) {
+            ir_finish("stopped");
+            return;
+        }
+        if ((long)(millis() - ir_state.next_at) < 0) return;
+        if (ir_state.step >= ir_state.total) {
+            ir_finish("done");
+            return;
+        }
+        if (!ir_start_step()) {
+            ir_finish("tx failed");
+            return;
+        }
+        /* Queued. The peripheral now owns it for a hundred-odd milliseconds,
+           which is everyone else's turn. */
         return;
-    }
-    if ((long)(millis() - ir_state.next_at) < 0) return;
-    if (ir_state.step >= ir_state.total) {
-        ir_finish("done");
-        return;
-    }
-    if (!ir_start_step()) {
-        ir_finish("tx failed");
     }
 }
 
@@ -512,29 +678,51 @@ static const char *ir_describe() {
            "### Endpoints\n\n"
            "| Method | Path | Description |\n"
            "|--------|------|-------------|\n"
-           "| POST | /ir/tvbgone | Start a blast: `{\"region\":\"eu\"\\|\"na\"\\|\"all\",\"repeat\":1-10}` |\n"
+           "| POST | /ir/tvbgone | Start a blast: `{\"region\":\"eu\"\\|\"na\"\\|\"all\",\"repeat\":1-10}` (defaults `all`, 1) |\n"
            "| GET | /ir/tvbgone/status | Running/idle, frames sent, elapsed, last code |\n"
            "| POST | /ir/tvbgone/stop | Abort the running job |\n"
            "| POST | /ir/send | One raw frame: `{\"khz\":38,\"duty\":33,\"raw\":[9000,4500,...],\"repeat\":1}` |\n\n"
            "### Behaviour\n\n"
-           "Every call returns immediately. The blast advances one frame per\n"
-           "loop() pass with a 45ms gap between frames, so a job of N frames\n"
-           "takes roughly N * (frame + 45ms). Only one job runs at a time:\n"
-           "starting another while one is in flight returns 409.\n\n"
-           "`repeat` defaults to 3 for a reason: a Sony receiver ignores a\n"
-           "SIRC frame it has seen fewer than about three times, so\n"
-           "`{\"repeat\":1}` reports success while never actually working on\n"
-           "the three Sony entries.\n\n"
+           "Every call returns immediately and nothing blocks: frames are\n"
+           "queued into the RMT peripheral and collected when it reports them\n"
+           "done. Only one job runs at a time — starting another while one is\n"
+           "in flight returns 409. A blast can be stopped at any point, from\n"
+           "the API or by clicking the knob, and stops within a frame.\n\n"
+           "Duration, on the default `repeat` of 1:\n\n"
+           "| Region | Codes | Frames | Airtime | Gaps | Total |\n"
+           "|--------|-------|--------|---------|------|-------|\n"
+           "| na | 146 | 152 | 25.0s | 14.9s | **39.9s** |\n"
+           "| eu | 147 | 153 | 24.3s | 15.0s | **39.2s** |\n"
+           "| all | 279 | 285 | 48.0s | 28.2s | **76.2s** |\n\n"
+           "Airtime is fixed by the codes themselves. The rest is two gaps:\n"
+           "100ms between two different codes, so the receiver's AGC settles\n"
+           "before a frame it has not seen, and 45ms between repeats of one\n"
+           "code, which only has to be long enough for them to count as two.\n\n"
+           "`repeat` is a multiplier over what each code's protocol already\n"
+           "requires, and the default of 1 does not mean one frame each. The\n"
+           "three Sony entries need three frames before a SIRC receiver acts on\n"
+           "them, and they get three. Everything else needs one — the\n"
+           "TV-B-Gone codes carry any repetition they need inside the frame,\n"
+           "which is why some run to 136 pairs. Raising `repeat` multiplies the\n"
+           "whole job and is rarely what you want.\n\n"
            "Progress appears on the device screen whenever the bottom line is\n"
            "not already carrying setup information.\n\n"
            "### Code table\n\n"
-           "Nine power codes across six protocols (NEC, Samsung, Sony SIRC,\n"
-           "Philips RC-5, Philips RC-6, Panasonic/Kaseikyo), covering LG,\n"
-           "Zenith, Vizio, Toshiba, Samsung, Sony, Philips and Panasonic. The\n"
-           "encoders are written from the published protocol descriptions, not\n"
-           "lifted from a TV-B-Gone table, so the set is small on purpose.\n\n"
-           "Every code currently ships worldwide, so `na` and `eu` select the\n"
-           "same set; the filter exists for codes added later.\n\n"
+           "279 codes, in two parts.\n\n"
+           "Nine are encoded here from the published descriptions of six\n"
+           "protocols (NEC, Samsung, Sony SIRC, Philips RC-5, Philips RC-6,\n"
+           "Panasonic/Kaseikyo), covering LG, Zenith, Vizio, Toshiba, Samsung,\n"
+           "Sony, Philips and Panasonic. They are sent first, in every region.\n\n"
+           "The other 270 are the TV-B-Gone power-code database by Mitch\n"
+           "Altman and Limor Fried, taken from Arduino-TV-B-Gone and kept in\n"
+           "`ir_codes_tvbgone.h` under Creative Commons Attribution-ShareAlike\n"
+           "— the one file in this repository that is not MIT. Its licence is\n"
+           "bundled as `LICENSE-CC-BY-SA`.\n\n"
+           "The region filter is real, and it is upstream's split: `na` selects\n"
+           "146 codes (North America, Asia, everywhere `eu` does not reach),\n"
+           "`eu` selects 147 (Europe, the Middle East, Australia, New Zealand,\n"
+           "parts of Africa and South America), `all` selects 279. Five of the\n"
+           "upstream codes belong to both lists and are sent once.\n\n"
            "### Raw frames\n\n"
            "`raw` is alternating mark/space durations in microseconds, starting\n"
            "with a mark. 3 to 512 entries, each 1-32767us (the RMT duration\n"
@@ -580,7 +768,10 @@ static void ir_register_routes(AsyncWebServer &server) {
         }
 
         uint8_t regions = IR_REGION_ALL;
-        int repeat = 3;
+        /* 1 means "what each code's protocol requires", not "one frame each" —
+           the Sony entries still go out three times. Anything higher is a
+           multiplier on top, for the rare receiver that wants more. */
+        int repeat = 1;
 
         if (body) {
             JsonDocument input;
@@ -637,7 +828,7 @@ static void ir_register_routes(AsyncWebServer &server) {
         doc["region"] = ir_region_name(regions);
         doc["repeat"] = repeat;
         doc["codes"] = codes;
-        doc["transmissions"] = codes * repeat;
+        doc["transmissions"] = ir_count_frames(regions, (uint8_t)repeat);
         ir_send_json(req, 200, doc);
     }, NULL, handle_body_collect);
 
@@ -775,7 +966,7 @@ static void ir_register_routes(AsyncWebServer &server) {
 
 static const Skill ir_skill = {
     .name = "ir",
-    .version = "0.1.0",
+    .version = "0.2.0",
     .describe = ir_describe,
     .endpoints = ir_endpoints,
     .register_routes = ir_register_routes

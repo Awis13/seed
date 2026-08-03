@@ -352,10 +352,10 @@ static void ui_enter(uint8_t screen) {
 static void ui_activate(int item) {
     switch (item) {
         case UI_ITEM_TVBGONE: {
-            /* Region "all" and repeat 3, the same defaults POST /ir/tvbgone
+            /* Region "all" and repeat 1, the same defaults POST /ir/tvbgone
                applies to a body-less request. A blast already running (started
                over HTTP, or by an earlier click) is watched, not restarted. */
-            uint16_t job = ir_start_tvbgone(IR_REGION_ALL, 3);
+            uint16_t job = ir_start_tvbgone(IR_REGION_ALL, 1);
             ui_blast_ok = (job != 0) || ir_busy();
             ui_blast_done_at = 0;
             if (job != 0) event_add("ir: job %u started from the menu", (unsigned)job);

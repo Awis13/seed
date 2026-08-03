@@ -263,4 +263,15 @@ AI agents get this automatically from `GET /skill` on any running node.
 
 ## License
 
-MIT
+MIT, with one exception.
+
+`seeds/esp32-tembed/src/skills/ir_codes_tvbgone.h` is the TV-B-Gone power-code
+database by Mitch Altman and Limor Fried, copied from
+[Arduino-TV-B-Gone](https://github.com/shirriff/Arduino-TV-B-Gone), and is under
+**Creative Commons Attribution-ShareAlike** (`CC-BY-SA-2.5`), the licence its
+upstream carries. The licence text is bundled as
+[`seeds/esp32-tembed/LICENSE-CC-BY-SA`](seeds/esp32-tembed/LICENSE-CC-BY-SA).
+
+It is data only, in a file of its own, so the share-alike terms stop at that
+file. Everything else in this repository is MIT.
+See [seeds/README.md](seeds/README.md#third-party-data) for the details.

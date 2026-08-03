@@ -51,7 +51,7 @@
 #include <TFT_eSPI.h>
 
 // ===== Configuration =====
-#define SEED_VERSION        "0.3.0"
+#define SEED_VERSION        "0.3.1"
 #define HTTP_PORT           8080
 #define TOKEN_FILE          "/auth_token.txt"
 #define WIFI_CONFIG_FILE    "/wifi.json"
@@ -1546,8 +1546,8 @@ void loop() {
     ap_poll();
     ap_key_poll();
 
-    // One IR frame per pass at most: the transmission itself runs in the RMT
-    // peripheral, so this only starts frames and collects completions.
+    // Starts frames and collects completions; the transmission itself runs in
+    // the RMT peripheral. Advances as far as it can each pass and never blocks.
     ir_poll();
 
     // Encoder and buttons, every pass: input latency is what makes the knob
@@ -1578,5 +1578,10 @@ void loop() {
         battery_refresh();
     }
 
-    delay(10);
+    // 10ms is the idle cadence, and it is the whole pass's granularity. A blast
+    // cannot queue its next frame until it has seen the previous one finish, so
+    // at 10ms that rounding is dead air on every one of several hundred frames —
+    // seconds of it. 1ms while a job runs costs nothing (delay() yields either
+    // way) and takes the scheduler out of the timing budget.
+    delay(ir_busy() ? 1 : 10);
 }
