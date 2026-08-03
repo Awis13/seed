@@ -24,6 +24,7 @@
 
 #include <SI4735.h>
 #include "../patch_init.h"
+#include "../Rotary.h"
 
 /*
  * Mode constants follow the ref ats-mini numbering so the SSB mode value doubles
@@ -64,6 +65,62 @@ static uint8_t  radio_volume = 40;       /* 0..63 */
 static bool     radio_ok = false;        /* true once the SI4732 answered on I2C */
 static bool     radio_ssb_loaded = false;/* true while the SSB patch is live in chip RAM */
 static int      radio_bfo = 0;           /* current BFO offset in Hz (SSB only) */
+
+/*
+ * Every I2C access to `rx` now runs from two contexts: the async HTTP task
+ * (tune/scan/status) and loop()'s radio_tick() (encoder-driven tuning + the
+ * display readout that snapshots signal quality). Concurrent SI4735 transfers
+ * on the shared Wire bus corrupt each other and hang the receiver, so a mutex
+ * serialises them. Held only around the rx calls themselves — never across a
+ * screen repaint.
+ */
+static SemaphoreHandle_t radio_mtx = nullptr;
+
+/*
+ * Rotary encoder on PIN_ENC_A/PIN_ENC_B (Ben Buxton's decoder). The constructor
+ * takes (pin1, pin2) = (B, A): passing them in this order makes a clockwise turn
+ * read as DIR_CW, matching "clockwise tunes up". An interrupt on both pins feeds
+ * process(); each detent nudges enc_delta, drained by radio_tick().
+ */
+static Rotary encoder = Rotary(PIN_ENC_B, PIN_ENC_A);
+static volatile int8_t enc_delta = 0;
+/* Guards the read-and-clear of enc_delta in radio_tick against the ISR that
+ * increments it, so a step can't be dropped between the read and the reset. */
+static portMUX_TYPE enc_mux = portMUX_INITIALIZER_UNLOCKED;
+
+static void IRAM_ATTR rotary_isr() {
+    uint8_t s = encoder.process();
+    if (s == DIR_CW) enc_delta = enc_delta + 1;
+    else if (s == DIR_CCW) enc_delta = enc_delta - 1;
+}
+
+/*
+ * Detach / re-attach the encoder interrupts. rotary_isr() calls encoder.process(),
+ * whose Rotary state table lives in flash; while the flash cache is disabled (an
+ * OTA Update.write or a SPIFFS write) any code that reads flash from an ISR
+ * crashes the chip. main.cpp brackets those flash writes with these so no encoder
+ * edge can fire mid-write. Non-static: forward-declared in main.cpp.
+ *
+ * detachInterrupt on an unattached pin is a safe no-op, so calling these before
+ * skill_radio_init() has run (e.g. the token write on first boot) does no harm.
+ */
+void radio_encoder_pause() {
+    detachInterrupt(digitalPinToInterrupt(PIN_ENC_A));
+    detachInterrupt(digitalPinToInterrupt(PIN_ENC_B));
+}
+
+void radio_encoder_resume() {
+    attachInterrupt(digitalPinToInterrupt(PIN_ENC_A), rotary_isr, CHANGE);
+    attachInterrupt(digitalPinToInterrupt(PIN_ENC_B), rotary_isr, CHANGE);
+}
+
+/*
+ * What the encoder currently adjusts. The push button (polled in radio_tick)
+ * toggles between tuning frequency and setting volume — the whole handheld UX
+ * for C1. Mode/band/step/BFO changes are deliberately out of scope here.
+ */
+enum TuneTarget { TUNE_FREQ, TUNE_VOLUME };
+static uint8_t tune_target = TUNE_FREQ;
 
 /* --- Endpoints --- */
 static const SkillEndpoint radio_endpoints[] = {
@@ -144,16 +201,39 @@ static void radio_format_freq(uint16_t freq, uint8_t mode, char *out, size_t len
 }
 
 /* --- State accessors for the display skill (avoids reaching into rx/state) ---
- * All three are only ever called from the HTTP task (tune handler / display
- * routes), so the RSSI snapshot below races with nothing. */
+ * Called from both the HTTP task and loop()'s radio_tick(), so the ones that
+ * touch the receiver take radio_mtx around the I2C read. The plain scalar reads
+ * (freq/mode/volume/target) are single aligned words and need no lock. */
 uint16_t radio_get_freq() { return radio_freq; }
 
 const char *radio_get_mode_str() { return radio_mode_str(radio_mode); }
 
+uint8_t radio_get_volume() { return radio_volume; }
+
+uint8_t radio_get_tune_target() { return tune_target; }
+
 uint8_t radio_get_rssi() {
     if (!radio_ok) return 0;
+    xSemaphoreTake(radio_mtx, portMAX_DELAY);
     rx.getCurrentReceivedSignalQuality();
-    return rx.getCurrentRSSI();
+    uint8_t rssi = rx.getCurrentRSSI();
+    xSemaphoreGive(radio_mtx);
+    return rssi;
+}
+
+/* RSSI and SNR from one signal-quality read under a single mutex hold, so the
+ * display can show both without taking the receiver twice. */
+void radio_get_signal(uint8_t *rssi, uint8_t *snr) {
+    if (!radio_ok) {
+        if (rssi) *rssi = 0;
+        if (snr)  *snr  = 0;
+        return;
+    }
+    xSemaphoreTake(radio_mtx, portMAX_DELAY);
+    rx.getCurrentReceivedSignalQuality();
+    if (rssi) *rssi = rx.getCurrentRSSI();
+    if (snr)  *snr  = rx.getCurrentSNR();
+    xSemaphoreGive(radio_mtx);
 }
 
 static void radio_register_routes(AsyncWebServer &server) {
@@ -204,7 +284,9 @@ static void radio_register_routes(AsyncWebServer &server) {
                     "{\"error\":\"FM freq out of range (6400..10800)\"}");
                 return;
             }
+            xSemaphoreTake(radio_mtx, portMAX_DELAY);
             rx.setFM(RADIO_FM_MIN, RADIO_FM_MAX, (uint16_t)freq, 10);
+            xSemaphoreGive(radio_mtx);
             radio_ssb_loaded = false;  /* SSB patch is dropped when we leave SSB */
         } else if (strcmp(mode_str, "AM") == 0) {
             mode = RADIO_MODE_AM;
@@ -213,7 +295,9 @@ static void radio_register_routes(AsyncWebServer &server) {
                     "{\"error\":\"AM freq out of range (520..1710)\"}");
                 return;
             }
+            xSemaphoreTake(radio_mtx, portMAX_DELAY);
             rx.setAM(RADIO_AM_MIN, RADIO_AM_MAX, (uint16_t)freq, 10);
+            xSemaphoreGive(radio_mtx);
             radio_ssb_loaded = false;  /* SSB patch is dropped when we leave SSB */
         } else if (strcmp(mode_str, "LSB") == 0 || strcmp(mode_str, "USB") == 0) {
             mode = (strcmp(mode_str, "LSB") == 0) ? RADIO_MODE_LSB : RADIO_MODE_USB;
@@ -227,6 +311,7 @@ static void radio_register_routes(AsyncWebServer &server) {
                     "{\"error\":\"bfo out of range (-14000..14000)\"}");
                 return;
             }
+            xSemaphoreTake(radio_mtx, portMAX_DELAY);
             /* Lazily upload the SSB patch (audiobw=1 -> 2.2 kHz) on first SSB use. */
             if (!radio_ssb_loaded) {
                 rx.loadPatch(ssb_patch_content, sizeof(ssb_patch_content), 1);
@@ -237,13 +322,18 @@ static void radio_register_routes(AsyncWebServer &server) {
             rx.setSSBAutomaticVolumeControl(1);
             radio_bfo = req_bfo;
             rx.setSSBBfo(-radio_bfo);  /* sign follows the ref convention */
+            xSemaphoreGive(radio_mtx);
         } else {
             req->send(400, "application/json", "{\"error\":\"mode must be FM, AM, LSB or USB\"}");
             return;
         }
 
+        /* These two are also written from radio_tick(); keep every writer under
+         * the same mutex so a concurrent encoder step can't interleave. */
+        xSemaphoreTake(radio_mtx, portMAX_DELAY);
         radio_mode = mode;
         radio_freq = (uint16_t)freq;
+        xSemaphoreGive(radio_mtx);
 
         event_add("radio: tuned %s %d", mode_str, freq);
 
@@ -340,6 +430,10 @@ static void radio_register_routes(AsyncWebServer &server) {
         doc["step"] = step;
         JsonArray points = doc["points"].to<JsonArray>();
 
+        /* Hold radio_mtx across the whole sweep: it monopolises the receiver for
+         * ~2 s anyway, and taking/giving per step would only invite a tick-driven
+         * tune to fight it mid-scan. No screen repaint happens under the lock. */
+        xSemaphoreTake(radio_mtx, portMAX_DELAY);
         for (int f = from; f <= to; f += step) {
             rx.setFrequency((uint16_t)f);
             rx.getCurrentReceivedSignalQuality();
@@ -356,6 +450,7 @@ static void radio_register_routes(AsyncWebServer &server) {
         /* Restore the pre-scan tuning. Mode never changed, so freq is enough;
          * radio_freq was left untouched and already holds saved_freq. */
         rx.setFrequency(saved_freq);
+        xSemaphoreGive(radio_mtx);
         display_show_status();
 
         doc["count"] = points.size();
@@ -377,7 +472,11 @@ static void radio_register_routes(AsyncWebServer &server) {
             return;
         }
 
+        xSemaphoreTake(radio_mtx, portMAX_DELAY);
         rx.getCurrentReceivedSignalQuality();
+        uint8_t rssi = rx.getCurrentRSSI();
+        uint8_t snr = rx.getCurrentSNR();
+        xSemaphoreGive(radio_mtx);
 
         char freq_display[24];
         radio_format_freq(radio_freq, radio_mode, freq_display, sizeof(freq_display));
@@ -387,8 +486,8 @@ static void radio_register_routes(AsyncWebServer &server) {
         doc["freq"] = radio_freq;
         doc["freq_display"] = freq_display;
         if (radio_is_ssb(radio_mode)) doc["bfo"] = radio_bfo;
-        doc["rssi"] = rx.getCurrentRSSI();
-        doc["snr"] = rx.getCurrentSNR();
+        doc["rssi"] = rssi;
+        doc["snr"] = snr;
         doc["volume"] = radio_volume;
         String response;
         serializeJson(doc, response);
@@ -396,12 +495,71 @@ static void radio_register_routes(AsyncWebServer &server) {
     });
 }
 
+/*
+ * Per-loop handheld control, called from main.cpp's loop() via the Skill.tick
+ * hook. Three jobs, all cheap: read the push button, drain the encoder into the
+ * receiver, and repaint the live screen on a throttle.
+ *
+ *   - Button (PIN_ENC_KEY, active-low, polled with a 300 ms debounce — no ISR)
+ *     toggles what the encoder adjusts: frequency or volume.
+ *   - Encoder delta (accumulated by rotary_isr) tunes up/down or nudges volume,
+ *     under radio_mtx so it never collides with an HTTP tune/scan/status.
+ *   - A ~10 Hz repaint keeps the display in step with the knob without hammering
+ *     the panel; it is skipped while custom /display text is showing.
+ */
+static void radio_tick() {
+    /* 1) Button: cycle the encoder's target on the press (falling edge only, so
+     * holding it down toggles once, not every tick). Poll + debounce, no ISR. */
+    static uint32_t last_press = 0;
+    static bool key_was_down = false;
+    bool key_down = (digitalRead(PIN_ENC_KEY) == LOW);
+    if (key_down && !key_was_down && millis() - last_press > 50) {  // falling edge + short debounce
+        last_press = millis();
+        tune_target = (tune_target == TUNE_FREQ) ? TUNE_VOLUME : TUNE_FREQ;
+    }
+    key_was_down = key_down;
+
+    /* 2) Apply the accumulated encoder delta under the receiver mutex. Read-and-
+     * clear enc_delta in a critical section so no ISR step slips through. */
+    portENTER_CRITICAL(&enc_mux);
+    int8_t d = enc_delta;
+    enc_delta = 0;
+    portEXIT_CRITICAL(&enc_mux);
+    if (d != 0 && radio_ok) {
+        xSemaphoreTake(radio_mtx, portMAX_DELAY);
+        if (tune_target == TUNE_FREQ) {
+            /* frequencyUp/Down steps by the current band's step. In SSB the step
+             * is 0 (set in /radio/tune) so this is a no-op there — fine for C1;
+             * SSB fine-tuning via BFO is a C2 job, deliberately not done here. */
+            for (int8_t k = 0; k < abs(d); k++) {
+                if (d > 0) rx.frequencyUp();
+                else       rx.frequencyDown();
+            }
+            radio_freq = rx.getFrequency();
+        } else {
+            int v = constrain((int)radio_volume + d, 0, 63);
+            radio_volume = (uint8_t)v;
+            rx.setVolume(radio_volume);
+        }
+        xSemaphoreGive(radio_mtx);
+    }
+
+    /* 3) Throttled repaint (~10 Hz). display_tick_render() itself leaves a custom
+     * /display screen untouched, so we never stomp user text. */
+    static uint32_t last_draw = 0;
+    if (millis() - last_draw > 100) {
+        last_draw = millis();
+        display_tick_render();
+    }
+}
+
 static const Skill radio_skill = {
     .name = "radio",
     .version = "0.2.0",
     .describe = radio_describe,
     .endpoints = radio_endpoints,
-    .register_routes = radio_register_routes
+    .register_routes = radio_register_routes,
+    .tick = radio_tick
 };
 
 /*
@@ -411,6 +569,16 @@ static const Skill radio_skill = {
  * uploaded lazily on the first SSB tune, not here.
  */
 static void skill_radio_init() {
+    /* Guard the receiver before any code path can touch it from two tasks.
+     * Created even on the chip-absent path so the accessors stay well-defined. */
+    radio_mtx = xSemaphoreCreateMutex();
+
+    /* Encoder: pull-up on the push button, interrupt on both quadrature pins.
+     * Wire and the pins are otherwise free here (this is boot, single-tasked). */
+    pinMode(PIN_ENC_KEY, INPUT_PULLUP);
+    attachInterrupt(digitalPinToInterrupt(PIN_ENC_A), rotary_isr, CHANGE);
+    attachInterrupt(digitalPinToInterrupt(PIN_ENC_B), rotary_isr, CHANGE);
+
     /* Amplifier off first — silences the power-on click. */
     pinMode(PIN_AMP_EN, OUTPUT);
     digitalWrite(PIN_AMP_EN, LOW);

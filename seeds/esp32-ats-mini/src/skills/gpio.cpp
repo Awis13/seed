@@ -406,7 +406,8 @@ static const Skill gpio_skill = {
     .version = "0.1.0",
     .describe = gpio_describe,
     .endpoints = gpio_endpoints,
-    .register_routes = gpio_register_routes
+    .register_routes = gpio_register_routes,
+    .tick = nullptr,
 };
 
 static void skill_gpio_init() {

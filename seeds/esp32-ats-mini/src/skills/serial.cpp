@@ -355,7 +355,8 @@ static const Skill serial_skill = {
     .version = "0.1.0",
     .describe = serial_describe,
     .endpoints = serial_endpoints,
-    .register_routes = serial_register_routes
+    .register_routes = serial_register_routes,
+    .tick = nullptr,
 };
 
 static void skill_serial_init() {

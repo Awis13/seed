@@ -131,6 +131,7 @@ struct Skill {
     const char *(*describe)();                          // returns markdown
     const SkillEndpoint *endpoints;                     // NULL-terminated array
     void (*register_routes)(AsyncWebServer &server);    // registers routes on the server
+    void (*tick)();           // called every loop() iteration, or nullptr if unused
 };
 
 #define MAX_SKILLS 16
@@ -305,6 +306,14 @@ static size_t ota_bytes_written = 0;
 static volatile bool pending_restart = false;
 static volatile bool pending_rollback = false;
 
+// Encoder-interrupt gate (defined in skills/radio.cpp, included far below). The
+// encoder ISR reads flash via encoder.process(); flash writes here — the SPIFFS
+// helper and the OTA stream — disable the cache, so they bracket themselves with
+// these to keep an ISR from faulting mid-write. Declared this high because
+// write_spiffs_file() below already calls them, well before radio.cpp is pulled in.
+void radio_encoder_pause();
+void radio_encoder_resume();
+
 // ===== Utilities =====
 
 static String get_mac_suffix() {
@@ -324,10 +333,14 @@ static String read_spiffs_file(const char *path) {
 }
 
 static bool write_spiffs_file(const char *path, const String &content) {
+    // Pause the encoder ISR around the flash write: SPIFFS disables the cache and
+    // encoder.process() reads flash, so an edge mid-write would crash the chip.
+    radio_encoder_pause();
     File f = SPIFFS.open(path, FILE_WRITE);
-    if (!f) return false;
+    if (!f) { radio_encoder_resume(); return false; }
     f.print(content);
     f.close();
+    radio_encoder_resume();
     return true;
 }
 
@@ -703,6 +716,12 @@ static void handle_firmware_upload_body(AsyncWebServerRequest *request, uint8_t 
 
         event_add("ota upload started, size=%u", (unsigned)total);
 
+        // Detach the encoder ISR for the whole OTA write: Update.write disables
+        // the flash cache and the ISR reads flash (encoder.process()), so an edge
+        // mid-write would crash. Re-attached in handle_firmware_upload(), which
+        // always runs once the stream finishes — every success and error path.
+        radio_encoder_pause();
+
         if (!Update.begin(total, U_FLASH)) {
             ota_upload_error = true;
             snprintf(ota_upload_error_msg, sizeof(ota_upload_error_msg),
@@ -741,6 +760,12 @@ static void handle_firmware_upload_body(AsyncWebServerRequest *request, uint8_t 
 }
 
 static void handle_firmware_upload(AsyncWebServerRequest *request) {
+    // The stream is done by the time this always-invoked completion handler runs,
+    // so re-attach the encoder ISR here — on every path, success or error —
+    // rather than in each body-handler branch. If no upload started (no body),
+    // radio_encoder_pause() never ran and this attach is a harmless idempotent.
+    radio_encoder_resume();
+
     // The body handler authenticates the upload itself, but a POST with no body
     // never reaches it and would otherwise report the md5 and size of whatever
     // was last flashed. Checking here gates every path through, and makes the
@@ -916,6 +941,9 @@ static void handle_wifi_post(AsyncWebServerRequest *request) {
 // Forward-declared here so radio.cpp can repaint the status screen on tune;
 // the definition lives in display.cpp, included after radio.cpp (same TU).
 void display_show_status();
+// Live radio readout, repainted from the radio skill's tick(): reads the radio
+// accessors and redraws frequency/mode/signal/volume. Defined in display.cpp.
+void display_tick_render();
 // Setup screen: AP SSID + one-boot password + token. The password lives only
 // here and on the screen, so this is the only channel that carries it.
 void display_show_ap(const char *ssid, const char *pass, const char *token);
@@ -1012,6 +1040,11 @@ void loop() {
         millis() - last_wifi > 30000) {
         WiFi.begin(wifi_ssid.c_str(), wifi_pass.c_str());
         last_wifi = millis();
+    }
+
+    // Give each skill its per-loop slice: encoder polling, screen repaint, etc.
+    for (int i = 0; i < g_skill_count; i++) {
+        if (g_skills[i]->tick) g_skills[i]->tick();
     }
 
     delay(10);
