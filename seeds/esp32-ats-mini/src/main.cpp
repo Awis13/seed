@@ -827,14 +827,20 @@ static void handle_wifi_post(AsyncWebServerRequest *request) {
 }
 
 // ===== Skills =====
+// Forward-declared here so radio.cpp can repaint the status screen on tune;
+// the definition lives in display.cpp, included after radio.cpp (same TU).
+void display_show_status();
+
 #include "skills/gpio.cpp"
 #include "skills/serial.cpp"
 #include "skills/radio.cpp"
+#include "skills/display.cpp"  // after radio.cpp — reads radio_get_* accessors
 
 static void skills_init() {
     skill_gpio_init();
     skill_serial_init();
     skill_radio_init();
+    skill_display_init();
 }
 
 // ===== Routes =====
