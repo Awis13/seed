@@ -829,10 +829,12 @@ static void handle_wifi_post(AsyncWebServerRequest *request) {
 // ===== Skills =====
 #include "skills/gpio.cpp"
 #include "skills/serial.cpp"
+#include "skills/radio.cpp"
 
 static void skills_init() {
     skill_gpio_init();
     skill_serial_init();
+    skill_radio_init();
 }
 
 // ===== Routes =====
