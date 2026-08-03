@@ -13,8 +13,9 @@
 //   - Battery telemetry comes from an ADC on GPIO4 (resistor divider), not a
 //     fuel gauge: volts = raw * 1.702 / 1000 (matches the ATS-Mini reference).
 //   - An SI4732 radio hangs off the I2C bus (SDA=18, SCL=17) with its RESET on
-//     GPIO16; the seed does not talk to it yet.
-//   - A 320x240 ST7789 sits on an 8-bit parallel (i8080) bus; not driven here.
+//     GPIO16; driven by the radio skill (skills/radio.cpp).
+//   - A 170x320 ST7789 sits on an 8-bit parallel (i8080) bus; driven by the
+//     display skill (skills/display.cpp).
 //
 // Endpoints:
 //   GET  /health            — alive check (no auth)
@@ -50,7 +51,7 @@
 
 // ===== ATS Mini v4 pin map =====
 #define PIN_PWR_EN      15  // power hold — HIGH before anything else, LOW = off
-#define PIN_SI4732_RST  16  // SI4732 receiver RESET (radio not driven yet)
+#define PIN_SI4732_RST  16  // SI4732 receiver RESET (driven by the radio skill)
 #define PIN_I2C_SCL     17  // I2C bus (SI4732 + peripherals)
 #define PIN_I2C_SDA     18
 #define PIN_AUDIO_MUTE   3  // audio mute control (also a strapping pin)
@@ -60,7 +61,7 @@
 #define PIN_ENC_B        1  // rotary encoder B
 #define PIN_ENC_KEY     21  // encoder push button
 #define PIN_VBAT_ADC     4  // battery voltage divider (ADC1)
-// ST7789 on an 8-bit parallel (i8080) bus — present but not driven by the seed
+// ST7789 170x320 on an 8-bit parallel (i8080) bus — driven by the display skill
 #define PIN_TFT_CS       6
 #define PIN_TFT_DC       7
 #define PIN_TFT_RST      5
@@ -552,14 +553,14 @@ static void handle_capabilities(AsyncWebServerRequest *request) {
     }
     doc["temp_c"] = serialized(String(hw.temp_c, 1));
 
-    // Peripherals — honest to the ATS-Mini, but none are driven by this seed yet.
+    // Peripherals — honest to the ATS-Mini; the SI4732 radio and ST7789 display are driven by skills.
     doc["has_wifi"] = true;
     doc["has_bluetooth"] = true;
     doc["si4732_reset_pin"] = PIN_SI4732_RST;
     doc["audio_mute_pin"] = PIN_AUDIO_MUTE;
     doc["amp_en_pin"] = PIN_AMP_EN;
     doc["lcd_bl_pin"] = PIN_LCD_BL;
-    doc["display"] = "ST7789 320x240 (8-bit parallel i8080) — present, not driven";
+    doc["display"] = "ST7789 170x320 (8-bit parallel i8080)";
     doc["encoder_pins"] = "A=2,B=1,PUSH=21";
     doc["power_hold_pin"] = PIN_PWR_EN;
     doc["vbat_adc_pin"] = PIN_VBAT_ADC;
@@ -851,10 +852,12 @@ static void handle_skill(AsyncWebServerRequest *request) {
     s += "7. POST /firmware/confirm (or auto after 60s)\n\n";
     s += "## Board gotchas\n\n";
     s += "- GPIO15 is power hold: drive it HIGH first in setup(), LOW powers off\n";
-    s += "- SI4732 receiver: RESET on GPIO16, I2C on SDA=18/SCL=17 — no radio driver in this seed yet\n";
+    s += "- SI4732 receiver: RESET on GPIO16, I2C on SDA=18/SCL=17 — driven by the `radio` skill (FM/AM/SSB tune, band scan, RSSI/SNR); see POST /radio/tune, /radio/scan, GET /radio/status\n";
     s += "- Battery telemetry: ADC on GPIO4, volts = raw * 1.702 / 1000 (no fuel gauge)\n";
-    s += "- ST7789 320x240 display on an 8-bit parallel bus — present but not driven\n";
-    s += "- Native USB-Serial/JTAG: flashing needs `--after watchdog_reset`\n\n";
+    s += "- ST7789 170x320 display (8-bit parallel i8080): driven by the `display` skill — live radio readout via a TFT_eSprite back-buffer, plus POST /display for custom text\n";
+    s += "- Rotary encoder (A=2/B=1, push=21): handheld control — turn to tune, press to toggle frequency/volume (driven in the radio skill's tick())\n";
+    s += "- Native USB-Serial/JTAG: flashing needs `--after watchdog_reset`\n";
+    s += "- To extend the radio (menu, band presets, RDS, memory, ...): edit skills/radio.cpp + skills/display.cpp; the SI4732 is accessed under a mutex, the UI is a shared sprite\n\n";
     s += "## API\n\n";
     s += "| Method | Path | Description |\n";
     s += "|--------|------|-------------|\n";
