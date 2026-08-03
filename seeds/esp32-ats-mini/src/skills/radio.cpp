@@ -25,6 +25,7 @@
 #include <SI4735.h>
 #include "../patch_init.h"
 #include "../Rotary.h"
+#include "../Button.h"
 
 /*
  * Mode constants follow the ref ats-mini numbering so the SSB mode value doubles
@@ -83,15 +84,69 @@ static SemaphoreHandle_t radio_mtx = nullptr;
  * process(); each detent nudges enc_delta, drained by radio_tick().
  */
 static Rotary encoder = Rotary(PIN_ENC_B, PIN_ENC_A);
-static volatile int8_t enc_delta = 0;
-/* Guards the read-and-clear of enc_delta in radio_tick against the ISR that
- * increments it, so a step can't be dropped between the read and the reset. */
+/* Two parallel detent counters, both accumulated by rotary_isr and drained
+ * together in radio_tick. enc_delta is the raw count (+/-1 per detent, used for
+ * the precise volume nudge); enc_delta_accel is the acceleration-weighted count
+ * (a fast spin multiplies each detent, used for the coarse frequency sweep). */
+static volatile int8_t  enc_delta = 0;
+static volatile int16_t enc_delta_accel = 0;
+/* Guards the read-and-clear of the two counters in radio_tick against the ISR
+ * that increments them, so a step can't be dropped between the read and the
+ * reset (and raw/accel are snapshotted as one consistent pair). */
 static portMUX_TYPE enc_mux = portMUX_INITIALIZER_UNLOCKED;
+
+/*
+ * Turn a raw detent direction into an acceleration-weighted delta. Ported from
+ * ats-mini's accelerateEncoder (integer-only, EMA-smoothed inter-detent time).
+ * A slow turn returns +/-1; the faster you spin, the larger the multiplier
+ * (up to 16x), so the frequency jumps in bigger strides on a fast sweep.
+ *
+ * Runs from rotary_isr (ISR context). Defense-in-depth against the flash cache:
+ * the function itself is IRAM_ATTR and its lookup tables are DRAM_ATTR, so nothing
+ * on this path reads flash. millis() is already an IRAM function on ESP32 Arduino.
+ * (encoder.process() in rotary_isr still reads its Rotary table from flash, but
+ * that is pre-existing and bracketed by detach — see radio_encoder_pause.) Both
+ * flash-write paths — OTA Update.write AND the SPIFFS write_spiffs_file — detach
+ * the encoder first, so there is no race; keeping this path IRAM/DRAM just removes
+ * the flash surface from the ISR entirely. Keep it free of any flash-resident calls.
+ */
+static int16_t IRAM_ATTR accelerate_encoder(int8_t dir) {
+    static const DRAM_ATTR uint32_t th[] = {350, 60, 45, 35, 25};  // ms between detents
+    static const DRAM_ATTR uint16_t fac[] = {1, 2, 4, 8, 16};      // matching multipliers
+    static uint32_t last_t = 0, last_speed = 350;
+    static uint16_t last_fac = 1;
+    static int8_t last_dir = 0;
+
+    uint32_t now = millis();
+    uint32_t dt = now - last_t;
+    if (dt > th[0]) dt = th[0];  // clamp idle gap so dt*7 can't overflow uint32
+    last_speed = (dt * 7 + last_speed * 3) / 10;  // EMA 70/30
+    if (last_speed > th[0] || last_dir != dir) {
+        last_speed = th[0];
+        last_fac = 1;
+    } else {
+        for (int8_t i = 4; i >= 0; i--) {
+            if (last_speed <= th[i] && last_fac < fac[i]) { last_fac = fac[i]; break; }
+        }
+    }
+    last_t = now;
+    last_dir = dir;
+    return (int16_t)dir * (int16_t)last_fac;
+}
 
 static void IRAM_ATTR rotary_isr() {
     uint8_t s = encoder.process();
-    if (s == DIR_CW) enc_delta = enc_delta + 1;
-    else if (s == DIR_CCW) enc_delta = enc_delta - 1;
+    int8_t dir = 0;
+    if (s == DIR_CW) dir = 1;
+    else if (s == DIR_CCW) dir = -1;
+    if (dir != 0) {
+        /* Backpressure: if radio_tick isn't draining (raw count backing up),
+         * stop accumulating so raw and accel counters stay in step. */
+        if (abs((int)enc_delta) < 5) {
+            enc_delta = enc_delta + dir;
+            enc_delta_accel = enc_delta_accel + accelerate_encoder(dir);
+        }
+    }
 }
 
 /*
@@ -115,12 +170,15 @@ void radio_encoder_resume() {
 }
 
 /*
- * What the encoder currently adjusts. The push button (polled in radio_tick)
- * toggles between tuning frequency and setting volume — the whole handheld UX
- * for C1. Mode/band/step/BFO changes are deliberately out of scope here.
+ * The handheld input router's mode: what the encoder currently adjusts. A click
+ * on the push button (tracked in radio_tick) toggles between tuning frequency
+ * and setting volume — the whole handheld UX for this cut. Long-press is wired
+ * up as a reserved hook for the menu that grows in a later step. UI_VFO/UI_VOLUME
+ * keep the old 0/1 values so the display's active-target highlight (which reads
+ * radio_get_tune_target()) needs no change.
  */
-enum TuneTarget { TUNE_FREQ, TUNE_VOLUME };
-static uint8_t tune_target = TUNE_FREQ;
+enum UiMode { UI_VFO, UI_VOLUME };
+static uint8_t ui_mode = UI_VFO;
 
 /* --- Endpoints --- */
 static const SkillEndpoint radio_endpoints[] = {
@@ -210,7 +268,9 @@ const char *radio_get_mode_str() { return radio_mode_str(radio_mode); }
 
 uint8_t radio_get_volume() { return radio_volume; }
 
-uint8_t radio_get_tune_target() { return tune_target; }
+/* Kept named radio_get_tune_target() (returning the UI_VFO/UI_VOLUME value) so
+ * display.cpp's active-target highlight needs no change. */
+uint8_t radio_get_tune_target() { return ui_mode; }
 
 uint8_t radio_get_rssi() {
     if (!radio_ok) return 0;
@@ -496,55 +556,91 @@ static void radio_register_routes(AsyncWebServer &server) {
 }
 
 /*
- * Per-loop handheld control, called from main.cpp's loop() via the Skill.tick
- * hook. Three jobs, all cheap: read the push button, drain the encoder into the
- * receiver, and repaint the live screen on a throttle.
+ * Auto-return timeout: after this long with no input the router falls back from
+ * UI_VOLUME to UI_VFO, so the knob is always tuning again when you next touch it
+ * (mirrors the ref's ELAPSED_COMMAND behaviour).
+ */
+#define RADIO_COMMAND_TIMEOUT_MS 10000
+
+/*
+ * Per-loop handheld input router, called from main.cpp's loop() via the
+ * Skill.tick hook. Four jobs, all cheap: track the push button, drain the two
+ * encoder counters into the receiver, apply the command timeout, and repaint the
+ * live screen on a throttle.
  *
- *   - Button (PIN_ENC_KEY, active-low, polled with a 300 ms debounce — no ISR)
- *     toggles what the encoder adjusts: frequency or volume.
- *   - Encoder delta (accumulated by rotary_isr) tunes up/down or nudges volume,
- *     under radio_mtx so it never collides with an HTTP tune/scan/status.
+ *   - Button (PIN_ENC_KEY, active-low) goes through ButtonTracker: a click
+ *     toggles what the encoder adjusts (frequency <-> volume); a long-press is a
+ *     reserved no-op hook for the menu that grows in a later step.
+ *   - Encoder: frequency uses the acceleration-weighted count (fast spin = bigger
+ *     jumps), volume uses the raw +/-1 count (precise). Both drained in one
+ *     critical section, then applied under radio_mtx so an HTTP tune/scan/status
+ *     can't interleave.
+ *   - Command timeout auto-returns UI_VOLUME -> UI_VFO after inactivity.
  *   - A ~10 Hz repaint keeps the display in step with the knob without hammering
  *     the panel; it is skipped while custom /display text is showing.
  */
 static void radio_tick() {
-    /* 1) Button: cycle the encoder's target on the press (falling edge only, so
-     * holding it down toggles once, not every tick). Poll + debounce, no ISR. */
-    static uint32_t last_press = 0;
-    static bool key_was_down = false;
-    bool key_down = (digitalRead(PIN_ENC_KEY) == LOW);
-    if (key_down && !key_was_down && millis() - last_press > 50) {  // falling edge + short debounce
-        last_press = millis();
-        tune_target = (tune_target == TUNE_FREQ) ? TUNE_VOLUME : TUNE_FREQ;
-    }
-    key_was_down = key_down;
+    static uint32_t last_input_ms = 0;
 
-    /* 2) Apply the accumulated encoder delta under the receiver mutex. Read-and-
-     * clear enc_delta in a critical section so no ISR step slips through. */
+    /* 1) Button through ButtonTracker (debounce/click/short/long handled inside). */
+    static ButtonTracker key_btn;
+    ButtonTracker::State key = key_btn.update(digitalRead(PIN_ENC_KEY) == LOW);
+    if (key.wasClicked || key.wasShortPressed) {
+        /* Any press under 2s toggles the encoder's target: frequency <-> volume.
+         * Treating wasShortPressed (0.5-2s) like a click removes the dead zone
+         * where a slightly-held tap did nothing. Long-press (>=2s) stays reserved
+         * for the menu below. */
+        ui_mode = (ui_mode == UI_VFO) ? UI_VOLUME : UI_VFO;
+        last_input_ms = millis();
+    }
+    if (key.isLongPressed) {
+        /* Reserved for the menu (grows in a later step) — deliberately a no-op. */
+    }
+
+    /* 2) Snapshot both encoder counters in one critical section so no ISR step
+     * slips through and raw/accel stay a consistent pair. */
+    int8_t  d;
+    int16_t da;
     portENTER_CRITICAL(&enc_mux);
-    int8_t d = enc_delta;
+    d = enc_delta;
+    da = enc_delta_accel;
     enc_delta = 0;
+    enc_delta_accel = 0;
     portEXIT_CRITICAL(&enc_mux);
-    if (d != 0 && radio_ok) {
+
+    if ((d != 0 || da != 0) || key.wasClicked) last_input_ms = millis();
+
+    if (radio_ok && (d != 0 || da != 0)) {
         xSemaphoreTake(radio_mtx, portMAX_DELAY);
-        if (tune_target == TUNE_FREQ) {
-            /* frequencyUp/Down steps by the current band's step. In SSB the step
-             * is 0 (set in /radio/tune) so this is a no-op there — fine for C1;
-             * SSB fine-tuning via BFO is a C2 job, deliberately not done here. */
-            for (int8_t k = 0; k < abs(d); k++) {
-                if (d > 0) rx.frequencyUp();
-                else       rx.frequencyDown();
+        if (ui_mode == UI_VFO) {
+            /* Frequency follows the accelerated count so a fast sweep strides in
+             * bigger jumps. frequencyUp/Down steps by the current band's step; in
+             * SSB the step is 0 (set in /radio/tune) so this is a no-op there —
+             * SSB fine-tuning via BFO is out of scope for this cut. */
+            if (da != 0) {
+                for (int k = 0; k < abs((int)da); k++) {
+                    if (da > 0) rx.frequencyUp();
+                    else        rx.frequencyDown();
+                }
+                radio_freq = rx.getFrequency();
             }
-            radio_freq = rx.getFrequency();
         } else {
-            int v = constrain((int)radio_volume + d, 0, 63);
-            radio_volume = (uint8_t)v;
-            rx.setVolume(radio_volume);
+            /* Volume follows the raw count for precise +/-1 steps. */
+            if (d != 0) {
+                int v = constrain((int)radio_volume + d, 0, 63);
+                radio_volume = (uint8_t)v;
+                rx.setVolume(radio_volume);
+            }
         }
         xSemaphoreGive(radio_mtx);
     }
 
-    /* 3) Throttled repaint (~10 Hz). display_tick_render() itself leaves a custom
+    /* 3) Command timeout: auto-return from volume to frequency after inactivity. */
+    if (ui_mode == UI_VOLUME && millis() - last_input_ms > RADIO_COMMAND_TIMEOUT_MS) {
+        ui_mode = UI_VFO;
+    }
+
+    /* 4) Throttled repaint (~10 Hz). display_tick_render() itself leaves a custom
      * /display screen untouched, so we never stomp user text. */
     static uint32_t last_draw = 0;
     if (millis() - last_draw > 100) {
