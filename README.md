@@ -71,6 +71,8 @@ seeds/                          <- bootloaders
   esp32/
     src/main.cpp                     1252 lines, PlatformIO, Heltec V3
     src/skills/gpio.cpp              GPIO control skill (360 lines)
+  esp32-cardputer/
+    src/main.cpp                     1717 lines, PlatformIO, M5Stack Cardputer ADVANCE
   pdp11/seed.c                      550 lines, K&R C, 2.11BSD
 
 firmware/                       <- grown from seeds
