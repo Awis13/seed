@@ -11,8 +11,9 @@
 //     VERSION) — a real radio driver is something an agent grows later.
 //   - 8MB of octal PSRAM eats GPIO33-37; the gpio skill refuses to drive them.
 //   - Battery telemetry comes from a BQ27220 fuel gauge over I2C, not an ADC.
-//   - ST7789 170x320 display shows IP/token/status so the device is
-//     self-describing without a serial console.
+//   - ST7789 170x320 display shows a clock plus address/battery so the device
+//     is self-describing without a serial console. The provisioning AP password
+//     and the auth token appear there only while the setup AP is up.
 //
 // Endpoints:
 //   GET  /health            — alive check (no auth)
@@ -20,6 +21,8 @@
 //   GET  /config.md         — node description
 //   POST /config.md         — update description
 //   GET  /events            — event log (?since=unix_ts)
+//   GET  /clock             — local time, timezone, NTP sync state
+//   POST /clock/tz          — set the POSIX TZ string
 //   GET  /firmware/version  — version, partition, uptime
 //   POST /firmware/upload   — upload OTA binary (streaming)
 //   POST /firmware/apply    — reboot into new firmware
@@ -27,9 +30,11 @@
 //   POST /firmware/rollback — revert to previous
 //   GET  /skill             — AI agent skill file
 //   GET  /                  — WiFi config page
-//   POST /wifi/config       — save WiFi credentials
+//   POST /wifi/config       — save WiFi credentials (token-free only on the AP)
 
 #include <Arduino.h>
+#include <stdlib.h>
+#include <time.h>
 #include <WiFi.h>
 #include <ESPmDNS.h>
 #include <SPIFFS.h>
@@ -42,12 +47,16 @@
 #include <TFT_eSPI.h>
 
 // ===== Configuration =====
-#define SEED_VERSION        "0.2.0"
+#define SEED_VERSION        "0.2.1"
 #define HTTP_PORT           8080
-#define AP_PASSWORD         "seed1313"
 #define TOKEN_FILE          "/auth_token.txt"
 #define WIFI_CONFIG_FILE    "/wifi.json"
 #define CONFIG_MD_FILE      "/config.md"
+#define TZ_FILE             "/tz.txt"
+// No location is baked into the seed: UTC until an agent posts a POSIX TZ.
+#define TZ_DEFAULT          "UTC0"
+// Anything older than this is the pre-NTP epoch, not a real wall clock.
+#define TIME_VALID_EPOCH    1700000000
 
 // ===== T-Embed CC1101 pin map =====
 #define PIN_PWR_EN      15  // power hold — HIGH before anything else, LOW = off
@@ -114,7 +123,7 @@ static void event_add(const char *fmt, ...) {
     va_start(ap, fmt);
     EventEntry *e = &events_buf[events_head];
     struct timeval tv;
-    if (gettimeofday(&tv, NULL) == 0 && tv.tv_sec > 1700000000) {
+    if (gettimeofday(&tv, NULL) == 0 && tv.tv_sec > TIME_VALID_EPOCH) {
         e->timestamp = (unsigned long)tv.tv_sec;
     } else {
         e->timestamp = millis() / 1000;
@@ -307,6 +316,17 @@ static void probe_battery() {
     }
 }
 
+// probe_battery() runs once at boot, so the cached figures would otherwise stay
+// frozen at the boot-time snapshot. Re-read the same two registers periodically
+// to keep the on-screen charge level honest.
+static void battery_refresh() {
+    if (!hw.has_battery) return;
+    uint16_t mv = 0, soc = 0;
+    if (!bq27220_read16(0x08, mv) || mv <= 2000 || mv >= 6000) return;
+    hw.battery_v = mv / 1000.0f;
+    hw.battery_soc = (bq27220_read16(0x2C, soc) && soc <= 100) ? (int)soc : -1;
+}
+
 static void hw_probe() {
     memset(&hw, 0, sizeof(hw));
 
@@ -357,6 +377,28 @@ static String ap_ssid = "";
 static String mdns_name = "";
 static unsigned long boot_time = 0;
 
+// Provisioning AP state, declared here because the display reads it. The
+// password is rolled on every raise and exists only in this variable and on the
+// screen — never persisted, never sent anywhere.
+//
+// A gesture-raised session is time-boxed: someone may have leaned on the key,
+// and the radio must not then stay up forever. The boot-time session does not
+// expire, because with no working credentials the AP is the only way in.
+#define AP_SESSION_MS (10UL * 60UL * 1000UL)
+static bool ap_active = false;
+static String ap_password = "";
+static bool ap_temporary = false;
+static unsigned long ap_expires_at = 0;
+
+// Whole minutes left on a temporary session, rounded up so it never reads 0
+// while the AP is still up. Returns 0 for a session that does not expire.
+static unsigned long ap_minutes_left() {
+    if (!ap_temporary) return 0;
+    long remaining = (long)(ap_expires_at - millis());
+    if (remaining <= 0) return 0;
+    return ((unsigned long)remaining + 59999UL) / 60000UL;
+}
+
 static String wifi_ssid = "";
 static String wifi_pass = "";
 
@@ -398,62 +440,222 @@ static bool write_spiffs_file(const char *path, const String &content) {
     return true;
 }
 
+// ===== Timezone =====
+//
+// The seed knows no city. It stores a raw POSIX TZ string in SPIFFS and hands
+// it to the C library; whoever provisions the node decides what "local" means.
+
+static String tz_string = TZ_DEFAULT;
+
+static void tz_apply() {
+    setenv("TZ", tz_string.c_str(), 1);
+    tzset();
+}
+
+static void tz_load() {
+    String stored = read_spiffs_file(TZ_FILE);
+    stored.trim();
+    if (stored.length() > 0) tz_string = stored;
+    tz_apply();
+}
+
+// POSIX TZ strings are printable ASCII without spaces, e.g. "UTC0" or
+// "CET-1CEST,M3.5.0,M10.5.0/3". Reject anything else rather than feed the
+// C library a string that silently degrades to UTC.
+static bool tz_valid(const String &tz) {
+    if (tz.length() == 0 || tz.length() > 63) return false;
+    for (unsigned int i = 0; i < tz.length(); i++) {
+        char c = tz.charAt(i);
+        if (c < 0x21 || c > 0x7E) return false;
+    }
+    return true;
+}
+
+static bool clock_local_time(struct tm &out) {
+    time_t now = time(NULL);
+    if (now <= TIME_VALID_EPOCH) return false;
+    return localtime_r(&now, &out) != NULL;
+}
+
 // ===== Display =====
+
+// Clock-first status screen on the 320x170 panel:
+//
+//   SEED v0.2.1              BAT 87%              192.168.1.42     <- font 2
+//   ------------------------------------------------------------
+//                     12:34   07                                   <- font 8 + 4
+//                    Sun 03 Aug 2026                               <- font 4
+//   RSSI -55 dBm                              seed-a1b2.local      <- font 2
+//                                                                  <- font 2
+//
+// The last two rows switch with the connectivity mode: on the network they
+// carry RSSI and the mDNS name, in setup mode the AP name, its one-shot
+// password and the auth token, and offline the gesture that raises the AP.
+//
+// Three colours only: warm white for the digits, slate for everything
+// secondary, one amber accent (seconds, and the AP password in setup mode).
+#define COL_BG      TFT_BLACK
+#define COL_TIME    0xFFBC  // warm white
+#define COL_DIM     0x7BD0  // slate grey
+#define COL_ACCENT  0xFD05  // amber
+#define COL_RULE    0x2945  // hairline under the header
+
+#define HDR_Y       2
+#define CLOCK_Y     24
+#define DATE_Y      102
+#define ROW1_Y      130
+#define ROW2_Y      150
+
+static bool display_ready = false;
+// Set from the web server task, consumed by the clock tick in loop(): TFT_eSPI
+// owns the SPI bus and must only be driven from one task.
+static volatile bool display_force = false;
+
+// Geometry of the time block, measured once — HH:MM is always five glyphs, so
+// the block never shifts and every field can be repainted in place.
+static int32_t clock_x = 0, clock_w = 0, sec_x = 0, sec_y = 0, sec_w = 0;
+
+// Last rendered text per field, so a tick that changes nothing costs no SPI.
+static char fld_batt[16]  = "";
+static char fld_addr[24]  = "";
+static char fld_time[8]   = "";
+static char fld_sec[4]    = "";
+static char fld_date[24]  = "";
+static char fld_left[32]  = "";
+static char fld_right[32] = "";
+static char fld_note[48]  = "";
+
+// Repaint a field only when its content changed. An opaque text background plus
+// a fixed padding width erases the previous value, so per-second updates never
+// need fillScreen and never flicker.
+static void draw_field(char *cache, size_t cache_size, const char *text,
+                       int32_t x, int32_t y, uint8_t font, uint16_t color,
+                       uint8_t datum, uint16_t padding) {
+    if (!display_force && strncmp(cache, text, cache_size - 1) == 0) return;
+    snprintf(cache, cache_size, "%s", text);
+    tft.setTextDatum(datum);
+    tft.setTextColor(color, COL_BG);
+    tft.setTextPadding(padding);
+    tft.drawString(text, x, y, font);
+    tft.setTextPadding(0);
+}
 
 static void display_init() {
     tft.init();
     tft.setRotation(3);  // 320x170 landscape, knob on the right
-    tft.fillScreen(TFT_BLACK);
+    tft.fillScreen(COL_BG);
     // Backlight only after the panel is initialized — avoids a garbage flash
     pinMode(PIN_TFT_BL, OUTPUT);
     digitalWrite(PIN_TFT_BL, HIGH);
+
+    clock_w = tft.textWidth("00:00", 8);
+    sec_w = tft.textWidth("00", 4);
+    clock_x = (tft.width() - (clock_w + 12 + sec_w)) / 2;
+    if (clock_x < 4) clock_x = 4;
+    sec_x = clock_x + clock_w + 12;
+    sec_y = CLOCK_Y + tft.fontHeight(8) - tft.fontHeight(4);  // sit on the baseline
+    display_ready = true;
 }
 
+// One second of screen work: everything here is change-detected.
+static void display_tick() {
+    if (!display_ready) return;
+    char buf[48];
+
+    bool connected = (WiFi.status() == WL_CONNECTED);
+
+    // Header row, three slots. The padding widths are also the erase
+    // rectangles, so they tile the row instead of overlapping.
+    if (hw.has_battery && hw.battery_soc >= 0) {
+        snprintf(buf, sizeof(buf), "BAT %d%%", hw.battery_soc);
+    } else {
+        snprintf(buf, sizeof(buf), "BAT --");
+    }
+    draw_field(fld_batt, sizeof(fld_batt), buf, tft.width() / 2, HDR_Y, 2,
+               COL_DIM, TC_DATUM, 70);
+
+    if (connected) {
+        snprintf(buf, sizeof(buf), "%s", WiFi.localIP().toString().c_str());
+    } else if (ap_active) {
+        snprintf(buf, sizeof(buf), "AP %s", WiFi.softAPIP().toString().c_str());
+    } else {
+        snprintf(buf, sizeof(buf), "offline");
+    }
+    draw_field(fld_addr, sizeof(fld_addr), buf, tft.width() - 8, HDR_Y, 2,
+               COL_DIM, TR_DATUM, 117);
+
+    struct tm now;
+    char hhmm[8], ss[4], date[24];
+    if (clock_local_time(now)) {
+        snprintf(hhmm, sizeof(hhmm), "%02d:%02d", now.tm_hour, now.tm_min);
+        snprintf(ss, sizeof(ss), "%02d", now.tm_sec);
+        strftime(date, sizeof(date), "%a %d %b %Y", &now);
+    } else {
+        // Before the first NTP sync a placeholder beats rendering 1970.
+        snprintf(hhmm, sizeof(hhmm), "--:--");
+        snprintf(ss, sizeof(ss), "--");
+        snprintf(date, sizeof(date), "waiting for NTP");
+    }
+    draw_field(fld_time, sizeof(fld_time), hhmm, clock_x, CLOCK_Y, 8,
+               COL_TIME, TL_DATUM, clock_w);
+    draw_field(fld_sec, sizeof(fld_sec), ss, sec_x, sec_y, 4,
+               COL_ACCENT, TL_DATUM, sec_w);
+    draw_field(fld_date, sizeof(fld_date), date, tft.width() / 2, DATE_Y, 4,
+               COL_DIM, TC_DATUM, 300);
+
+    // Bottom block: three mutually exclusive modes. The AP password and the
+    // auth token are on screen only while the setup AP is actually up — that
+    // screen is their only channel, so nothing else has to carry them.
+    char row1l[32], row1r[32], row2[48];
+    if (ap_active) {
+        // A gesture-raised AP is time-boxed, so say how long it has left.
+        unsigned long mins = ap_minutes_left();
+        if (mins > 0) {
+            snprintf(row1l, sizeof(row1l), "AP %s  %lum", ap_ssid.c_str(), mins);
+        } else {
+            snprintf(row1l, sizeof(row1l), "AP %s", ap_ssid.c_str());
+        }
+        snprintf(row1r, sizeof(row1r), "PW %s", ap_password.c_str());
+        snprintf(row2, sizeof(row2), "TOKEN %s", auth_token.c_str());
+    } else if (connected) {
+        snprintf(row1l, sizeof(row1l), "RSSI %d dBm", (int)WiFi.RSSI());
+        snprintf(row1r, sizeof(row1r), "%s.local", mdns_name.c_str());
+        row2[0] = '\0';
+    } else {
+        snprintf(row1l, sizeof(row1l), "WiFi offline");
+        row1r[0] = '\0';
+        snprintf(row2, sizeof(row2), "hold KEY 3s for setup AP");
+    }
+    draw_field(fld_left, sizeof(fld_left), row1l, 8, ROW1_Y, 2,
+               COL_DIM, TL_DATUM, 150);
+    draw_field(fld_right, sizeof(fld_right), row1r, tft.width() - 8, ROW1_Y, 2,
+               ap_active ? COL_ACCENT : COL_DIM, TR_DATUM, 150);
+    draw_field(fld_note, sizeof(fld_note), row2, tft.width() / 2, ROW2_Y, 2,
+               COL_DIM, TC_DATUM, 304);
+
+    display_force = false;
+}
+
+// Full repaint — only worth doing when the static chrome has to change.
 static void display_status() {
-    tft.fillScreen(TFT_BLACK);
-    tft.setTextFont(4);
-    tft.setTextColor(TFT_GREENYELLOW, TFT_BLACK);
-    tft.setCursor(8, 6);
-    tft.printf("SEED v%s", SEED_VERSION);
-
-    tft.setTextFont(2);
-    tft.setTextColor(TFT_WHITE, TFT_BLACK);
-    tft.setCursor(8, 40);
-    tft.print(hw.board);
-
-    tft.setCursor(8, 60);
-    if (WiFi.status() == WL_CONNECTED) {
-        tft.printf("WiFi  %s  %s", WiFi.SSID().c_str(),
-                   WiFi.localIP().toString().c_str());
-    } else {
-        tft.print("WiFi  not connected");
-    }
-
-    tft.setCursor(8, 78);
-    tft.printf("AP    %s  %s", ap_ssid.c_str(),
-               WiFi.softAPIP().toString().c_str());
-
-    tft.setCursor(8, 96);
-    tft.printf("mDNS  %s.local:%d", mdns_name.c_str(), HTTP_PORT);
-
-    tft.setCursor(8, 114);
-    if (hw.has_battery) {
-        tft.printf("Batt  %.2fV", hw.battery_v);
-        if (hw.battery_soc >= 0) tft.printf("  %d%%", hw.battery_soc);
-    } else {
-        tft.print("Batt  n/a");
-    }
-    tft.printf("   CC1101 %s", hw.has_cc1101 ? "ok" : "-");
-
-    tft.setTextColor(TFT_SKYBLUE, TFT_BLACK);
-    tft.setCursor(8, 140);
-    tft.print("Token");
-    tft.setCursor(8, 154);
-    tft.print(auth_token);
+    tft.fillScreen(COL_BG);
+    tft.setTextPadding(0);
+    tft.setTextDatum(TL_DATUM);
+    tft.setTextColor(COL_DIM, COL_BG);
+    tft.drawString("SEED v" SEED_VERSION, 8, HDR_Y, 2);
+    tft.drawFastHLine(8, 20, tft.width() - 16, COL_RULE);
+    display_force = true;  // the wipe took every field with it
+    display_tick();
 }
 
 // ===== Auth =====
 
+// Call only after wifi_setup(): the token generated on a device's first boot
+// gates /firmware/upload, which is arbitrary code execution, and it is then
+// persisted for the life of the node. esp_random() is only a hardware RNG once
+// the RF subsystem is running — before that it is a PRNG from a predictable
+// seed. The AP password in ap_generate_password() is generated after RF for
+// the same reason. An existing token in SPIFFS is always kept as-is.
 static void token_load() {
     auth_token = read_spiffs_file(TOKEN_FILE);
     auth_token.trim();
@@ -514,15 +716,154 @@ static bool wifi_save_config(const String &ssid, const String &pass) {
     return write_spiffs_file(WIFI_CONFIG_FILE, json);
 }
 
+// ===== Provisioning AP =====
+//
+// The softAP is up only while somebody is actually provisioning the node, and
+// its password is random per raise.
+//
+// It used to run permanently in WIFI_AP_STA with the password hardcoded as a
+// #define in a public repo. Combined with handle_wifi_page(), which hands the
+// auth token to any client on the AP subnet, that gave anyone within radio
+// range of a seed sitting inside the owner's LAN a token — and the token is
+// POST /firmware/upload, i.e. arbitrary code on a box behind the firewall.
+// The other seeds still ship that pattern and need the same treatment.
+
+// How long the user key must be held to raise the AP.
+#define AP_KEY_HOLD_MS 3000
+
+// The AP subnet is pinned rather than left on the ESP-IDF default of
+// 192.168.4.1/24. from_setup_ap() decides "this client came in over the setup
+// AP" by matching the first three octets, so an AP subnet that a STA network
+// might also use turns that test into a false positive reachable from the LAN.
+// 172.31.157.0/24 sits clear of every common consumer-router default
+// (192.168.0/1/2/4/8/10/100.0/24, 10.0.0-1.0/24, 172.16.0.0/24) and of the /20s
+// a default AWS VPC carves out of 172.31.0.0/16.
+#define AP_IP_A 172
+#define AP_IP_B  31
+#define AP_IP_C 157
+#define AP_IP_D   1
+
+// Whether the STA link has been down since the AP came up. The teardown is
+// edge-triggered on that transition, so raising the AP while already online
+// (to move the node to a different network) does not immediately undo itself.
+static bool ap_seen_sta_down = false;
+
+// One session's password. No lookalike glyphs — this gets typed off a 170px
+// screen; 12 chars out of a 32-symbol alphabet is 60 bits.
+static String ap_generate_password() {
+    static const char charset[] = "abcdefghijkmnpqrstuvwxyz23456789";
+    const uint32_t n = sizeof(charset) - 1;
+    char buf[13];
+    for (size_t i = 0; i < sizeof(buf) - 1; i++) {
+        buf[i] = charset[esp_random() % n];
+    }
+    buf[sizeof(buf) - 1] = '\0';
+    return String(buf);
+}
+
+// The responder binds to the interfaces that exist when it starts, so it is
+// restarted whenever the AP interface appears or goes away.
+static void mdns_restart() {
+    MDNS.end();
+    if (MDNS.begin(mdns_name.c_str())) {
+        MDNS.addService("http", "tcp", HTTP_PORT);
+        MDNS.addService("seed", "tcp", HTTP_PORT);
+    }
+}
+
+static void ap_start(bool temporary) {
+    if (ap_active) return;
+    // RF is up by now (wifi_setup() has run), which is what makes esp_random()
+    // a hardware RNG rather than a seeded PRNG — same reason token_load() is
+    // deferred until after wifi_setup().
+    ap_password = ap_generate_password();
+    WiFi.mode(WIFI_AP_STA);
+    // Pin the subnet before the AP comes up. If this ever fails the AP falls
+    // back to the default 192.168.4.1/24; from_setup_ap() reads the live
+    // softAPIP() so it stays self-consistent, just on a collision-prone subnet.
+    if (!WiFi.softAPConfig(IPAddress(AP_IP_A, AP_IP_B, AP_IP_C, AP_IP_D),
+                           IPAddress(AP_IP_A, AP_IP_B, AP_IP_C, AP_IP_D),
+                           IPAddress(255, 255, 255, 0))) {
+        event_add("setup AP: subnet pin failed, using default");
+    }
+    if (!WiFi.softAP(ap_ssid.c_str(), ap_password.c_str())) {
+        ap_password = "";
+        WiFi.mode(WIFI_STA);
+        event_add("setup AP failed to start");
+        return;
+    }
+    ap_active = true;
+    ap_temporary = temporary;
+    ap_expires_at = millis() + AP_SESSION_MS;
+    ap_seen_sta_down = (WiFi.status() != WL_CONNECTED);
+    event_add("setup AP up: %s", ap_ssid.c_str());  // SSID only, never the password
+    mdns_restart();
+    display_force = true;  // the password is only readable off the screen
+}
+
+static void ap_stop() {
+    if (!ap_active) return;
+    WiFi.softAPdisconnect(true);
+    WiFi.mode(WIFI_STA);
+    ap_active = false;
+    ap_password = "";
+    ap_temporary = false;
+    ap_seen_sta_down = false;
+    event_add("setup AP down");
+    mdns_restart();
+    display_force = true;
+}
+
+// Provisioning is finished the moment the STA link comes up, so the AP goes
+// away on its own. Losing WiFi later does NOT bring it back: a node that drops
+// off the network must not silently start offering a way in.
+static void ap_poll() {
+    if (!ap_active) return;
+    if (WiFi.status() != WL_CONNECTED) {
+        ap_seen_sta_down = true;
+    } else if (ap_seen_sta_down) {
+        ap_stop();
+        return;
+    }
+    // Nobody reprovisioned in time: close the window the gesture opened. The
+    // subtraction is rollover-safe as long as it stays in signed arithmetic.
+    if (ap_temporary && (long)(millis() - ap_expires_at) >= 0) {
+        event_add("setup AP expired");
+        ap_stop();
+    }
+}
+
+// The only way to raise the AP after boot: hold the user key for three seconds.
+// Physical presence, not network reachability, is what authorises provisioning,
+// so nothing remote can ask for the AP back. Contact bounce reads as a release
+// and restarts the timer, which is debounce enough for a hold this long.
+static void ap_key_poll() {
+    static unsigned long held_since = 0;
+    static bool fired = false;
+
+    if (digitalRead(PIN_USER_KEY) != LOW) {  // active low
+        held_since = 0;
+        fired = false;
+        return;
+    }
+    if (held_since == 0) held_since = millis();
+    if (fired || millis() - held_since < AP_KEY_HOLD_MS) return;
+    fired = true;
+    if (!ap_active) ap_start(true);  // time-boxed: see AP_SESSION_MS
+}
+
 static void wifi_setup() {
     String suffix = get_mac_suffix();
     ap_ssid = "Seed-" + suffix;
     mdns_name = "seed-" + suffix;
     mdns_name.toLowerCase();
 
-    WiFi.mode(WIFI_AP_STA);
-    WiFi.softAP(ap_ssid.c_str(), AP_PASSWORD);
-    delay(100);
+    WiFi.mode(WIFI_STA);
+
+    // Start SNTP with the stored TZ before associating: the daemon keeps
+    // retrying on its own, so the clock also syncs after a later reconnect
+    // instead of only on a successful boot-time connect.
+    configTzTime(tz_string.c_str(), "pool.ntp.org", "time.nist.gov");
 
     wifi_load_config();
     if (wifi_ssid.length() > 0) {
@@ -532,15 +873,13 @@ static void wifi_setup() {
             delay(500);
             attempts++;
         }
-        if (WiFi.status() == WL_CONNECTED) {
-            configTime(0, 0, "pool.ntp.org", "time.nist.gov");
-        }
     }
 
-    if (MDNS.begin(mdns_name.c_str())) {
-        MDNS.addService("http", "tcp", HTTP_PORT);
-        MDNS.addService("seed", "tcp", HTTP_PORT);
-    }
+    // Nothing to provision if the stored credentials already got us on the
+    // network: in that case the AP is never started at all.
+    if (WiFi.status() != WL_CONNECTED) ap_start(false);
+
+    mdns_restart();
 }
 
 // ===== HTTP Handlers =====
@@ -639,12 +978,18 @@ static void handle_capabilities(AsyncWebServerRequest *request) {
         doc["wifi_ip"] = WiFi.localIP().toString();
         doc["wifi_rssi"] = WiFi.RSSI();
     }
-    doc["ap_ssid"] = ap_ssid;
-    doc["ap_ip"] = WiFi.softAPIP().toString();
+    // Only reported when the AP is genuinely running. The AP password is
+    // deliberately absent: the device screen is its only channel.
+    doc["ap_active"] = ap_active;
+    if (ap_active) {
+        doc["ap_ssid"] = ap_ssid;
+        doc["ap_ip"] = WiFi.softAPIP().toString();
+    }
 
     JsonArray ep = doc["endpoints"].to<JsonArray>();
     const char *eps[] = {
         "/health", "/capabilities", "/config.md", "/events",
+        "/clock", "/clock/tz",
         "/firmware/version", "/firmware/upload", "/firmware/apply",
         "/firmware/confirm", "/firmware/rollback",
         "/skill", NULL
@@ -709,6 +1054,70 @@ static void handle_events(AsyncWebServerRequest *request) {
             e["msg"] = events_buf[idx].message;
         }
     }
+    String response;
+    serializeJson(doc, response);
+    request->send(200, "application/json", response);
+}
+
+// --- Clock ---
+
+static void handle_clock_get(AsyncWebServerRequest *request) {
+    if (!require_auth(request)) return;
+
+    struct tm now;
+    bool synced = clock_local_time(now);
+
+    JsonDocument doc;
+    doc["tz"] = tz_string;
+    doc["synced"] = synced;
+    doc["epoch"] = (unsigned long)time(NULL);
+    if (synced) {
+        char buf[40];
+        strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &now);
+        doc["local_time"] = buf;
+        strftime(buf, sizeof(buf), "%Z", &now);
+        doc["tz_abbrev"] = buf;
+    }
+    String response;
+    serializeJson(doc, response);
+    request->send(200, "application/json", response);
+}
+
+static void handle_clock_tz(AsyncWebServerRequest *request) {
+    char *body = (char*)request->_tempObject;
+    if (!check_auth(request)) {
+        if (body) { free(body); request->_tempObject = nullptr; }
+        request->send(401, "application/json",
+            "{\"error\":\"Authorization: Bearer <token> required\"}");
+        return;
+    }
+    if (!body) {
+        request->send(400, "application/json",
+            "{\"error\":\"body must be a POSIX TZ string\"}");
+        return;
+    }
+    String tz(body);
+    free(body);
+    request->_tempObject = nullptr;
+
+    tz.trim();
+    if (!tz_valid(tz)) {
+        request->send(400, "application/json",
+            "{\"error\":\"invalid TZ: 1-63 printable ASCII chars, no spaces\"}");
+        return;
+    }
+    if (!write_spiffs_file(TZ_FILE, tz)) {
+        request->send(500, "application/json", "{\"error\":\"write failed\"}");
+        return;
+    }
+    tz_string = tz;
+    tz_apply();
+    display_force = true;  // loop() repaints on the next tick
+    event_add("timezone set to %s", tz_string.c_str());
+
+    JsonDocument doc;
+    doc["ok"] = true;
+    doc["tz"] = tz_string;
     String response;
     serializeJson(doc, response);
     request->send(200, "application/json", response);
@@ -800,10 +1209,11 @@ static void handle_firmware_upload_body(AsyncWebServerRequest *request, uint8_t 
 }
 
 static void handle_firmware_upload(AsyncWebServerRequest *request) {
-    if (ota_upload_error && strstr(ota_upload_error_msg, "auth") != NULL) {
-        request->send(401, "application/json", "{\"error\":\"auth required\"}");
-        return;
-    }
+    // The body handler authenticates the upload itself, but a POST with no body
+    // never reaches it and would otherwise report the md5 and size of whatever
+    // was last flashed. Checking here gates every path through, and makes the
+    // body handler's own "auth required" unreachable from this side.
+    if (!require_auth(request)) return;
     if (ota_upload_error) {
         JsonDocument doc;
         doc["error"] = ota_upload_error_msg;
@@ -871,7 +1281,8 @@ static void handle_skill(AsyncWebServerRequest *request) {
     String s = "# ESP32 Seed — LilyGO T-Embed CC1101\n\n";
     s += "Host: " + ip + ":" + String(HTTP_PORT) + "\n";
     s += "mDNS: " + mdns_name + ".local\n";
-    s += "AP: " + ap_ssid + "\n\n";
+    if (ap_active) s += "AP: " + ap_ssid + " (setup mode; password is on the device screen)\n";
+    s += "\n";
     s += "Auth: `Authorization: Bearer <token>` (except /health)\n\n";
     s += "## Grow cycle\n\n";
     s += "ESP32 has no compiler. Build on host, upload binary:\n\n";
@@ -886,7 +1297,12 @@ static void handle_skill(AsyncWebServerRequest *request) {
     s += "- GPIO15 is power hold: drive it HIGH first in setup(), LOW powers off\n";
     s += "- ST7789 display, CC1101 radio and microSD share one SPI bus (SCK=11, MISO=10, MOSI=9)\n";
     s += "- Battery telemetry: BQ27220 fuel gauge at I2C 0x55 (SDA=8, SCL=18), not an ADC\n";
-    s += "- Flashing over USB-Serial/JTAG needs `--after watchdog_reset`\n\n";
+    s += "- Flashing over USB-Serial/JTAG needs `--after watchdog_reset`\n";
+    s += "- The clock runs on UTC until POST /clock/tz stores a POSIX TZ string in SPIFFS\n";
+    s += "- The setup AP is only up during provisioning: hold the user key (GPIO6) 3s to\n";
+    s += "  raise it, with a fresh random password shown on the device screen. A\n";
+    s += "  gesture-raised AP closes itself after 10 minutes if nothing reprovisions\n";
+    s += "- POST /wifi/config needs the token unless the request comes over that AP\n\n";
     s += "## API\n\n";
     s += "| Method | Path | Description |\n";
     s += "|--------|------|-------------|\n";
@@ -895,6 +1311,8 @@ static void handle_skill(AsyncWebServerRequest *request) {
     s += "| GET | /config.md | Node config |\n";
     s += "| POST | /config.md | Update config |\n";
     s += "| GET | /events | Event log |\n";
+    s += "| GET | /clock | Local time, timezone, NTP sync state |\n";
+    s += "| POST | /clock/tz | Set POSIX TZ, raw body e.g. `CET-1CEST,M3.5.0,M10.5.0/3` |\n";
     s += "| GET | /firmware/version | Version |\n";
     s += "| POST | /firmware/upload | Upload .bin |\n";
     s += "| POST | /firmware/apply | Apply + reboot |\n";
@@ -922,6 +1340,25 @@ static void handle_skill(AsyncWebServerRequest *request) {
 
 // --- WiFi config page ---
 
+// True only for a request that arrived over the provisioning AP while that AP
+// is actually up. Both halves matter: once the AP is down softAPIP() is
+// 0.0.0.0 and the subnet test is meaningless, and belonging to some subnet
+// proves nothing on its own. Reaching the node this way costs an attacker
+// physical presence plus the per-boot password shown on the screen, which is
+// why this is the one path allowed to skip the token.
+//
+// The /24 match is only as good as the AP subnet being one no STA network
+// uses: ours is pinned to 172.31.157.0/24 in ap_start() precisely so a LAN
+// client cannot land in it and pass this test while the AP happens to be up.
+static bool from_setup_ap(AsyncWebServerRequest *request) {
+    if (!ap_active) return false;
+    IPAddress client_ip;
+    client_ip.fromString(request->client()->remoteIP().toString());
+    IPAddress ap_ip = WiFi.softAPIP();
+    return client_ip[0] == ap_ip[0] && client_ip[1] == ap_ip[1] &&
+           client_ip[2] == ap_ip[2];
+}
+
 static void handle_wifi_page(AsyncWebServerRequest *request) {
     String html = "<!DOCTYPE html><html><head><meta charset='utf-8'>"
         "<meta name='viewport' content='width=device-width,initial-scale=1'>"
@@ -938,18 +1375,17 @@ static void handle_wifi_page(AsyncWebServerRequest *request) {
         "</form>";
     if (WiFi.status() == WL_CONNECTED)
         html += "<p>Connected: " + WiFi.SSID() + " (" + WiFi.localIP().toString() + ")</p>";
-    // Only show token to clients on the AP subnet (initial setup)
-    IPAddress client_ip;
-    client_ip.fromString(request->client()->remoteIP().toString());
-    IPAddress ap_ip = WiFi.softAPIP();
-    if (client_ip[0] == ap_ip[0] && client_ip[1] == ap_ip[1] && client_ip[2] == ap_ip[2]) {
-        html += "<p>Token: " + auth_token + "</p>";
-    }
+    if (from_setup_ap(request)) html += "<p>Token: " + auth_token + "</p>";
     html += "</body></html>";
     request->send(200, "text/html", html);
 }
 
 static void handle_wifi_post(AsyncWebServerRequest *request) {
+    // Rewriting the credentials moves the node to a different network, so off
+    // the provisioning AP this needs the token like any other mutating call —
+    // otherwise anyone on the LAN could repoint the device at their own AP.
+    if (!from_setup_ap(request) && !require_auth(request)) return;
+
     String ssid = "", pass = "";
     if (request->hasParam("ssid", true)) ssid = request->getParam("ssid", true)->value();
     if (request->hasParam("pass", true)) pass = request->getParam("pass", true)->value();
@@ -983,6 +1419,8 @@ static void setup_routes() {
     server.on("/config.md", HTTP_GET, handle_config_get);
     server.on("/config.md", HTTP_POST, handle_config_post, NULL, handle_body_collect);
     server.on("/events", HTTP_GET, handle_events);
+    server.on("/clock", HTTP_GET, handle_clock_get);
+    server.on("/clock/tz", HTTP_POST, handle_clock_tz, NULL, handle_body_collect);
     server.on("/firmware/version", HTTP_GET, handle_firmware_version);
     server.on("/firmware/upload", HTTP_POST, handle_firmware_upload, NULL, handle_firmware_upload_body);
     server.on("/firmware/apply", HTTP_POST, handle_firmware_apply);
@@ -1013,6 +1451,9 @@ void setup() {
     pinMode(PIN_SD_CS, OUTPUT);
     digitalWrite(PIN_SD_CS, HIGH);
 
+    // Read-only: the hold-to-raise-AP gesture is the only user of this pin.
+    pinMode(PIN_USER_KEY, INPUT_PULLUP);
+
     Serial.begin(115200);
     delay(500);
     boot_time = millis();
@@ -1023,8 +1464,9 @@ void setup() {
 
     hw_probe();       // I2C + CC1101 probe (before the display claims the SPI bus)
     display_init();
-    token_load();
+    tz_load();        // before wifi_setup(): configTzTime() needs the TZ string
     wifi_setup();
+    token_load();     // after wifi_setup(): needs RF up for a real RNG
     skills_init();
     setup_routes();
     server.begin();
@@ -1034,8 +1476,11 @@ void setup() {
     Serial.printf("Token: %s\n", auth_token.c_str());
     if (WiFi.status() == WL_CONNECTED)
         Serial.printf("http://%s:%d/health\n", WiFi.localIP().toString().c_str(), HTTP_PORT);
-    Serial.printf("http://%s:%d/health  (AP: %s)\n",
-        WiFi.softAPIP().toString().c_str(), HTTP_PORT, ap_ssid.c_str());
+    if (ap_active) {
+        // Password intentionally not printed: it lives on the screen only.
+        Serial.printf("http://%s:%d/health  (setup AP: %s)\n",
+            WiFi.softAPIP().toString().c_str(), HTTP_PORT, ap_ssid.c_str());
+    }
 
     event_add("seed started v%s", SEED_VERSION);
 }
@@ -1066,16 +1511,31 @@ void loop() {
         last_wifi = millis();
     }
 
-    // Redraw the status screen when connectivity changes
+    // Retire the provisioning AP once it has done its job, and watch the user
+    // key for the gesture that brings it back. Both polls are non-blocking.
+    ap_poll();
+    ap_key_poll();
+
+    // Clock tick: at most once a second, and each field only repaints when its
+    // text actually changed. The screen is only wiped when connectivity flips.
     static wl_status_t last_status = WL_NO_SHIELD;
-    static unsigned long last_draw_check = 0;
-    if (millis() - last_draw_check > 1000) {
-        last_draw_check = millis();
+    static unsigned long last_tick = 0;
+    if (display_force || millis() - last_tick >= 1000) {
+        last_tick = millis();
         wl_status_t st = WiFi.status();
         if (st != last_status) {
             last_status = st;
             display_status();
+        } else {
+            display_tick();
         }
+    }
+
+    // Keep the fuel gauge reading current — probe_battery() only ran at boot.
+    static unsigned long last_battery = 0;
+    if (millis() - last_battery > 60000) {
+        last_battery = millis();
+        battery_refresh();
     }
 
     delay(10);
