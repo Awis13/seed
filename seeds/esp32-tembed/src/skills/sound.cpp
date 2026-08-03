@@ -218,9 +218,11 @@
    96k; they are refused because the DMA cushion below is a fixed frame count,
    so its duration halves as the rate doubles, and a notification cue has
    nothing to gain from either. */
+/* host-test:begin rates — sliced out by tools/test_wav_parse.sh */
 static const uint32_t snd_rates_ok[] = {8000, 16000, 32000, 44100, 48000};
 static const int snd_rates_ok_count =
     (int)(sizeof(snd_rates_ok) / sizeof(snd_rates_ok[0]));
+/* host-test:end */
 
 /* --- DMA ---
  *
@@ -280,7 +282,12 @@ static const int snd_rates_ok_count =
 #define SND_CFG_TMP   "/sound.tmp"
 #define SND_CFG_DELAY_MS 1500
 
-#define SND_VOL_DEFAULT 60
+/* Maximum by default, at the owner's request. Only the compiled fallback: a
+   device with /sound.json on it keeps whatever is stored there, and this is
+   what a fresh flash or a wiped filesystem comes up with. Coming up quiet is
+   the worse failure for a pager — an unheard cue looks identical to a broken
+   amplifier, and the volume is a single API call away either way. */
+#define SND_VOL_DEFAULT 100
 
 /* --- State --- */
 
@@ -509,6 +516,11 @@ static void snd_up_abandon() {
  * speed or cuts off mid-word is worse than one that never uploaded, because
  * only the second kind gets noticed. */
 
+/* Everything between the marker below and the matching end marker is compiled
+   verbatim on the host by tools/test_wav_parse.sh, so the regression test runs
+   against this code rather than a copy of it that could drift. Keep the two
+   markers on lines of their own. */
+/* host-test:begin wav */
 struct SndWav {
     uint32_t rate;
     uint32_t data_off;
@@ -573,14 +585,44 @@ static bool snd_wav_parse(const uint8_t *p, size_t n, SndWav &out,
             return true;
         }
 
-        /* RIFF chunks are padded to an even length. */
-        at = body + size + (size & 1);
+        /* Advance past this chunk, padded to an even length as RIFF requires.
+         *
+         * Computed in 64 bits and required to move strictly forward, and both
+         * halves of that are the fix for a hang rather than tidiness. `size`
+         * is 32 bits of attacker-controlled input and size_t is 32 bits on
+         * this chip, so the obvious `at = body + size + (size & 1)` is modular
+         * arithmetic on hostile data. Exactly two values satisfy
+         * 8 + size + (size & 1) == 0 (mod 2^32) — 0xFFFFFFF8, which is even,
+         * and 0xFFFFFFF7, which is odd and picks up the pad byte — and either
+         * one leaves `at` exactly where it was while `at + 8 <= n` stays true.
+         * That is an unbreakable loop, and a whole range of other values moves
+         * `at` backwards, which can cycle between two offsets just as
+         * permanently.
+         *
+         * It mattered because of where this runs. snd_upload_body() calls this
+         * on the AsyncTCP task, so a single ~20-byte POST /sound/upload whose
+         * first chunk is neither `fmt ` nor `data` would spin the web server
+         * forever: no notifications, no API, no OTA, nothing but a power
+         * cycle. snd_open_file() calls it on the loop task, which would take
+         * the screen, the IR machine and the ring with it.
+         *
+         * In 64 bits the sum cannot wrap, so `next` is always at least at + 8.
+         * The check below is therefore an assertion rather than a filter, and
+         * it is kept because it is what makes the guarantee local: this loop
+         * terminates because `at` strictly increases towards `n`, and that is
+         * true by inspection of these four lines rather than by reasoning
+         * about every value `size` can take. */
+        uint64_t next = (uint64_t)body + (uint64_t)size + (uint64_t)(size & 1);
+        if (next <= (uint64_t)at) { *err = "malformed chunk size"; return false; }
+        if (next > (uint64_t)n) break;   /* runs past the scan window */
+        at = (size_t)next;
     }
 
     *err = have_fmt ? "no data chunk within the first 256 bytes"
                     : "no fmt chunk within the first 256 bytes";
     return false;
 }
+/* host-test:end */
 
 /* --- Source: file --- */
 
@@ -1056,7 +1098,12 @@ static void snd_poll() {
        Update.abort() makes in loop() — and it is only taken once the transfer
        has been silent for thirty seconds, by which point there is no handler
        to race. */
-    if (snd_up_active && millis() - snd_up_last_ms > SND_UPLOAD_STALL_MS) {
+    /* Signed for the same reason as the playback watchdog below. The window is
+       far narrower here — millis() is read fresh and snd_up_last_ms is stamped
+       on the web-server task — but a preemption between those two instructions
+       would abandon a healthy upload for nothing, and the file now documents
+       this idiom as the one to use. */
+    if (snd_up_active && (long)(millis() - snd_up_last_ms) > (long)SND_UPLOAD_STALL_MS) {
         snd_up_error = true;
         snprintf(snd_up_msg, sizeof(snd_up_msg), "upload abandoned after %us without data",
                  (unsigned)(SND_UPLOAD_STALL_MS / 1000));

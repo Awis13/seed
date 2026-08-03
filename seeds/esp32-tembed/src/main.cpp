@@ -59,7 +59,7 @@
 #include <TFT_eSPI.h>
 
 // ===== Configuration =====
-#define SEED_VERSION        "0.6.1"
+#define SEED_VERSION        "0.6.2"
 #define HTTP_PORT           8080
 #define TOKEN_FILE          "/auth_token.txt"
 #define WIFI_CONFIG_FILE    "/wifi.json"
@@ -1753,7 +1753,14 @@ void loop() {
     // genuinely dead upload frees the flash long before anyone retries by
     // hand. A healthy upload puts chunks milliseconds apart and never comes
     // near it.
-    if (ota_in_progress && millis() - ota_last_chunk_ms > OTA_STALL_TIMEOUT_MS) {
+    // Signed, because ota_last_chunk_ms is stamped by handle_firmware_upload_body()
+    // on the AsyncTCP task while this runs on the loop task. A chunk landing
+    // between the millis() read here and the subtraction makes the stamp newer
+    // than the reading, and in unsigned arithmetic those few milliseconds become
+    // about 4.29 billion — clearing the timeout instantly and aborting a healthy
+    // firmware upload. Found by sweeping for the pattern that cost 0.6.0 its
+    // audio; same shape, worse consequence.
+    if (ota_in_progress && (long)(millis() - ota_last_chunk_ms) > (long)OTA_STALL_TIMEOUT_MS) {
         Update.abort();
         ota_in_progress = false;
         ota_upload_started = false;

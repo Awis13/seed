@@ -314,10 +314,31 @@ static bool ring_night_now() {
 
 /* --- Effect triggers (called from loop(), ui.h and the endpoints) --- */
 
-static void ring_fire(uint8_t fx, uint8_t level) {
+/*
+ * Start a one-shot overlay, stamped with the caller's own clock reading.
+ *
+ * `now` is a parameter rather than a millis() call for the same reason
+ * ring_compose() takes one: ring_poll() samples the time once and every
+ * decision in that pass has to be made against that one sample. Stamping here
+ * with a fresh millis() made ring_fx_start LATER than the `now` the retirement
+ * checks below compare it to, and `now - ring_fx_start` is unsigned — so a
+ * single millisecond of drift underflowed to about 4.29 billion, cleared
+ * RING_COMET_MS instantly and cancelled the arrival comet on the very pass it
+ * was fired. ring_cfg_save() sits between the two in ring_poll() and is a
+ * SPIFFS write of several milliseconds, so any pass where a deferred settings
+ * save met an arrival lost its comet outright; without a save it was a
+ * millisecond race that silently dropped a fraction of them.
+ *
+ * The endpoint calls this from the web-server task, where there is no such
+ * sample and millis() is the only honest answer — which is why the comparisons
+ * are also signed. A stamp from that task can still land after ring_poll()
+ * read its clock, and signed arithmetic reads that as a small negative age
+ * rather than an enormous positive one.
+ */
+static void ring_fire(uint8_t fx, uint8_t level, unsigned long now) {
     ring_fx = fx;
     ring_fx_level = level;
-    ring_fx_start = millis();
+    ring_fx_start = now;
 }
 
 static void ring_knob(int steps) {
@@ -388,7 +409,13 @@ static void ring_compose(uint8_t frame[RING_LEDS][3], unsigned long now) {
     }
 
     if (ring_fx == RING_FX_COMET) {
+        /* Clamped rather than trusted: the endpoint can stamp ring_fx_start
+           from the web-server task after this pass sampled `now`, and an
+           unsigned difference would turn those few milliseconds into an
+           enormous elapsed time. The modulo below bounds the damage to a wrong
+           pixel, but a comet that starts at zero is the correct answer. */
         unsigned long el = now - ring_fx_start;
+        if ((long)el < 0) el = 0;
         int head = (int)(el * RING_LEDS / RING_COMET_MS);
         const RingColor &c = ring_level_color(ring_fx_level);
         /* Head at full, then a tail that falls away behind it. The tail is what
@@ -403,7 +430,8 @@ static void ring_compose(uint8_t frame[RING_LEDS][3], unsigned long now) {
     }
 
     if (ring_fx == RING_FX_WIPE) {
-        unsigned long el = now - ring_fx_start;
+        unsigned long el = now - ring_fx_start;   /* see the comet above */
+        if ((long)el < 0) el = 0;
         unsigned long fill_ms = RING_WIPE_MS - RING_WIPE_FADE_MS;
         int lit = (int)(el * RING_LEDS / fill_ms);
         if (lit > RING_LEDS) lit = RING_LEDS;
@@ -513,7 +541,11 @@ static const char *ring_effect_name() {
     if (!ring_ready) return "unavailable";
     if (!ring_enabled) return "disabled";
     if (ring_night_now()) return "night";
-    if (millis() - ring_knob_at < RING_KNOB_HOLD_MS) return "knob";
+    /* Signed: this one reports on the web-server task while ring_knob() stamps
+       on the loop task, so the stamp can be newer than the reading. Unsigned,
+       that underflowed and reported anything but "knob" during the one
+       response where the knob had just moved. */
+    if ((long)(millis() - ring_knob_at) < (long)RING_KNOB_HOLD_MS) return "knob";
     if (ring_test == RING_TEST_LEVELS) return "test-levels";
     if (ring_test == RING_TEST_BREATHE) return "test-breathe";
     if (ring_fx == RING_FX_COMET) return "comet";
@@ -545,12 +577,15 @@ static void ring_poll() {
        standing would show it a moment later, on top of whatever came next. */
     uint8_t level;
     bool acked = notify_take_ring_ack();
-    if (notify_take_ring_arrival(&level)) ring_fire(RING_FX_COMET, level);
-    else if (acked) ring_fire(RING_FX_WIPE, NOTIFY_INFO);
+    if (notify_take_ring_arrival(&level)) ring_fire(RING_FX_COMET, level, now);
+    else if (acked) ring_fire(RING_FX_WIPE, NOTIFY_INFO, now);
 
-    if (ring_fx == RING_FX_COMET && now - ring_fx_start >= RING_COMET_MS)
+    /* Signed, so an effect fired from the web-server task after this pass read
+       its clock reads as not-yet-started instead of as 4.29 billion
+       milliseconds old. See ring_fire(). */
+    if (ring_fx == RING_FX_COMET && (long)(now - ring_fx_start) >= (long)RING_COMET_MS)
         ring_fx = RING_FX_NONE;
-    if (ring_fx == RING_FX_WIPE && now - ring_fx_start >= RING_WIPE_MS)
+    if (ring_fx == RING_FX_WIPE && (long)(now - ring_fx_start) >= (long)RING_WIPE_MS)
         ring_fx = RING_FX_NONE;
     if (ring_test != RING_TEST_NONE && (long)(now - ring_test_until) >= 0)
         ring_test = RING_TEST_NONE;
@@ -842,10 +877,13 @@ static void ring_register_routes(AsyncWebServer &server) {
             ring_test_until = millis() + (unsigned long)seconds * 1000UL;
         } else if (strcmp(effect, "comet") == 0) {
             ring_test = RING_TEST_NONE;
-            ring_fire(RING_FX_COMET, level);
+            /* millis() here, not a shared sample: this runs on the web-server
+               task, which has no frame of its own. ring_poll()'s comparisons
+               are signed precisely so this stamp may be newer than theirs. */
+            ring_fire(RING_FX_COMET, level, millis());
         } else if (strcmp(effect, "wipe") == 0) {
             ring_test = RING_TEST_NONE;
-            ring_fire(RING_FX_WIPE, NOTIFY_INFO);
+            ring_fire(RING_FX_WIPE, NOTIFY_INFO, millis());
         } else {
             notify_send_error(req, 400,
                               "effect must be levels, breathe, comet, wipe or off");
