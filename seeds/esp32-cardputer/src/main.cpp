@@ -27,9 +27,16 @@
 //   - There is no power-latch pin to hold. The T-Embed seed drives GPIO15 HIGH
 //     first thing in setup() to stay alive on battery; on this board GPIO15 is
 //     an expansion-header UART line, and doing that would be actively wrong.
-//   - No sub-GHz radio and no fuel gauge on the mainboard: the CC1101 and
-//     BQ27220 probes the T-Embed seed runs have nothing to find here. Battery
-//     voltage is an ADC on GPIO10, left unread until its divider is verified.
+//   - No sub-GHz radio. The CC1101 probe the T-Embed seed runs has nothing to
+//     find on this mainboard.
+//   - No fuel gauge. The T-Embed's BQ27220 computes a charge percentage and
+//     hands it over I2C, which is what its status screen displays; there is no
+//     such chip here, so there is no percentage to display.
+//   - There IS a battery. It is sensed as a plain voltage divider on the ADC at
+//     GPIO10, and it is left unread because the divider ratio is documented
+//     nowhere: a guessed ratio would put a fabricated voltage in /capabilities,
+//     which states the pin number and stops there. Settling the ratio takes a
+//     meter across the cell, not a code change.
 //   - The mainboard I2C bus carries exactly three devices — the keyboard
 //     controller, the audio codec and the IMU — so it is scanned and reported
 //     but never reconfigured. A fourth address answering, 0x43, means a
