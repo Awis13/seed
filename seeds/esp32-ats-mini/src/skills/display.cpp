@@ -108,6 +108,110 @@ static uint8_t display_mode = DISPLAY_STATUS;
 /* Screen geometry after setRotation(3): 320 wide x 170 tall, so X centre = 160. */
 #define DISPLAY_CX 160
 
+/*
+ * --- Colour themes ---
+ *
+ * Every colour the status/menu/AP/custom screens paint is pulled from one active
+ * theme instead of hard-coded literals, so the whole palette can be swapped at
+ * runtime. A theme is 11 roles (plus a name); the ~47-slot reference palette is
+ * collapsed onto these roles:
+ *
+ *   bg           screen background (fillScreen + every text background box)
+ *   text         primary text (freq unit, signal line, menu title/rows)
+ *   muted        secondary text (wall clock, "TOKEN" label)
+ *   accent       menu frame / divider / selection bar, AP "AP:" label (was CYAN)
+ *   freq_hl      the encoder-target frequency/volume, drawn bright
+ *   freq_dim     the non-target frequency/volume, drawn dim
+ *   band         band label across the top
+ *   rds          decoded RDS station name (FM)
+ *   unit         frequency unit ("MHz"/"kHz")
+ *   signal       the mode/RSSI/SNR status line
+ *   menu_hl_text text of the highlighted menu row, drawn on the accent bar
+ *
+ * Theme 0 "Default" reproduces the exact pre-theme literals (black bg, white text,
+ * cyan accent, yellow band, dark-grey dim) so the default look is a byte-for-byte
+ * match — no visual regression. The other eight take their RGB565 values from the
+ * reference ats-mini palette (colour values are not copyrightable; the structure
+ * and the 47->11 mapping here are ours).
+ *
+ * The table is `static const ... PROGMEM` so it lives in flash, never IRAM/DRAM;
+ * theme_load() copies the active row out with memcpy_P before a repaint reads it.
+ */
+struct ColorTheme {
+    const char *name;
+    uint16_t bg, text, muted, accent;   /* accent = former CYAN (menu highlight / border) */
+    uint16_t freq_hl, freq_dim;         /* encoder-target active / dim */
+    uint16_t band, rds, unit, signal;   /* band label / RDS name / freq unit / signal line */
+    uint16_t menu_hl_text;              /* text on the accent selection bar */
+};
+
+static const ColorTheme themes[9] PROGMEM = {
+    /* name        bg      text    muted   accent  freq_hl freq_dim band    rds     unit    signal  menu_hl_text */
+    {"Default",  0x0000, 0xFFFF, 0x7BEF, 0x07FF, 0x07FF, 0x7BEF, 0xFFE0, 0xFFE0, 0xFFFF, 0xFFFF, 0x0000},
+    {"Bluesky",  0x2293, 0xFFFF, 0xD69A, 0xF800, 0xF800, 0xD69A, 0xD69A, 0xD69A, 0xFFFF, 0xFFFF, 0x2293},
+    {"eInk",     0xC616, 0x3A08, 0x632C, 0x3A08, 0x0000, 0x632C, 0x3A08, 0x632C, 0x3A08, 0x3A08, 0xC616},
+    {"Pager",    0x4309, 0x00C2, 0x1165, 0x00C2, 0x0000, 0x1165, 0x00C2, 0x1165, 0x00C2, 0x00C2, 0x4309},
+    {"Orange",   0xF3C1, 0x18C3, 0x2945, 0x18C3, 0x0000, 0x2945, 0x18C3, 0x2945, 0x18C3, 0x18C3, 0xF3C1},
+    {"Night",    0x0000, 0xD986, 0xB925, 0xF800, 0xF800, 0xB925, 0xB925, 0xB925, 0xD986, 0xD986, 0x0000},
+    {"Phosphor", 0x0060, 0x07AD, 0x052D, 0x2364, 0x5CF2, 0x052D, 0x052D, 0x052D, 0x07AD, 0x07AD, 0x07AD},
+    {"Space",    0x0004, 0x3FE0, 0xD69A, 0xF800, 0xF800, 0xD69A, 0xD69A, 0xD69A, 0x3FE0, 0x3FE0, 0xBEDF},
+    {"Magenta",  0xA12B, 0xFFFF, 0xFD95, 0x5005, 0x5005, 0xFD95, 0xC638, 0xFD95, 0xFFFF, 0xFFFF, 0xBEDF},
+};
+#define THEME_COUNT ((uint8_t)(sizeof(themes) / sizeof(themes[0])))
+
+/* Active theme index. Written only under display_mtx (display_set_theme); read in the
+ * draw path (also under display_mtx) and, as a lone atomic byte, by display_get_theme. */
+static uint8_t theme_idx = 0;
+
+/* Set by display_set_theme, consumed by display_tick_render: forces one repaint of the
+ * live screen so a theme change is visible immediately, bypassing the change-detector.
+ * Guarded by display_mtx. */
+static bool force_redraw = false;
+
+/* Copy the active theme row out of PROGMEM. Caller holds display_mtx (or is single-
+ * tasked at boot), the same contract as the draw helpers. The index is clamped so a
+ * bad value degrades to Default rather than reading past the table. */
+static void theme_load(ColorTheme *t) {
+    uint8_t i = theme_idx;
+    if (i >= THEME_COUNT) i = 0;
+    memcpy_P(t, &themes[i], sizeof(*t));
+}
+
+/* --- Theme accessors (non-static: forward-declared in radio.cpp for persist) --- */
+
+/*
+ * Select a theme by index (clamped to the table). Takes display_mtx and forces a
+ * repaint of the live screen on the next tick, so the switch is instant.
+ *
+ * Callable before skill_display_init() has created display_mtx: radio_restore_state()
+ * invokes this at boot to reapply the saved theme while the display is still single-
+ * tasked and unpainted. In that case there is no mutex to take and nothing on screen —
+ * just store the index; the boot paint in skill_display_init() picks it up.
+ */
+void display_set_theme(uint8_t idx) {
+    if (idx >= THEME_COUNT) idx = 0;
+    bool locked = (display_mtx != nullptr);
+    if (locked) xSemaphoreTake(display_mtx, portMAX_DELAY);
+    theme_idx = idx;
+    force_redraw = true;
+    if (locked) xSemaphoreGive(display_mtx);
+}
+
+/* Current theme index. A lone byte written only under display_mtx — the read is atomic,
+ * so no lock is taken (and none may be, this is called off the radio persist path). */
+uint8_t display_get_theme() { return theme_idx; }
+
+/* Number of themes in the table (for menu/UI bounds and the persist range check). */
+uint8_t display_theme_count() { return THEME_COUNT; }
+
+/* Display name of theme i (for the menu / UI in C2); empty string if out of range. */
+const char *display_theme_name(uint8_t i) {
+    if (i >= THEME_COUNT) return "";
+    ColorTheme t;
+    memcpy_P(&t, &themes[i], sizeof(t));
+    return t.name;  /* points at a flash string literal — valid after t goes out of scope */
+}
+
 /* --- Endpoints --- */
 static const SkillEndpoint display_endpoints[] = {
     {"POST", "/display", "Show custom text: {text, line?}"},
@@ -193,16 +297,17 @@ static void draw_radio_screen(const char *band, const char *mode, uint16_t freq,
                               uint8_t rssi, uint8_t snr, uint8_t volume,
                               uint8_t target, const char *rds_ps, bool rds_show,
                               const char *hhmm) {
+    ColorTheme t; theme_load(&t);
     uint16_t freq_color =
-        (target == DISPLAY_TUNE_FREQ) ? TFT_CYAN : TFT_DARKGREY;
+        (target == DISPLAY_TUNE_FREQ) ? t.freq_hl : t.freq_dim;
     uint16_t vol_color =
-        (target == DISPLAY_TUNE_VOLUME) ? TFT_CYAN : TFT_DARKGREY;
+        (target == DISPLAY_TUNE_VOLUME) ? t.freq_hl : t.freq_dim;
 
-    gfx->fillScreen(TFT_BLACK);
+    gfx->fillScreen(t.bg);
     gfx->setTextDatum(MC_DATUM);
 
     /* Current band name across the top, above the frequency. */
-    gfx->setTextColor(TFT_YELLOW, TFT_BLACK);
+    gfx->setTextColor(t.band, t.bg);
     gfx->drawString(band, DISPLAY_CX, 10, 2);
 
     /* NTP wall clock in the free right-top corner. The band name is centred on
@@ -211,7 +316,7 @@ static void draw_radio_screen(const char *band, const char *mode, uint16_t freq,
      * drawn dim grey so it never competes with the big frequency. Shown on every
      * mode (time is mode-independent, unlike the FM-only RDS row). The datum is
      * restored to MC_DATUM right after so the rows below still centre correctly. */
-    gfx->setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+    gfx->setTextColor(t.muted, t.bg);
     gfx->setTextDatum(TR_DATUM);
     gfx->drawString(hhmm, 318, 4, 2);
     gfx->setTextDatum(MC_DATUM);
@@ -227,9 +332,9 @@ static void draw_radio_screen(const char *band, const char *mode, uint16_t freq,
         snprintf(freq_str, sizeof(freq_str), "%u", (unsigned)freq);
         unit = "kHz";
     }
-    gfx->setTextColor(freq_color, TFT_BLACK);
+    gfx->setTextColor(freq_color, t.bg);
     gfx->drawString(freq_str, DISPLAY_CX, 48, 7);
-    gfx->setTextColor(TFT_WHITE, TFT_BLACK);
+    gfx->setTextColor(t.unit, t.bg);
     gfx->drawString(unit, DISPLAY_CX, 90, 4);
 
     /* RDS station name (FM only): the decoded PS name in yellow, in the narrow row
@@ -237,7 +342,7 @@ static void draw_radio_screen(const char *band, const char *mode, uint16_t freq,
      * name to show (FM + valid RDS + non-empty PS); on AM/SSB or before any RDS is
      * decoded rds_show is false and this row stays blank. 8 chars fit — no trunc. */
     if (rds_show && rds_ps && rds_ps[0]) {
-        gfx->setTextColor(TFT_YELLOW, TFT_BLACK);
+        gfx->setTextColor(t.rds, t.bg);
         gfx->drawString(rds_ps, DISPLAY_CX, 106, 2);
     }
 
@@ -245,13 +350,13 @@ static void draw_radio_screen(const char *band, const char *mode, uint16_t freq,
     char status_line[48];
     snprintf(status_line, sizeof(status_line),
              "%s   %u dBuV  S/N %u", mode, (unsigned)rssi, (unsigned)snr);
-    gfx->setTextColor(TFT_WHITE, TFT_BLACK);
+    gfx->setTextColor(t.signal, t.bg);
     gfx->drawString(status_line, DISPLAY_CX, 120, 2);
 
     /* Volume at the foot, highlighted when it is the encoder's target. */
     char vol_line[24];
     snprintf(vol_line, sizeof(vol_line), "VOL %u", (unsigned)volume);
-    gfx->setTextColor(vol_color, TFT_BLACK);
+    gfx->setTextColor(vol_color, t.bg);
     gfx->drawString(vol_line, DISPLAY_CX, 150, 4);
 }
 
@@ -267,37 +372,39 @@ static void draw_radio_screen(const char *band, const char *mode, uint16_t freq,
  * is left at MC_DATUM (the shared repaint default) on the way out.
  */
 static void draw_menu_screen(const char *title, int idx) {
-    gfx->fillScreen(TFT_BLACK);
+    ColorTheme t; theme_load(&t);
+    gfx->fillScreen(t.bg);
 
-    /* Bordered panel: a filled cyan roundrect with a black roundrect inset one
-     * pixel, giving a 1 px cyan frame around the black menu body. */
-    gfx->fillSmoothRoundRect(1, 19, 86, 110, 4, TFT_CYAN, TFT_BLACK);
-    gfx->fillSmoothRoundRect(2, 20, 84, 108, 4, TFT_BLACK, TFT_BLACK);
+    /* Bordered panel: a filled accent roundrect with a bg roundrect inset one pixel,
+     * giving a 1 px accent frame around the menu body. The inset (and the outer AA
+     * edges) blend against t.bg so light themes show no black halo. */
+    gfx->fillSmoothRoundRect(1, 19, 86, 110, 4, t.accent, t.bg);
+    gfx->fillSmoothRoundRect(2, 20, 84, 108, 4, t.bg, t.bg);
 
     /* Title, centred in the panel, with a divider line under it. */
     gfx->setTextDatum(MC_DATUM);
-    gfx->setTextColor(TFT_WHITE, TFT_BLACK);
+    gfx->setTextColor(t.text, t.bg);
     gfx->drawString(title, 45, 30, 2);
-    gfx->drawLine(1, 41, 86, 41, TFT_CYAN);
+    gfx->drawLine(1, 41, 86, 41, t.accent);
 
     /* Selection bar behind the centre row. */
-    gfx->fillRoundRect(6, 74, 76, 16, 2, TFT_CYAN);
+    gfx->fillRoundRect(6, 74, 76, 16, 2, t.accent);
 
     /* Five rows, i=-2..+2, 16 px apart around the cursor. The middle one is the
-     * highlighted selection (dark text on the cyan bar); the rest are plain. */
+     * highlighted selection (menu_hl_text on the accent bar); the rest are plain. */
     for (int i = -2; i <= 2; i++) {
         const char *item = radio_get_menu_item(idx + i);
         int y = 82 + i * 16;
         if (i == 0) {
-            gfx->setTextColor(TFT_BLACK, TFT_CYAN);
+            gfx->setTextColor(t.menu_hl_text, t.accent);
         } else {
-            gfx->setTextColor(TFT_WHITE, TFT_BLACK);
+            gfx->setTextColor(t.text, t.bg);
         }
         gfx->drawString(item, 45, y, 2);
     }
 
     /* Restore the shared repaint colour default; datum stays MC_DATUM. */
-    gfx->setTextColor(TFT_WHITE, TFT_BLACK);
+    gfx->setTextColor(t.text, t.bg);
 }
 
 /*
@@ -417,10 +524,13 @@ void display_tick_render() {
                      prev_mode != nullptr && strcmp(mode, prev_mode) == 0 &&
                      strcmp(shown_ps, prev_rds_ps) == 0 &&
                      strcmp(hhmm, prev_hhmm) == 0;
-    if (unchanged && (now - last_push_ms) < DISPLAY_MAX_IDLE_MS) {
+    /* force_redraw (set by display_set_theme) bypasses the change-detector so a theme
+     * switch repaints the live screen at once, even when no radio field moved. */
+    if (unchanged && !force_redraw && (now - last_push_ms) < DISPLAY_MAX_IDLE_MS) {
         xSemaphoreGive(display_mtx);
         return;
     }
+    force_redraw = false;
     prev_freq = freq;
     prev_rssi = rssi;
     prev_snr = snr;
@@ -455,23 +565,24 @@ void display_tick_render() {
  * Non-static: forward-declared in main.cpp, called from skill_display_init().
  */
 void display_show_ap(const char *ssid, const char *pass, const char *token) {
-    gfx->fillScreen(TFT_BLACK);
+    ColorTheme t; theme_load(&t);
+    gfx->fillScreen(t.bg);
     gfx->setTextDatum(MC_DATUM);
 
     char line[64];
 
-    gfx->setTextColor(TFT_CYAN, TFT_BLACK);
+    gfx->setTextColor(t.accent, t.bg);
     snprintf(line, sizeof(line), "AP: %s", ssid);
     gfx->drawString(line, DISPLAY_CX, 30, 4);
 
-    gfx->setTextColor(TFT_YELLOW, TFT_BLACK);
+    gfx->setTextColor(t.band, t.bg);
     snprintf(line, sizeof(line), "PW: %s", pass);
     gfx->drawString(line, DISPLAY_CX, 70, 4);
 
     /* Token in a small font: 32 hex chars is too wide for font 4. */
-    gfx->setTextColor(TFT_DARKGREY, TFT_BLACK);
+    gfx->setTextColor(t.muted, t.bg);
     gfx->drawString("TOKEN", DISPLAY_CX, 108, 2);
-    gfx->setTextColor(TFT_WHITE, TFT_BLACK);
+    gfx->setTextColor(t.text, t.bg);
     gfx->drawString(token, DISPLAY_CX, 130, 2);
     display_flush();
 }
@@ -565,8 +676,9 @@ static void display_register_routes(AsyncWebServer &server) {
          * with a tick-driven status repaint on loopTask. */
         xSemaphoreTake(display_mtx, portMAX_DELAY);
         display_mode = DISPLAY_CUSTOM;
-        gfx->fillScreen(TFT_BLACK);
-        gfx->setTextColor(TFT_WHITE, TFT_BLACK);
+        ColorTheme t; theme_load(&t);
+        gfx->fillScreen(t.bg);
+        gfx->setTextColor(t.text, t.bg);
         gfx->setTextDatum(MC_DATUM);
         /* line shifts vertically from centre: 30 px per row. */
         int y = 85 + line * 30;
