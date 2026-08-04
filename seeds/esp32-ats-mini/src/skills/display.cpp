@@ -28,6 +28,7 @@
 /* Accessors defined in radio.cpp (included just before this file). */
 uint16_t radio_get_freq();
 const char *radio_get_mode_str();
+const char *radio_get_band_name();
 uint8_t radio_get_rssi();
 uint8_t radio_get_volume();
 uint8_t radio_get_tune_target();
@@ -138,6 +139,7 @@ static const char *display_describe() {
  * drift into overlapping rows. Rows use MC_DATUM (y = vertical centre) on the
  * 170 px-tall panel and are spaced so no two glyph boxes touch:
  *
+ *   band    FONT2  y= 10  (~16 px tall ->  2..18, clears the freq box)
  *   freq    FONT7  y= 48  (~48 px tall -> 24..72)
  *   unit    FONT4  y= 90  (~26 px tall -> 77..103)
  *   signal  FONT2  y=120  (~16 px tall -> 112..128)
@@ -148,8 +150,9 @@ static const char *display_describe() {
  *
  * Draw-only helper: the caller owns display_mtx, display_mode and the flush/push.
  */
-static void draw_radio_screen(const char *mode, uint16_t freq, uint8_t rssi,
-                              uint8_t snr, uint8_t volume, uint8_t target) {
+static void draw_radio_screen(const char *band, const char *mode, uint16_t freq,
+                              uint8_t rssi, uint8_t snr, uint8_t volume,
+                              uint8_t target) {
     uint16_t freq_color =
         (target == DISPLAY_TUNE_FREQ) ? TFT_CYAN : TFT_DARKGREY;
     uint16_t vol_color =
@@ -157,6 +160,10 @@ static void draw_radio_screen(const char *mode, uint16_t freq, uint8_t rssi,
 
     gfx->fillScreen(TFT_BLACK);
     gfx->setTextDatum(MC_DATUM);
+
+    /* Current band name across the top, above the frequency. */
+    gfx->setTextColor(TFT_YELLOW, TFT_BLACK);
+    gfx->drawString(band, DISPLAY_CX, 10, 2);
 
     /* Big frequency: MHz for FM (freq is 10 kHz units), kHz otherwise. FONT7 is
      * the 7-segment face — digits and '.' only, all a frequency needs. */
@@ -245,6 +252,7 @@ void display_show_status() {
      * release it, so we never hold radio_mtx and display_mtx together. Take the
      * same fields the tick path does so both render the identical layout. */
     const char *mode = radio_get_mode_str();
+    const char *band = radio_get_band_name();
     uint16_t freq = radio_get_freq();
     uint8_t volume = radio_get_volume();
     uint8_t target = radio_get_tune_target();
@@ -253,7 +261,7 @@ void display_show_status() {
 
     xSemaphoreTake(display_mtx, portMAX_DELAY);
     display_mode = DISPLAY_STATUS;
-    draw_radio_screen(mode, freq, rssi, snr, volume, target);
+    draw_radio_screen(band, mode, freq, rssi, snr, volume, target);
     display_flush();
     xSemaphoreGive(display_mtx);
 }
@@ -276,6 +284,7 @@ void display_tick_render() {
     /* Snapshot the radio state up front (accessors lock radio_mtx internally and
      * release it) before touching display_mtx, so the two locks never nest. */
     const char *mode = radio_get_mode_str();
+    const char *band = radio_get_band_name();
     uint16_t freq = radio_get_freq();
     uint8_t volume = radio_get_volume();
     uint8_t target = radio_get_tune_target();
@@ -330,7 +339,7 @@ void display_tick_render() {
     if (ui == DISPLAY_UI_MENU) {
         draw_menu_screen(radio_get_menu_title(), menu_idx);
     } else {
-        draw_radio_screen(mode, freq, rssi, snr, volume, target);
+        draw_radio_screen(band, mode, freq, rssi, snr, volume, target);
     }
     display_flush();
     xSemaphoreGive(display_mtx);

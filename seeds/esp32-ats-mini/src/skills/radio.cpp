@@ -281,16 +281,28 @@ static uint8_t ui_mode = UI_VFO;
 /*
  * Modal menu state. Long-press drops the router into UI_MENU; the encoder then
  * scrolls a small on-screen list, a click selects, and inactivity/back returns to
- * UI_VFO. Two nested levels for now — a top MAIN list and a SETTINGS sublist —
- * each remembering its own cursor so a round-trip through Settings lands back on
- * the same MAIN row. Items are placeholders in this cut: only "Settings" (open
- * the sublist) and "Back" (return) do anything; the rest bounce straight back to
- * the VFO until later tickets wire real parameter editing onto them.
+ * UI_VFO. Three levels: a top MAIN list, a SETTINGS sublist and the BAND picker.
+ * MAIN and SETTINGS each remember their own cursor so a round-trip through
+ * Settings lands back on the same MAIN row; the BAND cursor is (re)seeded from the
+ * active band on every entry so the list opens on the band you are on. "Band" now
+ * drives real selection (via radio_select_band); "Settings" opens the sublist;
+ * Mode/Step/Bandwidth stay placeholders that bounce back to the VFO until later
+ * tickets wire real parameter editing onto them.
  */
-enum MenuLevel { MENU_MAIN, MENU_SETTINGS };
+enum MenuLevel { MENU_MAIN, MENU_SETTINGS, MENU_BAND };
 static uint8_t menu_level = MENU_MAIN;
 static int     menu_idx = 0;      /* cursor in the MAIN list */
 static int     menu_settings_idx = 0; /* cursor in the SETTINGS sublist */
+/* Cursor in the BAND picker (indexes bands[]). Re-seeded from radio_get_band_idx()
+ * each time MENU_BAND is entered, so the list always opens on the active band. */
+static uint8_t menu_band_idx = 0;
+
+/*
+ * MAIN-list dispatch keys. The order MUST match menu_main_items[] below so the
+ * click handler can switch on the raw cursor (menu_idx) instead of strcmp-ing the
+ * label — the label is display text, the index is the contract.
+ */
+enum MainItem { MI_BAND = 0, MI_MODE, MI_STEP, MI_BW, MI_SETTINGS };
 
 static const char *const menu_main_items[] = {
     "Band", "Mode", "Step", "Bandwidth", "Settings"
@@ -423,21 +435,41 @@ uint8_t radio_get_tune_target() { return ui_mode; }
 uint8_t radio_get_ui_mode() { return ui_mode; }
 uint8_t radio_get_menu_level() { return menu_level; }
 
-/* Cursor and length of whichever level is active. */
+/* Cursor of whichever level is active. Generalising this to the active cursor
+ * (MAIN / SETTINGS / BAND) is what lets the display's change-detection notice a
+ * band-list scroll: prev_menu_idx tracks this value, so paging bands forces a
+ * repaint without any extra prev_* field. */
 int radio_get_menu_idx() {
-    return (menu_level == MENU_SETTINGS) ? menu_settings_idx : menu_idx;
+    switch (menu_level) {
+        case MENU_SETTINGS: return menu_settings_idx;
+        case MENU_BAND:     return menu_band_idx;
+        default:            return menu_idx;
+    }
 }
+/* Length of the active level's list. */
 int radio_get_menu_count() {
-    return (menu_level == MENU_SETTINGS) ? MENU_SETTINGS_COUNT : MENU_MAIN_COUNT;
+    switch (menu_level) {
+        case MENU_SETTINGS: return MENU_SETTINGS_COUNT;
+        case MENU_BAND:     return BAND_COUNT;
+        default:            return MENU_MAIN_COUNT;
+    }
 }
 
 /* Title of the active level, and its item text at an arbitrary index. The index
  * is wrapped modulo the count so the caller can ask for idx-2..idx+2 (the visible
  * window) without bounds-checking each row itself. */
 const char *radio_get_menu_title() {
-    return (menu_level == MENU_SETTINGS) ? "Settings" : "Menu";
+    switch (menu_level) {
+        case MENU_SETTINGS: return "Settings";
+        case MENU_BAND:     return "Band";
+        default:            return "Menu";
+    }
 }
 const char *radio_get_menu_item(int i) {
+    if (menu_level == MENU_BAND) {
+        int n = BAND_COUNT;
+        return bands[((i % n) + n) % n].name;
+    }
     if (menu_level == MENU_SETTINGS) {
         int n = MENU_SETTINGS_COUNT;
         return menu_settings_items[((i % n) + n) % n];
@@ -979,14 +1011,31 @@ static void radio_tick() {
         if (ui_mode == UI_MENU) {
             /* In the menu a click selects the highlighted row. */
             if (menu_level == MENU_MAIN) {
-                if (strcmp(menu_main_items[menu_idx], "Settings") == 0) {
-                    /* Descend into the Settings sublist (keeps its own cursor). */
-                    menu_level = MENU_SETTINGS;
-                } else {
-                    /* Band/Mode/Step/Bandwidth are placeholders for now — real
-                     * parameter editing lands in later tickets. Bounce to the VFO. */
-                    ui_mode = UI_VFO;
+                /* Dispatch on the cursor index, not the label text: MainItem order
+                 * matches menu_main_items[] so this stays in step if labels change. */
+                switch (menu_idx) {
+                    case MI_SETTINGS:
+                        /* Descend into the Settings sublist (keeps its own cursor). */
+                        menu_level = MENU_SETTINGS;
+                        break;
+                    case MI_BAND:
+                        /* Open the band picker, seeded on the active band so the
+                         * list lands on where we already are. */
+                        menu_level = MENU_BAND;
+                        menu_band_idx = radio_get_band_idx();
+                        break;
+                    default:
+                        /* MI_MODE/MI_STEP/MI_BW are placeholders — real parameter
+                         * editing is wired in SEED-ATS-8. Bounce to the VFO. */
+                        ui_mode = UI_VFO;
+                        break;
                 }
+            } else if (menu_level == MENU_BAND) {
+                /* Selecting a band IS the exit: apply it and drop back to the VFO on
+                 * the new band. radio_select_band takes radio_mtx itself. */
+                radio_select_band(menu_band_idx);
+                ui_mode = UI_VFO;
+                menu_level = MENU_MAIN;  /* next menu entry opens at the top level */
             } else {
                 /* SETTINGS: "Back" and every other placeholder return to MAIN. */
                 menu_level = MENU_MAIN;
@@ -1034,6 +1083,8 @@ static void radio_tick() {
         if (d != 0) {
             if (menu_level == MENU_SETTINGS)
                 menu_settings_idx = menu_wrap(menu_settings_idx, d, MENU_SETTINGS_COUNT);
+            else if (menu_level == MENU_BAND)
+                menu_band_idx = (uint8_t)menu_wrap(menu_band_idx, d, BAND_COUNT);
             else
                 menu_idx = menu_wrap(menu_idx, d, MENU_MAIN_COUNT);
         }
@@ -1069,6 +1120,7 @@ static void radio_tick() {
     if ((ui_mode == UI_VOLUME || ui_mode == UI_MENU) &&
         millis() - last_input_ms > RADIO_COMMAND_TIMEOUT_MS) {
         ui_mode = UI_VFO;
+        menu_level = MENU_MAIN;  /* covers MENU_BAND too: next entry opens at the top */
     }
 
     /* 4) Throttled repaint (~10 Hz). display_tick_render() itself leaves a custom
