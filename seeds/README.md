@@ -14,7 +14,7 @@ The seed grows into whatever the node needs to be.
 |----------|------|-------|------|
 | Linux (any with gcc) | `linux/seed.c` | `gcc -O2 -o seed seed.c` | ~1000 lines |
 | ESP32 (Heltec V3) | `esp32/` | PlatformIO: `pio run` | ~1250 lines |
-| ESP32-S3 (M5Stack Cardputer ADVANCE) | `esp32-cardputer/` | PlatformIO: `pio run -e cardputer` | ~1700 lines |
+| ESP32-S3 (M5Stack Cardputer ADVANCE) | `esp32-cardputer/` | PlatformIO: `pio run -e cardputer` | ~4300 lines (main + gpio/serial skills) |
 | PDP-11 (2.11BSD) | `pdp11/seed.c` | `cc -o seed seed.c` | ~550 lines |
 
 ## Seed API

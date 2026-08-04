@@ -112,7 +112,16 @@ static const char *serial_describe() {
     static String out;
     if (out.length()) return out.c_str();
 
-    out.reserve(2600);
+    // Sized from a measurement, not an estimate: the literal below is 3323
+    // bytes and the GNSS block appended at the end is a further 776, so a node
+    // with the cap fitted produces 4099. 2600 did not cover even the base text
+    // (2720 before the nonprintable paragraph was rewritten), so the one call
+    // this reserve exists to prevent — a reallocating grow partway through
+    // building the string, on a heap this firmware shares with the OTA
+    // partition buffer and two 4 KB UART FIFOs — happened every time. Rounded
+    // up to leave room for small edits without silently going back to
+    // reallocating. Re-measure if the text changes materially.
+    out.reserve(4224);
     out += "## Skill: serial\n\n"
            "WiFi-to-serial bridge — talk to UART devices over HTTP.\n\n"
            "### Endpoints\n\n"
@@ -150,10 +159,19 @@ static const char *serial_describe() {
            "  not marked where. Sticky until reported, then cleared\n"
            "- `truncated: true` with `remaining` — more bytes were waiting than one\n"
            "  response carries (2048). Read again immediately; nothing is lost yet\n"
-           "- `nonprintable: N` — count of bytes replaced because they cannot be\n"
-           "  carried in a JSON string. `data` is a JSON string, so a binary\n"
-           "  protocol is not safe to read through this endpoint; NUL bytes are\n"
-           "  substituted rather than being allowed to silently cut the string\n\n"
+           "- `nonprintable: N` — count of bytes replaced with `.` because they\n"
+           "  cannot be carried in a JSON string. `data` is a JSON string and the\n"
+           "  JSON writer escapes only `\" \\ \\b \\f \\n \\r \\t`, so anything\n"
+           "  else outside printable ASCII would go out raw: a byte below 0x20 is\n"
+           "  an unescaped control character (invalid JSON), and a byte at or\n"
+           "  above 0x80 is a lone high byte (invalid UTF-8). Either would make\n"
+           "  the entire response unparseable, costing you `bytes`, `truncated`,\n"
+           "  `remaining` and `overflow` along with `data`. Tab, CR and LF are\n"
+           "  kept as themselves; everything else outside 0x20-0x7E is replaced.\n"
+           "  A binary protocol is therefore not readable through this endpoint —\n"
+           "  the bytes are not encoded elsewhere, they are gone, and `N` is all\n"
+           "  you get. Use it as a signal that you are on the wrong baud or the\n"
+           "  wrong protocol, not as a decodable count\n\n"
            "A short read is not evidence of a quiet peer, and a 200 is not\n"
            "evidence of a complete one. Check the flags.\n\n"
            "`timeout` waits up to 2000 ms for the first byte. That wait blocks the\n"
@@ -437,10 +455,33 @@ static void serial_register_routes(AsyncWebServer &server) {
         while (n < SERIAL_READ_CHUNK && sp->hw->available() > 0) {
             int c = sp->hw->read();
             if (c < 0) break;
-            /* `data` leaves here inside a JSON string. A NUL would cut that
-               string short and the caller would never know the rest existed, so
-               it is substituted and counted instead. */
-            if (c == 0) {
+            /* `data` leaves here inside a JSON string, so every byte that
+               cannot be carried in one is substituted and counted. This used to
+               substitute NUL alone, which covered the one byte that truncates a
+               C string and none of the bytes that destroy the document.
+
+               ArduinoJson escapes exactly " \ \b \f \n \r \t (see the table in
+               EscapeSequence.hpp) and emits everything else verbatim. So a
+               control byte below 0x20 goes out unescaped, which RFC 8259 s7
+               forbids outright, and any byte >= 0x80 goes out as a lone high
+               byte, which is not valid UTF-8. Either one is fatal to the WHOLE
+               response, not just this field: a caller that cannot parse the
+               document loses `bytes`, `truncated`, `remaining` and `overflow`
+               too — precisely the flags that would have told it the read was
+               incomplete. One stray byte turns a partial answer into no answer.
+
+               This is reachable without any binary protocol. Open the GNSS at
+               9600 while it is talking 115200 and the framing garbage arrives
+               with the high bit set on most bytes.
+
+               main.cpp's ui_handle_key() refuses the identical range for the
+               identical reason before stamping ui_last_key, which GET /ui puts
+               in a JSON string the same way. Tab, CR and LF are kept: those
+               three are on the escape table, they come out correct, and
+               line-oriented peers are the ordinary case. */
+            if (c == '\t' || c == '\r' || c == '\n') {
+                data[n++] = (char)c;
+            } else if (c < 0x20 || c > 0x7E) {
                 data[n++] = '.';
                 nonprintable++;
             } else {

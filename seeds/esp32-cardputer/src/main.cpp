@@ -6,7 +6,9 @@
 // The HTTP API, the security baseline (token, provisioning AP, exact route
 // matching), OTA, and the on-device UI: the ST7789 panel and the TCA8418
 // keyboard are driven through M5Cardputer/M5Unified. The gpio and serial skills
-// are the next step and are not here yet.
+// ship here too, #included into this translation unit from src/skills/ — see
+// the Skills section near the bottom for why they are #included rather than
+// compiled separately.
 //
 // The node has no camera and nobody can see its screen remotely, so GET /ui
 // exists to make the panel's state answerable over the network: which screen is
@@ -50,6 +52,20 @@
 //   GET  /skill             — AI agent skill file
 //   GET  /                  — WiFi config page
 //   POST /wifi/config       — save WiFi credentials (token-free only on the AP)
+//
+// gpio skill (src/skills/gpio.cpp):
+//   GET  /gpio/list         — every pin with class, safe/refused, mode, value
+//   GET  /gpio/read         — read a digital pin (?pin=N)
+//   POST /gpio/write        — set a digital output {pin, value}
+//   POST /gpio/mode         — set a pin mode {pin, mode}
+//   GET  /gpio/adc          — read an ADC-capable pin (?pin=N)
+//
+// serial skill (src/skills/serial.cpp):
+//   GET  /serial/ports      — UART state: open, pins, baud, bytes waiting
+//   POST /serial/open       — open a UART {uart, baud, rx, tx}
+//   POST /serial/write      — write bytes {uart, data}
+//   GET  /serial/read       — read buffered data (?uart=N&timeout=ms)
+//   POST /serial/close      — close a UART {uart}
 
 #include <Arduino.h>
 #include <stdlib.h>
@@ -586,7 +602,14 @@ static void hw_probe() {
 // ===== Globals =====
 static AsyncWebServer server(HTTP_PORT);
 static String auth_token = "";
-static String ap_ssid = "";
+// FIXED BUFFER, not String, for the same reason wifi_ssid below is one: it is
+// read by ui_field() on the AsyncTCP task (GET /ui) and a String reassignment
+// frees the buffer a concurrent reader is walking. Written once in wifi_setup()
+// before the web server starts and never again, so today no writer races it —
+// but the panel's cross-task reader makes that a property to keep by
+// construction, not one to rely on staying true. "Seed-" + four hex + NUL fits
+// in ten; sized with headroom.
+static char ap_ssid[16] = "";
 static String mdns_name = "";
 static unsigned long boot_time = 0;
 
@@ -601,7 +624,13 @@ static unsigned long boot_time = 0;
 // not work it is the only way into the node at all.
 #define AP_SESSION_MS (10UL * 60UL * 1000UL)
 static bool ap_active = false;
-static String ap_password = "";
+// FIXED BUFFER, not String. Written on the loop task (ap_start rolls it,
+// ap_stop clears it) and read on the AsyncTCP task by ui_field() — the exact
+// cross-task String reassignment that was a use-after-free for the WiFi
+// credentials. GET /ui never reaches the read (it passes redact=true and
+// returns a placeholder first), but the panel does, and defence here costs a
+// dozen bytes. The generated password is twelve chars; sized with headroom.
+static char ap_password[16] = "";
 static bool ap_temporary = false;
 static unsigned long ap_expires_at = 0;
 // Set when a keyboard-raised AP failed to come up, so the menu entry can say so
@@ -660,10 +689,19 @@ static bool ota_upload_ok = false;
 static bool ota_upload_error = false;
 static char ota_upload_error_msg[128] = "";
 static size_t ota_bytes_written = 0;
-// The request that owns the in-flight transfer. See the ownership guard at the
-// top of handle_firmware_upload_body() for why the flags above are not enough
-// on their own.
-static AsyncWebServerRequest *ota_owner = nullptr;
+// Identity of the in-flight transfer. See the ownership guard at the top of
+// handle_firmware_upload_body() for why the flags above are not enough on their
+// own, and why this is a session id rather than the request pointer it used to
+// be: the request object is destroyed on client disconnect, so a later request
+// whose AsyncWebServerRequest lands at the same freed address would pass a
+// pointer-equality check and splice its chunks into the abandoned transfer.
+// A monotonically increasing session id cannot be aliased that way. Zero means
+// no transfer is in flight. ota_claimed_total is what the owner declared, kept
+// so a chunk whose total disagrees is rejected — a continuity check aliasing
+// could not satisfy even if it forged the id.
+static volatile uint32_t ota_session = 0;
+static uint32_t ota_next_session = 1;
+static size_t ota_claimed_total = 0;
 // millis() of the last body chunk received, for the abandoned-upload watchdog
 // in loop(). Only meaningful while ota_in_progress. Volatile for the reason
 // given above, and additionally because the watchdog's comparison must read it
@@ -671,6 +709,26 @@ static AsyncWebServerRequest *ota_owner = nullptr;
 static volatile unsigned long ota_last_chunk_ms = 0;
 static volatile bool pending_restart = false;
 static volatile bool pending_rollback = false;
+// Set by POST /wifi/config on the AsyncTCP task, acted on by loop(). The
+// reconnect belongs to loop() for the same reason the OTA restart above does:
+// the handler runs on the web server's task and must not do slow work or touch
+// the radio there.
+//
+// It used to call delay(1000) and then WiFi.begin() inline. That was wrong
+// three times over. The delay blocks the single AsyncTCP task, so for a whole
+// second every other request queues behind it — including /health, the one an
+// agent uses to decide whether the node is alive, which makes a successful
+// provisioning look like a node that just went unresponsive. WiFi.begin() from
+// that task then races the identical call in wifi_poll() on loop(), two tasks
+// driving one radio through an API that is not reentrant. And it reads
+// wifi_ssid/wifi_pass, the fixed buffers this very handler has just rewritten
+// from the other task, so the connect could be issued with half of the old
+// credentials and half of the new.
+//
+// Deferring fixes all three: the response goes out immediately, and loop() does
+// the reconnect from the task that already owns the radio, after the buffers
+// are whole.
+static volatile bool pending_wifi_connect = false;
 
 // ===== Utilities =====
 
@@ -891,7 +949,7 @@ static void ap_start(bool manual) {
     // RF is up by now (wifi_setup() has run), which is what makes esp_random()
     // a hardware RNG rather than a seeded PRNG — same reason token_load() is
     // deferred until after wifi_setup().
-    ap_password = ap_generate_password();
+    snprintf(ap_password, sizeof(ap_password), "%s", ap_generate_password().c_str());
     WiFi.mode(WIFI_AP_STA);
     // Pin the subnet before the AP comes up, clear of the owner's LAN, so a LAN
     // client can never land in it and pass from_setup_ap()'s /24 test. If the pin
@@ -901,13 +959,13 @@ static void ap_start(bool manual) {
     if (!WiFi.softAPConfig(IPAddress(AP_IP_A, AP_IP_B, AP_IP_C, AP_IP_D),
                            IPAddress(AP_IP_A, AP_IP_B, AP_IP_C, AP_IP_D),
                            IPAddress(255, 255, 255, 0))) {
-        ap_password = "";
+        ap_password[0] = '\0';
         WiFi.mode(WIFI_STA);
         event_add("setup AP: subnet pin failed, not raising AP");
         return;
     }
-    if (!WiFi.softAP(ap_ssid.c_str(), ap_password.c_str())) {
-        ap_password = "";
+    if (!WiFi.softAP(ap_ssid, ap_password)) {
+        ap_password[0] = '\0';
         WiFi.mode(WIFI_STA);
         event_add("setup AP failed to start");
         return;
@@ -917,7 +975,7 @@ static void ap_start(bool manual) {
     ap_temporary = manual;
     ap_expires_at = millis() + AP_SESSION_MS;
     ap_seen_sta_down = (WiFi.status() != WL_CONNECTED);
-    event_add("setup AP up: %s%s", ap_ssid.c_str(),
+    event_add("setup AP up: %s%s", ap_ssid,
               manual ? " (time-boxed)" : "");  // SSID only, never the password
     mdns_restart();
     ui_force = true;  // the password exists nowhere but on the screen
@@ -928,7 +986,7 @@ static void ap_stop() {
     WiFi.softAPdisconnect(true);
     WiFi.mode(WIFI_STA);
     ap_active = false;
-    ap_password = "";
+    ap_password[0] = '\0';
     ap_temporary = false;
     ap_seen_sta_down = false;
     event_add("setup AP down");
@@ -961,7 +1019,16 @@ static void wifi_setup() {
     // the WiFi stack (see get_mac_suffix), so this is free to sit ahead of the
     // radio and is already settled by the time anything advertises it.
     String suffix = get_mac_suffix();
-    ap_ssid = "Seed-" + suffix;
+    // %.4s, not %s. get_mac_suffix() returns exactly four hex characters, so
+    // "Seed-" + suffix is nine and fits with room to spare — but the compiler
+    // cannot see inside the String and warned that up to 14 bytes could go into
+    // an 11-byte tail (-Wformat-truncation). The precision makes the invariant
+    // the source already relies on visible to the compiler instead of implied,
+    // and clamps the write if get_mac_suffix() ever returns something longer.
+    // Not silenced on the grounds that it looked like a false positive: the
+    // GNSS block in serial.cpp shipped truncated on a live node while the same
+    // warning was being reported and read as noise.
+    snprintf(ap_ssid, sizeof(ap_ssid), "Seed-%.4s", suffix.c_str());
     mdns_name = "seed-" + suffix;
     mdns_name.toLowerCase();
 
@@ -1091,7 +1158,7 @@ static const char *ui_screen_title[UI_SCREEN_COUNT] = {
 // network nobody can reach.
 enum ui_action_t {
     UI_ACT_SCREEN = 0,   // arg is the ui_screen_t to open
-    UI_ACT_AP,           // raise or drop the provisioning AP
+    UI_ACT_AP,           // raise the provisioning AP (raise-only; see ui_menu_activate)
     UI_ACT_BACKLIGHT     // panel dark / panel lit
 };
 
@@ -1125,13 +1192,19 @@ static_assert(UI_MENU_COUNT <= UI_ROWS, "menu does not scroll: keep it within UI
 // This block used to claim that nothing anywhere on the /ui path was a String a
 // reader could catch mid-reassignment. That was wrong, and it was wrong in the
 // dangerous direction: ui_field() reads the stored WiFi credentials, which the
-// provisioning POST rewrites from the AsyncTCP task. Strings there are now fixed
-// buffers — see wifi_ssid above — precisely so the claim can be true. What is
-// still NOT covered is ap_ssid and ap_password, which ui_field() also reads as
-// Strings; those are only ever written from loop(), in ap_start()/ap_stop(), so
-// the /ui reader on AsyncTCP is the only cross-task reader of them and a raise
-// or drop concurrent with a report remains a real (if narrow) window. Recorded
-// rather than claimed away.
+// provisioning POST rewrites from the AsyncTCP task. Those are now fixed buffers
+// — see wifi_ssid above — precisely so the claim can be true.
+//
+// ui_field() also reads ap_ssid and ap_password, which were the last two
+// Strings on the /ui path; both are now fixed buffers too. Their write patterns
+// differ and the difference is why they were not the same risk. ap_password is
+// rolled by ap_start() and cleared by ap_stop(), both on the loop task, so a
+// raise or drop concurrent with a report on AsyncTCP was a genuine reassignment
+// race — narrowed only by /ui redacting it before the read. ap_ssid, despite
+// what this ledger once said, is NOT written in ap_start()/ap_stop() at all: it
+// is set once in wifi_setup() (before the web server exists) and never touched
+// again, so it never actually raced. Both are fixed buffers now regardless, so
+// the whole /ui path is String-free by construction rather than by argument.
 static bool ui_ready = false;          // panel initialised and drawable
 // What M5GFX's panel autodetection actually answered, as opposed to what
 // M5.getBoard() reports after cfg.fallback_board has papered over a failure.
@@ -1281,10 +1354,10 @@ static bool ui_field(ui_screen_t screen, int idx, char *label, size_t label_n,
                 // standing here: a keyboard-raised AP closes on a timer, the
                 // boot AP stays up until the node is actually provisioned.
                 if (ap_temporary) {
-                    snprintf(value, value_n, "%s  %lum left", ap_ssid.c_str(),
+                    snprintf(value, value_n, "%s  %lum left", ap_ssid,
                              ap_minutes_left());
                 } else {
-                    snprintf(value, value_n, "%s  stays up", ap_ssid.c_str());
+                    snprintf(value, value_n, "%s  stays up", ap_ssid);
                 }
             } else {
                 snprintf(label, label_n, "heap");
@@ -1302,7 +1375,7 @@ static bool ui_field(ui_screen_t screen, int idx, char *label, size_t label_n,
                     // remaining time moved up to the "ap" row above, where it
                     // does not compete for width with the one string on this
                     // screen that has to be transcribed without a typo.
-                    snprintf(value, value_n, "%s", ap_password.c_str());
+                    snprintf(value, value_n, "%s", ap_password);
                 }
             } else {
                 snprintf(label, label_n, "seed");
@@ -1354,10 +1427,10 @@ static bool ui_field(ui_screen_t screen, int idx, char *label, size_t label_n,
             if (!ap_active) {
                 snprintf(value, value_n, "%s", ap_start_failed ? "failed to start" : "off");
             } else if (ap_temporary) {
-                snprintf(value, value_n, "%s  %lum left", ap_ssid.c_str(),
+                snprintf(value, value_n, "%s  %lum left", ap_ssid,
                          ap_minutes_left());
             } else {
-                snprintf(value, value_n, "%s  stays up", ap_ssid.c_str());
+                snprintf(value, value_n, "%s  stays up", ap_ssid);
             }
             return true;
         default:
@@ -2011,9 +2084,14 @@ static void handle_capabilities(AsyncWebServerRequest *request) {
              "TCA8418 matrix controller on I2C 0x%02X (INT=%d), driven via "
              "M5Cardputer; %s",
              TCA8418_ADDR, PIN_KB_INT,
-             ui_board_detected
-                 ? "board identified as CardputerADV, so the I2C reader is in use"
-                 : "board NOT identified, keys are not being read");
+             // ui_keyboard_enabled, not ui_board_detected: the reader is what
+             // actually gates key reading, and it is installed whenever the
+             // library's fallback applies, INCLUDING when panel autodetect
+             // failed. Reporting the panel-detect flag here would tell an agent
+             // the keys are dead on a board whose keys work.
+             ui_keyboard_enabled
+                 ? "reader installed, keys are being read over I2C"
+                 : "reader NOT installed, keys are not being read");
     doc["keyboard"] = peri;
     snprintf(peri, sizeof(peri), "CS=%d,MOSI=%d,MISO=%d,SCLK=%d",
              PIN_SD_CS, PIN_SD_MOSI, PIN_SD_MISO, PIN_SD_SCLK);
@@ -2147,17 +2225,54 @@ static void handle_capabilities(AsyncWebServerRequest *request) {
     request->send(200, "application/json", response);
 }
 
+// Collects a request body into a single NUL-terminated heap buffer for the
+// handlers below that parse one (POST /config.md, /clock/tz, and the gpio and
+// serial skills' JSON POSTs). Runs on the AsyncTCP task, once per body chunk.
+//
+// total is the declared body length. It is authoritative here and MUST be, for
+// two reasons that the firmware/upload body callback learned the hard way:
+//
+//   - total == 0 means the client sent Transfer-Encoding: chunked with no
+//     Content-Length. The library never fills in a running total for a chunked
+//     body — _contentLength stays 0 — and it delivers chunks through this
+//     callback with a *growing* index and total fixed at 0. There is no length
+//     to size an allocation from, and the non-chunked path's clamp
+//     (len = min(len, _contentLength - _parsedLength)) does not run for a
+//     chunked body, so index and len are attacker-controlled and unbounded. A
+//     naive malloc(total+1) then returns a 1-byte block that every later chunk
+//     memcpys past. Unknown length cannot be served safely, so it is refused
+//     outright with 411. Do NOT "relax" this to treat 0 as "allocate on
+//     demand": the endpoints here have no streaming parser and the growing
+//     index is exactly the primitive that overflows the heap. This is the same
+//     total == 0 guard handle_firmware_upload_body() already carries.
+//
+//   - even with a known total, every chunk is bounds-checked against it before
+//     the memcpy, and the buffer is NUL-terminated on every chunk rather than
+//     only when index + len == total. A body that never delivers its final
+//     byte (a truncated chunked stream, or bytes past the declared length)
+//     would otherwise leave the buffer unterminated, and the handlers all read
+//     it as a C string.
 static void handle_body_collect(AsyncWebServerRequest *request, uint8_t *data,
                                  size_t len, size_t index, size_t total) {
     if (index == 0) {
+        // Unknown length (chunked): cannot size the allocation, refuse. See above.
+        if (total == 0) { request->send(411, "application/json", "{\"error\":\"length required\"}"); return; }
         if (total > 4096) { request->send(413, "application/json", "{\"error\":\"too large\"}"); return; }
-        char *buf = (char*)malloc(total + 1);
+        // calloc so a body that never completes still leaves a defined,
+        // NUL-filled buffer rather than uninitialised heap.
+        char *buf = (char*)calloc(total + 1, 1);
         if (!buf) { request->send(500, "application/json", "{\"error\":\"OOM\"}"); return; }
         request->_tempObject = buf;
     }
     char *buf = (char*)request->_tempObject;
-    if (buf) memcpy(buf + index, data, len);
-    if (index + len == total && buf) buf[total] = '\0';
+    if (!buf) return;
+    // Drop anything that would land outside the allocation. index + len can
+    // overflow past total on a chunked stream the library did not clamp, and a
+    // single byte past the end is the whole bug.
+    if (index > total || len > total - index) return;
+    memcpy(buf + index, data, len);
+    // Terminate on every chunk: the final chunk is not guaranteed to arrive.
+    buf[index + len] = '\0';
 }
 
 static void handle_config_get(AsyncWebServerRequest *request) {
@@ -2409,9 +2524,21 @@ static void handle_firmware_version(AsyncWebServerRequest *request) {
 //
 // A bare `if (ota_in_progress)` is not a substitute: it says a transfer exists,
 // never whose it is, so any request could still write into another's state on
-// the paths that run before it. The owner pointer is compared, never
-// dereferenced — it is an identity token, valid only while the transfer it
-// names is live, which is why every exit path below clears it.
+// the paths that run before it. Identity is a session id, not the request
+// pointer it used to be: a pointer is only unique while the object it names is
+// alive, and this one is destroyed the instant the client disconnects — see
+// WebRequest.cpp's destructor — while ota_in_progress stays true for up to the
+// stall timeout. A later request whose AsyncWebServerRequest is allocated at
+// that same freed address would then pass a pointer-equality check and have its
+// chunks accepted into the abandoned transfer. The session id is stamped into
+// this request's own _tempObject (a small heap tag the library frees when the
+// request is destroyed) and cannot be inherited by whatever reuses the address:
+// a fresh request's _tempObject is NULL until it claims a session of its own.
+// Two continuity checks back it up — the declared total and the running byte
+// offset both have to match what the owner established — so even a forged id
+// cannot splice a differently-shaped stream in. The abandoned-connection path
+// is precisely the exit that does NOT clear ota_in_progress here; the watchdog
+// in loop() is what clears the session on that path.
 //
 // This guard is new here. The two sibling ESP32 seeds in this tree share the
 // same globals-only structure and the same hole; whoever ports this back needs
@@ -2440,7 +2567,22 @@ static void handle_firmware_upload_body(AsyncWebServerRequest *request, uint8_t 
             return;
         }
 
-        ota_owner = request;
+        // Stamp this request with a fresh session id and record it as the tag
+        // the library frees on destroy. A request that reuses this address later
+        // starts with _tempObject NULL and so cannot inherit the claim.
+        uint32_t *tag = (uint32_t*)malloc(sizeof(uint32_t));
+        if (!tag) {
+            ota_upload_error = true;
+            snprintf(ota_upload_error_msg, sizeof(ota_upload_error_msg),
+                     "OOM claiming upload");
+            return;
+        }
+        ota_session = ota_next_session++;
+        if (ota_next_session == 0) ota_next_session = 1;  // never hand out 0
+        *tag = ota_session;
+        request->_tempObject = tag;
+
+        ota_claimed_total = total;
         ota_in_progress = true;
         ota_upload_started = false;
         ota_upload_ok = false;
@@ -2456,15 +2598,24 @@ static void handle_firmware_upload_body(AsyncWebServerRequest *request, uint8_t 
             snprintf(ota_upload_error_msg, sizeof(ota_upload_error_msg),
                      "Update.begin failed: %s", Update.errorString());
             ota_in_progress = false;
-            ota_owner = nullptr;
+            ota_session = 0;
             return;
         }
         ota_upload_started = true;
     }
 
-    // Chunks of a request that never claimed the slot. Nothing of theirs is
-    // being tracked, so there is nothing to do with their bytes.
-    if (request != ota_owner) return;
+    // Chunks of a request that never claimed the slot, or whose session has been
+    // retired (the abandoned-upload watchdog zeroes ota_session). The tag is
+    // this request's own copy of the id it claimed; a request that reused a
+    // freed address has no tag at all. Nothing of theirs is being tracked, so
+    // there is nothing to do with their bytes.
+    uint32_t *tag = (uint32_t*)request->_tempObject;
+    if (!tag || *tag != ota_session) return;
+    // Continuity: a chunk that disagrees about the transfer's shape is not part
+    // of this transfer. index is the running byte offset the library hands us;
+    // it must track what has actually been written, and total must not change
+    // mid-stream. Either mismatch means the streams have been spliced.
+    if (total != ota_claimed_total || index != ota_bytes_written) return;
 
     if (ota_upload_error) return;
 
@@ -2479,7 +2630,7 @@ static void handle_firmware_upload_body(AsyncWebServerRequest *request, uint8_t 
                      "write failed: %s", Update.errorString());
             Update.abort();
             ota_in_progress = false;
-            ota_owner = nullptr;
+            ota_session = 0;
             return;
         }
         ota_bytes_written += len;
@@ -2495,7 +2646,7 @@ static void handle_firmware_upload_body(AsyncWebServerRequest *request, uint8_t 
             event_add("ota complete, %u bytes", (unsigned)ota_bytes_written);
         }
         ota_in_progress = false;
-        ota_owner = nullptr;
+        ota_session = 0;
     }
 }
 
@@ -2587,7 +2738,7 @@ static void handle_skill(AsyncWebServerRequest *request) {
     s = "# ESP32 Seed — M5Stack Cardputer ADVANCE\n\n";
     s += "Host: " + ip + ":" + String(HTTP_PORT) + "\n";
     s += "mDNS: " + mdns_name + ".local\n";
-    if (ap_active) s += "AP: " + ap_ssid + " (setup mode; the password is on the node's screen)\n";
+    if (ap_active) s += String("AP: ") + ap_ssid + " (setup mode; the password is on the node's screen)\n";
     s += "\n";
     s += "Auth: `Authorization: Bearer <token>` (except /health)\n";
     s += "The token is a 32-char hex string, generated on the node's first boot and\n";
@@ -2684,8 +2835,9 @@ static void handle_skill(AsyncWebServerRequest *request) {
     s += "| `,` / `/` | dim / brighten the panel, on any screen |\n";
     s += "| Enter | open the menu, or activate the selected entry |\n";
     s += "| `` ` `` | back — a screen returns to the menu, the menu to status |\n\n";
-    s += "Menu entries: Network, System, Hardware, Setup AP (raise or drop the\n";
-    s += "provisioning AP), Backlight (panel dark / lit).\n\n";
+    s += "Menu entries: Network, System, Hardware, Setup AP (raise the\n";
+    s += "provisioning AP; it comes down on its own, there is no keyboard path to\n";
+    s += "drop it), Backlight (panel dark / lit).\n\n";
     s += "You cannot see this screen. GET /ui answers what is on it: the active\n";
     s += "screen, every field it is showing with its current value, the menu and\n";
     s += "which entry is selected, the backlight level, whether the panel came up,\n";
@@ -2823,8 +2975,10 @@ static void handle_wifi_post(AsyncWebServerRequest *request) {
     request->send(200, "text/html",
         "<h2>Saved. Connecting...</h2><p>" + html_escape(ssid) +
         "</p><a href='/'>Back</a>");
-    delay(1000);
-    WiFi.begin(wifi_ssid, wifi_pass);
+    // Hand the reconnect to loop() rather than doing it here — see the flag's
+    // declaration. The page above is already on its way out, so the browser
+    // gets its answer at once instead of a second later.
+    pending_wifi_connect = true;
 }
 
 // ===== Skills =====
@@ -2951,10 +3105,10 @@ void setup() {
         // AP password is a node nobody can provision at all.
         Serial.printf("http://%s:%d/health  (setup AP: %s, password is on the "
                       "node's screen)\n",
-            WiFi.softAPIP().toString().c_str(), HTTP_PORT, ap_ssid.c_str());
+            WiFi.softAPIP().toString().c_str(), HTTP_PORT, ap_ssid);
         if (!ui_ready) {
             Serial.printf("[!] panel not initialised; AP password: %s\n",
-                          ap_password.c_str());
+                          ap_password);
         }
     }
 
@@ -2970,13 +3124,34 @@ void loop() {
         ESP.restart();
     }
 
-    // Auto-confirm after 60s
+    // Auto-confirm after 60s.
+    //
+    // firmware_confirmed records what the ROM actually did, not that it was
+    // asked — the same rule handle_firmware_confirm() follows, and the two
+    // paths set the one flag so they have to agree. This one used to set it
+    // unconditionally and merely suppress the event on failure, which left the
+    // node reporting the single state an operator most needs told truthfully as
+    // its exact opposite: /firmware/version and the SYSTEM screen both read
+    // "confirmed" while the rollback was still armed, so the next reboot threw
+    // the image away with nothing anywhere having said it might.
+    //
+    // The failure is logged rather than passed over in silence: it is the only
+    // notice that the window is closing, since firmware_confirm_attempted stops
+    // this from ever running again and POST /firmware/confirm is then the only
+    // way to commit the image.
     if (!firmware_confirmed && !firmware_confirm_attempted &&
         (millis() - boot_time) > 60000 && WiFi.status() == WL_CONNECTED) {
         firmware_confirm_attempted = true;
         esp_err_t err = esp_ota_mark_app_valid_cancel_rollback();
-        firmware_confirmed = true;
-        if (err == ESP_OK) event_add("firmware auto-confirmed");
+        firmware_confirmed = (err == ESP_OK);
+        // Two format strings, not one with an argument: the success message has
+        // nothing to substitute, and event_add() is printf-style.
+        if (firmware_confirmed) {
+            event_add("firmware auto-confirmed");
+        } else {
+            event_add("firmware auto-confirm FAILED (%s), rollback still armed",
+                      esp_err_to_name(err));
+        }
     }
 
     // Abandoned OTA upload.
@@ -3012,9 +3187,10 @@ void loop() {
         (long)(millis() - ota_last_chunk_ms) > (long)OTA_STALL_TIMEOUT_MS) {
         Update.abort();
         ota_in_progress = false;
-        // Releases the slot for the next uploader. The dead request is gone; a
-        // pointer to it must not stay behind as an owner.
-        ota_owner = nullptr;
+        // Retire the session for the next uploader. The dead request is gone;
+        // its id must not still match an incoming chunk. Any chunk that arrived
+        // late from the abandoned connection now fails the tag/session check.
+        ota_session = 0;
         ota_upload_started = false;
         ota_upload_error = true;
         snprintf(ota_upload_error_msg, sizeof(ota_upload_error_msg),
@@ -3026,6 +3202,22 @@ void loop() {
 
     // WiFi reconnect
     static unsigned long last_wifi = 0;
+    // Freshly provisioned credentials, handed over by POST /wifi/config. Acting
+    // on them here rather than in the handler is what keeps this WiFi.begin()
+    // the only one in the firmware: two tasks calling it on one radio was the
+    // race, and the retry below is the other half of it. Connect at once rather
+    // than making a just-provisioned node wait out the retry interval, and stamp
+    // last_wifi so the retry does not immediately fire on top of this attempt.
+    //
+    // The flag is cleared before the call, not after: a second POST landing
+    // while WiFi.begin() runs then sets it again and is reissued on the next
+    // pass, instead of being cleared away unserved.
+    if (pending_wifi_connect) {
+        pending_wifi_connect = false;
+        event_add("wifi credentials updated, reconnecting");
+        WiFi.begin(wifi_ssid, wifi_pass);
+        last_wifi = millis();
+    }
     if (wifi_ssid[0] && WiFi.status() != WL_CONNECTED &&
         millis() - last_wifi > 30000) {
         WiFi.begin(wifi_ssid, wifi_pass);

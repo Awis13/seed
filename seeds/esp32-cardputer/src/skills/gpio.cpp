@@ -145,16 +145,25 @@ static bool gpio_is_fpc(int pin) {
     return (pin == GPIO_PIN_INT_FPC);
 }
 
+/* The ESP32-S3's strapping pins, per datasheet section 2.4: GPIO0 (boot mode),
+ * GPIO3 (JTAG source select), GPIO45 (VDD_SPI voltage) and GPIO46 (boot-time
+ * ROM messages). 47 and 48 are NOT strapping pins — they were listed here by
+ * mistake — and M5Stack's Cardputer-Adv pinmap gives them no assignment at all,
+ * so they move to gpio_is_unclassified() on the same "excluded because we do
+ * not know" grounds the rest of that group uses. GPIO3 is also on the EXT
+ * header, and gpio_is_ext() is checked first so its more actionable class wins;
+ * the strapping note is appended to that pin's warning instead. */
 static bool gpio_is_strapping(int pin) {
-    return (pin == 0 || pin == 45 || pin == 46 || pin == 47 || pin == 48);
+    return (pin == 0 || pin == 3 || pin == 45 || pin == 46);
 }
 
-/* 16, 17 and 18. M5Stack's published Cardputer-Adv pinmap lists no assignment
- * for these three, yet the board carries a microphone and an NS4150B amplifier
- * that appear nowhere in that document. Excluded because we do not know, not
- * because we know — see the note on gpio_safe_pins[] in main.cpp. */
+/* Pins with no published assignment on M5Stack's Cardputer-Adv pinmap. 16, 17
+ * and 18 sit near a microphone and an NS4150B amplifier that appear nowhere in
+ * that document; 47 and 48 appear nowhere at all and are not strapping pins
+ * either. Excluded because we do not know, not because we know — see the note
+ * on gpio_safe_pins[] in main.cpp. */
 static bool gpio_is_unclassified(int pin) {
-    return (pin == 16 || pin == 17 || pin == 18);
+    return (pin == 16 || pin == 17 || pin == 18 || pin == 47 || pin == 48);
 }
 
 static bool gpio_is_adc1(int pin) {
@@ -190,7 +199,9 @@ static const char *gpio_warning(int pin) {
     if (gpio_is_kbd(pin))       return "TCA8418 interrupt output — the controller drives this line";
     if (gpio_is_panel(pin))     return "ST7789 panel SPI bus, driven from loop()";
     if (gpio_is_backlight(pin)) return "backlight on LEDC channel 7, and the RGB LED supply gate";
-    if (gpio_is_ext(pin))       return "EXT 2.54-14P header (SPI/UART fan-out, shared with microSD)";
+    if (gpio_is_ext(pin))       return (pin == 3)
+        ? "EXT 2.54-14P header (SPI/UART fan-out, shared with microSD); also an S3 strapping pin (JTAG source select) — may affect boot"
+        : "EXT 2.54-14P header (SPI/UART fan-out, shared with microSD)";
     if (gpio_is_sd(pin))        return "microSD chip select";
     if (gpio_is_audio(pin))     return "ES8311 audio codec (I2S) — configured, not started";
     if (gpio_is_ir(pin))        return "IR transmitter";
@@ -335,10 +346,12 @@ static const char *gpio_describe() {
            "  the RMT peripheral is only started by `M5.Led.begin()`, which this\n"
            "  firmware does not call\n"
            "- `vbat` (10): battery sense divider\n"
-           "- `strapping` (0,45,46,47,48): may affect boot\n"
-           "- `unclassified` (16,17,18): no published assignment. The board has a\n"
-           "  microphone and an amplifier whose pins appear in no M5Stack document,\n"
-           "  and three unexplained pins; guessing is worse than excluding\n\n"
+           "- `strapping` (0,45): may affect boot. GPIO3 and GPIO46 are strapping\n"
+           "  pins too, but they carry a more actionable class here and report as\n"
+           "  `ext_header` and `audio`; GPIO3's warning carries the strapping note\n"
+           "- `unclassified` (16,17,18,47,48): no published assignment. The board\n"
+           "  has a microphone and an amplifier whose pins appear in no M5Stack\n"
+           "  document; guessing is worse than excluding\n\n"
            "Note that 43 and 44 are NOT the free UART0 pins they are on the other\n"
            "two ESP32 seeds in this tree — here they are the codec's word clock and\n"
            "the IR transmitter. The console is USB-CDC.\n\n"
@@ -346,7 +359,11 @@ static const char *gpio_describe() {
            "- Pins 22-32 do not exist as usable GPIO: 22-25 are absent from the\n"
            "  ESP32-S3 entirely, 26-32 are the internal SPI flash lines\n"
            "- ADC1 (pins 1-10): always available\n"
-           "- ADC2 (pins 11-20): unavailable while WiFi is up, which it is\n";
+           "- ADC2 (pins 11-20): refused whenever the WiFi peripheral is\n"
+           "  initialised at all — STA, AP or both — because the radio owns the\n"
+           "  block. That includes a first-boot node serving only the\n"
+           "  provisioning AP, which has no STA association. In practice the\n"
+           "  radio is always up here, so treat ADC2 as unavailable\n";
 }
 
 /* Exact matching, like every route in the seed — see setup_routes() in main.cpp
@@ -578,8 +595,21 @@ static void gpio_register_routes(AsyncWebServer &server) {
             return;
         }
 
-        /* ADC2 is unavailable while WiFi is active */
-        if (gpio_is_adc2(pin) && WiFi.status() == WL_CONNECTED) {
+        /* ADC2 is unavailable whenever the radio owns it, which is whenever the
+           radio is up at all — not merely when it has an association.
+           WL_CONNECTED was the wrong test: it describes the STA link's state,
+           while what contends for ADC2 is the WiFi peripheral being
+           initialised. On a node running the provisioning AP (WIFI_AP, and
+           WIFI_AP_STA while the STA half is still searching) the radio has the
+           block and the status is not WL_CONNECTED, so the gate opened and the
+           endpoint returned numbers off a contended peripheral as though they
+           were measurements. A first-boot node with no credentials is exactly
+           that node, and gpio_describe() has always stated ADC2 flatly as
+           unavailable — so the description was right and the code was wrong.
+
+           WIFI_MODE_NULL is the only mode in which the peripheral is down; the
+           test covers STA, AP and AP_STA in one. */
+        if (gpio_is_adc2(pin) && WiFi.getMode() != WIFI_MODE_NULL) {
             req->send(400, "application/json",
                 "{\"error\":\"ADC2 pins (11-20) unavailable while WiFi is active\"}");
             return;
@@ -593,7 +623,14 @@ static void gpio_register_routes(AsyncWebServer &server) {
         doc["raw"] = raw;
         doc["voltage"] = serialized(String(voltage, 3));
         doc["class"] = gpio_class(pin);
-        if (gpio_is_adc2(pin)) doc["warning"] = "ADC2 — may be inaccurate with WiFi";
+        /* Reaching here on an ADC2 pin means the gate above found the radio in
+           WIFI_MODE_NULL, so nothing is contending for the block and the
+           reading is good. Said plainly, because the old text ("may be
+           inaccurate with WiFi") was attached to the one case in which WiFi is
+           provably not running. */
+        if (gpio_is_adc2(pin))
+            doc["note"] = "ADC2 — readable because the radio is currently down; "
+                          "this pin is refused whenever WiFi is up";
 
         String response;
         serializeJson(doc, response);
