@@ -5,14 +5,46 @@
  * message; the knob reads it and acknowledges it.
  *
  * Endpoints:
- *   POST /notify      — queue one {level, title, body, source, ttl_s, id}
+ *   POST /notify      — queue one {level, title, body, source, ttl_s, id, options}
  *   GET  /notify      — list, newest first, plus the unread count (?unread=1)
+ *   GET  /notify/one  — one entry by id (?id=N), for a caller waiting on a reply
  *   POST /notify/ack  — mark one read {"id":N} or all of them {"all":true}
  *
- * All three are registered with AsyncURIMatcher::exact(). The library's default
+ * All four are registered with AsyncURIMatcher::exact(). The library's default
  * matches ^{uri}(/.*)?$, under which /notify would also answer /notify/ack and,
  * being registered first, would silently swallow every acknowledgement. That
  * exact failure already cost this firmware a working POST /ir/tvbgone/stop.
+ *
+ * That rule is also why the single-entry read is /notify/one?id=N rather than
+ * /notify/12: an id in the path needs a prefix or a regex matcher. The library
+ * offers both, and this firmware's own route gate — tools/test_routes.sh, part
+ * 3 — allows neither, because a matcher looser than exact() is what once made
+ * POST /ir/tvbgone swallow /ir/tvbgone/stop. The id is a query parameter and
+ * the path is a constant, which is the shape exact() can defend.
+ *
+ * Reply options
+ * -------------
+ * A notification may carry up to NOTIFY_OPT_MAX short labels. The knob picks
+ * one and the index is STORED HERE, in `chosen`; nothing is sent anywhere.
+ * A caller that wants the answer comes back and reads it — GET /notify/one is
+ * that read, and it exists because polling the whole list for one entry
+ * serialises twenty of them on every pass.
+ *
+ * Two consequences, both deliberate:
+ *
+ *   - Re-posting under the same client key RESETS the choice. notify_push()
+ *     drops the old entry and appends a new one, so it happens by itself; it
+ *     is also what should happen. A re-post means the question changed, and
+ *     carrying yesterday's answer onto today's question is worse than having
+ *     no answer at all.
+ *   - Choosing an option also marks the entry read. Answering is a stronger
+ *     act than reading, and a queue that still counts an answered message as
+ *     unread is lying to the ring and to the badge.
+ *
+ * The labels themselves live in a table parallel to the slots rather than in
+ * Notification, which keeps the per-entry struct at the 208 bytes it already
+ * costs and puts the whole price of the feature — NOTIFY_MAX * NOTIFY_OPT_MAX
+ * * NOTIFY_OPT_LEN, about 1.3 KB — in one place that can be read off.
  *
  * Store shape
  * -----------
@@ -78,14 +110,40 @@
  *
  * The string lengths are what the API accepts, and they are deliberately a
  * little wider than the panel shows: the screen ellipsises, the JSON does not.
- * NOTIFY_MAX * sizeof(Notification) is the whole cost of this skill.
- */
+ * NOTIFY_MAX * sizeof(Notification), plus the option table below it, is the
+ * whole cost of this skill.
+ *
+ * Everything from here to the end marker is compiled verbatim on the host by
+ * tools/test_notify_options.sh. Keep the two markers on lines of their own, and
+ * keep every comment inside fully closed: the slicer copies from the marker
+ * without understanding what it copies. */
+/* host-test:begin types — sliced out by tools/test_notify_options.sh */
 #define NOTIFY_MAX          20
 #define NOTIFY_PERSIST       6
 #define NOTIFY_SOURCE_LEN   17   /* 16 chars, e.g. "home-rig", "k1c" */
 #define NOTIFY_TITLE_LEN    41   /* 40 chars */
 #define NOTIFY_BODY_LEN     97   /* 96 chars, two ellipsised lines on screen */
 #define NOTIFY_KEY_LEN      25   /* 24 chars of client-supplied dedup key */
+/* The range an id may take is 1..NOTIFY_ID_MAX, and both ends are excluded for
+   the same reason. 0 marks a free slot. 0xFFFFFFFF is the id whose successor is
+   0, and the id counter is always left one past the highest id in play — by
+   notify_push() as it hands one out, and by notify_restore_entries() as it reads
+   a snapshot back. An id of 0xFFFFFFFF therefore parks the counter on 0, and the
+   next notification is queued carrying the value that marks its slot free: the
+   caller is told "queue full" for a message that WAS queued, the next one takes
+   the same slot and overwrites it, and the list shows that one twice. */
+#define NOTIFY_ID_MAX       0xFFFFFFFEu
+/* Reply options. Three labels sit comfortably across the 320px panel and four
+   are tight — about seven capitals each — which is the width C2 has to draw
+   into and the reason the API says so in describe() rather than letting a
+   caller find out by looking at the device.
+   NOTIFY_OPT_LEN is 16 for the same reason every other field here is wider
+   than the panel: the JSON carries what was sent, the screen ellipsises. The
+   table costs NOTIFY_MAX * NOTIFY_OPT_MAX * NOTIFY_OPT_LEN = 1280 bytes of
+   static RAM, about 0.4% of it, which is worth paying once at boot rather than
+   allocating per notification. */
+#define NOTIFY_OPT_MAX       4
+#define NOTIFY_OPT_LEN      16   /* 15 chars plus the terminator */
 #define NOTIFY_FILE         "/notify.json"
 /* The snapshot is written here and renamed into place; see notify_save(). */
 #define NOTIFY_FILE_TMP     "/notify.tmp"
@@ -96,6 +154,13 @@
 
 enum { NOTIFY_INFO = 0, NOTIFY_WARN, NOTIFY_CRIT };
 
+/* The labels of one entry. A struct rather than a bare two-dimensional array so
+   that copying a set in or out is one assignment, which is what keeps the
+   critical sections here the fixed-size memcpys they have always been. */
+struct NotifyOptions {
+    char label[NOTIFY_OPT_MAX][NOTIFY_OPT_LEN];
+};
+
 struct Notification {
     uint32_t id;              /* 0 marks a free slot */
     uint32_t ttl_s;           /* 0 = never expires */
@@ -103,6 +168,12 @@ struct Notification {
     time_t   created_epoch;   /* 0 when the clock was unset at arrival */
     uint8_t  level;
     bool     unread;
+    /* Which option the knob picked, -1 while the question is unanswered, and
+       how many there are to pick from. Both land in what was the struct's tail
+       padding, so the queue costs exactly what it cost before. The labels are
+       in notify_opt[], indexed by the same slot. */
+    int8_t   chosen;
+    uint8_t  opt_count;
     char source[NOTIFY_SOURCE_LEN];
     char title[NOTIFY_TITLE_LEN];
     char body[NOTIFY_BODY_LEN];
@@ -115,16 +186,37 @@ struct NotifyView {
     uint32_t id;
     uint8_t  level;
     bool     unread;
+    int8_t   chosen;
+    uint8_t  opt_count;
     unsigned long age_s;
     char source[NOTIFY_SOURCE_LEN];
     char title[NOTIFY_TITLE_LEN];
     char body[NOTIFY_BODY_LEN];
+    NotifyOptions options;
 };
+/* host-test:end */
 
+/* The queue is twenty of these and nothing else, so its size is worth pinning
+   rather than trusting: `chosen` and `opt_count` were added into two bytes of
+   tail padding the struct was already paying for, and this is what says so.
+   Outside the sliced region deliberately — the host's `unsigned long` and
+   `time_t` are wider than the device's and the number would not hold there. */
+static_assert(sizeof(Notification) == 208,
+              "Notification changed size: the queue costs NOTIFY_MAX times this");
+
+/* The store itself is sliced onto the host too, because the restore loop under
+   it is where a refused entry can leak a slot and only a real slot array shows
+   that. The markers work the same way they do in the types region. */
+/* host-test:begin store — sliced out by tools/test_notify_options.sh */
 static Notification notify_slot[NOTIFY_MAX];
+/* Parallel to notify_slot and indexed the same way. Only the first opt_count
+   labels of a slot mean anything; the rest are whatever the previous occupant
+   left, which nothing reads. */
+static NotifyOptions notify_opt[NOTIFY_MAX];
 static uint8_t notify_order[NOTIFY_MAX];  /* slot indices, newest first */
 static uint8_t notify_len = 0;
 static uint32_t notify_next_id = 1;
+/* host-test:end */
 
 static portMUX_TYPE notify_mux = portMUX_INITIALIZER_UNLOCKED;
 
@@ -212,7 +304,11 @@ static bool notify_level_parse(const char *s, uint8_t &out) {
  *
  * Input that was not valid UTF-8 to begin with is not repaired, only left no
  * worse than it arrived.
+ *
+ * This and the two option helpers under it are compiled on the host by
+ * tools/test_notify_options.sh; the marker rules from the types region apply.
  */
+/* host-test:begin text — sliced out by tools/test_notify_options.sh */
 static void notify_copy_text(char *dst, size_t size, const char *src) {
     snprintf(dst, size, "%s", src);
     size_t len = strlen(dst);
@@ -232,6 +328,80 @@ static void notify_copy_text(char *dst, size_t size, const char *src) {
                 : 1;
     if (start + need > len) dst[start] = '\0';
 }
+
+/*
+ * Is this option label usable, and if not, why not.
+ *
+ * The ASCII rule is not tidiness, and it is the same rule progress.cpp keeps
+ * for the same reason: the panel's compiled TFT_eSPI fonts cover 32..126 and
+ * nothing else, so a Cyrillic or accented label is drawn as garbage on a device
+ * with no console and with no error raised anywhere. It is refused here, at the
+ * endpoint, while somebody is still holding the curl command.
+ *
+ * Length is not checked: an over-long label is truncated by notify_copy_text()
+ * like every other string this skill accepts. A label is a chip on a screen —
+ * cutting it is a cosmetic loss, and refusing the whole notification over it
+ * would lose the message.
+ */
+static bool notify_option_check(const char *label, const char **err) {
+    const char *sink = NULL;
+    if (!err) err = &sink;
+
+    if (!label || !label[0]) { *err = "an option label must not be empty"; return false; }
+
+    bool any = false;
+    for (size_t i = 0; label[i]; i++) {
+        unsigned char c = (unsigned char)label[i];
+        if (c < 0x20 || c > 0x7E) {
+            *err = "an option label must be printable ASCII (32..126): the panel has no other glyphs";
+            return false;
+        }
+        if (c != ' ') any = true;
+    }
+    /* All spaces is an empty label with extra steps: an unreadable chip that
+       still occupies a position the knob can land on. */
+    if (!any) { *err = "an option label must not be blank"; return false; }
+    return true;
+}
+
+/*
+ * Fill an option set from `n` labels, or refuse the whole set with a reason.
+ *
+ * Shared by POST /notify and by the restore path, because a snapshot is not a
+ * more trustworthy source than a request body — the filesystem can be replaced
+ * wholesale — and two validators that agree today are two that can disagree
+ * tomorrow.
+ *
+ * `n` above NOTIFY_OPT_MAX is refused BEFORE `labels` is read at all, so a
+ * caller holding more labels than fit may pass the count it saw while filling
+ * only the first NOTIFY_OPT_MAX pointers.
+ *
+ * All or nothing: one unusable label refuses the set rather than dropping it
+ * and renumbering the rest. `chosen` is an index into this set, and a set that
+ * quietly lost its second entry answers a different question than the one that
+ * was asked.
+ */
+static bool notify_options_build(NotifyOptions &out, uint8_t &count,
+                                 const char *const *labels, size_t n,
+                                 const char **err) {
+    const char *sink = NULL;
+    if (!err) err = &sink;
+
+    memset(&out, 0, sizeof(out));
+    count = 0;
+
+    if (n > NOTIFY_OPT_MAX) {
+        *err = "options must be an array of at most 4 strings";
+        return false;
+    }
+    for (size_t i = 0; i < n; i++) {
+        if (!notify_option_check(labels[i], err)) return false;
+        notify_copy_text(out.label[i], NOTIFY_OPT_LEN, labels[i]);
+    }
+    count = (uint8_t)n;
+    return true;
+}
+/* host-test:end */
 
 /* --- Age ---
  *
@@ -271,10 +441,28 @@ static void notify_drop_at(int pos) {
     notify_len--;
 }
 
+/* host-test:begin store — sliced out by tools/test_notify_options.sh */
 static int notify_free_slot() {
     for (int i = 0; i < NOTIFY_MAX; i++) if (notify_slot[i].id == 0) return i;
     return -1;
 }
+
+/* Hand out the next id, keeping the counter inside the range ids live in. It
+   can be found above the ceiling two ways: a restored snapshot leaves it one
+   past the highest id the file carried, and a device that has issued four
+   billion notifications gets there on its own. Rolling back to 1 can collide
+   with a live entry, which the list survives; walking off the end into 0 cannot
+   be survived, because the slot that id is written into reads as free.
+   Its own function, rather than two lines inside notify_push(), only so that
+   the host suite can reach it: notify_push() takes a spinlock, evicts and
+   copies structs, and cannot be sliced onto the host. The restore clamp alone
+   does not cover this — a counter parked at 0xFFFFFFFF still issues one valid
+   id, and it is the notification AFTER that one that lands on 0. */
+static uint32_t notify_take_id() {
+    if (notify_next_id > NOTIFY_ID_MAX) notify_next_id = 1;
+    return notify_next_id++;
+}
+/* host-test:end */
 
 /* Which entry loses its slot when the queue is full. See the header: read
    entries go first, then anything not critical, and only then the oldest
@@ -297,10 +485,17 @@ static int notify_victim() {
  * list. The previous numeric id is reported back so a client that was tracking
  * it knows which one it just superseded.
  *
+ * Replacement is also what resets a reply: the new entry starts unanswered,
+ * because the question it asks is a new one. See the header.
+ *
  * `e` arrives fully built — including its timestamps — so that the critical
- * section is one struct copy and two array shuffles.
+ * section is one struct copy and two array shuffles. `opts` is the label set
+ * for e.opt_count labels, or NULL when there are none; it is a second copy of
+ * the same shape rather than a field of `e` so that Notification stays the size
+ * it was.
  */
-static uint32_t notify_push(Notification &e, uint32_t *replaced_out) {
+static uint32_t notify_push(Notification &e, const NotifyOptions *opts,
+                            uint32_t *replaced_out) {
     uint32_t replaced = 0;
 
     portENTER_CRITICAL(&notify_mux);
@@ -324,8 +519,10 @@ static uint32_t notify_push(Notification &e, uint32_t *replaced_out) {
         return 0;
     }
 
-    e.id = notify_next_id++;
+    e.id = notify_take_id();
     notify_slot[slot] = e;
+    if (opts) notify_opt[slot] = *opts;
+    else      memset(&notify_opt[slot], 0, sizeof(notify_opt[slot]));
     for (int i = notify_len; i > 0; i--) notify_order[i] = notify_order[i - 1];
     notify_order[0] = (uint8_t)slot;
     notify_len++;
@@ -385,17 +582,23 @@ static int notify_count() {
     return n;
 }
 
-/* The copy itself, with the lock already held: three memcpys and the age
+/* The copy itself, with the lock already held: a handful of memcpys and the age
    arithmetic, both clocks having been read before the caller took it. */
-static void notify_fill_view(const Notification &e, NotifyView &out, time_t now,
-                             unsigned long now_ms) {
+static void notify_fill_view(const Notification &e, const NotifyOptions &op,
+                             NotifyView &out, time_t now, unsigned long now_ms) {
     out.id = e.id;
     out.level = e.level;
     out.unread = e.unread;
+    out.chosen = e.chosen;
+    out.opt_count = e.opt_count;
     out.age_s = notify_age_of(e, now, now_ms);
     memcpy(out.source, e.source, sizeof(out.source));
     memcpy(out.title, e.title, sizeof(out.title));
     memcpy(out.body, e.body, sizeof(out.body));
+    /* The labels come out with the entry rather than being fetched afterwards:
+       a second acquisition is a second chance for the slot to have been reused
+       under the reader, and then the chips would belong to another message. */
+    out.options = op;
 }
 
 /* Copy entry `index` out, 0 being the newest. False when the index is past the
@@ -410,7 +613,8 @@ static bool notify_view(int index, NotifyView &out) {
         portEXIT_CRITICAL(&notify_mux);
         return false;
     }
-    notify_fill_view(notify_slot[notify_order[index]], out, now, now_ms);
+    notify_fill_view(notify_slot[notify_order[index]], notify_opt[notify_order[index]],
+                     out, now, now_ms);
     portEXIT_CRITICAL(&notify_mux);
     return true;
 }
@@ -437,7 +641,7 @@ static bool notify_view_by_id(uint32_t id, NotifyView &out, int *index_out,
     for (int i = 0; i < notify_len; i++) {
         const Notification &e = notify_slot[notify_order[i]];
         if (e.id != id) continue;
-        notify_fill_view(e, out, now, now_ms);
+        notify_fill_view(e, notify_opt[notify_order[i]], out, now, now_ms);
         if (index_out) *index_out = i;
         found = true;
         break;
@@ -479,6 +683,55 @@ static bool notify_ack_id(uint32_t id) {
         notify_ring_acked = true;
     }
     return found;
+}
+
+/*
+ * Record which option the knob picked. Called from the loop task, which is
+ * where every input this device has is handled.
+ *
+ * False when there is no such entry, when it carries no options, or when the
+ * index is past the ones it does carry — the caller is then holding a stale
+ * view of a message that has been replaced under it, and drawing a choice it
+ * did not make would be worse than drawing none.
+ *
+ * Acknowledgement is not reimplemented here. Answering implies reading, so this
+ * calls notify_ack_id() and inherits whatever an ack does today: the deferred
+ * save, the redraw, and the ring's ack one-shot. The ring flag in particular is
+ * right to leave to it — an already-read entry being answered is not an event
+ * the ring should replay.
+ *
+ * What the ack does NOT cover is the choice itself, which changes the store
+ * whether or not the entry was still unread, so the save and the redraw are
+ * asked for again here. Both are idempotent: the earliest save deadline wins
+ * and display_force is a flag, so asking twice costs nothing.
+ *
+ * Nothing calls this yet — C2 binds it to the click. Marked unused so that
+ * -Wunused-function does not refuse the build in the meantime.
+ */
+static bool notify_choose_id(uint32_t id, uint8_t index) __attribute__((unused));
+static bool notify_choose_id(uint32_t id, uint8_t index) {
+    bool ok = false, changed = false;
+
+    portENTER_CRITICAL(&notify_mux);
+    for (int i = 0; i < notify_len; i++) {
+        Notification &e = notify_slot[notify_order[i]];
+        if (e.id != id) continue;
+        if (index < e.opt_count) {
+            changed = (e.chosen != (int8_t)index);
+            e.chosen = (int8_t)index;
+            ok = true;
+        }
+        break;
+    }
+    portEXIT_CRITICAL(&notify_mux);
+    if (!ok) return false;
+
+    notify_ack_id(id);
+    if (changed) {
+        notify_mark_dirty(NOTIFY_COALESCE_MS);
+        display_force = true;
+    }
+    return true;
 }
 
 static int notify_ack_all() {
@@ -574,7 +827,194 @@ static bool notify_take_sound_arrival(uint8_t *level, char *source, size_t n) {
     return true;
 }
 
-/* --- Persistence --- */
+/* --- Persistence ---
+ *
+ * The two halves of the file format, one entry at a time, with no filesystem
+ * and no store in either of them. tools/test_notify_options.sh compiles them on
+ * the host against the real ArduinoJson and round-trips one through the other,
+ * which is what pins the two-letter keys to each other: a writer emitting "op"
+ * against a reader looking for "opt" loses every reply across a reboot and
+ * nothing else in this firmware would notice.
+ */
+/* host-test:begin snapshot — sliced out by tools/test_notify_options.sh */
+
+/*
+ * One entry into one JSON object.
+ *
+ * `e` and `op` are NON-CONST, and that is load-bearing rather than an
+ * oversight. ArduinoJson stores a `const char *` by pointer and duplicates a
+ * `char *`; the entries here are stack copies taken under the lock, and they
+ * are gone by the time the document is serialised. Take these by const
+ * reference and the snapshot silently fills with whatever the stack holds
+ * later — it compiles, it runs, and the file is garbage.
+ */
+static void notify_snapshot_store(JsonObject o, Notification &e, NotifyOptions &op,
+                                  time_t now) {
+    o["id"] = e.id;
+    o["lv"] = e.level;
+    o["ur"] = e.unread;
+    o["tt"] = e.ttl_s;
+    /* An entry that arrived before the first NTP sync has no epoch of its own.
+       Stamping it with the current one on the way out is the best available
+       answer and beats writing a zero that reads as "just now" forever. */
+    o["ts"] = (uint32_t)(e.created_epoch > TIME_VALID_EPOCH ? e.created_epoch
+                         : (now > TIME_VALID_EPOCH ? now : 0));
+    if (e.source[0]) o["sr"] = e.source;
+    o["ti"] = e.title;
+    if (e.body[0]) o["bd"] = e.body;
+    if (e.key[0])  o["ky"] = e.key;
+    /* Options and the reply travel together or not at all: `ch` is an index
+       into `op` and means nothing beside a different set of labels. */
+    if (e.opt_count > 0) {
+        JsonArray a = o["op"].to<JsonArray>();
+        for (uint8_t i = 0; i < e.opt_count && i < NOTIFY_OPT_MAX; i++)
+            a.add(op.label[i]);
+        o["ch"] = e.chosen;
+    }
+}
+
+/*
+ * One JSON object back into one entry, clamped.
+ *
+ * False when there is nothing usable here — no id, or no title — which is how
+ * the caller skips an object instead of restoring a blank. `e` and `op` are
+ * fully overwritten either way, and a refusal leaves `e.id` at 0: the caller
+ * restores straight into a slot, and a non-zero id in a slot the caller then
+ * skips is a slot no free-slot search will ever hand out again. Every path
+ * that returns false must therefore clear the id it had already read.
+ *
+ * Every field that has a range is clamped into it. A stored file is not a more
+ * trustworthy source than a request body: this filesystem can be replaced
+ * wholesale by anyone who can write an image, so the numbers coming out of it
+ * get the same treatment the endpoint gives the ones coming in.
+ */
+static bool notify_snapshot_restore(JsonObjectConst o, Notification &e, NotifyOptions &op,
+                                    time_t now, unsigned long now_ms) {
+    memset(&e, 0, sizeof(e));
+    memset(&op, 0, sizeof(op));
+    e.chosen = -1;
+
+    e.id = o["id"] | 0u;
+    /* The id has a range like every other field here — see NOTIFY_ID_MAX — and a
+       stored file is the one place a value outside it can come from, because
+       nothing on the device ever issues one. 0xFFFFFFFF is the only value that
+       ever reaches the clamp: anything wider, negative, or not a number at all
+       reads back from the JSON as 0 and is refused a line below. The clamp is
+       not free. The first entry to hit it keeps its message under a name that
+       is not its own, and every later entry that clamps onto the same id — as
+       does a legitimate holder of NOTIFY_ID_MAX — is dropped whole by the load
+       loop as the duplicate it has been made into. */
+    if (e.id > NOTIFY_ID_MAX) e.id = NOTIFY_ID_MAX;
+    if (e.id == 0 || !o["ti"].is<const char *>()) { e.id = 0; return false; }
+
+    e.level = (uint8_t)(o["lv"] | 0);
+    if (e.level > NOTIFY_CRIT) e.level = NOTIFY_INFO;
+    e.unread = o["ur"] | false;
+    /* The same ceiling the API enforces, and a ttl past the cap says "never
+       expires", which is what ttl_s 0 already spells. */
+    e.ttl_s = o["tt"] | 0u;
+    if (e.ttl_s > NOTIFY_TTL_MAX) e.ttl_s = NOTIFY_TTL_MAX;
+    e.created_epoch = (time_t)(uint32_t)(o["ts"] | 0u);
+    /* Wind millis() back by however long the entry has really been alive. The
+       subtraction is meant to go negative and wrap: notify_age_of() reads it
+       back with the same unsigned arithmetic. */
+    unsigned long elapsed = 0;
+    if (e.created_epoch > TIME_VALID_EPOCH && now > e.created_epoch)
+        elapsed = (unsigned long)(now - e.created_epoch) * 1000UL;
+    e.created_ms = now_ms - elapsed;
+    /* Through the same copy the API path uses, for the same reason: these
+       strings go back out over GET /notify, and a stored file is not a more
+       trustworthy source of UTF-8 than a POST body. */
+    notify_copy_text(e.source, sizeof(e.source), o["sr"] | "");
+    notify_copy_text(e.title, sizeof(e.title), o["ti"] | "");
+    notify_copy_text(e.body, sizeof(e.body), o["bd"] | "");
+    notify_copy_text(e.key, sizeof(e.key), o["ky"] | "");
+
+    /* The options go through the endpoint's own validator, so a set that could
+       not have been posted cannot be restored either. A set that fails takes
+       the reply with it and leaves a plain notification, which is the readable
+       half of the entry and the half worth keeping. */
+    JsonArrayConst a = o["op"];
+    if (!a.isNull()) {
+        const char *labels[NOTIFY_OPT_MAX];
+        size_t n = a.size();
+        for (size_t i = 0; i < n && i < NOTIFY_OPT_MAX; i++) labels[i] = a[i] | "";
+        if (!notify_options_build(op, e.opt_count, labels, n, NULL)) {
+            memset(&op, 0, sizeof(op));
+            e.opt_count = 0;
+        }
+    }
+    if (e.opt_count > 0) {
+        int chosen = o["ch"] | -1;
+        /* -1 is "unanswered" and 0..opt_count-1 is an answer; anything else is
+           a reply to a question this entry is not asking. */
+        if (chosen >= 0 && chosen < (int)e.opt_count) e.chosen = (int8_t)chosen;
+    }
+    return true;
+}
+
+/*
+ * Fill the store from a stored array, and say how many entries went in.
+ *
+ * A function of its own rather than a loop inside notify_load() so that the
+ * host suite can run it against a real slot array: everything that can go
+ * wrong here is a slot left in a state nothing looks at again, which no test
+ * of notify_snapshot_restore() alone can see.
+ *
+ * setup()-time only. It walks and rewrites notify_slot[], notify_order[] and
+ * notify_len WITHOUT taking notify_mux, and that is safe for exactly one
+ * reason: notify_load() calls it from setup(), before the web server and its
+ * AsyncTCP task exist, so there is no second party to race. Do not call it from
+ * anywhere else — from a request handler it would rewrite the arrays a
+ * concurrent notify_push() is reading.
+ *
+ * The file is newest-first, so appending to the tail rebuilds the order as it
+ * was. Nothing else runs yet — notify_load() is called from setup() — so the
+ * slots are filled directly instead of going through notify_push(), which would
+ * issue new ids and reverse the list.
+ *
+ * Every path out of the loop that does not publish the slot puts its id back to
+ * 0 first. Restoring writes into the slot before it knows whether the entry is
+ * usable, so an id left behind on a slot that never reaches notify_order[] is
+ * a slot that is neither free nor in the list: notify_free_slot() skips it
+ * forever, and a file whose entries all fail this way leaves POST /notify
+ * answering "queue full" on an empty queue.
+ */
+static int notify_restore_entries(JsonArrayConst arr, time_t now, unsigned long now_ms) {
+    int restored = 0;
+
+    for (JsonObjectConst o : arr) {
+        if (notify_len >= NOTIFY_MAX) break;
+
+        int slot = notify_free_slot();
+        if (slot < 0) break;
+
+        if (!notify_snapshot_restore(o, notify_slot[slot], notify_opt[slot], now, now_ms)) {
+            /* Redundant today: notify_snapshot_restore() has one refusal path and
+               it clears the id itself. Kept because the state it prevents — a slot
+               neither free nor listed — answers "queue full" on an empty queue and
+               comes back only with a reflash, and that is one guard away. The line
+               DOES run, on every refused entry; what no test can observe is the
+               assignment doing anything, because the id is already 0 whenever the
+               guard upstream holds. Read it as belt-and-braces, not as something
+               the suite has proven. */
+            notify_slot[slot].id = 0;
+            continue;
+        }
+
+        uint32_t id = notify_slot[slot].id;
+        bool dup = false;
+        for (int i = 0; i < notify_len && !dup; i++)
+            dup = (notify_slot[notify_order[i]].id == id);
+        if (dup) { notify_slot[slot].id = 0; continue; }
+
+        notify_order[notify_len++] = (uint8_t)slot;
+        if (id >= notify_next_id) notify_next_id = id + 1;
+        restored++;
+    }
+    return restored;
+}
+/* host-test:end */
 
 static void notify_save() {
     JsonDocument doc;
@@ -588,27 +1028,17 @@ static void notify_save() {
     if (count > NOTIFY_PERSIST) count = NOTIFY_PERSIST;
     for (int i = 0; i < count; i++) {
         Notification e;
+        NotifyOptions op;
         portENTER_CRITICAL(&notify_mux);
         bool ok = (i < notify_len);
-        if (ok) e = notify_slot[notify_order[i]];
+        if (ok) {
+            e = notify_slot[notify_order[i]];
+            op = notify_opt[notify_order[i]];
+        }
         portEXIT_CRITICAL(&notify_mux);
         if (!ok) break;
 
-        JsonObject o = arr.add<JsonObject>();
-        o["id"] = e.id;
-        o["lv"] = e.level;
-        o["ur"] = e.unread;
-        o["tt"] = e.ttl_s;
-        /* An entry that arrived before the first NTP sync has no epoch of its
-           own. Stamping it with the current one on the way out is the best
-           available answer and beats writing a zero that reads as "just now"
-           forever. */
-        o["ts"] = (uint32_t)(e.created_epoch > TIME_VALID_EPOCH ? e.created_epoch
-                             : (now > TIME_VALID_EPOCH ? now : 0));
-        if (e.source[0]) o["sr"] = e.source;
-        o["ti"] = e.title;
-        if (e.body[0]) o["bd"] = e.body;
-        if (e.key[0])  o["ky"] = e.key;
+        notify_snapshot_store(arr.add<JsonObject>(), e, op, now);
     }
 
     String out;
@@ -636,58 +1066,8 @@ static void notify_load() {
         return;
     }
 
-    time_t now = time(NULL);
-    unsigned long now_ms = millis();
-    int restored = 0;
-
-    /* The file is newest-first, so appending to the tail rebuilds the order as
-       it was. Nothing else runs yet — this is called from setup() — so the
-       slots are filled directly instead of going through notify_push(), which
-       would issue new ids and reverse the list. */
-    for (JsonObject o : doc["n"].as<JsonArray>()) {
-        if (notify_len >= NOTIFY_MAX) break;
-        uint32_t id = o["id"] | 0u;
-        if (id == 0 || !o["ti"].is<const char*>()) continue;
-
-        bool dup = false;
-        for (int i = 0; i < notify_len && !dup; i++)
-            dup = (notify_slot[notify_order[i]].id == id);
-        if (dup) continue;
-
-        int slot = notify_free_slot();
-        if (slot < 0) break;
-        Notification &e = notify_slot[slot];
-        memset(&e, 0, sizeof(e));
-        e.id = id;
-        e.level = (uint8_t)(o["lv"] | 0);
-        if (e.level > NOTIFY_CRIT) e.level = NOTIFY_INFO;
-        e.unread = o["ur"] | false;
-        /* The same ceiling the API enforces. A restored entry is not more
-           trusted than a posted one — this file can be replaced wholesale with
-           a filesystem image — and a ttl past the cap says "never expires",
-           which is what ttl_s 0 already spells. */
-        e.ttl_s = o["tt"] | 0u;
-        if (e.ttl_s > NOTIFY_TTL_MAX) e.ttl_s = NOTIFY_TTL_MAX;
-        e.created_epoch = (time_t)(uint32_t)(o["ts"] | 0u);
-        /* Wind millis() back by however long the entry has really been alive.
-           The subtraction is meant to go negative and wrap: notify_age_of()
-           reads it back with the same unsigned arithmetic. */
-        unsigned long elapsed = 0;
-        if (e.created_epoch > TIME_VALID_EPOCH && now > e.created_epoch)
-            elapsed = (unsigned long)(now - e.created_epoch) * 1000UL;
-        e.created_ms = now_ms - elapsed;
-        /* Through the same copy the API path uses, for the same reason: these
-           strings go back out over GET /notify, and a stored file is not a
-           more trustworthy source of UTF-8 than a POST body. */
-        notify_copy_text(e.source, sizeof(e.source), o["sr"] | "");
-        notify_copy_text(e.title, sizeof(e.title), o["ti"] | "");
-        notify_copy_text(e.body, sizeof(e.body), o["bd"] | "");
-        notify_copy_text(e.key, sizeof(e.key), o["ky"] | "");
-
-        notify_order[notify_len++] = (uint8_t)slot;
-        if (id >= notify_next_id) notify_next_id = id + 1;
-        restored++;
-    }
+    int restored = notify_restore_entries(doc["n"].as<JsonArrayConst>(),
+                                          time(NULL), millis());
 
     /* A ttl that ran out while the device was off has still run out. */
     int dropped = notify_expire();
@@ -720,8 +1100,9 @@ static void notify_poll() {
 /* --- Endpoints --- */
 
 static const SkillEndpoint notify_endpoints[] = {
-    {"POST", "/notify",     "Queue a notification {level, title, body, source, ttl_s, id}"},
+    {"POST", "/notify",     "Queue a notification {level, title, body, source, ttl_s, id, options}"},
     {"GET",  "/notify",     "List notifications newest first (?unread=1) plus the unread count"},
+    {"GET",  "/notify/one", "One notification by id (?id=N), with its options and the reply"},
     {"POST", "/notify/ack", "Mark one read {\"id\":N} or all of them {\"all\":true}"},
     {NULL, NULL, NULL}
 };
@@ -733,8 +1114,9 @@ static const char *notify_describe() {
            "### Endpoints\n\n"
            "| Method | Path | Description |\n"
            "|--------|------|-------------|\n"
-           "| POST | /notify | `{\"level\":\"info\"\\|\"warn\"\\|\"crit\",\"title\":\"...\",\"body\":\"...\",\"source\":\"home-rig\",\"ttl_s\":3600,\"id\":\"backup\"}` |\n"
+           "| POST | /notify | `{\"level\":\"info\"\\|\"warn\"\\|\"crit\",\"title\":\"...\",\"body\":\"...\",\"source\":\"home-rig\",\"ttl_s\":3600,\"id\":\"backup\",\"options\":[\"Yes\",\"No\"]}` |\n"
            "| GET | /notify | `{\"unread\":N,\"count\":M,\"notifications\":[...]}`, newest first; `?unread=1` lists only unread |\n"
+           "| GET | /notify/one | one entry by numeric id: `/notify/one?id=12`, 404 if it is gone |\n"
            "| POST | /notify/ack | `{\"id\":12}` or `{\"all\":true}` |\n\n"
            "### Fields\n\n"
            "`title` is the only required one. `level` defaults to `info` and\n"
@@ -746,10 +1128,27 @@ static const char *notify_describe() {
            "the earlier message instead of queueing a second one, so a job that\n"
            "reports progress leaves one entry rather than fifty.\n\n"
            "Lengths are capped and longer values are truncated, not rejected:\n"
-           "title 40, body 96, source 16, id 24 — bytes, which is characters\n"
-           "for ASCII and fewer for anything else. The cut lands on a character\n"
-           "boundary, so a multi-byte one is dropped whole rather than left\n"
-           "half-written in the JSON.\n\n"
+           "title 40, body 96, source 16, id 24, and each option label 15 —\n"
+           "bytes, which is characters for ASCII and fewer for anything else.\n"
+           "The cut lands on a character boundary, so a multi-byte one is\n"
+           "dropped whole rather than left half-written in the JSON.\n\n"
+           "### Asking a question\n\n"
+           "`options` is up to four short labels. The knob picks one and the\n"
+           "index is stored on the device — nothing is sent anywhere, so ask,\n"
+           "then come back and read `chosen` with `GET /notify/one?id=N`. It is\n"
+           "-1 until somebody answers, and both `options` and `chosen` are\n"
+           "absent from an entry that carries no question at all.\n\n"
+           "Three labels fit the screen comfortably; four are tight, about\n"
+           "seven capitals each, so `Yes`/`No`/`Later` reads well and\n"
+           "`Restart now` does not — and a label over 15 bytes is cut like any\n"
+           "other field, so `Deploy to production` is stored and shown as\n"
+           "`Deploy to produ`. Labels are printable ASCII only (32..126):\n"
+           "anything else is refused with a reason, because the panel has no\n"
+           "glyphs for it and would draw a message nobody can read.\n\n"
+           "Posting again under the same `id` key clears any answer along with\n"
+           "the message it belonged to. A re-post is a new question, and\n"
+           "carrying the old reply onto it would be worse than losing it.\n"
+           "Answering also marks the entry read.\n\n"
            "### Behaviour\n\n"
            "Twenty entries are held in RAM and the newest six survive a reboot.\n"
            "A full queue drops the oldest read entry first, and only ever drops\n"
@@ -763,6 +1162,11 @@ static const char *notify_describe() {
            "curl -H \"Authorization: Bearer $TOKEN\" -H 'Content-Type: application/json' \\\n"
            "  -d '{\"level\":\"crit\",\"source\":\"home-rig\",\"title\":\"RAID degraded\"}' \\\n"
            "  http://seed.local:8080/notify\n"
+           "\n"
+           "curl -H \"Authorization: Bearer $TOKEN\" -H 'Content-Type: application/json' \\\n"
+           "  -d '{\"source\":\"claude\",\"title\":\"Deploy to prod?\",\"options\":[\"Yes\",\"No\",\"Later\"]}' \\\n"
+           "  http://seed.local:8080/notify\n"
+           "curl -H \"Authorization: Bearer $TOKEN\" http://seed.local:8080/notify/one?id=12\n"
            "```\n";
 }
 
@@ -781,11 +1185,75 @@ static void notify_send_json(AsyncWebServerRequest *req, int code, JsonDocument 
     req->send(code, "application/json", out);
 }
 
+/*
+ * One entry as the API renders it, shared by the list and the single-entry
+ * read so the two cannot drift into describing the same message differently.
+ *
+ * `v` is NON-CONST for the reason spelled out at notify_snapshot_store():
+ * ArduinoJson keeps a `const char *` by pointer and copies a `char *`, and this
+ * view is a stack local that is reused on the next pass of the caller's loop.
+ *
+ * `options` and `chosen` appear only on an entry that has options, so their
+ * absence means "this message asks nothing" rather than "no reply yet" — which
+ * is what -1 means, and only ever appears where there is something to choose.
+ */
+static void notify_entry_json(JsonObject o, NotifyView &v) {
+    o["id"] = v.id;
+    o["level"] = notify_level_name(v.level);
+    o["unread"] = v.unread;
+    o["age_s"] = v.age_s;
+    if (v.source[0]) o["source"] = v.source;
+    o["title"] = v.title;
+    if (v.body[0]) o["body"] = v.body;
+    if (v.opt_count > 0) {
+        JsonArray a = o["options"].to<JsonArray>();
+        for (uint8_t i = 0; i < v.opt_count && i < NOTIFY_OPT_MAX; i++)
+            a.add(v.options.label[i]);
+        o["chosen"] = v.chosen;
+    }
+}
+
 static void notify_send_error(AsyncWebServerRequest *req, int code, const char *msg) {
     JsonDocument doc;
     doc["error"] = msg;
     notify_send_json(req, code, doc);
 }
+
+/*
+ * The numeric id out of ?id=, or false with nothing written.
+ *
+ * Digits and nothing else, counted by hand, because every library parser here
+ * is more generous than the query string is allowed to be. strtoul() skips
+ * leading whitespace, accepts a leading '+', and turns a leading '-' into the
+ * unsigned negation — so "-1" arrives as 4294967295 and asks the store for a
+ * notification that cannot exist, which answers 404 to what is plainly a
+ * malformed request. It also reports overflow through errno rather than in its
+ * return value, and a 33-digit id truncated into uint32_t would not be refused
+ * at all: it would fetch some other entry and look like a successful read.
+ *
+ * The ceiling is checked on every digit, so the accumulator cannot wrap on the
+ * way to being compared against it. 0 is refused with the rest: it is what
+ * marks a slot free, so no notification ever carries it.
+ *
+ * Sliced onto the host by tools/test_notify_options.sh; the marker rules from
+ * the types region apply.
+ */
+/* host-test:begin id — sliced out by tools/test_notify_options.sh */
+static bool notify_parse_id(const char *s, uint32_t &out) {
+    if (!s || !s[0]) return false;
+
+    unsigned long long v = 0;
+    for (const char *p = s; *p; p++) {
+        if (*p < '0' || *p > '9') return false;
+        v = v * 10 + (unsigned long long)(*p - '0');
+        if (v > 0xFFFFFFFFULL) return false;
+    }
+    if (v == 0) return false;
+
+    out = (uint32_t)v;
+    return true;
+}
+/* host-test:end */
 
 static void notify_register_routes(AsyncWebServer &server) {
 
@@ -812,9 +1280,12 @@ static void notify_register_routes(AsyncWebServer &server) {
         }
 
         Notification e;
+        NotifyOptions opts;
         memset(&e, 0, sizeof(e));
+        memset(&opts, 0, sizeof(opts));
         e.level = NOTIFY_INFO;
         e.unread = true;
+        e.chosen = -1;   /* memset made it 0, which would read as "picked the first" */
 
         /* A field of the wrong type is a caller bug, and answering it with a
            silent default is how that bug survives to production. Absent is
@@ -851,6 +1322,32 @@ static void notify_register_routes(AsyncWebServer &server) {
             }
             e.ttl_s = (uint32_t)input["ttl_s"].as<unsigned long>();
         }
+        if (!input["options"].isNull()) {
+            /* Same rule as every other field here: absent is fine, present and
+               wrong is a 400. A caller that asked a question and got a plain
+               notification back would never find out. */
+            if (!input["options"].is<JsonArrayConst>()) {
+                notify_send_error(req, 400, "options must be an array of at most 4 strings");
+                return;
+            }
+            JsonArrayConst a = input["options"];
+            size_t n = a.size();
+            const char *labels[NOTIFY_OPT_MAX];
+            for (size_t i = 0; i < n && i < NOTIFY_OPT_MAX; i++) {
+                if (!a[i].is<const char *>()) {
+                    notify_send_error(req, 400, "each option must be a string");
+                    return;
+                }
+                labels[i] = a[i].as<const char *>();
+            }
+            /* A count over the maximum is refused inside, before the labels are
+               read — which is why only the ones that fit were collected. */
+            const char *why = NULL;
+            if (!notify_options_build(opts, e.opt_count, labels, n, &why)) {
+                notify_send_error(req, 400, why);
+                return;
+            }
+        }
 
         /* Both clocks are read before the lock: time() must not be called
            inside a critical section, and one timestamp for the whole entry is
@@ -860,7 +1357,7 @@ static void notify_register_routes(AsyncWebServer &server) {
         e.created_ms = millis();
 
         uint32_t replaced = 0;
-        uint32_t id = notify_push(e, &replaced);
+        uint32_t id = notify_push(e, e.opt_count ? &opts : NULL, &replaced);
         if (id == 0) {
             notify_send_error(req, 500, "queue full");
             return;
@@ -912,16 +1409,50 @@ static void notify_register_routes(AsyncWebServer &server) {
             NotifyView v;
             if (!notify_view(i, v)) break;
             if (only_unread && !v.unread) continue;
-            JsonObject o = arr.add<JsonObject>();
-            o["id"] = v.id;
-            o["level"] = notify_level_name(v.level);
-            o["unread"] = v.unread;
-            o["age_s"] = v.age_s;
-            if (v.source[0]) o["source"] = v.source;
-            o["title"] = v.title;
-            if (v.body[0]) o["body"] = v.body;
+            notify_entry_json(arr.add<JsonObject>(), v);
         }
 
+        notify_send_json(req, 200, doc);
+    });
+
+    /*
+     * GET /notify/one?id=N — one entry, and nothing else.
+     *
+     * The list endpoint builds and serialises the whole queue, which is several
+     * kilobytes of JSON for a caller that wants one field of one message. That
+     * caller is the point of the reply options: something that posted a
+     * question and is now waiting on the line for the knob to answer it, asking
+     * again every few seconds. This is what it should be asking.
+     *
+     * Registered under /notify with exact(), so it is a sibling of the list
+     * rather than something the list can swallow — the failure that once made
+     * POST /ir/tvbgone answer /ir/tvbgone/stop.
+     */
+    server.on(AsyncURIMatcher::exact("/notify/one"), HTTP_GET, [](AsyncWebServerRequest *req) {
+        if (!require_auth(req)) return;
+
+        if (!req->hasParam("id")) {
+            notify_send_error(req, 400, "id is required: /notify/one?id=N");
+            return;
+        }
+        /* Parsed rather than handed to toInt(): a typo must come back as a 400
+           with a reason, not as a silent lookup of notification 0 answering
+           404 — which is what toInt() returns for "twelve", for "" and for
+           "12x" alike. See notify_parse_id() for what it refuses and why. */
+        uint32_t id = 0;
+        if (!notify_parse_id(req->getParam("id")->value().c_str(), id)) {
+            notify_send_error(req, 400, "id must be a positive number");
+            return;
+        }
+
+        NotifyView v;
+        if (!notify_view_by_id(id, v, NULL, NULL)) {
+            notify_send_error(req, 404, "no notification with that id");
+            return;
+        }
+
+        JsonDocument doc;
+        notify_entry_json(doc.to<JsonObject>(), v);
         notify_send_json(req, 200, doc);
     });
 
@@ -970,7 +1501,7 @@ static void notify_register_routes(AsyncWebServer &server) {
 
 static const Skill notify_skill = {
     .name = "notify",
-    .version = "0.1.0",
+    .version = "0.2.0",
     .describe = notify_describe,
     .endpoints = notify_endpoints,
     .register_routes = notify_register_routes
