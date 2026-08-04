@@ -1133,13 +1133,65 @@ button.sec{background:#21262d;border-color:var(--border)}
 <input id="sqsl" type="range" min="0" max="127" oninput="document.getElementById('sqlab').textContent=this.value" onchange="setSql(this.value)">
 <div style="height:12px"></div>
 <div class="row"><button class="sec" onclick="toggleMute()">Toggle Mute</button><button class="sec" onclick="clearToken()">Log out</button></div>
-</div></div>
+</div>
+<div class="panel">
+<label>Band</label>
+<select id="bandsel" onchange="setBand(this.value)"></select>
+</div>
+<div class="panel">
+<label>Memory</label>
+<div id="memlist" class="mono" style="font-size:.85rem">--</div>
+<label>Save / clear slot</label>
+<div class="row"><input id="memslot" type="number" min="1" max="99" placeholder="1-99"><button class="sec" onclick="memAct('save')">Save</button><button class="sec" onclick="memAct('clear')">Clear</button></div>
+</div>
+<div class="panel">
+<label>DSP / Tuning</label>
+<div class="grid">
+<div class="cell"><div class="k">Step</div><div class="v mono" id="stepdesc">--</div></div>
+<div class="cell"><div class="k">Bandwidth</div><div class="v mono" id="bwdesc">--</div></div>
+</div>
+<div class="row"><div><label>Step idx</label><input id="stepidx" type="number" min="0"></div><div><label>BW idx</label><input id="bwidx" type="number" min="0"></div></div>
+<div style="height:6px"></div>
+<div class="row"><button class="sec" onclick="setCfg('step_idx','stepidx')">Set step</button><button class="sec" onclick="setCfg('bw_idx','bwidx')">Set BW</button></div>
+<label>AGC</label>
+<div class="row"><input id="agc" type="number"><button class="sec" onclick="setCfg('agc','agc')">Set</button></div>
+<label>Squelch metric</label>
+<div class="row"><button class="sec" id="mrssi" onclick="setMetric(false)">RSSI</button><button class="sec" id="msnr" onclick="setMetric(true)">SNR</button></div>
+<div id="dspssb">
+<label>AVC (AM/SSB)</label>
+<div class="row"><input id="avc" type="number"><button class="sec" onclick="setCfg('avc','avc')">Set</button></div>
+<label>SoftMute (AM/SSB)</label>
+<div class="row"><input id="softmute" type="number"><button class="sec" onclick="setCfg('softmute','softmute')">Set</button></div>
+<label>Cal (SSB, Hz)</label>
+<div class="row"><input id="cal" type="number"><button class="sec" onclick="setCfg('cal','cal')">Set</button></div>
+</div>
+</div>
+<div class="panel">
+<label>Clock</label>
+<div class="grid">
+<div class="cell"><div class="k">Local time</div><div class="v mono" id="clk2">--</div></div>
+<div class="cell"><div class="k">Timezone</div><div class="v mono" id="tzcur">--</div></div>
+</div>
+<label>POSIX TZ string</label>
+<div class="row"><input id="tzin" placeholder="CET-1CEST,M3.5.0,M10.5.0/3"><button class="sec" onclick="setTz()">Set</button></div>
+</div>
+<div class="panel">
+<label>Device</label>
+<div class="grid">
+<div class="cell"><div class="k">Battery</div><div class="v mono" id="batt">--</div></div>
+<div class="cell"><div class="k">Temp</div><div class="v mono" id="temp">--</div></div>
+<div class="cell"><div class="k">WiFi RSSI</div><div class="v mono" id="wrssi">--</div></div>
+<div class="cell"><div class="k">Free heap</div><div class="v mono" id="heap">--</div></div>
+<div class="cell"><div class="k">IP</div><div class="v mono" id="ip">--</div></div>
+</div>
+</div>
+</div>
 <script>
 var token=localStorage.getItem('ats_token')||'',lastMute=false;
 function $(i){return document.getElementById(i)}
 function showLogin(){$('login').style.display='block';$('app').style.display='none'}
 function showApp(){$('login').style.display='none';$('app').style.display='block'}
-function saveToken(){var v=$('tok').value.trim();if(!v)return;token=v;localStorage.setItem('ats_token',token);$('tok').value='';showApp();poll()}
+function saveToken(){var v=$('tok').value.trim();if(!v)return;token=v;localStorage.setItem('ats_token',token);$('tok').value='';showApp();poll();boot()}
 function clearToken(){token='';localStorage.removeItem('ats_token');showLogin()}
 function banner(m){var b=$('banner');if(!m){b.style.display='none';return}b.textContent=m;b.style.display='block'}
 function live(s){$('live').className='dot '+s}
@@ -1166,16 +1218,34 @@ $('sql').style.display=s.squelched?'inline-block':'none';
 lastMute=!!s.mute;
 if(s.rds_ps&&s.rds_ps.trim()){$('rds').style.display='block';$('rds').textContent=s.rds_ps}else{$('rds').style.display='none'}
 if(document.activeElement!==$('volsl')&&s.volume!=null){$('volsl').value=s.volume;$('vollab').textContent=s.volume}
-if(document.activeElement!==$('sqsl')&&s.squelch!=null){$('sqsl').value=s.squelch;$('sqlab').textContent=s.squelch}}
+if(document.activeElement!==$('sqsl')&&s.squelch!=null){$('sqsl').value=s.squelch;$('sqlab').textContent=s.squelch}
+renderDsp(s);}
 if(h){$('uptime').textContent=fmtUp(h.uptime_sec);$('ver').textContent=h.version||'--'}})
 .catch(function(e){if(e&&e.handled)return;live('off');banner('Device offline')});
-api('/clock').then(function(r){if(r.status===200){var c=r.body;$('clock').textContent=(c.synced&&c.local_time)?c.local_time:(c.synced?'synced':'no sync')}}).catch(function(){})}
+api('/clock').then(function(r){if(r.status===200){var c=r.body;var t=(c.synced&&c.local_time)?c.local_time:(c.synced?'synced':'no sync');$('clock').textContent=t;$('clk2').textContent=t;$('tzcur').textContent=c.tz||'--'}}).catch(function(){})}
 function tune(){var f=parseInt($('tfreq').value,10);if(!f){banner('Enter a frequency');return}post('/radio/tune',{mode:$('tmode').value,freq:f}).then(poll).catch(function(){})}
 function setVol(v){post('/radio/volume',{volume:parseInt(v,10)}).catch(function(){})}
 function setSql(v){post('/radio/config',{squelch:parseInt(v,10)}).catch(function(){})}
 function toggleMute(){post('/radio/config',{mute:!lastMute}).then(poll).catch(function(){})}
+function renderDsp(s){$('stepdesc').textContent=s.step||'--';$('bwdesc').textContent=s.bw||'--';
+if(document.activeElement!==$('agc')&&s.agc!=null)$('agc').value=s.agc;
+var snr=(s.squelch_metric==='snr');$('msnr').style.opacity=snr?'1':'.5';$('mrssi').style.opacity=snr?'.5':'1';
+var fm=(s.mode==='FM');$('dspssb').style.display=fm?'none':'block';
+if(!fm){if(document.activeElement!==$('avc')&&s.avc!=null)$('avc').value=s.avc;
+if(document.activeElement!==$('softmute')&&s.softmute!=null)$('softmute').value=s.softmute;
+if(document.activeElement!==$('cal')&&s.cal!=null)$('cal').value=s.cal}}
+function setBand(v){post('/radio/band',{idx:parseInt(v,10)}).then(poll).catch(function(){})}
+function loadBands(){api('/radio/bands').then(function(r){if(r.status!==200)return;var b=r.body,sel=$('bandsel');sel.innerHTML='';(b.bands||[]).forEach(function(x){var o=document.createElement('option');o.value=x.idx;o.textContent=x.name;if(x.idx===b.current)o.selected=true;sel.appendChild(o)})}).catch(function(){})}
+function loadMemory(){api('/radio/memory').then(function(r){if(r.status!==200)return;var h='';(r.body.slots||[]).forEach(function(x){h+='<div class="row" style="align-items:center;margin-bottom:4px"><span style="flex:2">#'+x.slot+' '+x.band+' '+x.freq_display+' '+x.mode+'</span><button class="sec" style="flex:1" onclick="memRecall('+x.slot+')">Recall</button></div>'});$('memlist').innerHTML=h||'<span style="color:var(--muted)">no saved slots</span>'}).catch(function(){})}
+function memRecall(n){post('/radio/memory',{slot:n,action:'recall'}).then(function(){poll();loadMemory()}).catch(function(){})}
+function memAct(a){var n=parseInt($('memslot').value,10);if(!n){banner('Enter a slot 1-99');return}post('/radio/memory',{slot:n,action:a}).then(function(){loadMemory();if(a!=='clear')poll()}).catch(function(){})}
+function setCfg(k,id){var v=$(id).value;if(v===''){banner('Enter a value');return}var o={};o[k]=parseInt(v,10);post('/radio/config',o).then(poll).catch(function(){})}
+function setMetric(b){post('/radio/config',{squelch_snr:b}).then(poll).catch(function(){})}
+function setTz(){var v=$('tzin').value.trim();if(!v){banner('Enter a TZ string');return}api('/clock/tz',{method:'POST',headers:{'Content-Type':'text/plain'},body:v}).then(function(r){if(r.status>=400){banner((r.body&&r.body.error)||('Error '+r.status));return}banner('');$('tzin').value=''}).catch(function(e){if(e&&e.handled)return})}
+function loadCaps(){if(!token)return;api('/capabilities').then(function(r){if(r.status!==200)return;var c=r.body;$('batt').textContent=(c.battery_v!=null?c.battery_v+' V':'n/a');$('temp').textContent=(c.temp_c!=null?c.temp_c+' C':'--');$('wrssi').textContent=(c.wifi_rssi!=null?c.wifi_rssi+' dBm':'--');$('heap').textContent=(c.free_heap!=null?((c.free_heap/1024)|0)+' KB':'--');$('ip').textContent=c.wifi_ip||'--'}).catch(function(){})}
+function boot(){if(!token){showLogin();return}loadBands();loadMemory();loadCaps()}
 if(token)showApp();else showLogin();
-poll();setInterval(poll,1000);
+poll();boot();setInterval(poll,1000);setInterval(loadCaps,5000);
 </script></body></html>)HTML";
 
 static void handle_ui(AsyncWebServerRequest *request) {
