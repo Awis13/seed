@@ -24,6 +24,11 @@
  * TVMENU, TVMENU to MENU, MENU to CLOCK — whether it comes from the Back item
  * or the user key, so the knob alone is enough to get anywhere and out again.
  *
+ * MENU also carries one row that opens nothing: Quiet switches the night window
+ * on and off in place and rewrites its own label. It is a setting with two
+ * states and no arguments, and a screen holding one line of that would be a
+ * screen to get out of again.
+ *
  * MSGCARD is the one screen where the click and the user key differ. A click
  * acknowledges the message and returns; the user key returns without
  * acknowledging, which is the only way to look at something and deliberately
@@ -267,6 +272,7 @@ static_assert(sizeof(ui_titles) / sizeof(ui_titles[0]) == UI_REC + 1,
    happens to carry. */
 enum {
     UI_ITEM_MSG = 0,
+    UI_ITEM_QUIET,
     UI_ITEM_TVBGONE,
     UI_ITEM_AP,
     UI_ITEM_INFO,
@@ -274,8 +280,14 @@ enum {
     UI_ITEM_COUNT
 };
 
+/* Quiet sits second, under Messages: it is the other thing this device does to
+   messages, and it is the row somebody reaches for at one in the morning
+   without wanting to read a menu first. Its label is built by
+   ring_quiet_label() rather than written here — the row shows the hours, and
+   they are the skill's to say. */
 static const char *ui_items[UI_ITEM_COUNT] = {
     "Messages >",   /* ui_list_label() appends the unread count */
+    "",             /* ui_list_label() builds this one from the ring's window */
     "TV-B-Gone >",
     "Setup AP",
     "Info",
@@ -759,9 +771,10 @@ static int ui_list_count() {
 }
 
 static const char *ui_list_label(int i) {
-    /* The Messages row carries its unread count, so its label is built rather
-       than looked up. ui_draw_list() consumes the return value into the row
-       string before asking for the next one, so one shared buffer is enough. */
+    /* The Messages row carries its unread count and the Quiet row carries the
+       window's hours, so those labels are built rather than looked up.
+       ui_draw_list() consumes the return value into the row string before
+       asking for the next one, so one shared buffer is enough. */
     static char built[24];
 
     switch (ui_screen) {
@@ -772,6 +785,14 @@ static const char *ui_list_label(int i) {
                     snprintf(built, sizeof(built), "Messages (%d) >", unread);
                     return built;
                 }
+            }
+            if (i == UI_ITEM_QUIET) {
+                /* "Quiet 00:00-08:00" or "Quiet off". The longer of the two is
+                   17 characters, which with the row's marker measures 218px of
+                   font 4 against the 296px ui_draw_row() has — measured against
+                   TFT_eSPI's own width table, like every other column here. */
+                ring_quiet_label(ring_night_from, ring_night_to, built, sizeof(built));
+                return built;
             }
             return ui_items[i];
         case UI_TVMENU: return ui_tv_items[i];
@@ -1378,6 +1399,18 @@ static void ui_activate(int item) {
     switch (item) {
         case UI_ITEM_MSG:
             ui_enter_list(UI_MSGLIST, 0);
+            break;
+        case UI_ITEM_QUIET:
+            /* The one row that acts without leaving the menu: the answer is the
+               row's own label, which now says the other thing. A screen of its
+               own would be a screen with one line on it.
+
+               display_force, because ui_draw_list() returns early when the
+               selection has not moved — and it has not: what changed is a
+               string the cache still holds the old copy of. */
+            ring_quiet_toggle();
+            display_force = true;
+            ui_draw();
             break;
         case UI_ITEM_TVBGONE:
             ui_enter_list(UI_TVMENU, UI_TV_ALL);
