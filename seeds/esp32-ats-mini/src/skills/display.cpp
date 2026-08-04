@@ -32,10 +32,22 @@ uint8_t radio_get_rssi();
 uint8_t radio_get_volume();
 uint8_t radio_get_tune_target();
 void radio_get_signal(uint8_t *rssi, uint8_t *snr);
+/* Menu accessors (radio.cpp). radio_get_menu_item wraps its index modulo the
+ * active level's count, so the caller can ask for idx-2..idx+2 directly. */
+uint8_t radio_get_ui_mode();
+uint8_t radio_get_menu_level();
+int radio_get_menu_idx();
+int radio_get_menu_count();
+const char *radio_get_menu_title();
+const char *radio_get_menu_item(int i);
 
 /* Mirror of radio.cpp's TuneTarget so the highlight can tell them apart. */
 #define DISPLAY_TUNE_FREQ 0
 #define DISPLAY_TUNE_VOLUME 1
+
+/* Mirror of radio.cpp's UiMode enum value for the menu; display.cpp does not see
+ * the enum, so the numeric value (UI_MENU is appended last, = 2) is pinned here. */
+#define DISPLAY_UI_MENU 2
 
 /* --- Panel + state (file-local) --- */
 static TFT_eSPI tft;
@@ -177,6 +189,51 @@ static void draw_radio_screen(const char *mode, uint16_t freq, uint8_t rssi,
 }
 
 /*
+ * Paint the modal menu into the draw target `gfx`: a small bordered panel on the
+ * left of the screen with a title, a divider and a five-row scrolling window
+ * centred on the current cursor. The middle row (i==0) is the selection — drawn
+ * dark-on-highlight — and the four neighbours are dimmer context above and below.
+ * Rows wrap around the list (radio_get_menu_item wraps its index), so a short list
+ * simply repeats to fill the window. Geometry is in the 320x170 landscape space.
+ *
+ * Draw-only helper: the caller owns display_mtx and the flush/push. The text datum
+ * is left at MC_DATUM (the shared repaint default) on the way out.
+ */
+static void draw_menu_screen(const char *title, int idx) {
+    gfx->fillScreen(TFT_BLACK);
+
+    /* Bordered panel: a filled cyan roundrect with a black roundrect inset one
+     * pixel, giving a 1 px cyan frame around the black menu body. */
+    gfx->fillSmoothRoundRect(1, 19, 86, 110, 4, TFT_CYAN, TFT_BLACK);
+    gfx->fillSmoothRoundRect(2, 20, 84, 108, 4, TFT_BLACK, TFT_BLACK);
+
+    /* Title, centred in the panel, with a divider line under it. */
+    gfx->setTextDatum(MC_DATUM);
+    gfx->setTextColor(TFT_WHITE, TFT_BLACK);
+    gfx->drawString(title, 45, 30, 2);
+    gfx->drawLine(1, 41, 86, 41, TFT_CYAN);
+
+    /* Selection bar behind the centre row. */
+    gfx->fillRoundRect(6, 74, 76, 16, 2, TFT_CYAN);
+
+    /* Five rows, i=-2..+2, 16 px apart around the cursor. The middle one is the
+     * highlighted selection (dark text on the cyan bar); the rest are plain. */
+    for (int i = -2; i <= 2; i++) {
+        const char *item = radio_get_menu_item(idx + i);
+        int y = 82 + i * 16;
+        if (i == 0) {
+            gfx->setTextColor(TFT_BLACK, TFT_CYAN);
+        } else {
+            gfx->setTextColor(TFT_WHITE, TFT_BLACK);
+        }
+        gfx->drawString(item, 45, y, 2);
+    }
+
+    /* Restore the shared repaint colour default; datum stays MC_DATUM. */
+    gfx->setTextColor(TFT_WHITE, TFT_BLACK);
+}
+
+/*
  * Repaint the receiver status screen from the radio accessors. Sets display_mode
  * back to STATUS. Called at boot and from POST /radio/tune — always the HTTP
  * task, so the snapshot below races with nothing.
@@ -222,6 +279,9 @@ void display_tick_render() {
     uint16_t freq = radio_get_freq();
     uint8_t volume = radio_get_volume();
     uint8_t target = radio_get_tune_target();
+    uint8_t ui = radio_get_ui_mode();
+    uint8_t menu_level = radio_get_menu_level();
+    int menu_idx = radio_get_menu_idx();
     uint8_t rssi = 0, snr = 0;
     radio_get_signal(&rssi, &snr);
 
@@ -238,14 +298,19 @@ void display_tick_render() {
      * These statics are only ever touched here, always under display_mtx. */
     static uint16_t prev_freq = 0xFFFF;
     static uint8_t prev_rssi = 0xFF, prev_snr = 0xFF, prev_volume = 0xFF,
-                   prev_target = 0xFF;
+                   prev_target = 0xFF, prev_ui = 0xFF, prev_menu_level = 0xFF;
+    static int prev_menu_idx = -1;
     static const char *prev_mode = nullptr;
     static uint32_t last_push_ms = 0;
     const uint32_t DISPLAY_MAX_IDLE_MS = 2000;
 
     uint32_t now = millis();
+    /* The menu fields (ui/level/idx) join the change set so scrolling the menu, or
+     * entering/leaving it, forces a fresh frame instead of being read as unchanged. */
     bool unchanged = freq == prev_freq && rssi == prev_rssi && snr == prev_snr &&
                      volume == prev_volume && target == prev_target &&
+                     ui == prev_ui && menu_level == prev_menu_level &&
+                     menu_idx == prev_menu_idx &&
                      prev_mode != nullptr && strcmp(mode, prev_mode) == 0;
     if (unchanged && (now - last_push_ms) < DISPLAY_MAX_IDLE_MS) {
         xSemaphoreGive(display_mtx);
@@ -256,10 +321,17 @@ void display_tick_render() {
     prev_snr = snr;
     prev_volume = volume;
     prev_target = target;
+    prev_ui = ui;
+    prev_menu_level = menu_level;
+    prev_menu_idx = menu_idx;
     prev_mode = mode;
     last_push_ms = now;
 
-    draw_radio_screen(mode, freq, rssi, snr, volume, target);
+    if (ui == DISPLAY_UI_MENU) {
+        draw_menu_screen(radio_get_menu_title(), menu_idx);
+    } else {
+        draw_radio_screen(mode, freq, rssi, snr, volume, target);
+    }
     display_flush();
     xSemaphoreGive(display_mtx);
 }
