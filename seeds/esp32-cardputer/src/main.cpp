@@ -650,8 +650,22 @@ static unsigned long ap_minutes_left() {
 // Ask the next UI tick to repaint everything rather than trusting its per-field
 // caches. Declared up here because state changes that the screen must show
 // immediately — the AP coming up with a fresh password on it — happen well
-// before the UI section below. Written from loop() context only.
-static bool ui_force = false;
+// before the UI section below.
+//
+// `volatile` is preparation, not a fix. Every one of today's writers runs in
+// setup() or loop() context, so nothing here is broken without it and nothing
+// here is made correct by it — `volatile` is not a synchronisation primitive
+// and this is a single-byte flag, not shared state that needs one. What it
+// buys is the one thing it is actually for: a writer on another task cannot
+// have its store optimised away or hoisted out of reach of the loop task that
+// polls this in ui_tick(). The notification store arrives on the AsyncTCP task
+// and will raise this from there. The firmware this is ported from already
+// marks its equivalent volatile for exactly that reason, so this is parity with
+// it and not an invention.
+//
+// See ui_tick() for the other half of that preparation — where the flag is
+// cleared, and why it is not where the source firmware clears it.
+static volatile bool ui_force = false;
 
 // Stored WiFi credentials.
 //
@@ -766,12 +780,55 @@ static String read_spiffs_file(const char *path) {
     return content;
 }
 
+// A SHORT WRITE IS A FAILED WRITE AND HAS TO BE REPORTED AS ONE. File::print()
+// reaches fwrite() through VFSFileImpl::write(), and fwrite() answers a full-
+// filesystem partition with a short count, not an error: 400 bytes of a 900
+// byte snapshot land on flash and the call comes back. The partition here is
+// 1.5 MB and the notification store is exactly the kind of file that grows into
+// it, so this is a case that will be reached rather than a theoretical one.
+// Comparing the count against the string is what turns it into a false return,
+// and every safety the callers have rests on that false.
 static bool write_spiffs_file(const char *path, const String &content) {
     File f = SPIFFS.open(path, FILE_WRITE);
     if (!f) return false;
-    f.print(content);
+    size_t written = f.print(content);
     f.close();
-    return true;
+    return written == content.length();
+}
+
+// Same, for a file whose previous contents are worth more than the write.
+//
+// FILE_WRITE truncates on open, so an ordinary write spends its whole duration
+// with the file empty: power lost in there takes the old snapshot with the new
+// one. Writing beside it and renaming afterwards narrows that to the remove
+// plus the rename, and even in there the complete new snapshot is still on
+// flash under the temp name.
+//
+// THAT LAST PART IS ONLY HALF A MECHANISM AND THIS FUNCTION IS THE OTHER HALF
+// OF NOTHING WITHOUT IT. The crash that this narrows the window on is exactly
+// the one that leaves the real name gone or empty and the whole snapshot
+// sitting under the temp name. A caller that reads the real name, gets an
+// empty string and gives up has bought nothing at all: every caller must fall
+// back to reading tmp_path when path comes back empty, or this is decoration.
+//
+// THAT FALLBACK COVERS THE CRASH WINDOW AND NOTHING ELSE. It is keyed on the
+// real name coming back empty, so it can only answer a power loss between the
+// remove and the rename. It is no answer at all to a write that ran out of
+// room, because the real name would not be empty then — it would hold a
+// truncated snapshot that parses as nothing, under a call that returned true.
+// A failed write is therefore not allowed to reach the remove: it has to stop
+// at the guard below, which is why write_spiffs_file() checks its byte count
+// and why this returns early instead of taking the old file down first.
+//
+// SPIFFS.rename() will not clobber an existing name, hence the remove.
+//
+// Used by the notification store, which is not part of this commit yet.
+__attribute__((unused))
+static bool write_spiffs_file_atomic(const char *path, const char *tmp_path,
+                                     const String &content) {
+    if (!write_spiffs_file(tmp_path, content)) return false;
+    SPIFFS.remove(path);
+    return SPIFFS.rename(tmp_path, path);
 }
 
 // ===== Timezone =====
@@ -1131,11 +1188,46 @@ static const uint16_t COL_DIM    = ui_rgb(120, 120, 120);
 static const uint16_t COL_RULE   = ui_rgb(60, 60, 60);
 static const uint16_t COL_ACCENT = ui_rgb(60, 200, 110);
 
+// Composite `fg` over `bg` at `alpha`/255 and hand back the RGB565 result.
+//
+// M5GFX has no equivalent — there is no alphaBlend anywhere in the library
+// tree — so a seed that wants a tint or a fade has to bring its own. The
+// argument order is the one TFT_eSPI uses, alpha first, so a call reads the
+// same here as in the firmware this is ported from.
+//
+// It is NOT bit-identical to TFT_eSPI's, on purpose. That one works on the
+// packed value and scales red and blue by `alpha >> 2` over 64, which makes
+// alpha 255 return 30/62/30 out of a possible 31/63/31 — the endpoint of a
+// fade is not quite the colour the fade was aimed at, and any test asserting
+// "fully opaque means fg" fails against it. Unpacking the three channels and
+// blending each as a weighted sum costs nothing at the sizes involved, cannot
+// underflow, rounds to nearest, and lands exactly on bg at alpha 0 and exactly
+// on fg at alpha 255. Everything in between differs from TFT_eSPI by at most
+// one step per channel, which is below what the panel resolves.
+//
+// ui_rgb() above already packs 5/6/5 in the order M5GFX expects, so the two
+// halves of the palette agree and nothing converts anything.
+//
+// No caller until the notification card, which is not part of this commit.
+__attribute__((unused))
+static uint16_t ui_blend(uint8_t alpha, uint16_t fg, uint16_t bg) {
+    uint32_t a = alpha;
+    uint32_t ia = 255u - a;
+    uint32_t r = ((((uint32_t)fg >> 11) & 0x1F) * a +
+                  (((uint32_t)bg >> 11) & 0x1F) * ia + 127u) / 255u;
+    uint32_t g = ((((uint32_t)fg >>  5) & 0x3F) * a +
+                  (((uint32_t)bg >>  5) & 0x3F) * ia + 127u) / 255u;
+    uint32_t b = (( (uint32_t)fg        & 0x1F) * a +
+                  ( (uint32_t)bg        & 0x1F) * ia + 127u) / 255u;
+    return (uint16_t)((r << 11) | (g << 5) | b);
+}
+
 // Text anchors. Spelled out here because M5GFX keeps them in a namespace that
 // no using-directive drags into global scope, and the short TL_DATUM spellings
 // are only reachable from inside the library's own namespaces.
 static const uint8_t UI_TL = lgfx::textdatum::top_left;
 static const uint8_t UI_TR = lgfx::textdatum::top_right;
+static const uint8_t UI_TC = lgfx::textdatum::top_center;
 
 enum ui_screen_t {
     UI_STATUS = 0,
@@ -1555,20 +1647,245 @@ static void ui_footer(ui_screen_t screen, char *out, size_t n) {
     }
 }
 
+// ---- Scrolling a list longer than the screen ----
+
+// Where the visible window starts, given where the selection is. Move it only
+// when the selection would otherwise leave it, which keeps a step inside the
+// window down to a two-row repaint instead of a full one.
+//
+// The source firmware spells this against a pair of file-scope globals. Here it
+// takes the position and returns the new one, because the seed has no such
+// globals and inventing them would land dead state in this commit for the sake
+// of a four-line function; whichever screen grows a scrolling list can then own
+// its own pair rather than sharing one with every other screen.
+//
+// The four clamps run in the source's order and the order is load-bearing. The
+// two selection clamps go first so the window follows the cursor; the
+// end-of-list clamp then pulls a window that ran off the bottom back on; and
+// the floor at zero runs last because it is the one that has to win — when
+// `count` is smaller than `rows` the previous line computes a negative start,
+// and this is what turns that into a list pinned at the top rather than one
+// indexed from before its own beginning.
+//
+// No caller until the notification list, which is not part of this commit.
+__attribute__((unused))
+static int ui_window(int sel, int first, int count, int rows) {
+    if (sel < first) first = sel;
+    if (sel >= first + rows) first = sel - rows + 1;
+    if (first > count - rows) first = count - rows;
+    if (first < 0) first = 0;
+    return first;
+}
+
+// ---- Fitting text to a column ----
+//
+// Columns are pixel budgets, and what goes in them is whatever an agent put in
+// the JSON. Everything below measures with M5GFX's own font tables — the same
+// ones drawString() renders from — so a string is cut where it actually stops
+// fitting rather than at a character count guessed from an average glyph.
+//
+// TWO M5GFX CALLS DO THE WHOLE JOB AND NEITHER IS OBVIOUS FROM ITS NAME:
+//
+//   textWidth(str, font)  — measures against `font` without disturbing the
+//                           live one. Takes the font as an argument and works
+//                           on a copy of the metrics, so it leaves no font
+//                           state behind. It still runs the display's shared
+//                           UTF-8 decoder, so "no font state" is not the same
+//                           as "safe from any task" — see the warning below.
+//
+//   textLength(str, width) — returns THE BYTE OFFSET OF THE FIRST CHARACTER
+//                           THAT DOES NOT FIT in `width`. That offset is the
+//                           cut point, already UTF-8 decoded with real per
+//                           glyph advances, and already on a code-point
+//                           boundary because the library captures the start of
+//                           each character before it decodes it. There is no
+//                           reason to walk a string a character at a time and
+//                           add up widths; this is that loop, written by people
+//                           who own the font tables.
+//
+// textLength() has two edges worth writing down. It takes NO font argument — it
+// measures with the live `_font` and rewrites the display's own metrics in
+// place — so the font has to be installed around the call and put back after.
+// And it advances the display's shared UTF-8 decoder, which is fine on a
+// complete well-formed string and is why nothing below ever hands it a
+// fragment.
+//
+// EVERYTHING IN THIS SECTION IS FOR THE loop() TASK AND NOTHING ELSE MAY CALL
+// IT. There is one M5.Display and these borrow its state: ui_fit_bytes()
+// installs a font on it, measures, and puts the caller's font back, and both
+// measuring calls advance its shared UTF-8 decoder. ui_ellipsis() and
+// ui_wrap2() inherit all of that. None of it is guarded by anything.
+//
+// The task that will want to break these rules is the AsyncTCP one, because
+// that is where a notification arrives and where formatting its card text is
+// the obvious thing to do. Do not. Run it there while loop() is inside
+// ui_draw_field() and the draw picks up whichever font was installed last,
+// which is not the one it asked for. THE PANEL DOES NOT RECOVER FROM THAT ON
+// ITS OWN: ui_draw_field() writes the string it was given into the field cache
+// whether or not it came out right, so the next tick compares equal, skips the
+// repaint, and the mis-rendered field stays mis-rendered until something
+// changes its text. A garbled row that never redraws is the symptom; a fit
+// call from the wrong task is the cause.
+//
+// The rule for the notification store, then: the web task owns the data and
+// nothing else, and every one of these calls happens inside ui_tick().
+
+// Copy at most `len` bytes of `src` into `dst`, bounded by the buffer, and
+// never split a well-formed UTF-8 sequence at the end: back off over any
+// continuation bytes at the cut. Returns how many bytes were written.
+//
+// The buffer bound is the one that needs this. Cut points from textLength() are
+// already on a boundary; a destination that simply ran out of room is not.
+//
+// WELL-FORMED IS A PRECONDITION, NOT SOMETHING THIS CHECKS. The back-off looks
+// at the byte AT the cut and stops when that byte is not a continuation byte,
+// which says nothing about whether the sequence before the cut was ever
+// complete. ui_copy_utf8(dst, n, "ab\xC3", 3) copies all three bytes and hands
+// back a string ending in a lone lead byte, because src[3] is the terminator
+// rather than a continuation byte. Malformed input passes through.
+//
+// It is left that way deliberately, because validating here would not buy the
+// thing it looks like it buys. The damage a bad sequence does is to the
+// display's shared UTF-8 decoder, which setFont() pointedly does not reset
+// (LGFXBase.cpp:2539) — but ui_ellipsis() and ui_wrap2() both measure the RAW
+// `src` with textWidth()/textLength() before a byte is ever copied, and those
+// run the same decodeUTF8() over the same bad bytes. The decoder is already
+// mid-sequence by the time control reaches here; a clean copy afterwards
+// cannot undo it. The reach of that is also short: decodeUTF8() only enters
+// its state machine for bytes with the high bit set, and any ASCII byte drops
+// it straight back to state0, so a stranded decoder is corrected by the very
+// next plain character and only ever mangles a following string that itself
+// begins non-ASCII. Rejecting malformed input belongs where it enters, at the
+// JSON, not in a copy helper three layers down.
+static size_t ui_copy_utf8(char *dst, size_t n, const char *src, size_t len) {
+    if (n == 0) return 0;
+    if (len > n - 1) len = n - 1;
+    while (len > 0 && ((unsigned char)src[len] & 0xC0) == 0x80) len--;
+    memcpy(dst, src, len);
+    dst[len] = '\0';
+    return len;
+}
+
+// Measure where `src` stops fitting in `width`, with `font` installed for the
+// duration and the caller's font restored afterwards.
+static size_t ui_fit_bytes(const char *src, const lgfx::IFont *font,
+                           int32_t width) {
+    const lgfx::IFont *prev = M5.Display.getFont();
+    M5.Display.setFont(font);
+    int32_t cut = M5.Display.textLength(src, width);
+    M5.Display.setFont(prev);
+    return cut < 0 ? 0 : (size_t)cut;
+}
+
+// Copy `src` into `dst`, cut to `max_px` with a trailing ellipsis if it does
+// not fit. A column too narrow for the ellipsis itself is hard-truncated
+// instead — three dots and nothing else says less than two real characters.
+static void ui_ellipsis(char *dst, size_t n, const char *src,
+                        const lgfx::IFont *font, int32_t max_px) {
+    if (n == 0) return;
+    dst[0] = '\0';
+    if (!src || !src[0]) return;
+
+    if (M5.Display.textWidth(src, font) <= max_px) {
+        ui_copy_utf8(dst, n, src, strlen(src));
+        return;
+    }
+
+    int32_t ell_w = M5.Display.textWidth("...", font);
+    bool with_ellipsis = (ell_w < max_px);
+    size_t cut = ui_fit_bytes(src, font,
+                              with_ellipsis ? max_px - ell_w : max_px);
+
+    // The ellipsis needs room in the destination as well as on the panel.
+    size_t cap = with_ellipsis ? (n >= 5 ? n - 4 : 0) : n - 1;
+    if (cut > cap) cut = cap;
+
+    size_t out = ui_copy_utf8(dst, n, src, cut);
+    // Hang the ellipsis off a word rather than off a gap.
+    while (out > 0 && dst[out - 1] == ' ') out--;
+    dst[out] = '\0';
+    if (with_ellipsis) snprintf(dst + out, n - out, "...");
+}
+
+// Break `src` over two lines of `max_px`, on a space where there is one. The
+// second line carries the ellipsis, so a body too long for the card ends
+// visibly rather than just stopping.
+//
+// LINE TWO RESUMES FROM WHAT LINE ONE ACTUALLY TOOK, NOT FROM WHERE THE PIXELS
+// RAN OUT. Those are two different offsets and confusing them drops text on the
+// floor. `brk` is a panel measurement; ui_copy_utf8() answers to the buffer as
+// well, and clamps to n1 - 1 when the buffer is the tighter of the two. Resume
+// at src + brk after that and the bytes between what l1 could hold and what the
+// column could show appear on neither line, with no ellipsis anywhere to admit
+// it — a narrow l1 against a wide column silently eats a run of characters out
+// of the middle of the body. Using the return value costs nothing and is
+// already on a code-point boundary. ui_ellipsis() handles the same collision
+// with its `cap` clamp; this is that idea applied to the other helper.
+//
+// No caller until the notification card, which is not part of this commit.
+__attribute__((unused))
+static void ui_wrap2(const char *src, char *l1, size_t n1, char *l2, size_t n2,
+                     const lgfx::IFont *font, int32_t max_px) {
+    if (n1) l1[0] = '\0';
+    if (n2) l2[0] = '\0';
+    if (!src || !src[0] || n1 == 0) return;
+
+    // Fits the column, which says nothing about fitting l1: a short buffer
+    // still overflows onto line two, and it is line two's ellipsis that keeps
+    // the overflow honest.
+    if (M5.Display.textWidth(src, font) <= max_px) {
+        size_t took = ui_copy_utf8(l1, n1, src, strlen(src));
+        const char *tail = src + took;
+        while (*tail == ' ') tail++;
+        if (*tail) ui_ellipsis(l2, n2, tail, font, max_px);
+        return;
+    }
+
+    size_t fit = ui_fit_bytes(src, font, max_px);
+    // Break on the last space inside what fits. The scan stops short of index
+    // zero on purpose: breaking on a leading space would put nothing at all on
+    // the first line. A single word wider than the line has no space to break
+    // on either way, and is cut where it stopped fitting.
+    size_t brk = fit;
+    for (size_t i = fit; i > 1; i--) {
+        if (src[i - 1] == ' ') { brk = i - 1; break; }
+    }
+
+    size_t took = ui_copy_utf8(l1, n1, src, brk);
+    const char *rest = src + took;
+    while (*rest == ' ') rest++;
+    ui_ellipsis(l2, n2, rest, font, max_px);
+}
+
 // ---- Drawing ----
 
 // Repaint one text field, and only if its content changed.
 //
 // The opaque background plus a fixed padding width is what erases the previous
 // value, so nothing here ever needs fillScreen and nothing ever flickers. The
-// cache keys on the text alone: a field whose colours change but whose string
-// does not needs ui_force, and every caller that moves a field onto or off a
-// coloured ground is a screen transition that already sets it.
-static void ui_draw_field(char *cache, size_t cache_n, const char *text,
+// cache keys on the text alone, so a field whose colours change but whose
+// string does not will not repaint on its own — MOVING A FIELD ONTO OR OFF A
+// COLOURED GROUND IS THE CALLER'S PROBLEM TO SOLVE, and there are two answers
+// to it in this file. A screen transition sets ui_force and every field
+// repaints. The menu selection bar does not: it slides one row on every arrow
+// key with no transition and no ui_force, and pays for that with the explicit
+// `moved` test below, which fills the new ground and blanks the two affected
+// rows' caches by hand so the fields draw themselves back over it.
+//
+// `force` is a PARAMETER AND NOT A READ OF ui_force, and that is the whole
+// reason ui_tick() can clear the flag before it draws instead of after. One
+// pass has to see one value throughout: the pass repaints the frame when it is
+// forced, which blanks the panel, and every field it then draws has to be told
+// to repaint over that blank ground. A field that consulted the global would
+// find it already cleared, find its cache still matching what it drew before
+// the fillScreen, and return without drawing — a black panel with two rules on
+// it and no text anywhere.
+static void ui_draw_field(bool force, char *cache, size_t cache_n,
+                          const char *text,
                           int32_t x, int32_t y, const lgfx::IFont *font,
                           uint16_t color, uint8_t datum, uint16_t padding,
                           uint16_t bg) {
-    if (!ui_force && strncmp(cache, text, cache_n - 1) == 0) return;
+    if (!force && strncmp(cache, text, cache_n - 1) == 0) return;
     snprintf(cache, cache_n, "%s", text);
     M5.Display.setFont(font);
     M5.Display.setTextDatum(datum);
@@ -1839,18 +2156,40 @@ static void ui_tick() {
     if (!ui_force && millis() - last_tick < UI_TICK_MS) return;
     last_tick = millis();
 
-    if (ui_force) {
+    // Take the flag and clear it BEFORE any drawing, then work from the copy.
+    //
+    // This is deliberately not what the source firmware does. That one clears
+    // its flag at the END of a pass, in eight separate places, and an
+    // end-of-pass clear is a one-way door: a writer that raises the flag from
+    // another task while the pass is in flight has its request overwritten by
+    // the clear that follows, and the repaint it asked for never happens. Not a
+    // hypothetical there either — its flag is already written from its web
+    // server task. Clearing first inverts which way that race falls. A flag
+    // raised after the take survives into the next tick and costs one redundant
+    // repaint, instead of being swallowed and costing a screen that does not
+    // show what the device knows. The window is not closed, only cut down to
+    // the two instructions between the take and the clear — a raise landing in
+    // there is still lost, where before the whole SPI-bound pass was exposed.
+    // This is an improvement over the firmware this was ported from, not parity
+    // with it.
+    //
+    // Everything below therefore reads `force` and never ui_force.
+    bool force = ui_force;
+    ui_force = false;
+
+    if (force) {
         ui_draw_frame();
         ui_cache_sel = -1;
     }
 
     // Header.
-    ui_draw_field(ui_cache_hdr, sizeof(ui_cache_hdr), ui_screen_title[ui_screen],
+    ui_draw_field(force, ui_cache_hdr, sizeof(ui_cache_hdr),
+                  ui_screen_title[ui_screen],
                   UI_LABEL_X, UI_HDR_Y, &fonts::Font2, COL_ACCENT,
                   UI_TL, 110, COL_BG);
     char buf[48];
     ui_net_summary(buf, sizeof(buf));
-    ui_draw_field(ui_cache_net, sizeof(ui_cache_net), buf,
+    ui_draw_field(force, ui_cache_net, sizeof(ui_cache_net), buf,
                   M5.Display.width() - UI_LABEL_X, UI_HDR_Y, &fonts::Font2,
                   COL_DIM, UI_TR, 124, COL_BG);
 
@@ -1861,8 +2200,8 @@ static void ui_tick() {
             // The selection bar is not a field, so it is painted from an
             // explicit test: only the row that gained the highlight and the one
             // that lost it are touched.
-            bool moved = ui_force || (ui_cache_sel != ui_menu_index &&
-                                      (selected || row == ui_cache_sel));
+            bool moved = force || (ui_cache_sel != ui_menu_index &&
+                                   (selected || row == ui_cache_sel));
             uint16_t bg = selected ? COL_ACCENT : COL_BG;
             uint16_t fg = selected ? COL_BG : COL_TEXT;
             if (moved) {
@@ -1871,11 +2210,13 @@ static void ui_tick() {
                 ui_cache_value[row][0] = '\0';
             }
             const char *title = row < UI_MENU_COUNT ? ui_menu[row].title : "";
-            ui_draw_field(ui_cache_label[row], sizeof(ui_cache_label[row]), title,
+            ui_draw_field(force, ui_cache_label[row],
+                          sizeof(ui_cache_label[row]), title,
                           UI_MENU_X, y, &fonts::Font2, fg, UI_TL,
                           140, bg);
             ui_menu_state(row, buf, sizeof(buf));
-            ui_draw_field(ui_cache_value[row], sizeof(ui_cache_value[row]), buf,
+            ui_draw_field(force, ui_cache_value[row],
+                          sizeof(ui_cache_value[row]), buf,
                           UI_MENU_R_X, y, &fonts::Font2,
                           selected ? COL_BG : COL_DIM, UI_TR, 80, bg);
         }
@@ -1886,21 +2227,21 @@ static void ui_tick() {
             int32_t y = ui_row_y(row);
             ui_field(ui_screen, row, label, sizeof(label), value, sizeof(value),
                      false);
-            ui_draw_field(ui_cache_label[row], sizeof(ui_cache_label[row]), label,
+            ui_draw_field(force, ui_cache_label[row],
+                          sizeof(ui_cache_label[row]), label,
                           UI_LABEL_X, y, &fonts::Font2, COL_DIM,
                           UI_TL, UI_LABEL_W, COL_BG);
-            ui_draw_field(ui_cache_value[row], sizeof(ui_cache_value[row]), value,
+            ui_draw_field(force, ui_cache_value[row],
+                          sizeof(ui_cache_value[row]), value,
                           UI_VALUE_X, y, &fonts::Font2, COL_TEXT,
                           UI_TL, UI_VALUE_W, COL_BG);
         }
     }
 
     ui_footer(ui_screen, buf, sizeof(buf));
-    ui_draw_field(ui_cache_foot, sizeof(ui_cache_foot), buf, UI_LABEL_X,
+    ui_draw_field(force, ui_cache_foot, sizeof(ui_cache_foot), buf, UI_LABEL_X,
                   UI_FOOT_Y, &fonts::Font0, COL_DIM, UI_TL,
                   236, COL_BG);
-
-    ui_force = false;
 }
 
 // Bring up M5Unified, the panel and the keyboard. Must run before hw_probe(),
@@ -1999,12 +2340,19 @@ static void ui_begin() {
 
     M5.Display.setRotation(1);  // 240x135 landscape, keyboard toward the user
     M5.Display.setBrightness(ui_brightness);
+    // The splash draws itself with a literal `true` rather than by leaning on
+    // the flag: these two fields have to land on the frame that was just
+    // blanked above them, and ui_draw_field() no longer reads the global. The
+    // flag is still raised, and still for its own reason — the first ui_tick()
+    // after setup() has to repaint the real screen over this splash rather than
+    // diff against the two strings it left in the caches.
     ui_force = true;
     ui_draw_frame();
-    ui_draw_field(ui_cache_hdr, sizeof(ui_cache_hdr), "SEED", UI_LABEL_X,
+    ui_draw_field(true, ui_cache_hdr, sizeof(ui_cache_hdr), "SEED", UI_LABEL_X,
                   UI_HDR_Y, &fonts::Font2, COL_ACCENT, UI_TL,
                   110, COL_BG);
-    ui_draw_field(ui_cache_value[0], sizeof(ui_cache_value[0]), "starting...",
+    ui_draw_field(true, ui_cache_value[0], sizeof(ui_cache_value[0]),
+                  "starting...",
                   UI_VALUE_X, ui_row_y(0), &fonts::Font2, COL_TEXT,
                   UI_TL, UI_VALUE_W, COL_BG);
 }
