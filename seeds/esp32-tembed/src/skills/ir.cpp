@@ -822,13 +822,14 @@ static void ir_poll() {
     }
 }
 
-/* Progress line for the status screen. main.cpp owns the display; this only
-   formats a string and never touches TFT_eSPI. */
-static bool ir_status_line(char *out, size_t n) {
-    if (ir_state.kind == IR_JOB_IDLE) return false;
-    snprintf(out, n, "IR %d/%d %s", ir_state.sent, ir_state.total, ir_state.label);
-    return true;
-}
+/* This file used to also format its own line for the clock face's note row,
+   which loop() drew whenever that row was free. That was the single-supplier
+   arrangement: one job worth showing, one line, no arbitration. The blast now
+   publishes a percentage into skills/progress.cpp like any other supplier and
+   the note row draws whichever job wins, so the line is gone from here. The
+   frame counts it carried are still on the blast screen in ui.h and in
+   GET /ir/tvbgone/status; what the clock face shows instead is a labelled bar,
+   which is the thing that is legible across a room. */
 
 /* --- Job control, independent of the transport ---
  *

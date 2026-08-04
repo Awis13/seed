@@ -252,8 +252,10 @@ static volatile unsigned long ring_fx_start = 0;
 static int ring_knob_pos = 0;
 static unsigned long ring_knob_at = 0;
 
-/* Progress, 0..100, or -1 for "no job". Fed from loop(); nothing in ir.cpp
-   knows this exists. */
+/* Progress, 0..100, or -1 for "no job". Fed from loop() with whichever job
+   skills/progress.cpp has arbitrated onto the bar, so the arc and the bar are
+   the same job by construction rather than by two suppliers agreeing. Nothing
+   that publishes progress knows this exists. */
 static int ring_progress_pct = -1;
 
 /* Test pattern, so colours can be judged without inventing a notification. */
@@ -366,9 +368,18 @@ static void ring_progress_clear() {
  *             the ring was saying on its own
  *   test      an operator asked for this pattern explicitly
  *   one-shot  arrival or acknowledgement, half a second each
+ *   dark      nothing to say
+ *
+ * and then, at the bottom, two claimants with no fixed order between them:
+ *
  *   progress  a job is running and its position is the information
  *   breathe   unread messages exist
- *   dark      nothing to say
+ *
+ * Against an unread info or warn the progress arc simply wins. Against an
+ * unread CRITICAL the two alternate, the critical taking the whole ring and the
+ * longer phase — the rule and the reason live in progress_ring_phase() in
+ * skills/progress.cpp, because that is where somebody tempted to remove it will
+ * be reading.
  *
  * `now` is passed in rather than read here: ring_poll() retires expired effects
  * against one timestamp, and composing against a second one taken microseconds
@@ -445,7 +456,21 @@ static void ring_compose(uint8_t frame[RING_LEDS][3], unsigned long now) {
         return;
     }
 
-    if (ring_progress_pct >= 0) {
+    /* The last two claimants do not have a fixed order between them. A progress
+       arc beats an unread info or warn outright — those are already on the
+       clock face as the amber dot and the count — but against an unread
+       CRITICAL it takes turns, and the shorter turn. The ring is the channel
+       that is readable from across a room, and a critical message must never
+       be outbid on it; see progress_ring_phase() in skills/progress.cpp for why
+       the two phases are deliberately unequal and must stay that way.
+
+       One acquisition of the notification lock serves both decisions, which is
+       also why the level is read here rather than by asking twice. */
+    uint8_t top;
+    bool unread = notify_top_unread_level(top);
+    bool crit = unread && top == NOTIFY_CRIT;
+
+    if (progress_ring_phase(crit, ring_progress_pct >= 0, now) == PROGRESS_RING_ARC) {
         /* The lit arc is the progress. The pixel at the boundary carries the
            fraction, so eight LEDs read as rather more than eight steps, and it
            never goes fully dark while a job is running — a blast that has not
@@ -464,8 +489,9 @@ static void ring_compose(uint8_t frame[RING_LEDS][3], unsigned long now) {
         return;
     }
 
-    uint8_t top;
-    if (notify_top_unread_level(top)) {
+    /* Either nothing is running, or the critical has the ring for this phase.
+       Both land here, and both want the same breathe. */
+    if (unread) {
         unsigned long cycle = (top == NOTIFY_CRIT) ? RING_BREATHE_CRIT_MS
                                                    : RING_BREATHE_MS;
         uint8_t env = RING_BREATHE_MIN +
@@ -550,9 +576,18 @@ static const char *ring_effect_name() {
     if (ring_test == RING_TEST_BREATHE) return "test-breathe";
     if (ring_fx == RING_FX_COMET) return "comet";
     if (ring_fx == RING_FX_WIPE) return "wipe";
-    if (ring_progress_pct >= 0) return "progress";
+    /* The same two-claimant decision ring_compose() makes, against a clock read
+       here rather than passed in: this reports on the web-server task, and what
+       it should report is what the ring is doing at the moment of the request.
+       While a critical alternates with a job this therefore flips between
+       "progress" and "breathe" from one GET to the next, which is the honest
+       answer rather than a confusing one. */
     uint8_t top;
-    if (notify_top_unread_level(top)) return "breathe";
+    bool unread = notify_top_unread_level(top);
+    bool crit = unread && top == NOTIFY_CRIT;
+    if (progress_ring_phase(crit, ring_progress_pct >= 0, millis()) == PROGRESS_RING_ARC)
+        return "progress";
+    if (unread) return "breathe";
     return "idle";
 }
 
@@ -642,8 +677,17 @@ static const char *ring_describe() {
            "On top of that: a comet lap when a message arrives, in that\n"
            "message's colour; a green wipe when one is acknowledged; an amber\n"
            "dot that follows the knob while you turn it; and, while a long job\n"
-           "runs, a lit arc that is the job's progress — an IR blast drives this\n"
-           "without knowing the ring exists.\n\n"
+           "runs, a lit arc that is the job's progress. That arc is whichever\n"
+           "job the progress skill has picked, so it always agrees with the bar\n"
+           "on the clock face; nothing that publishes progress knows the ring\n"
+           "exists.\n\n"
+           "While a `crit` is unacknowledged the ring alternates between the\n"
+           "red breathe and that arc — six seconds of red, three of arc — with\n"
+           "the red deliberately given the longer phase. This is the channel\n"
+           "you read from across a room, where the colour is the whole message,\n"
+           "and a critical must not be outbid on it by a percentage. Unread\n"
+           "info and warn do not alternate; a running job simply wins, because\n"
+           "those are already on the clock face as the dot and the count.\n\n"
            "### Brightness\n\n"
            "`brightness` is a percentage, 0 to 100, applied to every pixel as a\n"
            "linear cap on drive current. It defaults to 50 and is meant to be\n"
