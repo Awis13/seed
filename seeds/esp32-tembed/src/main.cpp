@@ -59,7 +59,7 @@
 #include <TFT_eSPI.h>
 
 // ===== Configuration =====
-#define SEED_VERSION        "0.6.3"
+#define SEED_VERSION        "0.7.0"
 #define HTTP_PORT           8080
 #define TOKEN_FILE          "/auth_token.txt"
 #define WIFI_CONFIG_FILE    "/wifi.json"
@@ -1607,6 +1607,12 @@ static void handle_wifi_post(AsyncWebServerRequest *request) {
 /* After ring.cpp, whose night window it shares: one device, one idea of night,
    so POST /ring sets the hours for both the light and the sound. */
 #include "skills/sound.cpp"
+/* After sound.cpp, which is what makes it possible: PDM receive is rejected on
+   any controller but I2S0, and the speaker had taken I2S0 by default until it
+   was pinned to I2S1. Before ui.h, which needs both MIC_HOLD_MS — the hold
+   that must not also read as a click — and mic_is_recording(), to put the
+   recording screen up while a take runs. */
+#include "skills/mic.cpp"
 
 static void skills_init() {
     skill_gpio_init();
@@ -1620,6 +1626,13 @@ static void skills_init() {
     /* No such contention here: the I2S channel comes from a different
        peripheral entirely, and the ESP32-S3 has two ports for one consumer. */
     skill_sound_init();
+    /* Nor here, and deliberately so: the speaker names I2S1 and the microphone
+       names I2S0, so neither can take the other's controller and this order is
+       documentation rather than a dependency. It also allocates the 320KB
+       capture buffer in PSRAM, which is why it goes last — the one skill that
+       asks for real memory asks for it after everything else has what it
+       needs. */
+    skill_mic_init();
 }
 
 // ===== On-device UI =====
@@ -1804,6 +1817,14 @@ void loop() {
     // SPIFFS. The endpoints only ever touch RAM; the flash write is here, on the
     // one task that is allowed to spend milliseconds.
     notify_poll();
+
+    // The microphone: the hold-to-record gesture on the encoder key, and the
+    // drain of whatever the I2S receive DMA has collected. Before ui_poll() so
+    // that a recording started on this pass puts its screen up on this pass —
+    // and it is here rather than inside ui_poll() because the gesture reads the
+    // pin level directly, the way ap_key_poll() does, and shares nothing with
+    // the click state machine but the pin itself. Idle cost is a digitalRead.
+    mic_poll();
 
     // Encoder and buttons, every pass: input latency is what makes the knob
     // feel attached to the screen. This owns the panel whenever the UI is on a

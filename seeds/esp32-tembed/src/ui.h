@@ -241,13 +241,18 @@ enum {
     UI_BRAND,
     UI_BLAST,
     UI_AP,
-    UI_INFO
+    UI_INFO,
+    /* Appended at the END, and anything added later must be too: this enum and
+       ui_titles[] below are parallel arrays with no static assert to catch a
+       value inserted in the middle. */
+    UI_REC
 };
 
-/* Capitals: this is the service text of the header bar, not prose. */
+/* Capitals: this is the service text of the header bar, not prose. One entry
+   per screen above, in the same order. */
 static const char *ui_titles[] = {
     "", "MENU", "MESSAGES", "MESSAGES", "TV-B-GONE", "BY BRAND", "TV-B-GONE",
-    "SETUP AP", "INFO"
+    "SETUP AP", "INFO", "RECORDING"
 };
 
 /* Top level. The marker on a selected row is also ">", so a submenu is spelled
@@ -299,6 +304,8 @@ static unsigned long ui_last_input = 0;
 static unsigned long ui_last_draw = 0;
 /* When the blast being watched stopped running, 0 while it still is. */
 static unsigned long ui_blast_done_at = 0;
+/* The same, for the recording screen: when the take ended, 0 while it runs. */
+static unsigned long ui_rec_done_at = 0;
 /* False when the menu could not start a blast and none was already running. */
 static bool ui_blast_ok = true;
 /* The list the blast was started from, so that finishing goes back to it. */
@@ -896,6 +903,116 @@ static void ui_draw_info() {
     display_force = false;
 }
 
+/* ===== Recording =====
+ *
+ * The one screen that comes up without anybody asking for it: mic.cpp decides
+ * a recording has started, ui_poll() notices and puts this in front. It is
+ * live output, like a running blast, so the idle timeout does not apply to it
+ * — a screen that vanished fifteen seconds into a hold would be exactly wrong.
+ *
+ * Two things are on it. The elapsed time, which comes from bytes captured
+ * rather than from the clock, so it stops moving if the samples stop arriving
+ * instead of counting up over audio that does not exist. And a level meter,
+ * which is the only feedback that says the microphone is hearing anything at
+ * all — without it a dead microphone and a quiet room look identical while you
+ * are standing there talking into it.
+ */
+#define REC_BAR_X    12
+#define REC_BAR_Y    86
+#define REC_BAR_W   296
+#define REC_BAR_H    24
+/* The fill is quantised to this many pixels before it is compared against what
+   is already on the panel. Room noise moves a peak meter constantly, and
+   without a step every tick would repaint the bar for a pixel nobody can see. */
+#define REC_BAR_STEP  8
+
+/* How long the finished take stays on screen before the clock comes back.
+   Longer than a blast's UI_RESULT_MS, because this result is a number to read
+   — the peak — rather than a word to glance at. */
+#define UI_REC_RESULT_MS 2500
+
+static int ui_rec_bar_drawn = -1;
+/* The colour that width was drawn in. Compared as well as the width, because
+   the bar changes colour when the take ends — and if the last live level
+   happened to quantise to the same width as the take's peak, comparing width
+   alone would leave the finished take showing the recording's red. */
+static uint16_t ui_rec_bar_color = 0;
+
+static void ui_draw_rec_bar(int pct, uint16_t color) {
+    if (pct < 0) pct = 0;
+    if (pct > 100) pct = 100;
+    int w = (REC_BAR_W * pct) / 100;
+    w = (w / REC_BAR_STEP) * REC_BAR_STEP;
+    if (color != ui_rec_bar_color) ui_rec_bar_drawn = -1;
+    ui_rec_bar_color = color;
+    if (w == ui_rec_bar_drawn) return;
+
+    /* Only the pixels that changed: the fill grows or the trough takes back
+       what it lost. Repainting the whole bar every step would be 296x24 of SPI
+       traffic on a pass that is already sharing the loop with the capture. */
+    if (w > ui_rec_bar_drawn) {
+        int from = (ui_rec_bar_drawn < 0) ? 0 : ui_rec_bar_drawn;
+        tft.fillRect(REC_BAR_X + from, REC_BAR_Y, w - from, REC_BAR_H, color);
+        if (ui_rec_bar_drawn < 0)
+            tft.fillRect(REC_BAR_X + w, REC_BAR_Y, REC_BAR_W - w, REC_BAR_H, COL_RULE);
+    } else {
+        tft.fillRect(REC_BAR_X + w, REC_BAR_Y, ui_rec_bar_drawn - w, REC_BAR_H, COL_RULE);
+    }
+    ui_rec_bar_drawn = w;
+}
+
+/* Seconds to one decimal, which is the resolution a hand on a button can
+   actually aim at. The layout does not move as the number grows: the string is
+   always the same shape. */
+static void ui_rec_secs(char *out, size_t n, uint32_t ms) {
+    snprintf(out, n, "%lu.%lus", (unsigned long)(ms / 1000),
+             (unsigned long)((ms % 1000) / 100));
+}
+
+static void ui_draw_rec() {
+    char buf[40];
+    char secs[16];
+    bool rec = mic_is_recording();
+
+    /* The wipe on the way in took the bar with it. */
+    if (display_force) ui_rec_bar_drawn = -1;
+
+    if (rec) {
+        ui_rec_secs(secs, sizeof(secs), mic_elapsed_ms());
+        snprintf(buf, sizeof(buf), "REC  %s", secs);
+        ui_draw_row(0, buf, 40, 4, COL_CRIT);
+        /* Reset-on-read: this is the level meter's own peak and nothing else
+           may sample it, or the meter would show whatever was left over from
+           the last reader. */
+        ui_draw_rec_bar(mic_level_pct(), COL_ACCENT);
+        ui_draw_row(2, "", 120, 2, COL_DIM);
+        ui_draw_row(3, "release the knob to stop", 148, 2, COL_DIM);
+    } else {
+        uint32_t ms = mic_last_take_ms();
+        int32_t peak = mic_last_take_peak();
+        ui_rec_secs(secs, sizeof(secs), ms);
+        snprintf(buf, sizeof(buf), "%s recorded", secs);
+        ui_draw_row(0, buf, 40, 4, COL_TIME);
+        /* The take's own peak, held still. A bar that drops to nothing the
+           moment the button comes up would say "silent" about a recording that
+           was not. */
+        ui_draw_rec_bar((int)((peak * 100) / 32767), COL_DIM);
+        if (ms == 0) {
+            snprintf(buf, sizeof(buf), "nothing captured");
+        } else if (peak == 0) {
+            /* ASCII only, here and on every other string this file draws: the
+               TFT_eSPI fonts compiled in cover 32-126, and a multi-byte dash
+               would render as two pieces of garbage rather than as a dash. */
+            snprintf(buf, sizeof(buf), "silent, peak 0");
+        } else {
+            snprintf(buf, sizeof(buf), "peak %ld / 32767", (long)peak);
+        }
+        ui_draw_row(2, buf, 120, 2, COL_DIM);
+        ui_draw_row(3, "GET /mic/last to hear it", 148, 2, COL_DIM);
+    }
+    display_force = false;
+}
+
 /* Screens whose content can only change when the knob moves, and which
    therefore have nothing to gain from the periodic repaint. The message list
    is deliberately not one of them: its age column advances on its own. */
@@ -913,6 +1030,7 @@ static void ui_draw() {
         case UI_BLAST:   ui_draw_blast();   break;
         case UI_AP:      ui_draw_ap();      break;
         case UI_INFO:    ui_draw_info();    break;
+        case UI_REC:     ui_draw_rec();     break;
         default: break;
     }
 }
@@ -1077,7 +1195,12 @@ static void ui_poll() {
     ui_button_poll(ui_enc_key);
     ui_button_poll(ui_user_key);
 
-    bool click = ui_enc_key.click;
+    /* The encoder key's long hold belongs to the recording gesture in
+       mic_key_poll(), so only a short press counts as a click here. Without
+       this the release that ends a recording would ALSO open the menu from the
+       clock, on top of stopping the take — the same trap the user key was
+       already guarded against below, and for the same reason. */
+    bool click = ui_enc_key.click && ui_enc_key.held_ms < MIC_HOLD_MS;
     /* The user key's long hold belongs to the AP gesture in ap_key_poll(), so
        only a short press counts as "back" here. */
     bool back = ui_user_key.click && ui_user_key.held_ms < AP_KEY_HOLD_MS;
@@ -1088,6 +1211,23 @@ static void ui_poll() {
        saying by itself: a hand is on the control. The screen and the ring get
        the same detents, and neither is told what the other did with them. */
     ring_knob(steps);
+
+    /*
+     * A recording takes the panel, from any screen and without being asked.
+     *
+     * It outranks everything else here for the same reason a running blast
+     * does: it is live output, and there is no point in a level meter you
+     * cannot see. It is also the only feedback that says the hold registered
+     * at all — mic.cpp decides that on its own, off the pin level, and this is
+     * how the UI finds out. Nothing below can take the screen back while a
+     * take runs: the arrival branch only fires on the clock face, and the case
+     * for UI_REC ignores input entirely.
+     */
+    if (mic_is_recording() && ui_screen != UI_REC) {
+        ui_rec_done_at = 0;
+        ui_enter(UI_REC);
+        return;
+    }
 
     /*
      * A message that arrives while the device is sitting on its clock puts
@@ -1181,6 +1321,28 @@ static void ui_poll() {
             break;
         }
 
+        case UI_REC:
+            /* Input is not how this screen ends. The release of the very key
+               that started the take is what stops it, and mic_key_poll() has
+               already acted on that release by the time ui_poll() runs — so
+               there is nothing here to react to, and reacting would mean
+               reacting twice. The click that release produced was suppressed
+               above by the MIC_HOLD_MS guard in any case. */
+            if (mic_is_recording()) {
+                ui_rec_done_at = 0;
+                break;
+            }
+            /* The take is over: hold the result up long enough to read the
+               peak, then go home. Signed, and against a fresh reading, as
+               everything in this firmware that subtracts clocks now is. */
+            if (ui_rec_done_at == 0) {
+                ui_rec_done_at = millis();
+            } else if ((long)(millis() - ui_rec_done_at) >= (long)UI_REC_RESULT_MS) {
+                ui_enter(UI_CLOCK);
+                return;
+            }
+            break;
+
         case UI_AP:
         case UI_INFO:
             if (click || back) {
@@ -1192,9 +1354,14 @@ static void ui_poll() {
     }
 
     /* A running blast is live output and must not be timed out from under the
-       user; everything else falls back to the clock. */
+       user; everything else falls back to the clock. The recording screen is
+       exempt outright rather than only while it records: a hold can outlast
+       fifteen seconds of "no input" — holding a key is not input to the click
+       state machine — and its own exit above is deterministic, so the idle
+       timer has nothing to add and could only fire mid-sentence. */
     bool watching_blast = (ui_screen == UI_BLAST && ir_busy());
-    if (!watching_blast && millis() - ui_last_input >= UI_IDLE_MS) {
+    bool watching_rec = (ui_screen == UI_REC);
+    if (!watching_blast && !watching_rec && millis() - ui_last_input >= UI_IDLE_MS) {
         ui_enter(UI_CLOCK);
         return;
     }
