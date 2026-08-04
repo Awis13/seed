@@ -2,8 +2,9 @@
  * skills/notify.cpp — notification queue: the seed as a pager
  *
  * Anything that can speak HTTP can poke this device. A one-line curl leaves a
- * message. The screen that shows it and the key that acknowledges it are the
- * next commit; until then the queue is read and acknowledged over HTTP too.
+ * message. The panel shows it — the Messages entry in the menu, the queue as a
+ * scrolling list, one message as a card — and Enter on the card acknowledges
+ * it; the queue is also readable and clearable over HTTP.
  *
  * Endpoints:
  *   POST /notify      — queue one {level, title, body, source, ttl_s, id}
@@ -47,7 +48,9 @@
  * nothing here to hand over: queueing a notification is a struct copy, not
  * seconds of bus time that would stall the web server task. What the endpoints
  * still do not do is draw — the panel is painted from loop() and from nowhere
- * else, so they raise ui_force and loop() decides what that means.
+ * else, so they raise ui_force_net and loop() decides what that means. The
+ * separate flag is what keeps a flood of POSTs from repainting the panel at
+ * network rate; notify_poll(), which runs on loop() already, raises ui_force.
  *
  * Persistence
  * -----------
@@ -160,7 +163,15 @@ static portMUX_TYPE notify_mux = portMUX_INITIALIZER_UNLOCKED;
 static volatile bool notify_arrived = false;
 static volatile uint32_t notify_arrived_id = 0;
 static volatile bool notify_dirty = false;
-static unsigned long notify_save_at = 0;
+/* Volatile for the same reason notify_dirty is, and it was not: the source
+   firmware declares its equivalent plain and this port inherited that. Written
+   by notify_mark_dirty() from the web server task, read by notify_poll() on
+   loop(). Nothing observed was broken by it — the comparison is correctly
+   signed and the worst a stale read costs is one coalescing window, never a
+   write, because the flag beside it stays raised until a save runs — but a
+   deadline and the flag that arms it are one decision and one of them being
+   hoistable while the other is not is an asymmetry with no reason behind it. */
+static volatile unsigned long notify_save_at = 0;
 /* When the last save finished. Written and read from loop() only — see
    notify_save_rate_allows(), which is why this one is not volatile and the two
    fields above are. Zero until the first save runs, which reads as "long
@@ -526,7 +537,13 @@ static int notify_index_of(uint32_t id) {
 }
 
 /* Returns false when there is no such entry, so the endpoint can answer 404
-   rather than pretend. Acking something already read is a success. */
+   rather than pretend. Acking something already read is a success.
+
+   The repaint this asks for is the GATED one, because the caller that matters
+   for the gate is POST /notify/ack on the web server task. The keyboard also
+   acks through here — Enter on a card — and it does not wait 200ms for the
+   screen, because it leaves the card in the same breath and the screen change
+   raises ui_force itself. */
 static bool notify_ack_id(uint32_t id) {
     bool found = false, changed = false;
     portENTER_CRITICAL(&notify_mux);
@@ -541,11 +558,12 @@ static bool notify_ack_id(uint32_t id) {
     portEXIT_CRITICAL(&notify_mux);
     if (changed) {
         notify_mark_dirty(NOTIFY_COALESCE_MS);
-        ui_force = true;
+        ui_force_net = true;
     }
     return found;
 }
 
+/* Endpoint-only, so the repaint is gated for the same reason as above. */
 static int notify_ack_all() {
     int n = 0;
     portENTER_CRITICAL(&notify_mux);
@@ -556,7 +574,7 @@ static int notify_ack_all() {
     portEXIT_CRITICAL(&notify_mux);
     if (n > 0) {
         notify_mark_dirty(NOTIFY_COALESCE_MS);
-        ui_force = true;
+        ui_force_net = true;
     }
     return n;
 }
@@ -944,7 +962,12 @@ static void notify_register_routes(AsyncWebServer &server) {
         notify_arrived_id = id;
         notify_arrived = true;
         notify_mark_dirty(e.level == NOTIFY_CRIT ? 0 : NOTIFY_COALESCE_MS);
-        ui_force = true;
+        /* The GATED repaint. This is the raise a flood arrives through, so it
+           must not be the one that can bypass UI_TICK_MS — see ui_force_net.
+           The card still comes up promptly: the arrival flag above is read at
+           the top of the next tick and ui_enter_card() raises ui_force there,
+           on the loop task, where a screen change belongs. */
+        ui_force_net = true;
 
         event_add("notify %s: %s%s%s", notify_level_name(e.level),
                   e.source[0] ? e.source : "", e.source[0] ? ": " : "", e.title);
@@ -1010,6 +1033,10 @@ static void notify_register_routes(AsyncWebServer &server) {
 
     /* POST /notify/ack — {"id":N} or {"all":true} */
     server.on(AsyncURIMatcher::exact("/notify/ack"), HTTP_POST, [](AsyncWebServerRequest *req) {
+        /* Named once: no body and an unusable body are the same 400 to the
+           caller, and two copies of the sentence are two things to keep in
+           step with each other and with the endpoint table. */
+        static const char *ack_usage = "body must be {\"id\":N} or {\"all\":true}";
         char *body = notify_take_body(req);
         if (!check_auth(req)) {
             free(body);
@@ -1017,7 +1044,7 @@ static void notify_register_routes(AsyncWebServer &server) {
             return;
         }
         if (!body) {
-            notify_send_error(req, 400, "body must be {\"id\":N} or {\"all\":true}");
+            notify_send_error(req, 400, ack_usage);
             return;
         }
 
@@ -1041,7 +1068,7 @@ static void notify_register_routes(AsyncWebServer &server) {
             doc["acked"] = 1;
             doc["id"] = id;
         } else {
-            notify_send_error(req, 400, "body must be {\"id\":N} or {\"all\":true}");
+            notify_send_error(req, 400, ack_usage);
             return;
         }
 

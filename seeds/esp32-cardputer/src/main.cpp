@@ -660,20 +660,45 @@ static unsigned long ap_minutes_left() {
 // immediately — the AP coming up with a fresh password on it — happen well
 // before the UI section below.
 //
-// `volatile` is preparation, not a fix. Every one of today's writers runs in
-// setup() or loop() context, so nothing here is broken without it and nothing
-// here is made correct by it — `volatile` is not a synchronisation primitive
-// and this is a single-byte flag, not shared state that needs one. What it
-// buys is the one thing it is actually for: a writer on another task cannot
-// have its store optimised away or hoisted out of reach of the loop task that
-// polls this in ui_tick(). The notification store arrives on the AsyncTCP task
-// and will raise this from there. The firmware this is ported from already
-// marks its equivalent volatile for exactly that reason, so this is parity with
-// it and not an invention.
+// `volatile` is not a fix. Every writer of THIS flag runs in setup() or loop()
+// context, so nothing here is broken without it and nothing here is made
+// correct by it — `volatile` is not a synchronisation primitive and this is a
+// single-byte flag, not shared state that needs one. What it buys is the one
+// thing it is actually for: a store cannot be optimised away or hoisted out of
+// reach of the loop task that polls it in ui_tick(). The firmware this is
+// ported from already marks its equivalent volatile, so this is parity with it
+// and not an invention.
 //
-// See ui_tick() for the other half of that preparation — where the flag is
-// cleared, and why it is not where the source firmware clears it.
+// See ui_tick() for the other half of that — where the flag is cleared, and
+// why it is not where the source firmware clears it.
 static volatile bool ui_force = false;
+
+// The same request, raised from the web server task instead, and it is a
+// SEPARATE FLAG PRECISELY SO THAT IT CANNOT REACH THE TICK GATE.
+//
+// A repaint costs a fillScreen() of the whole 240x135 panel plus every field
+// redrawn — tens of thousands of pixels of SPI, on the loop task, in one
+// uninterruptible run. ui_force short-circuits the 200ms gate in ui_tick(),
+// which is right for a keypress: a user who pressed a key and waited a fifth
+// of a second for the screen to answer would call the device slow. It is
+// wrong for anything the network raises, because the network sets the rate.
+// POST /notify at 20/s through ui_force is 20 full-frame repaints a second,
+// each one of them time the loop task is not spending in ui_key_poll() — which
+// retires at most one keyboard event per pass. That is the same starvation
+// NOTIFY_CRIT_MIN_GAP_MS exists to keep the flash writer out of, arriving by
+// the other door, and /skill tells agents the queue is rate-limited to protect
+// the keyboard.
+//
+// So network raises wait for the gate. They are folded into `force` inside
+// ui_tick() and appear nowhere in the expression that decides whether this
+// tick runs at all, which bounds the panel at one repaint per UI_TICK_MS no
+// matter what arrives. The cost is up to 200ms of latency on a message card,
+// on a node with no buzzer and no LED where the panel is not the thing that
+// makes an arrival urgent.
+//
+// Raised only from skills/notify.cpp, and there only on the endpoint paths.
+// notify_poll() runs on the loop task and correctly uses ui_force.
+static volatile bool ui_force_net = false;
 
 // Stored WiFi credentials.
 //
@@ -1136,8 +1161,8 @@ static void wifi_setup() {
 // The one thing it needs from further down the file is handle_body_collect(),
 // which is declared just above and defined with the other handlers. Everything
 // else it uses — event_add(), require_auth(), read_spiffs_file(),
-// write_spiffs_file_atomic(), skill_register(), SkillEndpoint, ui_force — is
-// already defined above this line.
+// write_spiffs_file_atomic(), skill_register(), SkillEndpoint, ui_force,
+// ui_force_net — is already defined above this line.
 #include "skills/notify.cpp"
 
 // ===== On-device UI =====
@@ -1392,6 +1417,22 @@ struct UiMenuItem {
     int arg;
 };
 
+// MESSAGES WENT IN AT THE TOP, NOT ON THE END, and that is a change to a menu
+// that already existed rather than an addition beside it: every entry below
+// moved down one, and the cursor a fresh boot starts on is now Messages where
+// it used to be Network. Deliberate, and worth the disruption for one reason —
+// this is the only row on the device that carries an unread count. There is no
+// badge on the status screen, no buzzer and no LED, so the queue gets noticed
+// here or not at all, and a row that has to be scrolled past five others to be
+// seen is not a notification. Everything below it is configuration a user goes
+// looking for; this is the row that has something to say without being asked.
+//
+// Nothing keys off the old numbering. The indices are used in exactly three
+// places and all three take them from this table: ui_activate() by lookup,
+// ui_window() by position, and GET /ui's menu.selected, which reports whatever
+// is here. The one literal index in the file — ui_handle_key()'s Back row,
+// which puts the cursor on Messages — is written against this order and
+// commented with the name it means.
 static const UiMenuItem ui_menu[] = {
     {"Messages",  UI_ACT_SCREEN,    UI_MESSAGES},
     {"Network",   UI_ACT_SCREEN,    UI_NETWORK},
@@ -1518,6 +1559,17 @@ static char ui_cache_note[16];
 // glass actually has on it. See handle_ui() for why the endpoint reads this
 // cache instead of wrapping the body itself.
 static char ui_card_body[2][NOTIFY_BODY_LEN + 4];
+// WHICH MESSAGE THOSE TWO LINES BELONG TO, and the report is worthless without
+// it. The cache is only ever refilled by a draw, and a draw happens on the tick
+// after the card opens — so between ui_enter_card() and the first
+// ui_draw_card(), and again on every `;`/`.` step from one card to the next,
+// ui_card_body still holds the PREVIOUS message's wrapped lines. A GET /ui
+// landing in that window would pair this card's id and title with another
+// card's body, which is worse than reporting no body at all: a reader has no
+// way to tell the two apart. ui_draw_card() stamps this with the id it just
+// wrapped, and handle_ui() emits the lines only while the stamp still matches.
+// Zero is not a valid notification id, so an unstamped cache matches nothing.
+static uint32_t ui_card_body_id = 0;
 
 // ---- Field values ----
 
@@ -1849,9 +1901,25 @@ static bool ui_field(ui_screen_t screen, int idx, char *label, size_t label_n,
 // THE SCROLL COUNTER LIVES HERE AND NOT IN THE HEADER. The source firmware puts
 // its `n/m` in the header bar, which on this panel is already full: the title
 // field runs 0..114 and the network summary 112..236, and those two overlap by
-// 2px as it is. The footer has the room — Font0 advances 6px a glyph, so the
-// 236px field holds 39 characters and the longest legend below is 38 with a
-// two-digit counter on it.
+// 2px as it is. The footer has the room, but not much of it — Font0 is fixed
+// at 6px a glyph, so the 236px field holds 39 characters, and the longest
+// legend below is the card's at exactly 39 with a two-digit counter on it:
+// "; . next  ENT ack  ` keep unread  20/20" measures 234px into 236. Two
+// pixels of slack, so a legend that grows by one character does not fit.
+//
+// A THREE-DIGIT COUNTER IS THE WAY THAT HAPPENS, and it is asserted rather
+// than left to the panel. The counters come from NOTIFY_MAX and UI_MENU_COUNT;
+// raising the queue to three digits pushes that legend to 246px, which the
+// field does not clip and the 240px panel silently cuts off at the right edge
+// — the user loses the end of the sentence that tells them backtick keeps a
+// message unread. Fail the build instead and let whoever raises the cap shorten
+// the legend in the same commit.
+static_assert(NOTIFY_MAX <= 99,
+              "the card's footer legend is 39 of the 39 characters Font0 fits "
+              "across 236px with a two-digit counter; a three-digit queue "
+              "overflows it off the panel — shorten the legend first");
+static_assert(UI_MENU_COUNT <= 99,
+              "the menu's footer legend needs a two-digit counter to fit");
 //
 // The card's legend is where the difference between the two ways of leaving it
 // is documented, because it is the only place it can be. Enter acknowledges and
@@ -2399,6 +2467,11 @@ static void ui_draw_card(bool force) {
     ui_draw_field(force, ui_card_body[1], sizeof(ui_card_body[1]), b2,
                   tx, y + MSG_BODY2_Y, &fonts::Font2, c_sec, UI_TL,
                   (uint16_t)text_w, tint);
+    // AFTER both, never before. The stamp is the promise that the cache holds
+    // this message's lines, and it must not be made until they are in it —
+    // GET /ui runs on the AsyncTCP task and preempts this one, so a stamp
+    // written first would be true for a reader arriving between the two.
+    ui_card_body_id = v.id;
 
     if (fading) ui_card_fade++;
 }
@@ -2506,10 +2579,19 @@ static void ui_activate(int index) {
 // All three wrap rather than clamp, which is the behaviour the menu already
 // had. On the card that wrap is through the message stack itself: the card
 // holds an id, so a step has to resolve that id to its current position first,
-// move from there, and adopt the id at the new position. Nothing here indexes
-// the store twice expecting the same list both times — the position is read
-// once and used immediately, and if the message has gone in the meantime the
-// lookup fails and ui_tick() leaves for the list on the next pass.
+// move from there, and adopt the id at the new position.
+//
+// THE CARD BRANCH TAKES THREE SEPARATE ACQUISITIONS — the depth, the position
+// and the entry at the new one — and a message arriving on the web server task
+// between any two of them makes them disagree. That is tolerated here and
+// nowhere else in this file, because the worst outcome is a step that lands on
+// a neighbour of the intended message or does not move at all: notify_view()
+// fails and the branch simply breaks, leaving the card where it was for the
+// user to press the key again. What is NOT tolerated is drawing from a split
+// read, and nothing here draws — ui_draw_card() gets entry, position and depth
+// out of one fused acquisition of its own, so whatever id this function
+// settles on is rendered self-consistently or not at all. If the message has
+// gone by then, ui_tick() leaves for the list on the next pass.
 static void ui_move(int step) {
     switch (ui_screen) {
     case UI_MENU: {
@@ -2747,6 +2829,10 @@ static void ui_tick() {
     unsigned long interval =
         (ui_screen == UI_MESSAGE && ui_card_fade < MSG_FADE_STEPS)
             ? MSG_FADE_MS : UI_TICK_MS;
+    // ui_force AND NOT ui_force_net. The whole difference between the two
+    // flags is this line: a keypress skips the gate because the user is
+    // standing there waiting, and a POST does not because the poster sets the
+    // rate. See the declaration of ui_force_net.
     if (!ui_force && millis() - last_tick < interval) return;
     last_tick = millis();
 
@@ -2804,8 +2890,14 @@ static void ui_tick() {
     // with it.
     //
     // Everything below therefore reads `force` and never ui_force.
-    bool force = ui_force;
+    //
+    // The network flag is folded in HERE and nowhere else. Having survived the
+    // gate above it is worth exactly as much as a local raise from this point
+    // on — a repaint is a repaint — so the two merge into one local and the
+    // rest of this function never learns which side asked.
+    bool force = ui_force || ui_force_net;
     ui_force = false;
+    ui_force_net = false;
 
     if (force) {
         ui_draw_frame(ui_screen);
@@ -3428,8 +3520,16 @@ static void handle_ui(AsyncWebServerRequest *request) {
     // STRING, and that is the difference between a report and a description of
     // one. NOTIFY_BODY_LEN is 97 and every buffer on this path is 48, so a body
     // pushed through ui_field() would be cut at 47 characters while the panel
-    // showed all 96 over two lines. These two lines each fit 48 by
-    // construction, because they are what fits a 206px column.
+    // showed all 96 over two lines.
+    //
+    // Neither line can truncate, and the reason is the BUFFER and not the
+    // column. ui_card_body[] is sized from NOTIFY_BODY_LEN, so each line has
+    // room for a whole 96-byte body on its own and the wrap is free to put the
+    // break wherever the pixels fall. It is emphatically NOT that a 206px
+    // column holds 48 characters: Font2's narrowest advance is 3px — `.` `,`
+    // `:` `;` `!` `|` — so 206px takes up to 68 of them, and a buffer sized to
+    // the column rather than to the body would cut a punctuation-heavy line in
+    // the middle. Nothing here shrinks with the column.
     //
     // They are READ FROM THE DRAW CACHE AND NOT WRAPPED HERE. Wrapping calls
     // ui_wrap2(), which installs a font on the one shared M5.Display and
@@ -3440,10 +3540,15 @@ static void handle_ui(AsyncWebServerRequest *request) {
     // computed and already drew.
     if (ui_screen == UI_MESSAGE) {
         JsonObject card = doc["card"].to<JsonObject>();
-        card["id"] = ui_msg_id;
+        // ONE READ OF ui_msg_id FOR THE WHOLE OBJECT. The card can step to the
+        // next message on the loop task while this handler runs, and an id
+        // reported from one read beside a lookup made from another would
+        // describe two different messages under one heading.
+        uint32_t id = ui_msg_id;
+        card["id"] = id;
         NotifyView v;
         int idx = 0, total = 0;
-        if (notify_view_by_id(ui_msg_id, v, &idx, &total)) {
+        if (notify_view_by_id(id, v, &idx, &total)) {
             card["present"] = true;
             card["source"] = v.source;
             card["title"] = v.title;
@@ -3457,8 +3562,17 @@ static void handle_ui(AsyncWebServerRequest *request) {
             // the card and saying so is more honest than omitting the object.
             card["present"] = false;
         }
-        card["body1"] = ui_card_body[0];
-        card["body2"] = ui_card_body[1];
+        // ONLY WHILE THE CACHE BELONGS TO THIS CARD. See ui_card_body_id: the
+        // draw that fills those two lines happens a tick after the card opens
+        // and a tick after every step through the stack, so an ungated read
+        // publishes the previous message's body under this message's id. The
+        // fields are omitted rather than emptied, because an absent key reads
+        // as "not known yet" while an empty string reads as "this message has
+        // no body", and those are different facts.
+        if (ui_card_body_id == id) {
+            card["body1"] = ui_card_body[0];
+            card["body2"] = ui_card_body[1];
+        }
     }
 
     JsonObject key = doc["last_key"].to<JsonObject>();
@@ -3477,7 +3591,18 @@ static void handle_ui(AsyncWebServerRequest *request) {
 
     // The bare keys navigation is on, repeated here so an agent reading /ui can
     // work out what to tell somebody standing at the device.
-    doc["keys"] = "; up, . down, , dim, / bright, Enter select, ` back";
+    //
+    // IT DESCRIBED THE MENU AND ONLY THE MENU. Two screens have since given
+    // the same keys different jobs — `;` and `.` step through the message
+    // stack on a card, and Enter there acknowledges while backtick deliberately
+    // does not — and telling an agent "Enter select" when the person in front
+    // of the device is looking at a card is telling them the wrong thing about
+    // the one key whose two exits mean different things. /skill was brought up
+    // to date when the card shipped and this string was not, so the two
+    // documents an agent has disagreed about the device.
+    doc["keys"] = "; up, . down (menu, message list, or previous/next card), "
+                  ", dim, / bright, Enter select — on a card it ACKNOWLEDGES "
+                  "the message, ` back — on a card it leaves it UNREAD";
 
     String response;
     serializeJson(doc, response);
@@ -3920,7 +4045,8 @@ static void handle_skill(AsyncWebServerRequest *request) {
     s += "| Enter | open the menu, activate the selected entry, or — on a card — acknowledge the message and return to the list |\n";
     s += "| `` ` `` | back — a card returns to the list LEAVING IT UNREAD, a screen returns to the menu, the menu to status |\n\n";
     s += "The menu scrolls: it has six entries and five rows, and the footer\n";
-    s += "carries the position. Entries: Messages (unread count beside it),\n";
+    s += "carries the position. Entries, in order: Messages FIRST, carrying the\n";
+    s += "queue's state beside it — \"empty\", \"3 new / 8\" or \"8 read\" — then\n";
     s += "Network, System, Hardware, Setup AP (raise the provisioning AP; it comes\n";
     s += "down on its own, there is no keyboard path to drop it), Backlight (panel\n";
     s += "dark / lit).\n\n";
