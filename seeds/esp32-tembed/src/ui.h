@@ -323,6 +323,12 @@ static int ui_blast_back_sel = 0;
 static uint32_t ui_msg_id = 0;
 /* Fade frames already drawn for the card in front, MSG_FADE_STEPS once done. */
 static uint8_t ui_card_fade = 0;
+/* Which reply chip the knob is on, for the card in front. Its own variable and
+   deliberately not ui_sel: ui_sel is the row in the message list this card was
+   opened from, and the card hands it straight back on the way out — a second
+   meaning on it would move the list under the user. Meaningless on a message
+   that carries no options, which is every message that never gets here. */
+static int ui_chip_sel = 0;
 /* Scroll window the message list was last drawn with, so that a window that
    moved is recognised as needing the same full repaint a moved selection does. */
 static int ui_first_drawn = -1;
@@ -381,6 +387,13 @@ static int ui_first_drawn = -1;
    constant and a socket recv() flag were suddenly the same macro. */
 #define MSG_CARD_PEEK  3
 #define MSG_HINT_Y   140
+/* The band under the card is one padded field the width of the card itself.
+   The padding is the erase: TFT_eSPI back-fills it with the background, so a
+   string that changes length — and the chip row changes length whenever it is
+   answered — leaves nothing of the previous one behind. Narrowing this is what
+   would produce ghosting, so it is a budget the chip row is fitted into rather
+   than a number to tune. */
+#define MSG_HINT_W   300
 
 /* Arrival: three frames of rising blend plus a few pixels of upward travel.
    40ms a frame, so the whole thing is over in 120ms — present enough to read
@@ -424,8 +437,14 @@ static void ui_draw_row(int i, const char *text, int32_t y, uint8_t font,
  * the JSON. Everything below measures with TFT_eSPI's own tables — the same
  * ones textWidth() reads — so a string is cut where it actually stops fitting
  * rather than at a character count guessed from an average glyph.
+ *
+ * The fitting helpers and the chip row further down are compiled verbatim on
+ * the host by tools/test_chips.sh. Keep every marker line self-closed and on a
+ * line of its own, and keep every comment inside a marked region fully closed:
+ * the slicer copies from the marker without understanding what it copies.
  */
 
+/* host-test:begin fit — sliced out by tools/test_chips.sh */
 static int ui_char_w(char c, uint8_t font) {
     char s[2] = {c, '\0'};
     return tft.textWidth(s, font);
@@ -467,6 +486,7 @@ static void ui_ellipsis(char *dst, size_t n, const char *src, uint8_t font,
     dst[out] = '\0';
     if (with_ellipsis) snprintf(dst + out, n - out, "...");
 }
+/* host-test:end */
 
 /* Break `src` over two lines of `max_px`, on a space where there is one. The
    second line carries the ellipsis, so a body too long for the card ends
@@ -504,6 +524,7 @@ static void ui_wrap2(const char *src, char *l1, size_t n1, char *l2, size_t n2,
 }
 
 /* Service text is capitals. Sources arrive as whatever an agent typed. */
+/* host-test:begin fit — sliced out by tools/test_chips.sh */
 static void ui_caps(char *dst, size_t n, const char *src) {
     size_t i = 0;
     for (; src && src[i] && i + 1 < n; i++) {
@@ -512,6 +533,186 @@ static void ui_caps(char *dst, size_t n, const char *src) {
     }
     dst[i] = '\0';
 }
+/* host-test:end */
+
+/* ===== Reply chips =====
+ *
+ * A notification may carry up to four short labels, and the knob picks one of
+ * them. They are drawn in the band under the card, in place of the hint that
+ * band shows for a message with nothing to pick.
+ *
+ * The whole row is ONE string with marks in it, the way the menu draws its
+ * selection: a step then costs one padded draw_field over the MSG_HINT_W band,
+ * with no fillRect and no display_force, instead of four fields plus the
+ * inverse bars an inverse-bar selection would need. The padding is what erases
+ * the previous row — it is at least as wide as the widest row that can be
+ * built here, which is the property the ellipsising below guarantees and the
+ * one tools/test_chips.sh pins.
+ */
+/* host-test:begin chips — sliced out by tools/test_chips.sh */
+/* One chip's text once it has been fitted: a label and its terminator are
+   NOTIFY_OPT_LEN already, and the ellipsis can add three characters on top of
+   15 kept whole — 19 bytes at worst. The fourth byte is spare rather than
+   counted out to nothing, since the room costs one byte per chip. */
+#define UI_CHIP_LEN     (NOTIFY_OPT_LEN + 4)
+/* The whole row: every chip carries two wrapper characters, one of them also
+   carries the answered mark, and the row carries a terminator. */
+#define UI_CHIP_ROW_LEN (NOTIFY_OPT_MAX * (UI_CHIP_LEN + 2) + 2)
+/* Two marks rather than one, because they answer two different questions —
+   what a click would do, and what a click already did. A message can be
+   answered again, which puts both marks on the same chip. */
+#define UI_CHIP_OPEN    '['
+#define UI_CHIP_CLOSE   ']'
+#define UI_CHIP_ANSWER  '*'
+
+/*
+ * Build the row: the labels, in the order they arrived, with the selected one
+ * bracketed and the answered one starred.
+ *
+ * Every chip pays for both of its wrapper characters whether it is the selected
+ * one or not. That gives the chips their gap without a separator that would
+ * have to be counted separately, and it keeps the row's width the same
+ * wherever the selection sits — exactly one chip is bracketed at a time — so
+ * the band is sized once for the widest row a detent can produce. A bracket is
+ * two pixels narrower than a space, so the labels either side of the selection
+ * do shift by that much as it moves; holding them still would mean a field per
+ * chip, four cached strings and four draw_field calls a step, for two pixels.
+ *
+ * `row_px` is the pixel budget the whole row has to fit in, and it is shared
+ * out: each chip gets what is left after the wrappers and the one answered mark
+ * are paid for. A label wider than its share is cut with the same trailing
+ * ellipsis every other column on this device uses — 15 bytes of label can be
+ * wider than a quarter of the row, and a chip that says "ROLLBA..." is a chip
+ * you can still ask about, while one clipped mid-glyph is a smear.
+ *
+ * `sel` and `chosen` outside 0..count-1 simply mark nothing, which is what an
+ * unanswered message (chosen = -1) needs and what a card nobody has turned the
+ * knob on yet (sel = -1) needs: a row with no bracket anywhere on it says the
+ * click would not answer, which on that card it does not. It is also what an
+ * index arriving from the store or from a snapshot outside 0..count-1 gets,
+ * rather than a read past the labels there are.
+ */
+static void ui_chip_row(char *dst, size_t n, const NotifyOptions &opts,
+                        uint8_t count, int sel, int chosen, int row_px,
+                        uint8_t font) {
+    if (!dst || n == 0) return;
+    dst[0] = '\0';
+    if (count == 0) return;
+    if (count > NOTIFY_OPT_MAX) count = NOTIFY_OPT_MAX;
+
+    int wrap_px = 2 * ui_char_w(' ', font);
+    int budget = (row_px - (int)count * wrap_px - ui_char_w(UI_CHIP_ANSWER, font))
+                 / (int)count;
+    if (budget < 1) budget = 1;
+
+    size_t out = 0;
+    for (int i = 0; i < (int)count; i++) {
+        char caps[UI_CHIP_LEN], text[UI_CHIP_LEN];
+        char mark[2] = { (i == chosen) ? UI_CHIP_ANSWER : '\0', '\0' };
+
+        ui_caps(caps, sizeof(caps), opts.label[i]);
+        ui_ellipsis(text, sizeof(text), caps, font, budget);
+
+        int wrote = snprintf(dst + out, n - out, "%c%s%s%c",
+                             (i == sel) ? UI_CHIP_OPEN : ' ', mark, text,
+                             (i == sel) ? UI_CHIP_CLOSE : ' ');
+        /* The caller's buffer is sized for the worst case this can build, so a
+           short one is a mistake elsewhere: stop with whole chips in it rather
+           than leave half a label and an unbalanced bracket on the panel. */
+        if (wrote < 0 || (size_t)wrote >= n - out) {
+            dst[out] = '\0';
+            return;
+        }
+        out += (size_t)wrote;
+    }
+}
+
+/*
+ * One detent on the chip row. It wraps at both ends, the way every other list
+ * on this device does, because the knob has no end stops.
+ *
+ * A negative `sel` is "nothing is selected yet", which is how a card opens
+ * before anybody has turned the knob on it. The first detent then lands ON the
+ * first chip instead of stepping past it, in either direction: there was no
+ * position to step from, so the step is what makes one. Everything after that
+ * is the ordinary walk.
+ *
+ * `sel` at or above `count` is a value that did not come from a previous detent
+ * — a `chosen` read back out of the store or out of a snapshot, which is only
+ * as trustworthy as the file it came from. It is clamped back into range rather
+ * than trusted, and the click path steps by zero for exactly that clamp before
+ * handing the value to notify_choose_id() as the answer.
+ *
+ * The reduction of `steps` is a guard rather than arithmetic the caller needs:
+ * it keeps the addition below in range for any int, and no test claims it.
+ */
+static int ui_chip_step(int sel, int steps, uint8_t count) {
+    if (count == 0) return 0;
+    int n = (int)count;
+    if (sel < 0) {
+        sel = 0;
+        if (steps > 0)      steps--;
+        else if (steps < 0) steps++;
+    }
+    if (sel >= n) sel = n - 1;
+    steps %= n;
+    sel = (sel + steps) % n;
+    if (sel < 0) sel += n;
+    return sel;
+}
+
+/*
+ * Where the knob sits the moment a card opens: on the answer the message
+ * already carries, or on nothing at all.
+ *
+ * Nothing is the answer for a message nobody has replied to, and it is not a
+ * detail of the drawing. A card can arrive in front of somebody who never asked
+ * for it — ui_poll() opens one on arrival while the device sits on its clock —
+ * and the click that comes next has meant "dismiss" on every firmware this
+ * device has run. Starting the knob on a chip would file that reflex as a
+ * deliberate answer, and by convention the first chip is the one that says yes.
+ *
+ * `chosen` is bounds-checked against the count rather than only tested for -1,
+ * because it arrives from the store and a snapshot is only as trustworthy as
+ * the file it came out of: an answer pointing past the labels that are there is
+ * no answer, and starting the knob on it would let the click that leaves record
+ * it as one.
+ *
+ * Its own function, rather than one line inside ui_enter_card(), only so that
+ * the host suite can reach it — the caller needs the store, the screen state
+ * and the encoder, and cannot be sliced. Same reason notify_take_id() is its
+ * own function in notify.cpp.
+ */
+static int ui_chip_start(int chosen, uint8_t count) {
+    if (chosen < 0 || chosen >= (int)count) return -1;
+    return chosen;
+}
+
+/*
+ * Does this click record an answer, or is it the plain acknowledge every other
+ * card gets?
+ *
+ * It answers only when the message asks something AND the knob has been turned
+ * to one of the chips. Both halves matter and they fail in opposite ways: with
+ * no options there is nothing to record, and with options but no selection
+ * there is nobody's decision to record — see ui_chip_start() for why a card
+ * can be in front of somebody who never chose to open it.
+ *
+ * Extracted for the same reason as ui_chip_start(), and next to it because the
+ * two are one rule in two halves: the click may only answer what an entry to
+ * the card, or a detent since, actually selected.
+ */
+static bool ui_chip_answers(int sel, uint8_t count) {
+    return count > 0 && sel >= 0;
+}
+/* host-test:end */
+
+/* The chip row's own cache, sized by the region above rather than shared with
+   ui_row[]: four 15-character labels and their marks are longer than a row
+   line, and draw_field compares only the first cache_size-1 bytes — a cache
+   shorter than what is on the panel lets two different rows compare equal and
+   silently skips the repaint. */
+static char ui_card_hint[UI_CHIP_ROW_LEN];
 
 static uint16_t ui_level_color(uint8_t level) {
     switch (level) {
@@ -790,10 +991,24 @@ static void ui_draw_card() {
     draw_field(ui_card_body[1], sizeof(ui_card_body[1]), b2, tx, y + 78, 2,
                c_sec, TL_DATUM, (uint16_t)text_w, tint);
 
-    /* Below the card, on the ground: what the knob does next. */
-    draw_field(ui_row[5], sizeof(ui_row[5]),
-               v.unread ? "CLICK TO ACK" : "CLICK TO GO BACK",
-               tft.width() / 2, MSG_HINT_Y, 2, COL_DIM, TC_DATUM, 300);
+    /* Below the card, on the ground: what the knob does next. A message that
+       carries reply options answers that with the options themselves, drawn in
+       the accent so they read as the live control rather than as a caption —
+       everything else on this screen is text about the message. Both go into
+       the same field, and both are erased by the same padding. */
+    if (v.opt_count > 0) {
+        char chips[UI_CHIP_ROW_LEN];
+        ui_chip_row(chips, sizeof(chips), v.options, v.opt_count,
+                    ui_chip_sel, v.chosen, MSG_HINT_W, 2);
+        draw_field(ui_card_hint, sizeof(ui_card_hint), chips,
+                   tft.width() / 2, MSG_HINT_Y, 2, COL_ACCENT, TC_DATUM,
+                   MSG_HINT_W);
+    } else {
+        draw_field(ui_card_hint, sizeof(ui_card_hint),
+                   v.unread ? "CLICK TO ACK" : "CLICK TO GO BACK",
+                   tft.width() / 2, MSG_HINT_Y, 2, COL_DIM, TC_DATUM,
+                   MSG_HINT_W);
+    }
 
     ui_draw_msg_counter(idx + 1, total);
 
@@ -1107,8 +1322,21 @@ static void ui_enter_blast(uint16_t job, int back_sel) {
    message arriving or expiring while it is up cannot silently swap it for a
    different one. */
 static void ui_enter_card(uint32_t id) {
+    NotifyView v;
+
     ui_msg_id = id;
     ui_card_fade = 0;
+    /* Where the knob starts is ui_chip_start()'s decision and only its, so that
+       the host suite can hold it to account: an already-answered message opens
+       on its own answer, so the click that leaves the card cannot quietly
+       change it, and an unanswered one opens on nothing, so that same click
+       stays the dismissal it has always been. notify_view_by_id() is the lookup
+       ui_draw_card() draws with and stops at the same first id match, so the
+       chip the knob starts on is the chip drawn starred. No entry to read is
+       nothing to answer, which is the same nothing. */
+    ui_chip_sel = notify_view_by_id(id, v, NULL, NULL)
+                      ? ui_chip_start(v.chosen, v.opt_count)
+                      : -1;
     ui_enter(UI_MSGCARD);
 }
 
@@ -1287,25 +1515,64 @@ static void ui_poll() {
             int idx = notify_index_of(ui_msg_id);
             /* Expired or evicted out from under the card. */
             if (idx < 0) { ui_enter_list(UI_MSGLIST, 0); return; }
-            /* A click is "I have seen this"; the user key is the same plain
-               step up it is on every other screen and leaves the message
-               unread on purpose. */
+
+            /* What the message carries is what decides what the knob does, and
+               it is read on the pass that carries the input rather than kept
+               across passes: a count cached at entry is a count that can no
+               longer be checked against the entry being answered.
+               notify_view_by_id() is the lookup ui_draw_card() draws with and
+               stops at the same first id match, so the row on screen and the
+               row being answered cannot be different rows. */
+            NotifyView v;
+            uint8_t opts = 0;
+            if ((click || steps != 0) &&
+                notify_view_by_id(ui_msg_id, v, NULL, NULL)) {
+                opts = v.opt_count;
+            }
+
+            /* A click is "I have seen this" — or, when ui_chip_answers() says
+               this one is an answer, the answer, which is stronger:
+               notify_choose_id() marks it read as part of recording the choice.
+               Everything else falls through to the plain acknowledgement,
+               including a click on a card that asks something nobody has
+               turned the knob to yet. The step by zero is the clamp, for a
+               selection restored from a `chosen` the store no longer has
+               options for. The user key is the same plain step up it is on
+               every other screen and leaves the message unread, and its
+               question unanswered, on purpose. */
             if (click) {
-                notify_ack_id(ui_msg_id);
+                if (ui_chip_answers(ui_chip_sel, opts)) {
+                    notify_choose_id(ui_msg_id,
+                                     (uint8_t)ui_chip_step(ui_chip_sel, 0, opts));
+                } else {
+                    notify_ack_id(ui_msg_id);
+                }
                 ui_enter_list(UI_MSGLIST, idx);
                 return;
             }
             if (back) { ui_enter_list(UI_MSGLIST, idx); return; }
             if (steps != 0) {
+                /* Rotation belongs to the chips only while there are chips to
+                   pick. On every other message it keeps walking the stack
+                   exactly as it always has, so nothing is taken away from a
+                   message that asks nothing. */
+                if (opts > 0) {
+                    ui_chip_sel = ui_chip_step(ui_chip_sel, steps, opts);
+                    ui_draw();
+                    break;
+                }
                 int count = notify_count();
                 if (count > 0) {
                     int n = (idx + steps) % count;
                     if (n < 0) n += count;
-                    NotifyView v;
+                    /* Its own name: `v` above is the card on screen, this is
+                       the neighbour being stepped to, and they are two
+                       different messages. */
+                    NotifyView next;
                     /* Re-fade on the way in, so moving through the stack reads
                        as one card replacing another rather than as text
                        changing inside a frame that never moved. */
-                    if (notify_view(n, v)) { ui_sel = n; ui_enter_card(v.id); return; }
+                    if (notify_view(n, next)) { ui_sel = n; ui_enter_card(next.id); return; }
                 }
             }
             break;

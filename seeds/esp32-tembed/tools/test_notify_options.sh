@@ -410,6 +410,16 @@ int main(void) {
         bad_label("a\tb", "an embedded tab");
         bad_label("a\x01" "b", "a control character");
         bad_label("a\x7f" "b", "DEL, which is above the printable range");
+        /* Blank AFTER the cut, which is the only way the two rules interact:
+           the printable character that carries this label past the check is
+           also the one the cut throws away, leaving fifteen spaces to draw as a
+           chip and to serve back over GET /notify. Refused on what is stored,
+           not on what was typed. */
+        bad_label("               XYZ", "a label whose only printable characters are cut off");
+        {
+            const char *kept[] = { "              X" };
+            good_set(kept, 1, "and one whose printable character survives the cut");
+        }
 
         const char *ok[] = { "Yes please", "no-2", "~!@#$%^&*()" };
         good_set(ok, 3, "spaces, digits, punctuation");
@@ -697,7 +707,7 @@ int main(void) {
     {
         good_id("12", 12);
         good_id("1", 1);
-        good_id("4294967295", 4294967295u);
+        good_id("4294967294", NOTIFY_ID_MAX);
         /* Leading zeroes are still just digits; nothing here is octal. */
         good_id("0012", 12);
 
@@ -718,9 +728,15 @@ int main(void) {
         bad_id("+12", "a leading plus");
         bad_id("-1", "a negative id");
         bad_id("-4294967295", "a negative id that would have wrapped into range");
+        /* The ceiling is the store's, not the type's. 4294967295 fits a
+           uint32_t and is refused anyway: no notification can carry it — the
+           id counter is never left there — so asking for it is a malformed
+           request, and answering 404 would say "not here yet" about a value
+           that can never be here. */
+        bad_id("4294967295", "the one id above the store's ceiling");
         /* And past the range of an id rather than truncated into some other
            entry's: 4294967297 & 0xFFFFFFFF is 1. */
-        bad_id("4294967296", "one past the largest id");
+        bad_id("4294967296", "one past what a uint32_t holds");
         bad_id("4294967297", "a value that would truncate onto id 1");
         bad_id("99999999999999999999999999", "a value past every integer here");
     }

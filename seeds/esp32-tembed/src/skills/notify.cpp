@@ -134,9 +134,9 @@
    the same slot and overwrites it, and the list shows that one twice. */
 #define NOTIFY_ID_MAX       0xFFFFFFFEu
 /* Reply options. Three labels sit comfortably across the 320px panel and four
-   are tight — about seven capitals each — which is the width C2 has to draw
-   into and the reason the API says so in describe() rather than letting a
-   caller find out by looking at the device.
+   are tight — about seven capitals each — which is the width the card's chip
+   row draws into and the reason the API says so in describe() rather than
+   letting a caller find out by looking at the device.
    NOTIFY_OPT_LEN is 16 for the same reason every other field here is wider
    than the panel: the JSON carries what was sent, the screen ellipsises. The
    table costs NOTIFY_MAX * NOTIFY_OPT_MAX * NOTIFY_OPT_LEN = 1280 bytes of
@@ -144,6 +144,10 @@
    allocating per notification. */
 #define NOTIFY_OPT_MAX       4
 #define NOTIFY_OPT_LEN      16   /* 15 chars plus the terminator */
+/* The refusal that quotes the maximum, in one place and next to the maximum
+   itself: the endpoint and the builder both say it, and two copies of a number
+   are how a device ends up stating a limit it no longer has. */
+static const char *NOTIFY_OPT_ERR = "options must be an array of at most 4 strings";
 #define NOTIFY_FILE         "/notify.json"
 /* The snapshot is written here and renamed into place; see notify_save(). */
 #define NOTIFY_FILE_TMP     "/notify.tmp"
@@ -342,6 +346,11 @@ static void notify_copy_text(char *dst, size_t size, const char *src) {
  * like every other string this skill accepts. A label is a chip on a screen —
  * cutting it is a cosmetic loss, and refusing the whole notification over it
  * would lose the message.
+ *
+ * The truncation is why notify_options_build() runs this twice, on what was
+ * sent and again on what was kept: the blank rule is about what the panel draws
+ * and what GET /notify serves, and a cut can turn something that read as a
+ * label into fifteen spaces.
  */
 static bool notify_option_check(const char *label, const char **err) {
     const char *sink = NULL;
@@ -391,12 +400,21 @@ static bool notify_options_build(NotifyOptions &out, uint8_t &count,
     count = 0;
 
     if (n > NOTIFY_OPT_MAX) {
-        *err = "options must be an array of at most 4 strings";
+        *err = NOTIFY_OPT_ERR;
         return false;
     }
     for (size_t i = 0; i < n; i++) {
         if (!notify_option_check(labels[i], err)) return false;
         notify_copy_text(out.label[i], NOTIFY_OPT_LEN, labels[i]);
+        /* Again, on the bytes that were kept. What was sent passing the check
+           is not the same claim as what is stored passing it: "<15 spaces>XYZ"
+           has a printable character in it, loses it to the cut, and is left as
+           a chip nobody can read and a blank label served back over the API —
+           the exact thing the blank rule exists to refuse. Checking the stored
+           bytes also keeps the restore path honest, since a snapshot arrives
+           already truncated and would otherwise be held to a different rule
+           than the request that produced it. */
+        if (!notify_option_check(out.label[i], err)) return false;
     }
     count = (uint8_t)n;
     return true;
@@ -690,9 +708,11 @@ static bool notify_ack_id(uint32_t id) {
  * where every input this device has is handled.
  *
  * False when there is no such entry, when it carries no options, or when the
- * index is past the ones it does carry — the caller is then holding a stale
- * view of a message that has been replaced under it, and drawing a choice it
- * did not make would be worse than drawing none.
+ * index is past the ones it does carry. The index is the screen's, and the
+ * options are the store's: this is where the two are checked against each
+ * other, so that an index which came from anywhere but a detent on this row —
+ * a `chosen` read back out of a snapshot, a count that does not match the one
+ * the caller drew — records nothing rather than an answer nobody gave.
  *
  * Acknowledgement is not reimplemented here. Answering implies reading, so this
  * calls notify_ack_id() and inherits whatever an ack does today: the deferred
@@ -705,10 +725,8 @@ static bool notify_ack_id(uint32_t id) {
  * asked for again here. Both are idempotent: the earliest save deadline wins
  * and display_force is a flag, so asking twice costs nothing.
  *
- * Nothing calls this yet — C2 binds it to the click. Marked unused so that
- * -Wunused-function does not refuse the build in the meantime.
+ * The caller is the card screen in ui.h, on a click while reply chips are up.
  */
-static bool notify_choose_id(uint32_t id, uint8_t index) __attribute__((unused));
 static bool notify_choose_id(uint32_t id, uint8_t index) {
     bool ok = false, changed = false;
 
@@ -1141,8 +1159,11 @@ static const char *notify_describe() {
            "Three labels fit the screen comfortably; four are tight, about\n"
            "seven capitals each, so `Yes`/`No`/`Later` reads well and\n"
            "`Restart now` does not — and a label over 15 bytes is cut like any\n"
-           "other field, so `Deploy to production` is stored and shown as\n"
-           "`Deploy to produ`. Labels are printable ASCII only (32..126):\n"
+           "other field, so `Deploy to production` is stored as `Deploy to\n"
+           "produ`. The panel then puts it in capitals and cuts it again to\n"
+           "whatever share of the row it gets, which depends on how many\n"
+           "options there are: what is stored is what the API serves back, not\n"
+           "what appears on screen. Labels are printable ASCII only (32..126):\n"
            "anything else is refused with a reason, because the panel has no\n"
            "glyphs for it and would draw a message nobody can read.\n\n"
            "Posting again under the same `id` key clears any answer along with\n"
@@ -1231,9 +1252,12 @@ static void notify_send_error(AsyncWebServerRequest *req, int code, const char *
  * return value, and a 33-digit id truncated into uint32_t would not be refused
  * at all: it would fetch some other entry and look like a successful read.
  *
- * The ceiling is checked on every digit, so the accumulator cannot wrap on the
- * way to being compared against it. 0 is refused with the rest: it is what
- * marks a slot free, so no notification ever carries it.
+ * The ceiling is NOTIFY_ID_MAX, which is the largest id this store ever hands
+ * out, and it is checked on every digit so the accumulator cannot wrap on the
+ * way to being compared against it. Refusing at the store's own ceiling rather
+ * than at the width of the type is what makes `?id=4294967295` a 400 — a value
+ * no notification can carry is a malformed request, not a lookup that missed.
+ * 0 is refused with it, for the same reason: it is what marks a slot free.
  *
  * Sliced onto the host by tools/test_notify_options.sh; the marker rules from
  * the types region apply.
@@ -1246,7 +1270,7 @@ static bool notify_parse_id(const char *s, uint32_t &out) {
     for (const char *p = s; *p; p++) {
         if (*p < '0' || *p > '9') return false;
         v = v * 10 + (unsigned long long)(*p - '0');
-        if (v > 0xFFFFFFFFULL) return false;
+        if (v > (unsigned long long)NOTIFY_ID_MAX) return false;
     }
     if (v == 0) return false;
 
@@ -1327,7 +1351,7 @@ static void notify_register_routes(AsyncWebServer &server) {
                wrong is a 400. A caller that asked a question and got a plain
                notification back would never find out. */
             if (!input["options"].is<JsonArrayConst>()) {
-                notify_send_error(req, 400, "options must be an array of at most 4 strings");
+                notify_send_error(req, 400, NOTIFY_OPT_ERR);
                 return;
             }
             JsonArrayConst a = input["options"];
