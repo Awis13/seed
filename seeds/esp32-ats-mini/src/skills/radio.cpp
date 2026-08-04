@@ -57,6 +57,16 @@ uint8_t     display_get_layout();
 uint8_t     display_layout_count();
 const char *display_layout_name(uint8_t i);
 
+/* Idle-dim ("sleep") accessors, also in display.cpp. sleep_timeout (seconds, 0=off)
+ * is a global display setting persisted in the same v8 (read tolerantly, no bump);
+ * the dim state machine and the backlight PWM live in display.cpp — this is idle
+ * BACKLIGHT dimming only, never a real sleep (WiFi/HTTP/mesh stay up). radio.cpp
+ * only reads/restores the threshold and reports the live dim stage in /radio/status.
+ * Guarded by display_mtx inside display_set_sleep — never touch radio_mtx for it. */
+void        display_set_sleep(uint16_t secs);
+uint16_t    display_get_sleep();
+const char *display_dim_state();
+
 /*
  * Mode constants follow the ref ats-mini numbering so the SSB mode value doubles
  * as setSSB()'s usblsb argument (1=LSB, 2=USB) — no separate mapping needed.
@@ -475,6 +485,32 @@ static void radio_mark_dirty() {
 }
 
 /*
+ * Millisecond timestamp of the last user input. Written on every encoder detent,
+ * button event, and HTTP control request (radio_mark_activity), and read for two
+ * things: the UI command-timeout in radio_tick() and the idle backlight dimming
+ * (radio_idle_ms, consumed by display.cpp). A lone 32-bit word touched from both
+ * loopTask and the async HTTP task — an aligned 32-bit load/store is atomic on the
+ * ESP32, so no lock guards it (mirrors the other cross-task byte/word atomics here).
+ */
+static uint32_t last_input_ms = 0;
+
+/*
+ * Mark user activity: reset the idle timer so the idle-dimming state machine wakes
+ * the backlight. Called from the HTTP control handlers (tune/band/volume/config) so
+ * driving the receiver from the web counts as activity and un-dims the screen, the
+ * same way an encoder detent or a button press does on the device. A single atomic
+ * store — safe to call from the async HTTP task with no lock.
+ */
+void radio_mark_activity() { last_input_ms = millis(); }
+
+/*
+ * Milliseconds since the last user input. Backs display.cpp's idle backlight
+ * dimming (full -> dim -> off) — see display_apply_dimming. A lone millis()
+ * subtraction over the atomic word above, no lock.
+ */
+uint32_t radio_idle_ms() { return millis() - last_input_ms; }
+
+/*
  * Every I2C access to `rx` now runs from two contexts: the async HTTP task
  * (tune/scan/status) and loop()'s radio_tick() (encoder-driven tuning + the
  * display readout that snapshots signal quality). Concurrent SI4735 transfers
@@ -674,7 +710,7 @@ static const SkillEndpoint radio_endpoints[] = {
     {"GET",  "/radio/bands",  "List band-plan presets for UI: {bands:[{idx,name}],current}"},
     {"GET",  "/radio/themes", "List colour themes for UI: {themes:[{idx,name}],current}"},
     {"GET",  "/radio/layouts","List screen layouts for UI: {layouts:[{idx,name}],current}"},
-    {"POST", "/radio/config", "Set mode/step/bandwidth/squelch/mute/DSP/theme/layout: {mode?:\"AM\"|\"LSB\"|\"USB\", step_idx?:<int>, bw_idx?:<int>, squelch?:0-127, squelch_snr?:<bool>, mute?:<bool>, agc?:<int>, avc?:<even 12-90>, softmute?:0-32, cal?:<-2000-2000 SSB>, theme?:<int>, layout?:0-1}"},
+    {"POST", "/radio/config", "Set mode/step/bandwidth/squelch/mute/DSP/theme/layout/sleep: {mode?:\"AM\"|\"LSB\"|\"USB\", step_idx?:<int>, bw_idx?:<int>, squelch?:0-127, squelch_snr?:<bool>, mute?:<bool>, agc?:<int>, avc?:<even 12-90>, softmute?:0-32, cal?:<-2000-2000 SSB>, theme?:<int>, layout?:0-1, sleep?:<0-3600 s, 0=off>}"},
     {"POST", "/radio/volume", "Set volume: {volume:0-63}"},
     {"POST", "/radio/scan",   "Sweep current-mode band: {from,to,step,min_rssi?} -> RSSI/SNR per step"},
     {"GET",  "/radio/status", "Current freq/mode/RSSI/SNR (+bfo in SSB, +RDS ps/rt/pi/pty in FM)"},
@@ -694,7 +730,7 @@ static const char *radio_describe() {
            "| GET | /radio/bands | List band-plan presets (name + index) for UI dropdowns |\n"
            "| GET | /radio/themes | List colour themes (name + index) for the UI selector |\n"
            "| GET | /radio/layouts | List screen layouts (name + index) for the UI selector |\n"
-           "| POST | /radio/config | Set mode/step/bandwidth + squelch/mute + DSP + theme + layout: `{\"mode\":\"AM|LSB|USB\",\"step_idx\":<int>,\"bw_idx\":<int>,\"squelch\":<0..127>,\"squelch_snr\":<bool>,\"mute\":<bool>,\"agc\":<int>,\"avc\":<even 12..90>,\"softmute\":<0..32>,\"cal\":<-2000..2000>,\"theme\":<int>,\"layout\":<0..1>}` |\n"
+           "| POST | /radio/config | Set mode/step/bandwidth + squelch/mute + DSP + theme + layout + sleep: `{\"mode\":\"AM|LSB|USB\",\"step_idx\":<int>,\"bw_idx\":<int>,\"squelch\":<0..127>,\"squelch_snr\":<bool>,\"mute\":<bool>,\"agc\":<int>,\"avc\":<even 12..90>,\"softmute\":<0..32>,\"cal\":<-2000..2000>,\"theme\":<int>,\"layout\":<0..1>,\"sleep\":<0..3600 s, 0=off>}` |\n"
            "| POST | /radio/volume | Set volume: `{\"volume\":<0..63>}` |\n"
            "| POST | /radio/scan | Blocking band sweep in the current mode: `{\"from\":<int>,\"to\":<int>,\"step\":<int>,\"min_rssi\":<int>}` |\n"
            "| GET | /radio/status | Current freq, mode, RSSI, SNR (+bfo in SSB; +RDS `rds_ps`/`rds_rt`/`pi`/`pty` in FM) |\n"
@@ -1524,6 +1560,7 @@ static void radio_register_routes(AsyncWebServer &server) {
             if (req->_tempObject) { free(req->_tempObject); req->_tempObject = nullptr; }
             return;
         }
+        radio_mark_activity();  /* web control counts as input -> wake the backlight */
 
         if (!radio_ok) {
             req->send(503, "application/json", "{\"error\":\"SI4732 not detected\"}");
@@ -1672,6 +1709,7 @@ static void radio_register_routes(AsyncWebServer &server) {
             if (req->_tempObject) { free(req->_tempObject); req->_tempObject = nullptr; }
             return;
         }
+        radio_mark_activity();  /* web control counts as input -> wake the backlight */
 
         if (!radio_ok) {
             req->send(503, "application/json", "{\"error\":\"SI4732 not detected\"}");
@@ -1791,6 +1829,7 @@ static void radio_register_routes(AsyncWebServer &server) {
             if (req->_tempObject) { free(req->_tempObject); req->_tempObject = nullptr; }
             return;
         }
+        radio_mark_activity();  /* web control counts as input -> wake the backlight */
 
         /* No radio_ok gate here: the "theme" field is a global DISPLAY property and
          * must work even when the SI4732 was never detected. The receiver-affecting
@@ -1850,6 +1889,14 @@ static void radio_register_routes(AsyncWebServer &server) {
         bool has_layout = !input["layout"].isNull();
         int  layout_v   = input["layout"] | -1;
 
+        /* Optional idle-dim threshold: "sleep" (seconds, 0 = never dim; the backlight
+         * steps to ~20% at this idle time and off at 3x it). A DISPLAY property like
+         * theme/layout — applied without radio_ok and without radio_mtx (guarded by
+         * display_mtx inside display_set_sleep). Never a real sleep: WiFi/HTTP/mesh
+         * stay up, only the backlight PWM changes. */
+        bool has_sleep = !input["sleep"].isNull();
+        int  sleep_v   = input["sleep"] | -1;
+
         /* Parse the optional demod mode. Only AM/LSB/USB are settable here: FM is a
          * broadcast demod locked to the VHF band (a native-FM band is rejected under
          * the lock below), so it is never a valid config target. */
@@ -1865,9 +1912,10 @@ static void radio_register_routes(AsyncWebServer &server) {
         free(body); req->_tempObject = nullptr;
 
         if (!has_step && !has_bw && !has_mode && !has_squelch && !has_mute &&
-            !has_agc && !has_avc && !has_sm && !has_cal && !has_theme && !has_layout) {
+            !has_agc && !has_avc && !has_sm && !has_cal && !has_theme && !has_layout &&
+            !has_sleep) {
             req->send(400, "application/json",
-                "{\"error\":\"provide step_idx, bw_idx, mode, squelch, mute, agc, avc, softmute, cal, theme and/or layout\"}");
+                "{\"error\":\"provide step_idx, bw_idx, mode, squelch, mute, agc, avc, softmute, cal, theme, layout and/or sleep\"}");
             return;
         }
         if (mode_str_bad) {
@@ -1908,9 +1956,23 @@ static void radio_register_routes(AsyncWebServer &server) {
             radio_mark_dirty();
         }
 
-        /* If the only fields were display ones (theme/layout), respond now without
-         * touching the receiver — this path succeeds regardless of radio_ok. Any
-         * receiver-affecting field falls through to the radio_ok gate below. */
+        /* Apply the idle-dim threshold BEFORE the radio_ok gate too — a display
+         * property, so it must take effect even with the receiver absent. Validate the
+         * range (0..3600 s), then set it under display_mtx (inside display_set_sleep),
+         * never under radio_mtx. Persisted (v8, tolerant). */
+        if (has_sleep) {
+            if (sleep_v < 0 || sleep_v > 3600) {
+                req->send(400, "application/json",
+                    "{\"error\":\"sleep out of range (0..3600 s, 0=off)\"}");
+                return;
+            }
+            display_set_sleep((uint16_t)sleep_v);
+            radio_mark_dirty();
+        }
+
+        /* If the only fields were display ones (theme/layout/sleep), respond now
+         * without touching the receiver — this path succeeds regardless of radio_ok.
+         * Any receiver-affecting field falls through to the radio_ok gate below. */
         bool has_radio_field = has_step || has_bw || has_mode || has_squelch ||
                                has_mute || has_agc || has_avc || has_sm || has_cal;
         if (!has_radio_field) {
@@ -1918,6 +1980,8 @@ static void radio_register_routes(AsyncWebServer &server) {
             doc["ok"] = true;
             doc["theme"] = display_get_theme();
             doc["layout"] = display_get_layout();
+            doc["sleep"] = display_get_sleep();
+            doc["dim_state"] = display_dim_state();
             String response;
             serializeJson(doc, response);
             req->send(200, "application/json", response);
@@ -2120,9 +2184,11 @@ static void radio_register_routes(AsyncWebServer &server) {
         }
         /* Cal is SSB-only; report it only in LSB/USB. */
         if (mode_is_ssb) doc["cal"] = cal_snap;
-        /* Theme and layout are global; always report the current indices. */
+        /* Theme, layout and idle-dim are global; always report the current values. */
         doc["theme"] = display_get_theme();
         doc["layout"] = display_get_layout();
+        doc["sleep"] = display_get_sleep();
+        doc["dim_state"] = display_dim_state();
         String response;
         serializeJson(doc, response);
         req->send(200, "application/json", response);
@@ -2137,6 +2203,7 @@ static void radio_register_routes(AsyncWebServer &server) {
             if (req->_tempObject) { free(req->_tempObject); req->_tempObject = nullptr; }
             return;
         }
+        radio_mark_activity();  /* web control counts as input -> wake the backlight */
 
         if (!radio_ok) {
             req->send(503, "application/json", "{\"error\":\"SI4732 not detected\"}");
@@ -2372,6 +2439,11 @@ static void radio_register_routes(AsyncWebServer &server) {
         doc["theme_name"] = display_theme_name(display_get_theme());
         doc["layout"] = display_get_layout();
         doc["layout_name"] = display_layout_name(display_get_layout());
+        /* Idle backlight dimming: the configured threshold (seconds, 0=off) and the
+         * live stage ("full"/"dim"/"off"). The physical backlight is invisible over
+         * HTTP, so dim_state is how an agent verifies the state machine. */
+        doc["sleep"] = display_get_sleep();
+        doc["dim_state"] = display_dim_state();
         /* RDS is an FM-broadcast feature; report the decoded fields only in FM. pi is
          * the numeric 16-bit Program Identification, pty the 5-bit Program Type. */
         if (lmode_fm) {
@@ -2530,7 +2602,8 @@ static void radio_register_routes(AsyncWebServer &server) {
  *     the panel; it is skipped while custom /display text is showing.
  */
 static void radio_tick() {
-    static uint32_t last_input_ms = 0;
+    /* last_input_ms is a file-scope static (declared with radio_mark_activity above)
+     * so an HTTP control request can reset it too, not just on-device input. */
 
     /* 1) Button through ButtonTracker (debounce/click/short/long handled inside). */
     static ButtonTracker key_btn;
@@ -3036,6 +3109,11 @@ static void radio_tick() {
          * v8 file written before this key existed simply lacks it and restores as 0
          * (Default), so no version bump is needed. */
         doc["layout"] = display_get_layout();
+        /* v8 (same schema, no bump): the global idle-dim threshold (seconds, 0=off).
+         * Owned by display.cpp; read here through the accessor OUTSIDE radio_mtx (a
+         * lone aligned 16-bit read is atomic). A v8 file written before this key
+         * existed simply lacks it and restores as 0 (dimming off), so no bump. */
+        doc["sleep"] = display_get_sleep();
         String out;
         serializeJson(doc, out);
         write_spiffs_file(RADIO_STATE_FILE, out);  /* blocking flash write + encoder detach, outside the mutex */
@@ -3111,6 +3189,15 @@ static void radio_restore_state() {
      * index and the boot paint applies it. */
     int ly = doc["layout"] | 0;
     if (ly >= 0 && ly < display_layout_count()) display_set_layout((uint8_t)ly);
+
+    /* v8 (same schema, no bump): the global idle-dim threshold. Restored up front with
+     * the other display props — a malformed radio field below must not cost it. Absent
+     * (older v8 file) defaults to 0 (dimming off) via the | 0; validated to the same
+     * 0..3600 s range display_set_sleep clamps to. Runs before skill_display_init (the
+     * ledc channel is not up yet), so it just stores the threshold; the first dim tick
+     * after boot applies it. */
+    int slp = doc["sleep"] | 0;
+    if (slp >= 0 && slp <= 3600) display_set_sleep((uint16_t)slp);
 
     /* Reject anything malformed — a single bad field falls back to the defaults. */
     if (band < 0 || band >= BAND_COUNT) return;

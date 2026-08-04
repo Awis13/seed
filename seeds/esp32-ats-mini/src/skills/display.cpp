@@ -33,6 +33,9 @@ const char *radio_get_band_name();
 uint8_t radio_get_rssi();
 uint8_t radio_get_volume();
 uint8_t radio_get_tune_target();
+/* Milliseconds since the last user input (encoder / button / HTTP control). Drives
+ * the idle backlight dimming below; a lone millis() subtraction, no lock. */
+uint32_t radio_idle_ms();
 void radio_get_signal(uint8_t *rssi, uint8_t *snr);
 /* RDS snapshot (radio.cpp). Takes radio_mtx briefly; any out pointer may be NULL.
  * Must be called BEFORE display_mtx to keep the radio_mtx -> display_mtx order.
@@ -313,6 +316,106 @@ void display_set_brightness(uint8_t v) {
 /* Current backlight duty. A lone byte written under display_mtx — the read is
  * atomic, so no lock is taken (and none may be, off the radio persist path). */
 uint8_t display_get_brightness() { return brightness; }
+
+/*
+ * --- Idle backlight dimming (NO sleep) ---
+ *
+ * After a stretch with no user input the panel backlight is stepped down and then
+ * off, WITHOUT ever touching the CPU, WiFi, HTTP server or the ST7789 controller:
+ * this is purely ledcWrite() on the backlight PWM. The node stays fully awake —
+ * seed-mesh / OTA / the web API keep running and the sprite keeps rendering — only
+ * the physical backlight dims, so a wake is instant (the current frame is already
+ * on the panel behind the dark backlight). Deliberately not esp_light_sleep /
+ * netStop / DISPOFF: any of those would drop the node off the mesh.
+ *
+ * Three stages keyed off the idle time (radio_idle_ms(), reset by any encoder /
+ * button / HTTP-control activity):
+ *   full : idle < sleep_timeout        -> ledcWrite(brightness)   (saved level)
+ *   dim  : sleep_timeout <= idle < *3  -> ledcWrite(~20% of brightness, floor 10)
+ *   off  : idle >= sleep_timeout * 3   -> ledcWrite(0)            (backlight off)
+ *
+ * sleep_timeout is in SECONDS; 0 disables dimming entirely (always full — this is
+ * the default, so behaviour is unchanged until a timeout is set). The dim:off
+ * ratio is a fixed 1:3 (e.g. 20 s -> dim, 60 s -> off) so a single configurable
+ * threshold drives both stages. The saved `brightness` is NEVER modified — dimming
+ * is a physical PWM overlay, restored to `brightness` on wake.
+ */
+#define DIM_STAGE_FULL 0
+#define DIM_STAGE_DIM  1
+#define DIM_STAGE_OFF  2
+
+/* Idle-dim threshold in seconds (0 = never dim). Written under display_mtx
+ * (display_set_sleep, shared with the persist read); read as a lone aligned 16-bit
+ * word in the dim path and by display_get_sleep — both atomic, so no lock taken. */
+static uint16_t sleep_timeout = 0;
+
+/* Current dim stage (DIM_STAGE_*). Written only by display_apply_dimming, which runs
+ * solely on loopTask (display_tick_render), so it needs no lock; read as a lone byte
+ * by display_dim_state for /radio/status. */
+static uint8_t dim_stage = DIM_STAGE_FULL;
+
+/*
+ * Set the idle-dim threshold in seconds (0 = disabled), clamped to 0..3600. Takes
+ * display_mtx when it exists (the value is shared with the persist read); callable
+ * before skill_display_init() from radio_restore_state, where it just stores the
+ * value. Does not force a repaint — the next display_apply_dimming tick re-evaluates
+ * the stage against the new threshold.
+ */
+void display_set_sleep(uint16_t secs) {
+    if (secs > 3600) secs = 3600;
+    bool locked = (display_mtx != nullptr);
+    if (locked) xSemaphoreTake(display_mtx, portMAX_DELAY);
+    sleep_timeout = secs;
+    if (locked) xSemaphoreGive(display_mtx);
+}
+
+/* Current idle-dim threshold in seconds (0 = disabled). A lone aligned 16-bit read,
+ * atomic, so no lock is taken (and none may be, off the radio persist path). */
+uint16_t display_get_sleep() { return sleep_timeout; }
+
+/* Current dim stage as a short string for /radio/status: "full"/"dim"/"off". Lets an
+ * agent verify the state machine without seeing the physical backlight (the sprite
+ * capture shows pixels, not the BL duty). A lone byte read, atomic. */
+const char *display_dim_state() {
+    switch (dim_stage) {
+        case DIM_STAGE_DIM: return "dim";
+        case DIM_STAGE_OFF: return "off";
+        default:            return "full";
+    }
+}
+
+/*
+ * Drive the backlight PWM from the idle time. Called every display tick (~10 Hz)
+ * from display_tick_render BEFORE its change-detector early-outs, so dimming keeps
+ * advancing while the screen content is static (idle == nothing changing, which is
+ * exactly when we dim). Only writes the ledc channel on a STAGE CHANGE, never per
+ * frame, so it does not spam the PWM. Backlight only — no sleep, no DISPOFF, no
+ * netStop; the node never leaves the air.
+ */
+void display_apply_dimming(uint32_t idle_ms) {
+    if (!bl_ready) return;   /* ledc channel not attached yet (before the boot paint) */
+
+    uint16_t to = sleep_timeout;   /* seconds; 0 disables dimming */
+    uint8_t want;
+    if (to == 0) {
+        want = DIM_STAGE_FULL;
+    } else {
+        uint32_t dim_ms = (uint32_t)to * 1000u;
+        uint32_t off_ms = dim_ms * 3u;
+        if      (idle_ms >= off_ms) want = DIM_STAGE_OFF;
+        else if (idle_ms >= dim_ms) want = DIM_STAGE_DIM;
+        else                        want = DIM_STAGE_FULL;
+    }
+    if (want == dim_stage) return;   /* only touch the PWM on a stage transition */
+    dim_stage = want;
+
+    uint8_t b = brightness;          /* saved level, never modified by dimming */
+    uint8_t duty;
+    if      (want == DIM_STAGE_FULL) duty = b;
+    else if (want == DIM_STAGE_DIM)  duty = (b / 5 < 10) ? 10 : (uint8_t)(b / 5);
+    else                             duty = 0;
+    ledcWrite(PIN_LCD_BL, duty);
+}
 
 /*
  * --- Battery gauge ---
@@ -733,6 +836,12 @@ void display_show_status() {
  * Non-static: forward-declared in main.cpp, called from radio.cpp's tick.
  */
 void display_tick_render() {
+    /* Idle-dim the backlight FIRST, before any early-out below: the dim stages must
+     * keep advancing even when the screen content is static (idle == unchanged
+     * content, which is precisely when we want to dim). Backlight PWM only — never
+     * sleeps the node. radio_idle_ms() is a lone millis() subtraction, no lock. */
+    display_apply_dimming(radio_idle_ms());
+
     /* Refresh the battery gauge (throttled to ~2 s inside). Done before any lock —
      * the sampler only touches its own atomics and the ADC. */
     battery_sample();
