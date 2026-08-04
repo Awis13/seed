@@ -1280,12 +1280,14 @@ void display_show_ap(const char *ssid, const char *pass, const char *token);
 #include "skills/gpio.cpp"
 #include "skills/serial.cpp"
 #include "skills/radio.cpp"
+#include "skills/eibi.cpp"     // after radio.cpp — reads radio_get_* accessors
 #include "skills/display.cpp"  // after radio.cpp — reads radio_get_* accessors
 
 static void skills_init() {
     skill_gpio_init();
     skill_serial_init();
     skill_radio_init();
+    skill_eibi_init();
     skill_display_init();
 }
 
