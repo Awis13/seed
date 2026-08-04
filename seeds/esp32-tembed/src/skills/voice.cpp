@@ -1002,8 +1002,20 @@ static void voice_register_routes(AsyncWebServer &server) {
         JsonDocument doc;
         voice_state_json(doc);
         notify_send_json(req, 200, doc);
-    });
+    /* The body collector, and it is NOT optional. Registering a route with
+       only an onRequest callback registers no body handler at all, so
+       _tempObject is never filled and notify_take_body() returns NULL on every
+       request. 0.8.0 shipped without this argument, and the symptom was not a
+       crash but a lie: every POST here, valid or not, answered "body must be
+       JSON" — which reads as a client problem and is not one. It compiles,
+       because the three-argument overload is perfectly valid, and no host test
+       can see it, because the parser it accuses was never at fault. Any route
+       that calls notify_take_body() needs this; tools/test_routes.sh now
+       checks that mechanically instead of leaving it to review. */
+    }, NULL, handle_body_collect);
 
+    /* No collector here on purpose: this route takes no body. Everything it
+       needs is already on the device. */
     server.on(AsyncURIMatcher::exact("/voice/send"), HTTP_POST, [](AsyncWebServerRequest *req) {
         if (!require_auth(req)) return;
         if (!voice_ready) {
