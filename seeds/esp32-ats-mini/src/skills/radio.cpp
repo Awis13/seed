@@ -47,6 +47,16 @@ const char *display_theme_name(uint8_t i);
 void        display_set_brightness(uint8_t v);
 uint8_t     display_get_brightness();
 
+/* Screen-layout accessors, also defined in display.cpp. The layout (Default vs.
+ * S-Meter) is a global display setting persisted alongside the radio state in the
+ * same v8 (read tolerantly, no bump). radio.cpp only reads and restores the index;
+ * display.cpp owns the draw. Guarded by display_mtx inside display_set_layout —
+ * never touch radio_mtx for it. */
+void        display_set_layout(uint8_t idx);
+uint8_t     display_get_layout();
+uint8_t     display_layout_count();
+const char *display_layout_name(uint8_t i);
+
 /*
  * Mode constants follow the ref ats-mini numbering so the SSB mode value doubles
  * as setSSB()'s usblsb argument (1=LSB, 2=USB) — no separate mapping needed.
@@ -607,7 +617,7 @@ static int     menu_settings_idx = 0; /* cursor in the SETTINGS sublist */
  * no-op on FM/AM). Its cursor is a 0..400 INDEX (Hz = idx*10 - 2000), not the raw Hz,
  * so the five-row window steps one detent per row (a raw-Hz cursor with a 10 Hz step
  * would leave four of every five rows blank). */
-enum AdjustTarget { ADJ_STEP, ADJ_BW, ADJ_MODE, ADJ_SQUELCH, ADJ_AGC, ADJ_AVC, ADJ_SOFTMUTE, ADJ_CAL, ADJ_THEME, ADJ_BRIGHTNESS };
+enum AdjustTarget { ADJ_STEP, ADJ_BW, ADJ_MODE, ADJ_SQUELCH, ADJ_AGC, ADJ_AVC, ADJ_SOFTMUTE, ADJ_CAL, ADJ_THEME, ADJ_BRIGHTNESS, ADJ_LAYOUT };
 static uint8_t adjust_target = ADJ_STEP;
 /* Cursor in the BAND picker (indexes bands[]). Re-seeded from radio_get_band_idx()
  * each time MENU_BAND is entered, so the list always opens on the active band. */
@@ -633,15 +643,16 @@ enum MainItem { MI_BAND = 0, MI_MEMORY, MI_MODE, MI_STEP, MI_BW, MI_SQUELCH, MI_
  * SETTINGS-sublist dispatch keys. The order MUST match menu_settings_items[] below,
  * exactly like MainItem/menu_main_items[]: the click handler switches on the raw
  * cursor (menu_settings_idx), never the label text. AGC/AVC/SoftMute/Calibration and
- * Brightness/Theme drop into their adjust editors; About is not a leaf yet; Back exits.
+ * Brightness/Theme/Layout drop into their adjust editors; About is not a leaf yet;
+ * Back exits.
  */
-enum SettingsItem { SI_AGC = 0, SI_AVC, SI_SOFTMUTE, SI_CAL, SI_BRIGHTNESS, SI_THEME, SI_ABOUT, SI_BACK };
+enum SettingsItem { SI_AGC = 0, SI_AVC, SI_SOFTMUTE, SI_CAL, SI_BRIGHTNESS, SI_THEME, SI_LAYOUT, SI_ABOUT, SI_BACK };
 
 static const char *const menu_main_items[] = {
     "Band", "Memory", "Mode", "Step", "Bandwidth", "Squelch", "Mute", "Settings"
 };
 static const char *const menu_settings_items[] = {
-    "AGC", "AVC", "SoftMute", "Calibration", "Brightness", "Theme", "About", "Back"
+    "AGC", "AVC", "SoftMute", "Calibration", "Brightness", "Theme", "Layout", "About", "Back"
 };
 #define MENU_MAIN_COUNT     ((int)(sizeof(menu_main_items) / sizeof(menu_main_items[0])))
 #define MENU_SETTINGS_COUNT ((int)(sizeof(menu_settings_items) / sizeof(menu_settings_items[0])))
@@ -662,7 +673,8 @@ static const SkillEndpoint radio_endpoints[] = {
     {"POST", "/radio/band",   "Jump to a band-plan preset: {idx:<int>}"},
     {"GET",  "/radio/bands",  "List band-plan presets for UI: {bands:[{idx,name}],current}"},
     {"GET",  "/radio/themes", "List colour themes for UI: {themes:[{idx,name}],current}"},
-    {"POST", "/radio/config", "Set mode/step/bandwidth/squelch/mute/DSP/theme: {mode?:\"AM\"|\"LSB\"|\"USB\", step_idx?:<int>, bw_idx?:<int>, squelch?:0-127, squelch_snr?:<bool>, mute?:<bool>, agc?:<int>, avc?:<even 12-90>, softmute?:0-32, cal?:<-2000-2000 SSB>, theme?:<int>}"},
+    {"GET",  "/radio/layouts","List screen layouts for UI: {layouts:[{idx,name}],current}"},
+    {"POST", "/radio/config", "Set mode/step/bandwidth/squelch/mute/DSP/theme/layout: {mode?:\"AM\"|\"LSB\"|\"USB\", step_idx?:<int>, bw_idx?:<int>, squelch?:0-127, squelch_snr?:<bool>, mute?:<bool>, agc?:<int>, avc?:<even 12-90>, softmute?:0-32, cal?:<-2000-2000 SSB>, theme?:<int>, layout?:0-1}"},
     {"POST", "/radio/volume", "Set volume: {volume:0-63}"},
     {"POST", "/radio/scan",   "Sweep current-mode band: {from,to,step,min_rssi?} -> RSSI/SNR per step"},
     {"GET",  "/radio/status", "Current freq/mode/RSSI/SNR (+bfo in SSB, +RDS ps/rt/pi/pty in FM)"},
@@ -681,7 +693,8 @@ static const char *radio_describe() {
            "| POST | /radio/band | Jump to a band-plan preset: `{\"idx\":<int>}` |\n"
            "| GET | /radio/bands | List band-plan presets (name + index) for UI dropdowns |\n"
            "| GET | /radio/themes | List colour themes (name + index) for the UI selector |\n"
-           "| POST | /radio/config | Set mode/step/bandwidth + squelch/mute + DSP + theme: `{\"mode\":\"AM|LSB|USB\",\"step_idx\":<int>,\"bw_idx\":<int>,\"squelch\":<0..127>,\"squelch_snr\":<bool>,\"mute\":<bool>,\"agc\":<int>,\"avc\":<even 12..90>,\"softmute\":<0..32>,\"cal\":<-2000..2000>,\"theme\":<int>}` |\n"
+           "| GET | /radio/layouts | List screen layouts (name + index) for the UI selector |\n"
+           "| POST | /radio/config | Set mode/step/bandwidth + squelch/mute + DSP + theme + layout: `{\"mode\":\"AM|LSB|USB\",\"step_idx\":<int>,\"bw_idx\":<int>,\"squelch\":<0..127>,\"squelch_snr\":<bool>,\"mute\":<bool>,\"agc\":<int>,\"avc\":<even 12..90>,\"softmute\":<0..32>,\"cal\":<-2000..2000>,\"theme\":<int>,\"layout\":<0..1>}` |\n"
            "| POST | /radio/volume | Set volume: `{\"volume\":<0..63>}` |\n"
            "| POST | /radio/scan | Blocking band sweep in the current mode: `{\"from\":<int>,\"to\":<int>,\"step\":<int>,\"min_rssi\":<int>}` |\n"
            "| GET | /radio/status | Current freq, mode, RSSI, SNR (+bfo in SSB; +RDS `rds_ps`/`rds_rt`/`pi`/`pty` in FM) |\n"
@@ -855,6 +868,9 @@ int radio_get_menu_idx() {
             /* ADJ_BRIGHTNESS: cursor IS the backlight duty 10..255 (display owns it). */
             if (adjust_target == ADJ_BRIGHTNESS)
                 return display_get_brightness();
+            /* ADJ_LAYOUT: cursor IS the global layout index (display owns it). */
+            if (adjust_target == ADJ_LAYOUT)
+                return display_get_layout();
             /* ADJ_MODE: cursor is the band's mode position within modeCycle. */
             return mode_cycle_pos(band_mode[radio_band_idx]);
         }
@@ -877,6 +893,7 @@ int radio_get_menu_count() {
             /* +/-RADIO_CAL_MAX Hz in RADIO_CAL_STEP detents -> 0..400 index, 401 rows. */
             if (adjust_target == ADJ_CAL) return 2 * RADIO_CAL_MAX / RADIO_CAL_STEP + 1;
             if (adjust_target == ADJ_THEME) return display_theme_count();
+            if (adjust_target == ADJ_LAYOUT) return display_layout_count();
             /* Brightness spans 0..255 nominal; item() blanks below the 10 floor. */
             if (adjust_target == ADJ_BRIGHTNESS) return 256;
             return MODE_CYCLE_COUNT;
@@ -902,6 +919,7 @@ const char *radio_get_menu_title() {
             if (adjust_target == ADJ_CAL) return "Cal Hz";
             if (adjust_target == ADJ_THEME) return "Theme";
             if (adjust_target == ADJ_BRIGHTNESS) return "Brightness";
+            if (adjust_target == ADJ_LAYOUT) return "Layout";
             return "Mode";
         default:            return "Menu";
     }
@@ -967,6 +985,12 @@ const char *radio_get_menu_item(int i) {
             if (i < 10 || i > 255) return "";
             snprintf(buf, sizeof(buf), "%d", i);
             return buf;
+        }
+        if (adjust_target == ADJ_LAYOUT) {
+            /* Layout names come from display.cpp; wrap the window index modulo the
+             * count like the theme list so the caller can ask cursor-2..cursor+2. */
+            int n = display_layout_count();
+            return display_layout_name((uint8_t)(((i % n) + n) % n));
         }
         /* Menu window items come from the band's own table mode, not radio_mode. */
         uint8_t m = band_table_mode();
@@ -1735,6 +1759,26 @@ static void radio_register_routes(AsyncWebServer &server) {
         req->send(200, "application/json", response);
     });
 
+    /* GET /radio/layouts — the screen-layout list for the UI selector: each name with
+     * its index, plus the current layout. Mirrors /radio/themes; the layout lives in
+     * display.cpp and is read through the public accessors (no receiver access). */
+    server.on("/radio/layouts", HTTP_GET, [](AsyncWebServerRequest *req) {
+        if (!require_auth(req)) return;
+
+        JsonDocument doc;
+        JsonArray arr = doc["layouts"].to<JsonArray>();
+        uint8_t n = display_layout_count();
+        for (uint8_t i = 0; i < n; i++) {
+            JsonObject o = arr.add<JsonObject>();
+            o["idx"] = i;
+            o["name"] = display_layout_name(i);
+        }
+        doc["current"] = display_get_layout();
+        String response;
+        serializeJson(doc, response);
+        req->send(200, "application/json", response);
+    });
+
     /* POST /radio/config — set the current band's demod mode and/or tuning step
      * and/or channel bandwidth. step_idx/bw_idx are indices into the (effective)
      * mode's step/bandwidth table, matching the desc strings reported by
@@ -1800,6 +1844,12 @@ static void radio_register_routes(AsyncWebServer &server) {
         bool has_theme = !input["theme"].isNull();
         int  theme_v   = input["theme"] | -1;
 
+        /* Optional global screen layout: "layout" (0..count-1). A DISPLAY property like
+         * the theme — applied without radio_ok and without radio_mtx (the layout is
+         * guarded by display_mtx inside display_set_layout). */
+        bool has_layout = !input["layout"].isNull();
+        int  layout_v   = input["layout"] | -1;
+
         /* Parse the optional demod mode. Only AM/LSB/USB are settable here: FM is a
          * broadcast demod locked to the VHF band (a native-FM band is rejected under
          * the lock below), so it is never a valid config target. */
@@ -1815,9 +1865,9 @@ static void radio_register_routes(AsyncWebServer &server) {
         free(body); req->_tempObject = nullptr;
 
         if (!has_step && !has_bw && !has_mode && !has_squelch && !has_mute &&
-            !has_agc && !has_avc && !has_sm && !has_cal && !has_theme) {
+            !has_agc && !has_avc && !has_sm && !has_cal && !has_theme && !has_layout) {
             req->send(400, "application/json",
-                "{\"error\":\"provide step_idx, bw_idx, mode, squelch, mute, agc, avc, softmute, cal and/or theme\"}");
+                "{\"error\":\"provide step_idx, bw_idx, mode, squelch, mute, agc, avc, softmute, cal, theme and/or layout\"}");
             return;
         }
         if (mode_str_bad) {
@@ -1842,15 +1892,32 @@ static void radio_register_routes(AsyncWebServer &server) {
             radio_mark_dirty();
         }
 
-        /* If the only field was the theme, respond now without touching the receiver —
-         * this path succeeds regardless of radio_ok. Any receiver-affecting field falls
-         * through to the radio_ok gate below. */
+        /* Apply the global layout BEFORE the radio_ok gate too — a display property,
+         * so it must take effect even with the receiver absent. Validate the range,
+         * then set it under display_mtx (inside display_set_layout), never under
+         * radio_mtx. Persisted (v8). */
+        if (has_layout) {
+            if (layout_v < 0 || layout_v >= (int)display_layout_count()) {
+                char err[52];
+                snprintf(err, sizeof(err),
+                    "{\"error\":\"layout out of range (0..%d)\"}", display_layout_count() - 1);
+                req->send(400, "application/json", err);
+                return;
+            }
+            display_set_layout((uint8_t)layout_v);
+            radio_mark_dirty();
+        }
+
+        /* If the only fields were display ones (theme/layout), respond now without
+         * touching the receiver — this path succeeds regardless of radio_ok. Any
+         * receiver-affecting field falls through to the radio_ok gate below. */
         bool has_radio_field = has_step || has_bw || has_mode || has_squelch ||
                                has_mute || has_agc || has_avc || has_sm || has_cal;
         if (!has_radio_field) {
             JsonDocument doc;
             doc["ok"] = true;
             doc["theme"] = display_get_theme();
+            doc["layout"] = display_get_layout();
             String response;
             serializeJson(doc, response);
             req->send(200, "application/json", response);
@@ -2053,8 +2120,9 @@ static void radio_register_routes(AsyncWebServer &server) {
         }
         /* Cal is SSB-only; report it only in LSB/USB. */
         if (mode_is_ssb) doc["cal"] = cal_snap;
-        /* Theme is global; always report the current index. */
+        /* Theme and layout are global; always report the current indices. */
         doc["theme"] = display_get_theme();
+        doc["layout"] = display_get_layout();
         String response;
         serializeJson(doc, response);
         req->send(200, "application/json", response);
@@ -2302,6 +2370,8 @@ static void radio_register_routes(AsyncWebServer &server) {
         /* Global colour theme (a display property, not gated by receiver mode). */
         doc["theme"] = display_get_theme();
         doc["theme_name"] = display_theme_name(display_get_theme());
+        doc["layout"] = display_get_layout();
+        doc["layout_name"] = display_layout_name(display_get_layout());
         /* RDS is an FM-broadcast feature; report the decoded fields only in FM. pi is
          * the numeric 16-bit Program Identification, pty the 5-bit Program Type. */
         if (lmode_fm) {
@@ -2597,6 +2667,13 @@ static void radio_tick() {
                         menu_level = MENU_ADJUST;
                         adjust_target = ADJ_BRIGHTNESS;
                         break;
+                    case SI_LAYOUT:
+                        /* Descend into the layout list editor. The layout is a global
+                         * display property (not per-radio), edited live under display_mtx
+                         * inside display_set_layout. */
+                        menu_level = MENU_ADJUST;
+                        adjust_target = ADJ_LAYOUT;
+                        break;
                     default:
                         /* SI_ABOUT placeholder (TODO: wire a real leaf) and SI_BACK
                          * both step back up to the MAIN list. */
@@ -2748,6 +2825,16 @@ static void radio_tick() {
                     if (v < 10)  v = 10;
                     if (v > 255) v = 255;
                     display_set_brightness((uint8_t)v);
+                    radio_mark_dirty();
+                } else if (adjust_target == ADJ_LAYOUT) {
+                    /* Global layout select. Owned by display.cpp and guarded by
+                     * display_mtx inside display_set_layout — NOT radio_mtx, so this
+                     * branch takes no radio lock (nesting radio_mtx <-> display_mtx is
+                     * forbidden, same as the theme/brightness branches above).
+                     * display_set_layout forces a full repaint, so scrolling previews
+                     * each layout live. Persisted (v8); mark_dirty triggers the flush. */
+                    int v = menu_wrap(display_get_layout(), d, display_layout_count());
+                    display_set_layout((uint8_t)v);
                     radio_mark_dirty();
                 } else {
                     /* The value editor scrolls the parameter itself, not a cursor:
@@ -2943,6 +3030,12 @@ static void radio_tick() {
          * the accessor OUTSIDE radio_mtx (already released above) — it takes no radio
          * lock and a byte read is atomic. */
         doc["brt"] = display_get_brightness();
+        /* v8 (same schema, no bump): the global screen layout index. Owned by
+         * display.cpp; read here through the accessor OUTSIDE radio_mtx (already
+         * released above) — it takes no radio lock and a byte read is atomic. A
+         * v8 file written before this key existed simply lacks it and restores as 0
+         * (Default), so no version bump is needed. */
+        doc["layout"] = display_get_layout();
         String out;
         serializeJson(doc, out);
         write_spiffs_file(RADIO_STATE_FILE, out);  /* blocking flash write + encoder detach, outside the mutex */
@@ -3008,6 +3101,16 @@ static void radio_restore_state() {
      * the boot paint applies it. Read tolerantly so future v8 keys need no bump. */
     int brt = doc["brt"] | -1;
     if (brt >= 10 && brt <= 255) display_set_brightness((uint8_t)brt);
+
+    /* v8 (same schema, no bump): the global screen layout. Restored up front with the
+     * theme/brightness for the same reason — a malformed radio field below must not
+     * cost it. Absent (older v8 file) defaults to 0 (Default) via the | 0; out-of-range
+     * is ignored by display_set_layout's own clamp, but gate on the live count too so a
+     * future extra layout dropped from the table can never select a stale index. Runs
+     * before skill_display_init (panel not up), so display_set_layout just stores the
+     * index and the boot paint applies it. */
+    int ly = doc["layout"] | 0;
+    if (ly >= 0 && ly < display_layout_count()) display_set_layout((uint8_t)ly);
 
     /* Reject anything malformed — a single bad field falls back to the defaults. */
     if (band < 0 || band >= BAND_COUNT) return;

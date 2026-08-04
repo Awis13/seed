@@ -100,6 +100,22 @@ static void display_flush() {
     if (spr_ready) spr.pushSprite(0, 0);
 }
 
+/*
+ * Clear the whole draw target to `color`. On the back-buffer this MUST go through
+ * fillSprite(), not fillScreen(): a TFT_eSprite inherits the panel's *native*
+ * _width/_height (TFT_WIDTH x TFT_HEIGHT = 170x320 here), and createSprite/
+ * setViewport update the sprite's own _iwidth/_iheight/_xWidth (320x170) but never
+ * those base fields. fillScreen() is fillRect(0, 0, _width, _height) = (0,0,170,320),
+ * which TFT_eSprite::fillRect then clamps to _iwidth/_iheight -> only the top-left
+ * 170x170 square gets cleared, leaving the x>=170 strip uncleared frame after frame.
+ * fillSprite() uses the sprite's real 320x170 extent and clears all of it. The
+ * direct-to-panel fallback has no sprite, so fillScreen() on tft is correct there.
+ */
+static void display_clear(uint16_t color) {
+    if (spr_ready) spr.fillSprite(color);
+    else           tft.fillScreen(color);
+}
+
 /* What is currently on screen: the auto status readout or user custom text. */
 #define DISPLAY_STATUS 0
 #define DISPLAY_CUSTOM 1
@@ -210,6 +226,54 @@ const char *display_theme_name(uint8_t i) {
     ColorTheme t;
     memcpy_P(&t, &themes[i], sizeof(t));
     return t.name;  /* points at a flash string literal — valid after t goes out of scope */
+}
+
+/*
+ * --- Screen layout ---
+ *
+ * The receiver readout has two interchangeable layouts that differ only in the
+ * signal zone (y~116..130): layout 0 "Default" keeps the textual mode/RSSI/SNR
+ * line; layout 1 "S-Meter" swaps in a 17-bar signal-strength meter plus a compact
+ * mode/dBuV/SNR tag. Every other row (band / freq / unit / RDS / volume / clock /
+ * battery) is shared, so both layouts run through draw_radio_screen and branch only
+ * on this index. Written under display_mtx (display_set_layout, which forces a
+ * repaint); read in the draw path (also under display_mtx) and, as a lone atomic
+ * byte, by display_get_layout on the radio persist path.
+ */
+static uint8_t layout_idx = 0;
+#define LAYOUT_COUNT ((uint8_t)2)
+
+/*
+ * Select a layout by index (clamped). Mirrors display_set_theme: takes display_mtx
+ * when it exists and forces a live repaint on the next tick so the switch is
+ * instant. Callable before skill_display_init() has created display_mtx —
+ * radio_restore_state() reapplies the saved layout at boot while the display is
+ * still single-tasked and unpainted, in which case there is no mutex to take and
+ * nothing on screen: just store the index; the boot paint picks it up.
+ */
+void display_set_layout(uint8_t idx) {
+    if (idx >= LAYOUT_COUNT) idx = 0;
+    bool locked = (display_mtx != nullptr);
+    if (locked) xSemaphoreTake(display_mtx, portMAX_DELAY);
+    layout_idx = idx;
+    force_redraw = true;
+    if (locked) xSemaphoreGive(display_mtx);
+}
+
+/* Current layout index. A lone byte written only under display_mtx — the read is
+ * atomic, so no lock is taken (and none may be, off the radio persist path). */
+uint8_t display_get_layout() { return layout_idx; }
+
+/* Number of layouts (for menu/UI bounds and the persist range check). */
+uint8_t display_layout_count() { return LAYOUT_COUNT; }
+
+/* Display name of layout i (for the menu / UI); empty string if out of range. */
+const char *display_layout_name(uint8_t i) {
+    switch (i) {
+        case 0:  return "Default";
+        case 1:  return "S-Meter";
+        default: return "";
+    }
 }
 
 /*
@@ -377,6 +441,94 @@ static void display_format_clock(char *buf, size_t len) {
  *
  * Draw-only helper: the caller owns display_mtx, display_mode and the flush/push.
  */
+/*
+ * Map an RSSI reading (dBuV) to a signal-meter bar count 0..17. The two threshold
+ * tables (broadcast FM vs. everything else) are the dBuV break-points at which one
+ * more S-bar lights, ported from the reference ats-mini getStrength(): FM starts
+ * its scale higher (a broadcast carrier rarely reads below S6), so the two ramps
+ * differ. The break-point numbers come from the reference; the code is ours. An
+ * rssi of 0 (no signal / receiver absent) shows an empty meter.
+ */
+static uint8_t signal_strength(uint8_t rssi, bool is_fm) {
+    if (rssi == 0) return 0;
+    if (!is_fm) {
+        if (rssi <=  1) return  1;   /* S0    */
+        if (rssi <=  2) return  2;   /* S1    */
+        if (rssi <=  3) return  3;   /* S2    */
+        if (rssi <=  4) return  4;   /* S3    */
+        if (rssi <= 10) return  5;   /* S4    */
+        if (rssi <= 16) return  6;   /* S5    */
+        if (rssi <= 22) return  7;   /* S6    */
+        if (rssi <= 28) return  8;   /* S7    */
+        if (rssi <= 34) return  9;   /* S8    */
+        if (rssi <= 44) return 10;   /* S9    */
+        if (rssi <= 54) return 11;   /* S9+10 */
+        if (rssi <= 64) return 12;   /* S9+20 */
+        if (rssi <= 74) return 13;   /* S9+30 */
+        if (rssi <= 84) return 14;   /* S9+40 */
+        if (rssi <= 94) return 15;   /* S9+50 */
+        if (rssi <= 95) return 16;   /* S9+60 */
+        return 17;                   /* >S9+60 */
+    } else {
+        if (rssi <=  1) return  1;   /* S0    */
+        if (rssi <=  2) return  7;   /* S6    */
+        if (rssi <=  8) return  8;   /* S7    */
+        if (rssi <= 14) return  9;   /* S8    */
+        if (rssi <= 24) return 10;   /* S9    */
+        if (rssi <= 34) return 11;   /* S9+10 */
+        if (rssi <= 44) return 12;   /* S9+20 */
+        if (rssi <= 54) return 13;   /* S9+30 */
+        if (rssi <= 64) return 14;   /* S9+40 */
+        if (rssi <= 74) return 15;   /* S9+50 */
+        if (rssi <= 76) return 16;   /* S9+60 */
+        return 17;                   /* >S9+60 */
+    }
+}
+
+/*
+ * Paint the S-Meter layout's signal zone: a source icon, a 17-bar strength meter
+ * and a compact mode/RSSI/SNR tag, all inside the y~116..130 band that the Default
+ * layout fills with the textual signal line (so it clears the RDS row at y106 and
+ * the volume row at y150). The bar count comes from signal_strength(): bars below
+ * S9 (i<10) use t.accent, the "plus" over-scale bars use t.freq_hl, and the unlit
+ * remainder up to 17 use t.freq_dim so the full scale is always visible. Geometry
+ * (icon + 4 px bar pitch) follows the reference drawSMeter; the code and the
+ * colour-role mapping are ours. Draw-only: the caller owns display_mtx; the text
+ * datum is left back at MC_DATUM (the shared repaint default) on the way out.
+ */
+static void draw_smeter(const char *mode, uint8_t rssi, uint8_t snr, bool is_fm,
+                        const ColorTheme &t) {
+    uint8_t strength = signal_strength(rssi, is_fm);
+    const int x0 = 30, y0 = 116;      /* icon origin; bars start x0+15, y0+2 */
+    const int NBARS = 17;
+
+    /* Signal-source icon: a small down-triangle with a stem, drawn muted so it
+     * frames the meter without competing with the lit bars. */
+    gfx->drawTriangle(x0 + 1, y0 + 1, x0 + 11, y0 + 1, x0 + 6, y0 + 6, t.muted);
+    gfx->drawLine(x0 + 6, y0 + 1, x0 + 6, y0 + 14, t.muted);
+
+    /* The 17 bars: lit up to `strength`, the rest drawn dim so the whole scale is
+     * visible even on a dead band. 3 px wide on a 4 px pitch (1 px gap), 12 px tall. */
+    for (int i = 0; i < NBARS; i++) {
+        uint16_t c;
+        if (i >= strength)  c = t.freq_dim;   /* unlit remainder */
+        else if (i < 10)    c = t.accent;     /* S0..S9 */
+        else                c = t.freq_hl;    /* S9+ over-scale */
+        gfx->fillRect(x0 + 15 + i * 4, y0 + 2, 3, 12, c);
+    }
+
+    /* Compact tag right of the meter: mode + SNR in the small GLCD font so it
+     * stays inside the zone. The bars already convey signal strength, so the
+     * dBuV figure is dropped here to give the tag breathing room off the bars. */
+    char tag[32];
+    snprintf(tag, sizeof(tag), "%s S/N%u",
+             mode, (unsigned)snr);
+    gfx->setTextDatum(TL_DATUM);
+    gfx->setTextColor(t.signal, t.bg);
+    gfx->drawString(tag, x0 + 15 + NBARS * 4 + 8, y0 + 3, 1);
+    gfx->setTextDatum(MC_DATUM);
+}
+
 static void draw_radio_screen(const char *band, const char *mode, uint16_t freq,
                               uint8_t rssi, uint8_t snr, uint8_t volume,
                               uint8_t target, const char *rds_ps, bool rds_show,
@@ -387,7 +539,7 @@ static void draw_radio_screen(const char *band, const char *mode, uint16_t freq,
     uint16_t vol_color =
         (target == DISPLAY_TUNE_VOLUME) ? t.freq_hl : t.freq_dim;
 
-    gfx->fillScreen(t.bg);
+    display_clear(t.bg);
     gfx->setTextDatum(MC_DATUM);
 
     /* Current band name across the top, above the frequency. */
@@ -459,12 +611,21 @@ static void draw_radio_screen(const char *band, const char *mode, uint16_t freq,
         gfx->drawString(rds_ps, DISPLAY_CX, 106, 2);
     }
 
-    /* Exactly one signal line: mode, RSSI in dBuV, S/N — no duplicate dBuV. */
-    char status_line[48];
-    snprintf(status_line, sizeof(status_line),
-             "%s   %u dBuV  S/N %u", mode, (unsigned)rssi, (unsigned)snr);
-    gfx->setTextColor(t.signal, t.bg);
-    gfx->drawString(status_line, DISPLAY_CX, 120, 2);
+    /* Signal zone (y~116..130): the two layouts diverge only here. Layout 0
+     * "Default" draws the textual mode/RSSI/SNR line; layout 1 "S-Meter" draws the
+     * bar meter instead. layout_idx is read here under the display_mtx the caller
+     * already holds around this whole repaint. */
+    bool is_fm = (strcmp(mode, "FM") == 0);
+    if (layout_idx == 1) {
+        draw_smeter(mode, rssi, snr, is_fm, t);
+    } else {
+        /* Exactly one signal line: mode, RSSI in dBuV, S/N — no duplicate dBuV. */
+        char status_line[48];
+        snprintf(status_line, sizeof(status_line),
+                 "%s   %u dBuV  S/N %u", mode, (unsigned)rssi, (unsigned)snr);
+        gfx->setTextColor(t.signal, t.bg);
+        gfx->drawString(status_line, DISPLAY_CX, 120, 2);
+    }
 
     /* Volume at the foot, highlighted when it is the encoder's target. */
     char vol_line[24];
@@ -486,7 +647,7 @@ static void draw_radio_screen(const char *band, const char *mode, uint16_t freq,
  */
 static void draw_menu_screen(const char *title, int idx) {
     ColorTheme t; theme_load(&t);
-    gfx->fillScreen(t.bg);
+    display_clear(t.bg);
 
     /* Bordered panel: a filled accent roundrect with a bg roundrect inset one pixel,
      * giving a 1 px accent frame around the menu body. The inset (and the outer AA
@@ -683,7 +844,7 @@ void display_tick_render() {
  */
 void display_show_ap(const char *ssid, const char *pass, const char *token) {
     ColorTheme t; theme_load(&t);
-    gfx->fillScreen(t.bg);
+    display_clear(t.bg);
     gfx->setTextDatum(MC_DATUM);
 
     char line[64];
@@ -794,7 +955,7 @@ static void display_register_routes(AsyncWebServer &server) {
         xSemaphoreTake(display_mtx, portMAX_DELAY);
         display_mode = DISPLAY_CUSTOM;
         ColorTheme t; theme_load(&t);
-        gfx->fillScreen(t.bg);
+        display_clear(t.bg);
         gfx->setTextColor(t.text, t.bg);
         gfx->setTextDatum(MC_DATUM);
         /* line shifts vertically from centre: 30 px per row. */
