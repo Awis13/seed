@@ -653,7 +653,7 @@ static void handle_capabilities(AsyncWebServerRequest *request) {
         "/clock", "/clock/tz",
         "/firmware/version", "/firmware/upload", "/firmware/apply",
         "/firmware/confirm", "/firmware/rollback",
-        "/skill", NULL
+        "/skill", "/ui", NULL
     };
     for (int i = 0; eps[i]; i++) ep.add(eps[i]);
 
@@ -1032,7 +1032,8 @@ static void handle_wifi_page(AsyncWebServerRequest *request) {
         "<label>SSID:</label><input type='text' name='ssid' required>"
         "<label>Password:</label><input type='password' name='pass'>"
         "<button type='submit'>Connect</button>"
-        "</form>";
+        "</form>"
+        "<p><a href='/ui' style='color:#58a6ff'>Radio UI</a></p>";
     if (WiFi.status() == WL_CONNECTED)
         html += "<p>Connected: " + WiFi.SSID() + " (" + WiFi.localIP().toString() + ")</p>";
     // The token is handed out only over the provisioning AP (initial setup) —
@@ -1064,6 +1065,123 @@ static void handle_wifi_post(AsyncWebServerRequest *request) {
         "<h2>Saved. Connecting...</h2><p>" + ssid + "</p><a href='/'>Back</a>");
     delay(1000);
     WiFi.begin(wifi_ssid.c_str(), wifi_pass.c_str());
+}
+
+// --- Radio dashboard page (/ui) ---
+//
+// A public, self-contained control panel. Unlike the WiFi page above it never
+// carries the token: the page ships zero secrets and the browser supplies the
+// Bearer token from localStorage on every fetch. So it is safe to serve to any
+// LAN client — an unauthenticated GET /ui only returns static HTML/JS, and the
+// data/control endpoints it calls still enforce require_auth on their own.
+// Served straight from flash with send_P so it never lands on the heap.
+static const char UI_HTML[] PROGMEM = R"HTML(<!DOCTYPE html><html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ATS Mini Radio</title>
+<style>
+:root{--bg:#0d1117;--panel:#161b22;--fg:#e6edf3;--muted:#8b949e;--accent:#3fb950;--err:#f85149;--border:#30363d}
+*{box-sizing:border-box}
+body{margin:0 auto;max-width:520px;padding:16px;font-family:system-ui,-apple-system,sans-serif;background:var(--bg);color:var(--fg)}
+h1{font-size:1.1rem;margin:0 0 12px;font-weight:600}
+.mono{font-family:ui-monospace,Menlo,Consolas,monospace}
+.panel{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:16px;margin-bottom:14px}
+.freq{font-size:2.6rem;font-weight:700;text-align:center;letter-spacing:1px}
+.sub{text-align:center;color:var(--muted);margin-top:4px}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:14px}
+.cell{background:#0d1117;border:1px solid var(--border);border-radius:8px;padding:8px 10px}
+.cell .k{color:var(--muted);font-size:.72rem;text-transform:uppercase}
+.cell .v{font-size:1.05rem;margin-top:2px}
+label{display:block;color:var(--muted);font-size:.8rem;margin:12px 0 4px}
+input,select,button{font-size:1rem;padding:11px;border-radius:8px;border:1px solid var(--border);background:#0d1117;color:var(--fg)}
+input,select{width:100%}
+input[type=range]{padding:6px 0}
+button{background:#238636;border-color:#238636;color:#fff;cursor:pointer;width:100%;font-weight:600}
+button.sec{background:#21262d;border-color:var(--border)}
+.row{display:flex;gap:8px}.row>*{flex:1}
+.tag{display:inline-block;padding:2px 8px;border-radius:12px;font-size:.72rem;margin-left:6px;background:var(--err);color:#fff}
+#banner{display:none;padding:10px;border-radius:8px;margin-bottom:12px;font-size:.9rem;background:#3a1416;border:1px solid var(--err);color:#ffb3b0}
+.dot{display:inline-block;width:9px;height:9px;border-radius:50%;background:var(--muted);margin-right:6px}
+.dot.ok{background:var(--accent)}.dot.off{background:var(--err)}
+</style></head><body>
+<h1><span class="dot" id="live"></span>ATS Mini Radio</h1>
+<div id="banner"></div>
+<div id="login" class="panel" style="display:none">
+<label>Enter Bearer token (shown on the device screen at setup)</label>
+<input id="tok" type="password" autocomplete="off" placeholder="token">
+<div style="height:8px"></div><button onclick="saveToken()">Save</button>
+</div>
+<div id="app" style="display:none">
+<div class="panel">
+<div class="freq mono" id="freq">--</div>
+<div class="sub"><span id="mode">--</span><span class="tag" id="muted" style="display:none">MUTE</span><span class="tag" id="sql" style="display:none">SQL</span></div>
+<div class="sub mono" id="rds" style="display:none"></div>
+<div class="grid">
+<div class="cell"><div class="k">RSSI</div><div class="v mono" id="rssi">--</div></div>
+<div class="cell"><div class="k">SNR</div><div class="v mono" id="snr">--</div></div>
+<div class="cell"><div class="k">Volume</div><div class="v mono" id="vol">--</div></div>
+<div class="cell"><div class="k">Clock</div><div class="v mono" id="clock">--</div></div>
+<div class="cell"><div class="k">Uptime</div><div class="v mono" id="uptime">--</div></div>
+<div class="cell"><div class="k">Version</div><div class="v mono" id="ver">--</div></div>
+</div></div>
+<div class="panel">
+<label>Tune</label>
+<div class="row"><input id="tfreq" type="number" placeholder="freq"><select id="tmode"><option>FM</option><option>AM</option><option>LSB</option><option>USB</option></select></div>
+<div style="height:8px"></div><button onclick="tune()">Tune</button>
+<label>Volume <span id="vollab" class="mono"></span></label>
+<input id="volsl" type="range" min="0" max="63" oninput="document.getElementById('vollab').textContent=this.value" onchange="setVol(this.value)">
+<label>Squelch <span id="sqlab" class="mono"></span></label>
+<input id="sqsl" type="range" min="0" max="127" oninput="document.getElementById('sqlab').textContent=this.value" onchange="setSql(this.value)">
+<div style="height:12px"></div>
+<div class="row"><button class="sec" onclick="toggleMute()">Toggle Mute</button><button class="sec" onclick="clearToken()">Log out</button></div>
+</div></div>
+<script>
+var token=localStorage.getItem('ats_token')||'',lastMute=false;
+function $(i){return document.getElementById(i)}
+function showLogin(){$('login').style.display='block';$('app').style.display='none'}
+function showApp(){$('login').style.display='none';$('app').style.display='block'}
+function saveToken(){var v=$('tok').value.trim();if(!v)return;token=v;localStorage.setItem('ats_token',token);$('tok').value='';showApp();poll()}
+function clearToken(){token='';localStorage.removeItem('ats_token');showLogin()}
+function banner(m){var b=$('banner');if(!m){b.style.display='none';return}b.textContent=m;b.style.display='block'}
+function live(s){$('live').className='dot '+s}
+function api(p,o){o=o||{};o.headers=o.headers||{};o.headers['Authorization']='Bearer '+token;
+return fetch(p,o).then(function(r){if(r.status===401){clearToken();throw{handled:true}}
+return r.json().then(function(j){return{status:r.status,body:j}})})}
+function post(p,obj){return api(p,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(obj)})
+.then(function(r){if(r.status===503){banner('Radio not detected');throw{handled:true}}
+if(r.status>=400){banner((r.body&&r.body.error)||('Error '+r.status));throw{handled:true}}
+banner('');return r.body})}
+function fmtUp(s){s=s|0;return((s/3600)|0)+'h '+(((s%3600)/60)|0)+'m'}
+function poll(){if(!token){showLogin();return}
+Promise.all([api('/radio/status'),api('/health')]).then(function(res){live('ok');
+var s=res[0].body,h=res[1].body;
+if(res[0].status===503){banner('Radio not detected')}else{banner('')}
+if(res[0].status===200){
+$('freq').textContent=s.freq_display||s.freq||'--';
+$('mode').textContent=s.mode||'--';
+$('rssi').textContent=(s.rssi!=null?s.rssi+' dBuV':'--');
+$('snr').textContent=(s.snr!=null?s.snr+' dB':'--');
+$('vol').textContent=(s.volume!=null?s.volume:'--');
+$('muted').style.display=s.mute?'inline-block':'none';
+$('sql').style.display=s.squelched?'inline-block':'none';
+lastMute=!!s.mute;
+if(s.rds_ps&&s.rds_ps.trim()){$('rds').style.display='block';$('rds').textContent=s.rds_ps}else{$('rds').style.display='none'}
+if(document.activeElement!==$('volsl')&&s.volume!=null){$('volsl').value=s.volume;$('vollab').textContent=s.volume}
+if(document.activeElement!==$('sqsl')&&s.squelch!=null){$('sqsl').value=s.squelch;$('sqlab').textContent=s.squelch}}
+if(h){$('uptime').textContent=fmtUp(h.uptime_sec);$('ver').textContent=h.version||'--'}})
+.catch(function(e){if(e&&e.handled)return;live('off');banner('Device offline')});
+api('/clock').then(function(r){if(r.status===200){var c=r.body;$('clock').textContent=(c.synced&&c.local_time)?c.local_time:(c.synced?'synced':'no sync')}}).catch(function(){})}
+function tune(){var f=parseInt($('tfreq').value,10);if(!f){banner('Enter a frequency');return}post('/radio/tune',{mode:$('tmode').value,freq:f}).then(poll).catch(function(){})}
+function setVol(v){post('/radio/volume',{volume:parseInt(v,10)}).catch(function(){})}
+function setSql(v){post('/radio/config',{squelch:parseInt(v,10)}).catch(function(){})}
+function toggleMute(){post('/radio/config',{mute:!lastMute}).then(poll).catch(function(){})}
+if(token)showApp();else showLogin();
+poll();setInterval(poll,1000);
+</script></body></html>)HTML";
+
+static void handle_ui(AsyncWebServerRequest *request) {
+    // Public: the page holds no secret, so no auth here. The endpoints it calls
+    // do their own require_auth; the browser attaches the Bearer token itself.
+    request->send_P(200, "text/html", UI_HTML);
 }
 
 // ===== Skills =====
@@ -1105,6 +1223,7 @@ static void setup_routes() {
     server.on("/firmware/confirm", HTTP_POST, handle_firmware_confirm);
     server.on("/firmware/rollback", HTTP_POST, handle_firmware_rollback);
     server.on("/skill", HTTP_GET, handle_skill);
+    server.on("/ui", HTTP_GET, handle_ui);
     server.on("/", HTTP_GET, handle_wifi_page);
     server.on("/wifi/config", HTTP_POST, handle_wifi_post);
 
