@@ -609,22 +609,48 @@ static bool notify_crit_unread() {
     return found;
 }
 
-/* The most severe level still unacknowledged, or false if nothing is. The LED
-   ring breathes in this colour, so it is asked for once per ring frame — hence
-   one pass under the lock rather than three calls to notify_crit_unread() and
-   friends. */
-static bool notify_top_unread_level(uint8_t &out) {
+/* host-test:begin unread — sliced out by tools/test_notify_options.sh */
+/*
+ * The most severe unread level in the queue, with one id left out of the walk.
+ *
+ * The exclusion exists for the ring. While a message card is open the ring
+ * names that card's message, and the one thing that may interrupt it is an
+ * unread critical the person is NOT looking at — a ring alternating a message
+ * with itself would be nonsense, and a ring that stayed on the card while a
+ * second critical arrived would hide it. Which of those two it is depends on
+ * whether the unread critical is the card's own message, and that question can
+ * only be answered here, where the ids are.
+ *
+ * `except_id` of 0 excludes nothing: no notification is ever issued id 0 — see
+ * notify_take_id() — so it is the one value free to mean "no card is open".
+ *
+ * The lock belongs to the caller, the way it does for notify_pos_of(): this is
+ * the walk, and the walk is what a host can run.
+ */
+static bool notify_top_unread_walk(uint32_t except_id, uint8_t &out) {
     bool found = false;
     uint8_t top = NOTIFY_INFO;
-    portENTER_CRITICAL(&notify_mux);
     for (int i = 0; i < notify_len; i++) {
         const Notification &e = notify_slot[notify_order[i]];
         if (!e.unread) continue;
+        if (except_id != 0 && e.id == except_id) continue;
         if (!found || e.level > top) top = e.level;
         found = true;
     }
-    portEXIT_CRITICAL(&notify_mux);
     if (found) out = top;
+    return found;
+}
+/* host-test:end */
+
+/* The most severe level still unacknowledged, or false if nothing is. The LED
+   ring breathes in this colour, so it is asked for once per ring frame — hence
+   one pass under the lock rather than three calls to notify_crit_unread() and
+   friends. `except_id` defaults to 0, which is every caller that is not the
+   ring asking about the card in front of somebody. */
+static bool notify_top_unread_level(uint8_t &out, uint32_t except_id = 0) {
+    portENTER_CRITICAL(&notify_mux);
+    bool found = notify_top_unread_walk(except_id, out);
+    portEXIT_CRITICAL(&notify_mux);
     return found;
 }
 

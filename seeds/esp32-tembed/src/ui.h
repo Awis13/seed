@@ -282,12 +282,12 @@ enum {
 
 /* Quiet sits second, under Messages: it is the other thing this device does to
    messages, and it is the row somebody reaches for at one in the morning
-   without wanting to read a menu first. Its label is built by
-   ring_quiet_label() rather than written here — the row shows the hours, and
-   they are the skill's to say. */
+   without wanting to read a menu first. The row's name is here; the hours after
+   it come from ring_quiet_hours(), because they are the skill's to say — the
+   same division as the Messages row and its unread count. */
 static const char *ui_items[UI_ITEM_COUNT] = {
     "Messages >",   /* ui_list_label() appends the unread count */
-    "",             /* ui_list_label() builds this one from the ring's window */
+    "Quiet",        /* ui_list_label() appends the ring's window, or "off" */
     "TV-B-Gone >",
     "Setup AP",
     "Info",
@@ -787,11 +787,16 @@ static const char *ui_list_label(int i) {
                 }
             }
             if (i == UI_ITEM_QUIET) {
-                /* "Quiet 00:00-08:00" or "Quiet off". The longer of the two is
-                   17 characters, which with the row's marker measures 218px of
-                   font 4 against the 296px ui_draw_row() has — measured against
-                   TFT_eSPI's own width table, like every other column here. */
-                ring_quiet_label(ring_night_from, ring_night_to, built, sizeof(built));
+                /* "Quiet 00:00-08:00" or "Quiet off" — the row's name from the
+                   table above, the window from the skill that owns it. The
+                   longer of the two is 17 characters, which with the row's
+                   marker measures 218px of font 4 against the 296px
+                   ui_draw_row() has — measured against TFT_eSPI's own width
+                   table, like every other column here, and pinned by
+                   tools/test_quiet.sh at the hours' end. */
+                char win[16];
+                ring_quiet_hours(ring_night_from, ring_night_to, win, sizeof(win));
+                snprintf(built, sizeof(built), "%s %s", ui_items[i], win);
                 return built;
             }
             return ui_items[i];
@@ -1289,6 +1294,30 @@ static void ui_enter(uint8_t screen) {
     ui_last_input = millis();
     ui_last_draw = millis();
     ui_encoder_reset();
+
+    /* Tell the ring what is on the panel, the same way loop() tells it which
+       job is on the bar: the UI hands over a fact, and skills/ring.cpp decides
+       on its own what to do with it.
+       This is the only place a screen changes, which is exactly why the telling
+       is here. Every way out of a card passes through it — the click that
+       acknowledges the message, the user key, the idle timeout, the message
+       expiring underneath the card — so the ring cannot be left naming a
+       message nobody is looking at by a new exit path somebody forgets to
+       update. The lookup can fail on a card whose message went away between the
+       decision to show it and this line, and that is a card about to be closed
+       on the next pass; the ring says nothing for it in the meantime.
+       No host test covers these six lines and none can: they are a call into a
+       driver from a function that draws. What IS covered is everything they
+       feed — progress_ring_phase() by tools/test_progress.sh and the exclusion
+       of the card's own message by tools/test_notify_options.sh — so the part
+       left to inspection is that this sits in ui_enter() and nowhere else. */
+    if (screen == UI_MSGCARD) {
+        NotifyView v;
+        if (notify_view_by_id(ui_msg_id, v, NULL, NULL)) ring_card_set(v.id, v.level);
+        else ring_card_clear();
+    } else {
+        ring_card_clear();
+    }
 
     if (screen == UI_CLOCK) {
         display_status();  /* repaints the clock chrome and every clock field */

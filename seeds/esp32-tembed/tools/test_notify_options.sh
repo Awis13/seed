@@ -165,6 +165,7 @@ PRELUDE
     slice "$src" text
     slice "$src" id
     slice "$src" store
+    slice "$src" unread
     slice "$src" snapshot
     cat <<'MAIN'
 
@@ -1023,6 +1024,90 @@ int main(void) {
                            "\"op\":[\"Yes\"],\"ch\":0}", out, out_op, now),
               "a snapshot carrying fields from some later version");
         check(out.opt_count == 1 && out.chosen == 0, "restores everything it does know");
+    }
+
+    printf("the top unread level, and the one message left out of the walk\n");
+    {
+        /* What the LED ring asks the queue forty times a second, and what it
+           asks it while a message card is open: the same walk, with the card's
+           own message excluded.
+           Why the exclusion has a test of its own. While a card is up the ring
+           holds that message's colour, and an unread CRITICAL is the one thing
+           allowed to interrupt it — see progress_ring_phase(). Get the
+           exclusion wrong in one direction and the ring alternates a message
+           with itself, which is silly; get it wrong in the other — exclude by
+           slot, by index, or unconditionally — and a second critical arriving
+           while somebody reads his mail is HIDDEN, on the channel that exists
+           to make criticals impossible to miss. Neither shows up on the device
+           as anything but a ring that looked fine. */
+        uint8_t top = 200;
+
+        /* Five entries, newest first, and then one removed from the middle —
+           which is the only way to make an entry's SLOT and its POSITION in the
+           order list differ, and the two checks furthest down need them to
+           differ to mean anything. After the drop the unread crit, id 30, sits
+           in slot 2 at position 1.
+
+           Levels: 10 info, 30 crit, 40 warn, 50 crit but READ. That last one is
+           what makes "excluding the crit leaves warn" a real claim — an
+           implementation that forgot `unread` would answer crit from it. */
+        store_reset();
+        check(load_text("{\"n\":["
+                        "{\"id\":10,\"ti\":\"a\",\"lv\":0,\"ur\":true},"
+                        "{\"id\":20,\"ti\":\"b\",\"lv\":0,\"ur\":true},"
+                        "{\"id\":30,\"ti\":\"c\",\"lv\":2,\"ur\":true},"
+                        "{\"id\":40,\"ti\":\"d\",\"lv\":1,\"ur\":true},"
+                        "{\"id\":50,\"ti\":\"e\",\"lv\":2,\"ur\":false}"
+                        "]}", now) == 5,
+              "a queue of five: info, info, crit, warn, and a crit already read");
+        /* PRECONDITIONS, not guards: this is the store the checks below run
+           against, and no defect in the walk can fail either of them. */
+        check(notify_drop_id(20) == 1, "  ..the second entry is dropped");
+        check_str(order_str(), "10,30,40,50", "  ..leaving 10,30,40,50");
+
+        check(notify_top_unread_walk(0, top) && top == NOTIFY_CRIT,
+              "excluding nothing, the top unread level is crit");
+        check(notify_top_unread_walk(30, top) && top == NOTIFY_WARN,
+              "excluding the unread crit leaves warn — not the read crit below it");
+        check(notify_top_unread_walk(40, top) && top == NOTIFY_CRIT,
+              "excluding a lesser message does not disturb the crit above it");
+
+        /* The exclusion is by id and by nothing else. 2 is the slot the unread
+           crit sits in and 1 is its position in the order list; an
+           implementation that compared either of those to `except_id` still
+           passes everything above, and fails exactly one of these two. */
+        top = 200;
+        check(notify_top_unread_walk(2, top) && top == NOTIFY_CRIT,
+              "a number that is only a slot index excludes nothing");
+        check(notify_top_unread_walk(1, top) && top == NOTIFY_CRIT,
+              "and neither does one that is only a position in the list");
+        check(notify_top_unread_walk(99, top) && top == NOTIFY_CRIT,
+              "nor an id no entry carries");
+
+        /* The whole queue excluded one message at a time still answers about
+           the others: an exclusion that leaked into the loop's bookkeeping
+           would empty the queue rather than skip one entry. */
+        store_reset();
+        /* PRECONDITION again, and so is the one further down: what the store
+           was built with, which no defect in the walk can fail. */
+        check(load_text("{\"n\":[{\"id\":7,\"ti\":\"only\",\"lv\":2,\"ur\":true}]}",
+                        now) == 1, "a queue holding one unread crit");
+        check(notify_top_unread_walk(0, top) && top == NOTIFY_CRIT,
+              "reads as crit when nothing is excluded");
+        top = 200;
+        check(!notify_top_unread_walk(7, top),
+              "and as nothing unread when it is the message being excluded — "
+              "the case where the card in front IS the critical");
+        check(top == 200, "with the level left untouched rather than zeroed");
+
+        /* Nothing unread at all, and an empty queue: both must answer false
+           rather than "info", which is a different statement. */
+        store_reset();
+        check(load_text("{\"n\":[{\"id\":8,\"ti\":\"seen\",\"lv\":2,\"ur\":false}]}",
+                        now) == 1, "a queue whose only message has been read");
+        check(!notify_top_unread_walk(0, top), "reports nothing unread");
+        store_reset();
+        check(!notify_top_unread_walk(0, top), "and so does an empty queue");
     }
 
     printf("\n%s\n", failures ? "FAILED" : "all checks passed");

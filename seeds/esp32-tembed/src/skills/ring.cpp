@@ -8,6 +8,11 @@
  * unread message exists the ring breathes in that message's colour, and it
  * keeps breathing until somebody acknowledges it.
  *
+ * The one place the two channels meet is a message card: while one is open the
+ * ring holds that message's colour steady, so what is on the panel and what is
+ * visible from the doorway are the same message. Breathing still means
+ * "waiting, unlooked-at"; steady means "this is the one in front of you".
+ *
  *
  * RMT coexistence with the IR transmitter — the thing that had to be settled
  * ------------------------------------------------------------------------
@@ -277,6 +282,40 @@ static unsigned long ring_knob_at = 0;
    that publishes progress knows this exists. */
 static int ring_progress_pct = -1;
 
+/*
+ * The message card in front of somebody: its level, or -1 for "no card", and
+ * the id it is showing.
+ *
+ * Fed the same way the arc is — the UI hands it over, this file never asks what
+ * screen is up — but from ui_enter() rather than from loop(), because that is
+ * the single place a screen changes and therefore the single place a card can
+ * be left. Every way out of one goes through it: the click that acknowledges
+ * the message, the user key, the idle timeout, the message expiring underneath
+ * the card, a recording taking the panel. None of them has to remember to say
+ * so, which is what makes "the ring goes dark when the card is left" a property
+ * of the code rather than a list of call sites to keep in step.
+ *
+ * The id is here so that an unread critical can be told from THE CARD'S OWN
+ * message — see notify_top_unread_walk() and progress_ring_phase().
+ *
+ * The pair is written level-last on the way in and level-first on the way out,
+ * so a reader that catches the two words mid-update sees "no card" rather than
+ * a level belonging to the wrong id. What that ordering rests on: each word is
+ * a single naturally aligned scalar and is therefore written whole, and both
+ * are volatile — as every other cross-task word in this file is — so the
+ * compiler may not reorder the two stores against each other. Nothing more is
+ * claimed; this is not a barrier between cores.
+ *
+ * It is worth stating exactly how much that buys, because it is less than it
+ * looks. The writers below and ring_compose() — the only reader that decides
+ * what the LEDs show — all run on the loop task, so the ring's colour cannot be
+ * affected by a torn read at all. The two readers on the web-server task are
+ * ring_effect_name() and ring_state_json(), and both only build an HTTP
+ * response. So the worst this ordering prevents is a wrong `effect` string or
+ * `card_level` in one network reply, never a wrong colour on the device. */
+static volatile int ring_card_level = -1;
+static volatile uint32_t ring_card_id = 0;
+
 /* Test pattern, so colours can be judged without inventing a notification. */
 enum { RING_TEST_NONE = 0, RING_TEST_BREATHE, RING_TEST_LEVELS };
 static volatile uint8_t ring_test = RING_TEST_NONE;
@@ -406,6 +445,25 @@ static void ring_quiet_switch(RingQuiet &q, bool on,
 }
 
 /*
+ * The switch as a click works it: whichever way the window is now, go the other
+ * way, and say which way that was.
+ *
+ * One line, and it is here rather than inside ring_quiet_toggle() because that
+ * function reads the live volatile words and cannot be sliced onto the host — a
+ * test wanting this decision had to re-implement it, which proves something
+ * about the test's copy and nothing about the firmware. The defaults come from
+ * the caller for the same reason ring_quiet_switch() takes them.
+ *
+ * The answer is what the event line names: switched on, the hours are what the
+ * device will be silent for; switched off, what a second click gets back.
+ */
+static bool ring_quiet_flip(RingQuiet &q, uint16_t def_from, uint16_t def_to) {
+    bool on = !ring_night_is_window(q.from, q.to);
+    ring_quiet_switch(q, on, def_from, def_to);
+    return on;
+}
+
+/*
  * The whole silence rule with the clock reading lifted out of it: a window that
  * exists, a clock that has been set, and a minute inside the window.
  *
@@ -485,6 +543,56 @@ static void ring_progress_clear() {
     ring_progress_pct = -1;
 }
 
+/* A card is up, showing message `id` at `level`. */
+static void ring_card_set(uint32_t id, uint8_t level) {
+    ring_card_id = id;
+    ring_card_level = (int)level;   /* last: see the declaration */
+}
+
+/* No card is up. Called for every screen that is not one, so it runs far more
+   often than it changes anything — which is the point of it being the same
+   unconditional statement every time rather than a condition somebody has to
+   get right. */
+static void ring_card_clear() {
+    ring_card_level = -1;           /* first: see the declaration */
+    ring_card_id = 0;
+}
+
+/*
+ * Which of the three bottom claimants has the ring at `now`, and what with.
+ *
+ * Two callers ask the same question: ring_compose(), on the loop task, against
+ * the frame's own clock sample, and ring_effect_name(), on the web-server task,
+ * against a fresh millis(). In a file whose whole argument is that the ring has
+ * a single arbiter, that decision has to exist once — so `now` is a parameter
+ * and each caller keeps its own reading, which is the same move already made
+ * for notify_pos_of() and notify_take_id().
+ *
+ * The card's own message is left out of the unread question here, once, for
+ * both of them. Otherwise a critical would alternate with the card showing that
+ * same critical — one message taking turns with itself, in one colour, for no
+ * gain. A second unread critical is a different message and still gets its
+ * phase. One acquisition of the notification lock serves the whole decision,
+ * which is also why the level comes back from here rather than being asked for
+ * a second time.
+ */
+struct RingOwner {
+    uint8_t who;     /* PROGRESS_RING_NONE, _ARC, _CRIT or _CARD */
+    int card;        /* the open card's level, or -1 for no card */
+    bool unread;     /* an unread message exists, the card's own excluded */
+    uint8_t top;     /* and its level, when one does */
+};
+
+static RingOwner ring_owner(unsigned long now) {
+    RingOwner o;
+    o.card = ring_card_level;       /* one read; see the declaration */
+    o.top = NOTIFY_INFO;
+    o.unread = notify_top_unread_level(o.top, o.card >= 0 ? ring_card_id : 0);
+    bool crit = o.unread && o.top == NOTIFY_CRIT;
+    o.who = progress_ring_phase(crit, ring_progress_pct >= 0, o.card >= 0, now);
+    return o;
+}
+
 /* --- Frame composition ---
  *
  * Priority, highest first:
@@ -495,16 +603,22 @@ static void ring_progress_clear() {
  *   one-shot  arrival or acknowledgement, half a second each
  *   dark      nothing to say
  *
- * and then, at the bottom, two claimants with no fixed order between them:
+ * and then, at the bottom, three claimants with no fixed order between them:
  *
+ *   card      a message is open on the panel and this is its colour
  *   progress  a job is running and its position is the information
  *   breathe   unread messages exist
  *
- * Against an unread info or warn the progress arc simply wins. Against an
- * unread CRITICAL the two alternate, the critical taking the whole ring and the
- * longer phase — the rule and the reason live in progress_ring_phase() in
- * skills/progress.cpp, because that is where somebody tempted to remove it will
- * be reading.
+ * The card outranks the arc; the arc outranks an unread info or warn. Against
+ * an unread CRITICAL whichever of the two holds the ring alternates with it,
+ * the critical taking the whole ring and the longer phase — the rule and the
+ * reason live in progress_ring_phase() in skills/progress.cpp, because that is
+ * where somebody tempted to remove it will be reading.
+ *
+ * The card sits BELOW the knob feedback and the one-shots deliberately. A hand
+ * on the control, an arriving message's comet and an acknowledgement's wipe are
+ * all half a second of something happening right now, and a card that is going
+ * to be there for the next fifteen seconds can wait for them.
  *
  * `now` is passed in rather than read here: ring_poll() retires expired effects
  * against one timestamp, and composing against a second one taken microseconds
@@ -581,21 +695,33 @@ static void ring_compose(uint8_t frame[RING_LEDS][3], unsigned long now) {
         return;
     }
 
-    /* The last two claimants do not have a fixed order between them. A progress
-       arc beats an unread info or warn outright — those are already on the
-       clock face as the amber dot and the count — but against an unread
-       CRITICAL it takes turns, and the shorter turn. The ring is the channel
-       that is readable from across a room, and a critical message must never
-       be outbid on it; see progress_ring_phase() in skills/progress.cpp for why
-       the two phases are deliberately unequal and must stay that way.
+    /* The last three claimants do not have a fixed order between them. An open
+       card beats a progress arc, because it is the message somebody is holding
+       the device to read; an arc beats an unread info or warn outright, because
+       those are already on the clock face as the amber dot and the count; and
+       against an unread CRITICAL whichever of the two holds the ring takes
+       turns with it, and the shorter turn. The ring is the channel that is
+       readable from across a room, and a critical message must never be outbid
+       on it; see progress_ring_phase() in skills/progress.cpp for why the two
+       phases are deliberately unequal and must stay that way.
 
-       One acquisition of the notification lock serves both decisions, which is
-       also why the level is read here rather than by asking twice. */
-    uint8_t top;
-    bool unread = notify_top_unread_level(top);
-    bool crit = unread && top == NOTIFY_CRIT;
+       Made by ring_owner(), against this pass's own `now` — including leaving
+       the card's own message out of the unread question, which is why that is
+       stated there rather than here. */
+    RingOwner o = ring_owner(now);
 
-    if (progress_ring_phase(crit, ring_progress_pct >= 0, now) == PROGRESS_RING_ARC) {
+    if (o.who == PROGRESS_RING_CARD) {
+        /* The whole ring in the card's colour, and STEADY. The breathe means
+           "something is waiting and nobody has looked at it"; this message is
+           being looked at, so it says the same colour with the pulse taken out.
+           Held only as long as the card is — the panel drops back to the clock
+           after UI_IDLE_MS of no input, and this goes out with it. */
+        for (int i = 0; i < RING_LEDS; i++)
+            ring_put(frame, i, ring_level_color((uint8_t)o.card), 255);
+        return;
+    }
+
+    if (o.who == PROGRESS_RING_ARC) {
         /* The lit arc is the progress. The pixel at the boundary carries the
            fraction, so eight LEDs read as rather more than eight steps, and it
            never goes fully dark while a job is running — a blast that has not
@@ -616,14 +742,14 @@ static void ring_compose(uint8_t frame[RING_LEDS][3], unsigned long now) {
 
     /* Either nothing is running, or the critical has the ring for this phase.
        Both land here, and both want the same breathe. */
-    if (unread) {
-        unsigned long cycle = (top == NOTIFY_CRIT) ? RING_BREATHE_CRIT_MS
-                                                   : RING_BREATHE_MS;
+    if (o.unread) {
+        unsigned long cycle = (o.top == NOTIFY_CRIT) ? RING_BREATHE_CRIT_MS
+                                                     : RING_BREATHE_MS;
         uint8_t env = RING_BREATHE_MIN +
                       (uint8_t)((255 - RING_BREATHE_MIN) *
                                 ring_triangle(now, cycle) / 255);
         for (int i = 0; i < RING_LEDS; i++)
-            ring_put(frame, i, ring_level_color(top), env);
+            ring_put(frame, i, ring_level_color(o.top), env);
     }
 }
 
@@ -823,18 +949,17 @@ static const char *ring_effect_name() {
     if (ring_test == RING_TEST_BREATHE) return "test-breathe";
     if (ring_fx == RING_FX_COMET) return "comet";
     if (ring_fx == RING_FX_WIPE) return "wipe";
-    /* The same two-claimant decision ring_compose() makes, against a clock read
-       here rather than passed in: this reports on the web-server task, and what
-       it should report is what the ring is doing at the moment of the request.
-       While a critical alternates with a job this therefore flips between
-       "progress" and "breathe" from one GET to the next, which is the honest
-       answer rather than a confusing one. */
-    uint8_t top;
-    bool unread = notify_top_unread_level(top);
-    bool crit = unread && top == NOTIFY_CRIT;
-    if (progress_ring_phase(crit, ring_progress_pct >= 0, millis()) == PROGRESS_RING_ARC)
-        return "progress";
-    if (unread) return "breathe";
+    /* The same decision ring_compose() makes — literally the same function —
+       against a clock read here rather than passed in: this reports on the
+       web-server task, and what it should report is what the ring is doing at
+       the moment of the request. While a critical alternates with a job or a
+       card this therefore flips between "progress"/"card" and "breathe" from
+       one GET to the next, which is the honest answer rather than a confusing
+       one. */
+    RingOwner o = ring_owner(millis());
+    if (o.who == PROGRESS_RING_CARD) return "card";
+    if (o.who == PROGRESS_RING_ARC) return "progress";
+    if (o.unread) return "breathe";
     return "idle";
 }
 
@@ -928,13 +1053,32 @@ static const char *ring_describe() {
            "job the progress skill has picked, so it always agrees with the bar\n"
            "on the clock face; nothing that publishes progress knows the ring\n"
            "exists.\n\n"
+           "### The message on the panel\n\n"
+           "While a message card is open the ring is that message's colour,\n"
+           "**steady** — `effect` reads `card` and `card_level` is the colour\n"
+           "it is lit with. Reading a message a second time therefore lights\n"
+           "the ring again, which the unread breathe alone would not do: the\n"
+           "panel and the across-the-room channel say the same thing about the\n"
+           "same message. Steady rather than breathing is the distinction —\n"
+           "a pulse means something is waiting that nobody has looked at yet.\n\n"
+           "It goes out the moment the card is left, by any route: the click\n"
+           "that acknowledges the message, the second button, or the fifteen\n"
+           "seconds of no input that drop the panel back to the clock. A card\n"
+           "outranks the progress arc, because it is the message in somebody's\n"
+           "hand; both lose to the knob dot and to an arriving comet.\n\n"
            "While a `crit` is unacknowledged the ring alternates between the\n"
-           "red breathe and that arc — six seconds of red, three of arc — with\n"
-           "the red deliberately given the longer phase. This is the channel\n"
-           "you read from across a room, where the colour is the whole message,\n"
-           "and a critical must not be outbid on it by a percentage. Unread\n"
-           "info and warn do not alternate; a running job simply wins, because\n"
-           "those are already on the clock face as the dot and the count.\n\n"
+           "red breathe and whatever else wants it — the arc, or an open card —\n"
+           "six seconds of red against three, with the red deliberately given\n"
+           "the longer phase. This is the channel you read from across a room,\n"
+           "where the colour is the whole message, and a critical must not be\n"
+           "outbid on it by a percentage or by the message being read at that\n"
+           "moment. Unread info and warn do not alternate; a running job or an\n"
+           "open card simply wins, because those are already on the clock face\n"
+           "as the dot and the count.\n\n"
+           "A card showing the unread critical ITSELF does not alternate with\n"
+           "it — the answer would be red either way, so it stays steady red for\n"
+           "as long as the card is open. A second unread critical is a\n"
+           "different message and does take its phase.\n\n"
            "### Brightness\n\n"
            "`brightness` is a percentage, 0 to 100, applied to every pixel as a\n"
            "linear cap on drive current. It defaults to 50 and is meant to be\n"
@@ -989,24 +1133,26 @@ static void ring_time_str(uint16_t mins, char *out, size_t n) {
     snprintf(out, n, "%02u:%02u", (unsigned)(mins / 60), (unsigned)(mins % 60));
 }
 
-/* The menu row's text. It carries the hours rather than just "on", so the row
-   answers when as well as whether — this device has no other screen that could,
-   and the hours are exactly what a toggle without a memory would have lost.
+/* What the menu row carries: the hours, or "off". The row says when as well as
+   whether, because this device has no other screen that could and the hours are
+   exactly what a toggle without a memory would have lost. The row's NAME is
+   ui.h's, put in front of this the same way the unread count goes after the
+   Messages row's name — one idiom for both built rows.
 
    It takes a window rather than reading the live words, which is what lets it
    be sliced onto the host: it is the only user-facing string this release adds,
    the width argument at its call site in ui.h counts these exact characters,
    and formatting somebody reads at one in the morning should not be the one
    thing here with no test. */
-static void ring_quiet_label(uint16_t from, uint16_t to, char *out, size_t n) {
+static void ring_quiet_hours(uint16_t from, uint16_t to, char *out, size_t n) {
     if (!ring_night_is_window(from, to)) {
-        snprintf(out, n, "Quiet off");
+        snprintf(out, n, "off");
         return;
     }
     char f[8], t[8];
     ring_time_str(from, f, sizeof(f));
     ring_time_str(to, t, sizeof(t));
-    snprintf(out, n, "Quiet %s-%s", f, t);
+    snprintf(out, n, "%s-%s", f, t);
 }
 /* host-test:end */
 
@@ -1019,19 +1165,19 @@ static void ring_quiet_label(uint16_t from, uint16_t to, char *out, size_t n) {
  * the skill owns the state and formats the string.
  */
 
-/* Flip the silence and report where it landed. The event line names the hours
-   either way — switched on, they are what the device will be silent for;
-   switched off, they are what a second click gets back. */
-static bool ring_quiet_toggle() {
+/* Flip the silence, on the live words. The decision itself is
+   ring_quiet_flip()'s, which is what the host test drives; this is the half
+   that reads the volatiles, writes them back and says so in the log. Nothing
+   asks which way it went — the menu row redraws from the window itself — so
+   this reports nothing rather than returning an answer no caller reads. */
+static void ring_quiet_toggle() {
     RingQuiet q;
     ring_quiet_read(q);
-    bool on = !ring_night_is_window(q.from, q.to);
-    ring_quiet_switch(q, on, RING_NIGHT_FROM_DEFAULT, RING_NIGHT_TO_DEFAULT);
+    bool on = ring_quiet_flip(q, RING_NIGHT_FROM_DEFAULT, RING_NIGHT_TO_DEFAULT);
     if (ring_quiet_apply(q)) ring_cfg_mark_dirty();
     event_add("ring: quiet %s (%02u:%02u-%02u:%02u)", on ? "on" : "off, kept",
               (unsigned)(q.saved_from / 60), (unsigned)(q.saved_from % 60),
               (unsigned)(q.saved_to / 60), (unsigned)(q.saved_to % 60));
-    return on;
 }
 
 /* Accepts "HH:MM" or a plain minute count, because one of those is what a
@@ -1099,7 +1245,17 @@ static void ring_state_json(JsonDocument &doc) {
     doc["effect"] = ring_effect_name();
     doc["unread"] = notify_unread_count();
     uint8_t top;
+    /* The queue's top unread level, asked WITHOUT the card exclusion on
+       purpose: this field is about what is waiting, not about what the ring is
+       lit with. The two differ exactly when a card is open, which is what
+       `card_level` below is for. */
     if (notify_top_unread_level(top)) doc["level"] = notify_level_name(top);
+    /* Present only while a message card is on the panel, and then it is the
+       ring's colour: an effect of "card" says which supplier has the ring and
+       this says what it is showing. Without it the colour would be the one
+       thing about the ring that cannot be read over the API. */
+    if (ring_card_level >= 0)
+        doc["card_level"] = notify_level_name((uint8_t)ring_card_level);
     if (ring_progress_pct >= 0) doc["progress"] = ring_progress_pct;
 }
 

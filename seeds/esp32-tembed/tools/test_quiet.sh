@@ -31,8 +31,9 @@
 #     tm_hour * 60 + tm_min — that line has no test and cannot have one here.
 #   - the panel and the ring. The menu row, the clock face's mark and whether a
 #     click reaches ring_quiet_toggle() at all need TFT_eSPI, a WS2812 string
-#     and a hand. The row's TEXT is here — ring_quiet_label() takes a window
-#     rather than reading the live words, precisely so that it can be.
+#     and a hand. The row's TEXT is here — ring_quiet_hours() takes a window
+#     rather than reading the live words, precisely so that it can be, and the
+#     decision a click makes is ring_quiet_flip()'s and is driven directly.
 #   - SPIFFS. That the document reaches the flash and comes back is
 #     read_spiffs_file()'s and write_spiffs_file_atomic()'s, and neither is here.
 #     What IS here is the whole of what gets written, what a stored document
@@ -169,12 +170,12 @@ static void saved_is(const RingQuiet &q, uint16_t from, uint16_t to,
     }
 }
 
-/* The switch as the menu works it: whichever way the window is now, go the
-   other way. This is ring_quiet_toggle()'s decision, spelled out here because
-   that function reads the volatiles and cannot be sliced. */
+/* The switch as the menu works it. This is the shipping ring_quiet_flip() with
+   the compiled defaults filled in and nothing else: the decision used to be
+   spelled out here, which pinned this file's copy of it rather than the
+   firmware's. ring_quiet_toggle() is the same call against the live words. */
 static void toggle(RingQuiet &q) {
-    ring_quiet_switch(q, !ring_night_is_window(q.from, q.to),
-                      RING_NIGHT_FROM_DEFAULT, RING_NIGHT_TO_DEFAULT);
+    ring_quiet_flip(q, RING_NIGHT_FROM_DEFAULT, RING_NIGHT_TO_DEFAULT);
 }
 
 /* Load one stored settings document, exactly as ring_cfg_load() does: the pair
@@ -315,6 +316,24 @@ int main(void) {
            fine once and be wrong by morning. */
         for (int i = 0; i < 20; i++) toggle(q);
         window_is(q, HM(22, 30), HM(6, 45), "and after ten more round trips it is unchanged");
+    }
+
+    printf("the switch says which way it went\n");
+    {
+        /* ring_quiet_toggle()'s event line is written from this answer — "on"
+           against "off, kept" — and it is the only record of a click anybody
+           reads afterwards. A flip that moved the window correctly and reported
+           the opposite would log the reverse of what the device did, which is
+           worse than no log. */
+        RingQuiet q = made(0, HM(8, 0), 0, 0);
+        check(!ring_quiet_flip(q, RING_NIGHT_FROM_DEFAULT, RING_NIGHT_TO_DEFAULT),
+              "a window that is set switches off");
+        check(ring_quiet_flip(q, RING_NIGHT_FROM_DEFAULT, RING_NIGHT_TO_DEFAULT),
+              "and an empty one switches on");
+        /* Said against the window it produced, so "reports on" and "is on"
+           cannot drift apart. */
+        check(ring_night_is_window(q.from, q.to),
+              "and what it reported is what the window then is");
     }
 
     printf("switching on with nothing remembered\n");
@@ -552,12 +571,14 @@ int main(void) {
         }
 
         /* The other half of the split: a change somebody actually made does
-           schedule one. Without this, deleting the mark everywhere would pass. */
+           schedule one. Without this, deleting the mark everywhere would pass.
+           These three lines are ring_quiet_toggle()'s body without its event
+           line — every part of it that is not a live-word read. */
         booted();
         {
             RingQuiet q;
             ring_quiet_read(q);
-            ring_quiet_switch(q, false, RING_NIGHT_FROM_DEFAULT, RING_NIGHT_TO_DEFAULT);
+            ring_quiet_flip(q, RING_NIGHT_FROM_DEFAULT, RING_NIGHT_TO_DEFAULT);
             if (ring_quiet_apply(q)) ring_cfg_mark_dirty();
             check(ring_cfg_dirty, "while switching the silence off does schedule one");
         }
@@ -573,27 +594,29 @@ int main(void) {
         }
     }
 
-    printf("the menu row's text, which is the only new string on the device\n");
+    printf("the menu row's hours, which are the only new string on the device\n");
     {
-        char s[24];
-        ring_quiet_label(0, HM(8, 0), s, sizeof(s));
-        check(strcmp(s, "Quiet 00:00-08:00") == 0, "a window reads as its two hours");
-        ring_quiet_label(HM(22, 30), HM(7, 0), s, sizeof(s));
-        check(strcmp(s, "Quiet 22:30-07:00") == 0, "including one that wraps midnight");
-        ring_quiet_label(0, 0, s, sizeof(s));
-        check(strcmp(s, "Quiet off") == 0, "an empty window reads as off");
-        ring_quiet_label(HM(9, 0), HM(9, 0), s, sizeof(s));
-        check(strcmp(s, "Quiet off") == 0, "and so does an equal pair naming any other hour");
+        char s[16];
+        ring_quiet_hours(0, HM(8, 0), s, sizeof(s));
+        check(strcmp(s, "00:00-08:00") == 0, "a window reads as its two hours");
+        ring_quiet_hours(HM(22, 30), HM(7, 0), s, sizeof(s));
+        check(strcmp(s, "22:30-07:00") == 0, "including one that wraps midnight");
+        ring_quiet_hours(0, 0, s, sizeof(s));
+        check(strcmp(s, "off") == 0, "an empty window reads as off");
+        ring_quiet_hours(HM(9, 0), HM(9, 0), s, sizeof(s));
+        check(strcmp(s, "off") == 0, "and so does an equal pair naming any other hour");
         /* Both halves padded to two digits, or 09:05 would print as 9:5 and the
            row would change width as the clock moved. */
-        ring_quiet_label(HM(9, 5), HM(7, 0), s, sizeof(s));
-        check(strcmp(s, "Quiet 09:05-07:00") == 0, "hours and minutes are both padded");
-        /* The width argument at the call site in ui.h counts these characters:
-           17 with the row's marker measures 218px of font 4 against the 296px
-           ui_draw_row() has. A longer string runs off the panel, so the length
-           is pinned here rather than left as a sentence in a comment. */
-        ring_quiet_label(HM(23, 59), HM(23, 58), s, sizeof(s));
-        check(strlen(s) == 17, "the longest row is the 17 characters ui.h measured");
+        ring_quiet_hours(HM(9, 5), HM(7, 0), s, sizeof(s));
+        check(strcmp(s, "09:05-07:00") == 0, "hours and minutes are both padded");
+        /* The width argument at the call site in ui.h counts these characters.
+           ui.h writes "Quiet " in front of them, so eleven here is the
+           seventeen that, with the row's marker, measures 218px of font 4
+           against the 296px ui_draw_row() has. A longer string runs off the
+           panel, so the length is pinned rather than left as a sentence in a
+           comment. */
+        ring_quiet_hours(HM(23, 59), HM(23, 58), s, sizeof(s));
+        check(strlen(s) == 11, "the longest is 11 characters, the 17 ui.h measured less \"Quiet \"");
     }
 
     printf("the extraction out of ring_night_now(), against 0.12.0 itself\n");
