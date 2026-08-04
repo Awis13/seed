@@ -68,9 +68,11 @@
  * keeps the blocking flash write off the settle-critical tuning path.
  */
 #define RADIO_STATE_FILE    "/radio.json"
-/* v2 adds the selected band-plan index; a v1 file (no "band") is rejected by the
- * version check in radio_restore_state() and falls back to the FM defaults. */
-#define RADIO_STATE_VERSION 2
+/* v2 added the selected band-plan index; v3 adds the active band's live demod mode
+ * and its step/bandwidth cursors so a mode switch and tuning-step/bandwidth choice
+ * survive a reboot. An older-version file is rejected by the version check in
+ * radio_restore_state() and falls back to the FM defaults. */
+#define RADIO_STATE_VERSION 3
 #define RADIO_STORE_IDLE_MS 10000
 
 /*
@@ -228,6 +230,13 @@ static int      radio_bfo = 0;           /* current BFO offset in Hz (SSB only) 
  */
 static uint8_t  radio_band_idx = 0;      /* index into bands[]; 0 = FM VHF */
 static uint16_t band_freq[BAND_COUNT];   /* per-band saved frequency (band's units) */
+/* Per-band live demodulation mode, seeded from each band's native bands[i].mode in
+ * skill_radio_init() (before restore). The Mode menu / POST /radio/config can move a
+ * non-FM band between AM/LSB/USB, so this — not bands[i].mode — is the source of truth
+ * for the band's demod and for which step/bandwidth table the indices below belong to.
+ * A native-FM band (VHF broadcast) stays RADIO_MODE_FM: mode switching is locked there.
+ * In RAM (mutable); written only under radio_mtx (or single-tasked at boot). */
+static uint8_t  band_mode[BAND_COUNT];
 /* Per-band selected step / bandwidth, as row indices into stepsForMode(mode) /
  * bwForMode(mode) for that band's mode. Seeded from defaultStepIdx/defaultBwIdx in
  * skill_radio_init() before the saved state is restored. Written only under
@@ -245,14 +254,33 @@ static uint8_t  band_bw_idx[BAND_COUNT];
  * (AM=7) and run off the end. Always trust the band's mode for these tables.
  * Single-thread reader (display/loop task); callers that also need radio_band_idx
  * under radio_mtx derive the mode from their locked local instead (see below).
+ *
+ * Reads band_mode[] (the live per-band demod), NOT bands[].mode: after a mode switch
+ * the two diverge, and the step/bandwidth indices always belong to the live mode's
+ * table. This keeps step/bw menus, /radio/status and the chip set-calls consistent.
  */
-static uint8_t band_table_mode() { return bands[radio_band_idx].mode; }
+static uint8_t band_table_mode() { return band_mode[radio_band_idx]; }
 
 /* Defensive clamp of a stored table row into [0, count-1]. Tables are never empty
  * (count >= 1), so count-1 is always valid. Used at every table dereference so a
  * broken invariant degrades to the last row instead of an out-of-bounds read. */
 static uint8_t clamp_idx(uint8_t v, uint8_t count) {
     return (v >= count) ? (uint8_t)(count - 1) : v;
+}
+
+/*
+ * The demod modes the Mode menu cycles through, in display order. FM is deliberately
+ * excluded: it is the native mode of the VHF broadcast band only and cannot be
+ * selected on the AM/SW/ham bands (nor can a VHF band leave FM). mode_cycle_pos maps
+ * a mode to its position here (0 if absent, e.g. FM) for the cursor/wrap arithmetic.
+ */
+static const uint8_t modeCycle[] = { RADIO_MODE_AM, RADIO_MODE_LSB, RADIO_MODE_USB };
+#define MODE_CYCLE_COUNT ((uint8_t)(sizeof(modeCycle) / sizeof(modeCycle[0])))
+
+static uint8_t mode_cycle_pos(uint8_t mode) {
+    for (uint8_t i = 0; i < MODE_CYCLE_COUNT; i++)
+        if (modeCycle[i] == mode) return i;
+    return 0;
 }
 
 /*
@@ -401,10 +429,11 @@ static int     menu_settings_idx = 0; /* cursor in the SETTINGS sublist */
 /*
  * MENU_ADJUST is a value-editing leaf reached from the MAIN "Step"/"Bandwidth"
  * rows. There is no separate cursor: the encoder scrolls the value itself (the
- * active band's band_step_idx/band_bw_idx), which the render accessors expose so
- * the same draw_menu_screen window shows the step/bandwidth choices. adjust_target
- * says which of the two we are editing. */
-enum AdjustTarget { ADJ_STEP, ADJ_BW };
+ * active band's band_step_idx/band_bw_idx, or its band_mode), which the render
+ * accessors expose so the same draw_menu_screen window shows the choices.
+ * adjust_target says which of the three we are editing. ADJ_MODE is reachable only
+ * on a non-FM band (mode is locked on VHF). */
+enum AdjustTarget { ADJ_STEP, ADJ_BW, ADJ_MODE };
 static uint8_t adjust_target = ADJ_STEP;
 /* Cursor in the BAND picker (indexes bands[]). Re-seeded from radio_get_band_idx()
  * each time MENU_BAND is entered, so the list always opens on the active band. */
@@ -440,7 +469,7 @@ static int menu_wrap(int idx, int delta, int count) {
 static const SkillEndpoint radio_endpoints[] = {
     {"POST", "/radio/tune",   "Tune: {mode:\"FM\"|\"AM\"|\"LSB\"|\"USB\", freq:<int>, bfo?:<int>}"},
     {"POST", "/radio/band",   "Jump to a band-plan preset: {idx:<int>}"},
-    {"POST", "/radio/config", "Set current band's step/bandwidth by table index: {step_idx?:<int>, bw_idx?:<int>}"},
+    {"POST", "/radio/config", "Set current band's mode/step/bandwidth: {mode?:\"AM\"|\"LSB\"|\"USB\", step_idx?:<int>, bw_idx?:<int>}"},
     {"POST", "/radio/volume", "Set volume: {volume:0-63}"},
     {"POST", "/radio/scan",   "Sweep current-mode band: {from,to,step,min_rssi?} -> RSSI/SNR per step"},
     {"GET",  "/radio/status", "Current freq/mode/RSSI/SNR (+bfo in SSB)"},
@@ -455,7 +484,7 @@ static const char *radio_describe() {
            "|--------|------|-------------|\n"
            "| POST | /radio/tune | Tune: `{\"mode\":\"FM|AM|LSB|USB\",\"freq\":<int>,\"bfo\":<int>}` |\n"
            "| POST | /radio/band | Jump to a band-plan preset: `{\"idx\":<int>}` |\n"
-           "| POST | /radio/config | Set current band's step/bandwidth by table index: `{\"step_idx\":<int>,\"bw_idx\":<int>}` |\n"
+           "| POST | /radio/config | Set current band's mode/step/bandwidth: `{\"mode\":\"AM|LSB|USB\",\"step_idx\":<int>,\"bw_idx\":<int>}` |\n"
            "| POST | /radio/volume | Set volume: `{\"volume\":<0..63>}` |\n"
            "| POST | /radio/scan | Blocking band sweep in the current mode: `{\"from\":<int>,\"to\":<int>,\"step\":<int>,\"min_rssi\":<int>}` |\n"
            "| GET | /radio/status | Current freq, mode, RSSI, SNR (+bfo in SSB) |\n\n"
@@ -562,9 +591,12 @@ int radio_get_menu_idx() {
             /* Index the band's own table mode, and clamp so a cursor read never
              * exceeds the current table (belt-and-suspenders). */
             uint8_t m = band_table_mode();
-            return (adjust_target == ADJ_STEP)
-                       ? clamp_idx(band_step_idx[radio_band_idx], stepCount(m))
-                       : clamp_idx(band_bw_idx[radio_band_idx], bwCount(m));
+            if (adjust_target == ADJ_STEP)
+                return clamp_idx(band_step_idx[radio_band_idx], stepCount(m));
+            if (adjust_target == ADJ_BW)
+                return clamp_idx(band_bw_idx[radio_band_idx], bwCount(m));
+            /* ADJ_MODE: cursor is the band's mode position within modeCycle. */
+            return mode_cycle_pos(band_mode[radio_band_idx]);
         }
         default:            return menu_idx;
     }
@@ -574,8 +606,10 @@ int radio_get_menu_count() {
     switch (menu_level) {
         case MENU_SETTINGS: return MENU_SETTINGS_COUNT;
         case MENU_BAND:     return BAND_COUNT;
-        case MENU_ADJUST:   return (adjust_target == ADJ_STEP)
-                                ? stepCount(band_table_mode()) : bwCount(band_table_mode());
+        case MENU_ADJUST:
+            if (adjust_target == ADJ_STEP) return stepCount(band_table_mode());
+            if (adjust_target == ADJ_BW)   return bwCount(band_table_mode());
+            return MODE_CYCLE_COUNT;
         default:            return MENU_MAIN_COUNT;
     }
 }
@@ -587,12 +621,19 @@ const char *radio_get_menu_title() {
     switch (menu_level) {
         case MENU_SETTINGS: return "Settings";
         case MENU_BAND:     return "Band";
-        case MENU_ADJUST:   return (adjust_target == ADJ_STEP) ? "Step" : "Bandwidth";
+        case MENU_ADJUST:
+            if (adjust_target == ADJ_STEP) return "Step";
+            if (adjust_target == ADJ_BW)   return "Bandwidth";
+            return "Mode";
         default:            return "Menu";
     }
 }
 const char *radio_get_menu_item(int i) {
     if (menu_level == MENU_ADJUST) {
+        if (adjust_target == ADJ_MODE) {
+            int n = MODE_CYCLE_COUNT;
+            return radio_mode_str(modeCycle[((i % n) + n) % n]);
+        }
         /* Menu window items come from the band's own table mode, not radio_mode. */
         uint8_t m = band_table_mode();
         if (adjust_target == ADJ_STEP) {
@@ -684,7 +725,9 @@ static void apply_bandwidth_locked(uint8_t mode, uint8_t bidx) {
  */
 static void apply_band_locked(uint8_t idx, uint16_t freq) {
     const RadioBand *b = &bands[idx];
-    uint8_t mode = b->mode;
+    /* Live demod mode (band_mode[], not b->mode): a mode switch must survive reapply.
+     * Band edges/type/defFreq still come from bands[idx] — only the demod changes. */
+    uint8_t mode = band_mode[idx];
     /* The band's selected step/bandwidth rows (seeded from the mode defaults, or
      * changed via the adjust menu / POST /radio/config). Clamp defensively to this
      * band mode's table so a stale/broken index can never index out of bounds. */
@@ -750,6 +793,40 @@ static const char *radio_select_band(uint8_t idx) {
     xSemaphoreGive(radio_mtx);
 
     return bands[idx].name;
+}
+
+/*
+ * Cycle the active band's demod mode one detent in `dir` (+1/-1) through {AM,LSB,USB}
+ * — never FM — then reapply the band so the new demod takes effect. Ported from the
+ * ref's doMode. A native-FM band (VHF broadcast) is mode-locked: FM is a broadcast
+ * demod that does not belong on MW/SW/ham, so this is a no-op there.
+ *
+ * Switching mode resets the band's step/bandwidth cursors to the new mode's defaults
+ * (the old row indexes a different table and would be out of range) and zeroes the
+ * BFO, then apply_band_locked handles the SSB patch load/unload and the setAM/setSSB
+ * set-call. The current frequency is kept. Takes radio_mtx and marks the state dirty;
+ * a no-op returns false, a real switch true.
+ */
+static bool radio_cycle_mode(int8_t dir) {
+    xSemaphoreTake(radio_mtx, portMAX_DELAY);
+    uint8_t bnd = radio_band_idx;
+    if (bands[bnd].mode == RADIO_MODE_FM) {  /* native-FM band -> mode locked */
+        xSemaphoreGive(radio_mtx);
+        return false;
+    }
+    uint8_t pos = mode_cycle_pos(band_mode[bnd]);
+    pos = (uint8_t)menu_wrap(pos, dir, MODE_CYCLE_COUNT);
+    uint8_t newmode = modeCycle[pos];
+    band_mode[bnd] = newmode;
+    /* The old step/bw indices belong to the old mode's tables; reset to the new
+     * mode's defaults before apply_band_locked reads them. */
+    band_step_idx[bnd] = defaultStepIdx[newmode];
+    band_bw_idx[bnd]   = defaultBwIdx[newmode];
+    radio_bfo = 0;
+    apply_band_locked(bnd, radio_freq);
+    radio_mark_dirty();
+    xSemaphoreGive(radio_mtx);
+    return true;
 }
 
 /* --- Band accessors for the menu/display skill (plain aligned reads, no lock) --- */
@@ -952,11 +1029,12 @@ static void radio_register_routes(AsyncWebServer &server) {
         req->send(200, "application/json", response);
     }, NULL, handle_body_collect);
 
-    /* POST /radio/config — set the current band's tuning step and/or channel
-     * bandwidth by table index (indices into the current mode's step/bandwidth
-     * table, matching the desc strings reported by /radio/status). Mirrors
-     * /radio/band's auth + JSON handling; the receiver work runs under radio_mtx.
-     * Both fields are optional, but at least one must be present. */
+    /* POST /radio/config — set the current band's demod mode and/or tuning step
+     * and/or channel bandwidth. step_idx/bw_idx are indices into the (effective)
+     * mode's step/bandwidth table, matching the desc strings reported by
+     * /radio/status; mode is "AM"|"LSB"|"USB" (FM is locked to the VHF band). Mirrors
+     * /radio/band's auth + JSON handling; the receiver work runs under radio_mtx. All
+     * three fields are optional, but at least one must be present. */
     server.on("/radio/config", HTTP_POST, [](AsyncWebServerRequest *req) {
         if (!require_auth(req)) {
             /* Body callback already ran; free the collected buffer before bailing. */
@@ -981,14 +1059,33 @@ static void radio_register_routes(AsyncWebServer &server) {
 
         bool has_step = !input["step_idx"].isNull();
         bool has_bw   = !input["bw_idx"].isNull();
+        bool has_mode = !input["mode"].isNull();
         int step_idx = input["step_idx"] | -1;
         int bw_idx   = input["bw_idx"]   | -1;
+        const char *mode_str = input["mode"] | (const char*)nullptr;
+
+        /* Parse the optional demod mode. Only AM/LSB/USB are settable here: FM is a
+         * broadcast demod locked to the VHF band (a native-FM band is rejected under
+         * the lock below), so it is never a valid config target. */
+        uint8_t new_mode = RADIO_MODE_AM;
+        bool mode_str_bad = false;
+        if (has_mode) {
+            if      (mode_str && strcmp(mode_str, "AM")  == 0) new_mode = RADIO_MODE_AM;
+            else if (mode_str && strcmp(mode_str, "LSB") == 0) new_mode = RADIO_MODE_LSB;
+            else if (mode_str && strcmp(mode_str, "USB") == 0) new_mode = RADIO_MODE_USB;
+            else mode_str_bad = true;
+        }
 
         free(body); req->_tempObject = nullptr;
 
-        if (!has_step && !has_bw) {
+        if (!has_step && !has_bw && !has_mode) {
             req->send(400, "application/json",
-                "{\"error\":\"provide step_idx and/or bw_idx\"}");
+                "{\"error\":\"provide step_idx, bw_idx and/or mode\"}");
+            return;
+        }
+        if (mode_str_bad) {
+            req->send(400, "application/json",
+                "{\"error\":\"mode must be AM, LSB or USB\"}");
             return;
         }
 
@@ -1000,12 +1097,28 @@ static void radio_register_routes(AsyncWebServer &server) {
          * until after release so no HTTP response runs while holding radio_mtx. */
         xSemaphoreTake(radio_mtx, portMAX_DELAY);
         uint8_t bnd  = radio_band_idx;
-        uint8_t mode = bands[bnd].mode;
+        /* A native-FM band is mode-locked: FM demod cannot be switched away from and
+         * no other demod can be set on it. Reject a mode request there outright. */
+        bool mode_locked = has_mode && bands[bnd].mode == RADIO_MODE_FM;
+        /* Effective mode after a (valid) switch decides which step/bw table the
+         * step_idx/bw_idx must validate against; band_mode[] is the live demod. */
+        uint8_t mode = (has_mode && !mode_locked) ? new_mode : band_mode[bnd];
         uint8_t step_max = stepCount(mode);
         uint8_t bw_max   = bwCount(mode);
         bool step_bad = has_step && (step_idx < 0 || step_idx >= step_max);
         bool bw_bad   = has_bw   && (bw_idx   < 0 || bw_idx   >= bw_max);
-        if (!step_bad && !bw_bad) {
+        if (!mode_locked && !step_bad && !bw_bad) {
+            if (has_mode) {
+                /* Mode switch: reset step/bw cursors to the new mode's defaults (the
+                 * old indices belong to a different table), zero the BFO, and reapply
+                 * the band so the SSB patch loads/unloads and setAM/setSSB run. An
+                 * explicit step_idx/bw_idx below then overrides the reset defaults. */
+                band_mode[bnd] = new_mode;
+                band_step_idx[bnd] = defaultStepIdx[new_mode];
+                band_bw_idx[bnd]   = defaultBwIdx[new_mode];
+                radio_bfo = 0;
+                apply_band_locked(bnd, radio_freq);
+            }
             if (has_step) {
                 band_step_idx[bnd] = (uint8_t)step_idx;
                 apply_step_locked(mode, band_step_idx[bnd]);
@@ -1020,8 +1133,14 @@ static void radio_register_routes(AsyncWebServer &server) {
          * .desc pointers are flash-resident constants, safe to use after release. */
         const char *step_desc = stepsForMode(mode)[clamp_idx(band_step_idx[bnd], step_max)].desc;
         const char *bw_desc   = bwForMode(mode)[clamp_idx(band_bw_idx[bnd], bw_max)].desc;
+        const char *mode_desc = radio_mode_str(mode);
         xSemaphoreGive(radio_mtx);
 
+        if (mode_locked) {
+            req->send(400, "application/json",
+                "{\"error\":\"mode locked on FM band\"}");
+            return;
+        }
         if (step_bad) {
             char err[80];
             snprintf(err, sizeof(err),
@@ -1037,11 +1156,12 @@ static void radio_register_routes(AsyncWebServer &server) {
             return;
         }
 
-        event_add("radio: config step=%s bw=%s", step_desc, bw_desc);
+        event_add("radio: config mode=%s step=%s bw=%s", mode_desc, step_desc, bw_desc);
         display_show_status();
 
         JsonDocument doc;
         doc["ok"] = true;
+        doc["mode"] = mode_desc;
         doc["step"] = step_desc;
         doc["bw"] = bw_desc;
         String response;
@@ -1237,12 +1357,12 @@ static void radio_register_routes(AsyncWebServer &server) {
         doc["freq"] = radio_freq;
         doc["freq_display"] = freq_display;
         if (radio_is_ssb(radio_mode)) doc["bfo"] = radio_bfo;
-        /* Step/bandwidth labels come from the BAND's own table mode (bands[idx].mode),
+        /* Step/bandwidth labels come from the BAND's live demod mode (band_mode[idx]),
          * not the live radio_mode — /radio/tune can leave radio_mode on a different
          * mode with a larger table, so reading these under radio_mode risks an OOB.
          * Clamp defensively on top. */
         uint8_t bnd = radio_band_idx;
-        uint8_t bmode = bands[bnd].mode;
+        uint8_t bmode = band_mode[bnd];
         doc["step"] = stepsForMode(bmode)[clamp_idx(band_step_idx[bnd], stepCount(bmode))].desc;
         doc["bw"] = bwForMode(bmode)[clamp_idx(band_bw_idx[bnd], bwCount(bmode))].desc;
         doc["rssi"] = rssi;
@@ -1311,9 +1431,19 @@ static void radio_tick() {
                         menu_level = MENU_ADJUST;
                         adjust_target = ADJ_BW;
                         break;
+                    case MI_MODE:
+                        /* Mode editing is locked on the native-FM (VHF) band — FM is a
+                         * broadcast-only demod. There, bounce back to the VFO; on any
+                         * other band drop into the AM/LSB/USB mode value-editor. */
+                        if (bands[radio_band_idx].mode == RADIO_MODE_FM) {
+                            ui_mode = UI_VFO;
+                        } else {
+                            menu_level = MENU_ADJUST;
+                            adjust_target = ADJ_MODE;
+                        }
+                        break;
                     default:
-                        /* MI_MODE is still a placeholder — real mode editing is
-                         * wired in SEED-ATS-8 C2. Bounce back to the VFO for now. */
+                        /* No other MAIN row is a leaf yet — bounce back to the VFO. */
                         ui_mode = UI_VFO;
                         break;
                 }
@@ -1373,27 +1503,33 @@ static void radio_tick() {
          * radio_ok nor radio_mtx. */
         if (d != 0) {
             if (menu_level == MENU_ADJUST) {
-                /* The value editor scrolls the parameter itself, not a cursor:
-                 * bump the active band's step/bandwidth row and apply it live so
-                 * the change is audible immediately. This one menu branch does
-                 * touch the receiver, so it takes radio_mtx. */
-                xSemaphoreTake(radio_mtx, portMAX_DELAY);
-                uint8_t bnd = radio_band_idx;
-                /* Scroll the band's own table mode, not the live radio_mode: they
-                 * can differ after /radio/tune, and menu_wrap must wrap modulo the
-                 * table these indices actually belong to. */
-                uint8_t mode = bands[bnd].mode;
-                if (adjust_target == ADJ_STEP) {
-                    band_step_idx[bnd] =
-                        (uint8_t)menu_wrap(band_step_idx[bnd], d, stepCount(mode));
-                    if (radio_ok) apply_step_locked(mode, band_step_idx[bnd]);
+                if (adjust_target == ADJ_MODE) {
+                    /* Mode cycle takes radio_mtx itself and handles the FM-lock,
+                     * step/bw reset and full band reapply (SSB patch load/unload). */
+                    radio_cycle_mode(d > 0 ? 1 : -1);
                 } else {
-                    band_bw_idx[bnd] =
-                        (uint8_t)menu_wrap(band_bw_idx[bnd], d, bwCount(mode));
-                    if (radio_ok) apply_bandwidth_locked(mode, band_bw_idx[bnd]);
+                    /* The value editor scrolls the parameter itself, not a cursor:
+                     * bump the active band's step/bandwidth row and apply it live so
+                     * the change is audible immediately. This one menu branch does
+                     * touch the receiver, so it takes radio_mtx. */
+                    xSemaphoreTake(radio_mtx, portMAX_DELAY);
+                    uint8_t bnd = radio_band_idx;
+                    /* Scroll the band's live demod mode (band_mode[]), not radio_mode:
+                     * they can differ after /radio/tune, and menu_wrap must wrap modulo
+                     * the table these indices actually belong to. */
+                    uint8_t mode = band_mode[bnd];
+                    if (adjust_target == ADJ_STEP) {
+                        band_step_idx[bnd] =
+                            (uint8_t)menu_wrap(band_step_idx[bnd], d, stepCount(mode));
+                        if (radio_ok) apply_step_locked(mode, band_step_idx[bnd]);
+                    } else {
+                        band_bw_idx[bnd] =
+                            (uint8_t)menu_wrap(band_bw_idx[bnd], d, bwCount(mode));
+                        if (radio_ok) apply_bandwidth_locked(mode, band_bw_idx[bnd]);
+                    }
+                    radio_mark_dirty();
+                    xSemaphoreGive(radio_mtx);
                 }
-                radio_mark_dirty();
-                xSemaphoreGive(radio_mtx);
             } else if (menu_level == MENU_SETTINGS)
                 menu_settings_idx = menu_wrap(menu_settings_idx, d, MENU_SETTINGS_COUNT);
             else if (menu_level == MENU_BAND)
@@ -1452,18 +1588,25 @@ static void radio_tick() {
      * concurrent status/tune. Clearing radio_dirty inside the lock closes the
      * window where a change during the write would be lost. */
     if (radio_dirty && millis() - radio_last_change_ms > RADIO_STORE_IDLE_MS) {
-        uint16_t f; uint8_t m, v, bnd; int b;
+        uint16_t f; uint8_t v, bnd, bmode, bstep, bbw; int b;
         xSemaphoreTake(radio_mtx, portMAX_DELAY);
-        f = radio_freq; m = radio_mode; v = radio_volume; b = radio_bfo; bnd = radio_band_idx;
+        f = radio_freq; v = radio_volume; b = radio_bfo; bnd = radio_band_idx;
+        /* v3: persist the active band's live demod mode and step/bw cursors so a mode
+         * switch / step / bandwidth choice survives the reboot (restore reapplies them
+         * via apply_band_locked). The old "mode" key held radio_mode but restore never
+         * read it; it now carries band_mode[bnd], which restore does use. */
+        bmode = band_mode[bnd]; bstep = band_step_idx[bnd]; bbw = band_bw_idx[bnd];
         radio_dirty = false;
         xSemaphoreGive(radio_mtx);
         JsonDocument doc;
         doc["v"] = RADIO_STATE_VERSION;
-        doc["mode"] = m;
+        doc["mode"] = bmode;
         doc["freq"] = f;
         doc["volume"] = v;
         doc["bfo"] = b;
         doc["band"] = bnd;
+        doc["step"] = bstep;
+        doc["bw"] = bbw;
         String out;
         serializeJson(doc, out);
         write_spiffs_file(RADIO_STATE_FILE, out);  /* blocking flash write + encoder detach, outside the mutex */
@@ -1486,12 +1629,13 @@ static const Skill radio_skill = {
  * mutex needed. Anything missing, unparseable, schema-mismatched or out of range
  * is ignored, leaving the FM defaults in place. Never marks the state dirty.
  *
- * v2 stores the selected band index rather than the raw mode, so the reapply runs
- * through the same per-band path (apply_band_locked) as /radio/band: the saved
- * frequency is validated against that band's own min/max — which is what lets an
- * SW or SSB frequency survive a reboot (the old fixed-window check rejected them
- * and fell back to FM). A v1 file has no "band" and is rejected by the version
- * check above, resetting to the FM defaults.
+ * The stored band index drives the reapply through the same per-band path
+ * (apply_band_locked) as /radio/band: the saved frequency is validated against that
+ * band's own min/max — which is what lets an SW or SSB frequency survive a reboot
+ * (the old fixed-window check rejected them and fell back to FM). v3 additionally
+ * restores the band's live demod mode and its step/bandwidth cursors (set BEFORE the
+ * reapply so apply_band_locked reads them). An older-version file is rejected by the
+ * version check above, resetting to the FM defaults.
  */
 static void radio_restore_state() {
     String raw = read_spiffs_file(RADIO_STATE_FILE);
@@ -1504,7 +1648,10 @@ static void radio_restore_state() {
     int band   = doc["band"]   | -1;
     int freq   = doc["freq"]   | -1;
     int volume = doc["volume"] | -1;
-    int bfo    = doc["bfo"]     | 0;
+    int bfo    = doc["bfo"]    | 0;
+    int smode  = doc["mode"]   | -1;
+    int sstep  = doc["step"]   | -1;
+    int sbw    = doc["bw"]     | -1;
 
     /* Reject anything malformed — a single bad field falls back to the defaults. */
     if (band < 0 || band >= BAND_COUNT) return;
@@ -1517,14 +1664,34 @@ static void radio_restore_state() {
     if (f < b->minFreq) f = b->minFreq;
     if (f > b->maxFreq) f = b->maxFreq;
 
+    /* Restore the band's live demod mode: a native-FM band is always FM (locked); any
+     * other band takes a saved AM/LSB/USB, else falls back to its native default. The
+     * step/bw cursors are then clamped to that mode's tables (bad -> mode default).
+     * All three are set before apply_band_locked, which reads band_mode/step/bw. */
+    uint8_t rmode;
+    if (b->mode == RADIO_MODE_FM) {
+        rmode = RADIO_MODE_FM;
+    } else if (smode == RADIO_MODE_AM || smode == RADIO_MODE_LSB || smode == RADIO_MODE_USB) {
+        rmode = (uint8_t)smode;
+    } else {
+        rmode = b->mode;
+    }
+    band_mode[band] = rmode;
+    band_step_idx[band] = (sstep >= 0 && sstep < stepCount(rmode))
+                              ? (uint8_t)sstep : defaultStepIdx[rmode];
+    band_bw_idx[band]   = (sbw  >= 0 && sbw  < bwCount(rmode))
+                              ? (uint8_t)sbw  : defaultBwIdx[rmode];
+
     /* Volume must be set before apply_band_locked, which reapplies it to the chip. */
     radio_volume  = (uint8_t)volume;
     band_freq[band] = f;
     apply_band_locked((uint8_t)band, f);
 
-    /* apply_band_locked zeroes the BFO on every band change; a valid saved offset
-     * on an SSB band is reapplied here so fine-tuning survives the reboot. */
-    if (radio_is_ssb(b->mode) && bfo >= -RADIO_BFO_MAX && bfo <= RADIO_BFO_MAX) {
+    /* apply_band_locked zeroes the BFO on every band change; a valid saved offset is
+     * reapplied here so SSB fine-tuning survives the reboot. Gate on the RESTORED
+     * demod (rmode), not the band's native mode — a mode switch may have moved the
+     * band into or out of SSB. */
+    if (radio_is_ssb(rmode) && bfo >= -RADIO_BFO_MAX && bfo <= RADIO_BFO_MAX) {
         radio_bfo = bfo;
         rx.setSSBBfo(-bfo);
     }
@@ -1583,6 +1750,7 @@ static void skill_radio_init() {
      * 0 (FM VHF); the boot FM tune above matches band 0's mode. */
     for (uint8_t i = 0; i < BAND_COUNT; i++) {
         band_freq[i] = bands[i].defFreq;
+        band_mode[i] = bands[i].mode;  /* live demod starts at the band's native mode */
         band_step_idx[i] = defaultStepIdx[bands[i].mode];
         band_bw_idx[i]   = defaultBwIdx[bands[i].mode];
     }
