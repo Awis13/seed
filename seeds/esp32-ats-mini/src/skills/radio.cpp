@@ -20,7 +20,7 @@
  *   POST /radio/tune    — tune: {mode:"FM"|"AM"|"LSB"|"USB", freq:<int>, bfo?:<int>}
  *   POST /radio/band    — jump to a band-plan preset: {idx:<int>}
  *   POST /radio/scan    — blocking band sweep in the current mode: {from,to,step,min_rssi?}
- *   GET  /radio/status  — current freq/mode/RSSI/SNR (+bfo in SSB)
+ *   GET  /radio/status  — current freq/mode/RSSI/SNR (+bfo in SSB, +RDS in FM)
  */
 
 #include <SI4735.h>
@@ -70,6 +70,13 @@
  * pauses without audible chatter.
  */
 #define RADIO_SQUELCH_POLL_MS 250
+
+/*
+ * RDS poll cadence (FM only). getRdsStatus() is an I2C round-trip taken under
+ * radio_mtx from radio_tick(); 250 ms keeps the station name/RadioText fresh
+ * without hammering the bus or fighting the squelch poll for the mutex.
+ */
+#define RADIO_RDS_POLL_MS 250
 
 /*
  * Radio-state persistence. The last-tuned mode/freq/volume/bfo are stashed in a
@@ -227,13 +234,62 @@ static uint8_t bwCount(uint8_t mode) {
 }
 
 /* --- Receiver + state (file-local) --- */
-static SI4735 rx;
+/*
+ * Thin subclass over the vendor driver to fix two RDS getters that are broken in
+ * this library version (2.1.8): getRdsPI() returns only the low byte and
+ * getRdsProgramType() only 3 bits, because the full Block A/B words live in the
+ * protected currentRdsStatus struct. We reach into it directly (public inheritance,
+ * the field is protected) and assemble the correct 16-bit PI and 5-bit PTY. No
+ * IRAM footprint: this is plain flash/DRAM code, no IRAM_ATTR. */
+class RadioSI4735 : public SI4735 {
+public:
+    /* Full 16-bit Program Identification from Block A (valid only once Block A has
+     * been received; 0 otherwise so callers can treat 0 as "no PI yet"). */
+    uint16_t getRdsPIFixed() {
+        return (getRdsReceived() && getRdsNewBlockA())
+            ? (uint16_t)((currentRdsStatus.resp.BLOCKAH << 8) | currentRdsStatus.resp.BLOCKAL)
+            : 0;
+    }
+    /* 5-bit Program Type from bits 4..0 of the group-type field in Block B. */
+    uint8_t getRdsPTYFixed() {
+        uint16_t b = (uint16_t)((currentRdsStatus.resp.BLOCKBH << 8) | currentRdsStatus.resp.BLOCKBL);
+        return (uint8_t)((b >> 5) & 0x1F);
+    }
+    /* Wipe the chip's group-0A (station name) and 2A (RadioText) buffers. The base
+     * clearRdsBuffer* are protected; expose them so a retune can drop stale text. */
+    void clearRdsTextFixed() { clearRdsBuffer0A(); clearRdsBuffer2A(); }
+};
+static RadioSI4735 rx;
 static uint16_t radio_freq;              /* current frequency (FM: 10 kHz units, AM/SSB: kHz) */
 static uint8_t  radio_mode;              /* RADIO_MODE_FM | _LSB | _USB | _AM */
 static uint8_t  radio_volume = 40;       /* 0..63 */
 static bool     radio_ok = false;        /* true once the SI4732 answered on I2C */
 static bool     radio_ssb_loaded = false;/* true while the SSB patch is live in chip RAM */
 static int      radio_bfo = 0;           /* current BFO offset in Hz (SSB only) */
+
+/*
+ * RDS decode state (FM only; ephemeral, never persisted). Filled by the throttled
+ * RDS poll in radio_tick() under radio_mtx, read out by radio_get_rds() and
+ * /radio/status. rds_ps is the 8-char station name, rds_rt the 64-char RadioText.
+ * got_rds latches true once any RDS group has been decoded on the current station;
+ * all fields are cleared on every retune / band change / mode change via
+ * rds_reset_locked() so a stale name can never survive a move off the frequency.
+ * Written only under radio_mtx (or single-tasked at boot). */
+static char     rds_ps[9]  = "";         /* PS station name (8 chars + NUL) */
+static char     rds_rt[65] = "";         /* RadioText (64 chars + NUL) */
+static uint16_t rds_pi     = 0;          /* Program Identification (16-bit) */
+static uint8_t  rds_pty    = 0;          /* Program Type (5-bit) */
+static bool     got_rds    = false;      /* true once any RDS group decoded here */
+
+/* Clear the local RDS snapshot. Caller holds radio_mtx (or is single-tasked at
+ * boot), same contract as apply_*_locked — never nests another lock. */
+static void rds_reset_locked() {
+    got_rds = false;
+    rds_ps[0] = 0;
+    rds_rt[0] = 0;
+    rds_pi = 0;
+    rds_pty = 0;
+}
 
 /*
  * Layered audio mute + squelch state. See radio_set_mute() for the OR layering.
@@ -580,7 +636,7 @@ static const SkillEndpoint radio_endpoints[] = {
     {"POST", "/radio/config", "Set mode/step/bandwidth/squelch/mute/DSP: {mode?:\"AM\"|\"LSB\"|\"USB\", step_idx?:<int>, bw_idx?:<int>, squelch?:0-127, squelch_snr?:<bool>, mute?:<bool>, agc?:<int>, avc?:<even 12-90>, softmute?:0-32, cal?:<-2000-2000 SSB>}"},
     {"POST", "/radio/volume", "Set volume: {volume:0-63}"},
     {"POST", "/radio/scan",   "Sweep current-mode band: {from,to,step,min_rssi?} -> RSSI/SNR per step"},
-    {"GET",  "/radio/status", "Current freq/mode/RSSI/SNR (+bfo in SSB)"},
+    {"GET",  "/radio/status", "Current freq/mode/RSSI/SNR (+bfo in SSB, +RDS ps/rt/pi/pty in FM)"},
     {"GET",  "/radio/memory", "List occupied memory slots: {count, slots:[{slot,band,freq,mode,freq_display}]}"},
     {"POST", "/radio/memory", "Save/recall/clear a memory slot: {slot:1-99, action:\"save\"|\"recall\"|\"clear\"}"},
     {NULL, NULL, NULL}
@@ -597,7 +653,7 @@ static const char *radio_describe() {
            "| POST | /radio/config | Set mode/step/bandwidth + squelch/mute + DSP: `{\"mode\":\"AM|LSB|USB\",\"step_idx\":<int>,\"bw_idx\":<int>,\"squelch\":<0..127>,\"squelch_snr\":<bool>,\"mute\":<bool>,\"agc\":<int>,\"avc\":<even 12..90>,\"softmute\":<0..32>,\"cal\":<-2000..2000>}` |\n"
            "| POST | /radio/volume | Set volume: `{\"volume\":<0..63>}` |\n"
            "| POST | /radio/scan | Blocking band sweep in the current mode: `{\"from\":<int>,\"to\":<int>,\"step\":<int>,\"min_rssi\":<int>}` |\n"
-           "| GET | /radio/status | Current freq, mode, RSSI, SNR (+bfo in SSB) |\n"
+           "| GET | /radio/status | Current freq, mode, RSSI, SNR (+bfo in SSB; +RDS `rds_ps`/`rds_rt`/`pi`/`pty` in FM) |\n"
            "| GET | /radio/memory | List occupied memory slots |\n"
            "| POST | /radio/memory | Save/recall/clear a memory slot |\n\n"
            "### Frequency units\n\n"
@@ -920,6 +976,23 @@ void radio_get_signal(uint8_t *rssi, uint8_t *snr) {
 }
 
 /*
+ * Copy out the current RDS snapshot for the display (FM only; consumed by C2). Takes
+ * radio_mtx briefly to copy a coherent snapshot, mirroring radio_get_signal — the
+ * caller (the TFT task) must grab this BEFORE any display_mtx to keep the lock order
+ * radio_mtx -> display_mtx. Any out pointer may be NULL. *valid reports whether any
+ * RDS has been decoded on the current station; off FM the snapshot is empty/false. */
+void radio_get_rds(char *ps, size_t ps_len, char *rt, size_t rt_len,
+                   uint16_t *pi, uint8_t *pty, bool *valid) {
+    xSemaphoreTake(radio_mtx, portMAX_DELAY);
+    if (ps && ps_len) { strncpy(ps, rds_ps, ps_len - 1); ps[ps_len - 1] = 0; }
+    if (rt && rt_len) { strncpy(rt, rds_rt, rt_len - 1); rt[rt_len - 1] = 0; }
+    if (pi)    *pi    = rds_pi;
+    if (pty)   *pty   = rds_pty;
+    if (valid) *valid = got_rds;
+    xSemaphoreGive(radio_mtx);
+}
+
+/*
  * Layered audio mute. Three request layers — MAIN (the user/HTTP mute toggle),
  * SQUELCH (the signal gate) and TEMP (a one-shot transient mute) — are OR-ed: the
  * audio is muted whenever ANY layer wants it, a pared-down take on the reference
@@ -1088,17 +1161,25 @@ static void apply_band_locked(uint8_t idx, uint16_t freq) {
         /* Zero the BFO here; the calibration trim is folded in by apply_cal_locked()
          * at the tail, once radio_mode/radio_band_idx below name the new target. */
         radio_bfo = 0;
+        rds_reset_locked();  /* no RDS off FM: drop any stale snapshot */
     } else if (mode == RADIO_MODE_FM) {
         rx.setFM(b->minFreq, b->maxFreq, freq, stepsForMode(mode)[sidx].step);
         /* Match /radio/tune's post-setFM config: 50 us de-emphasis. The FM AGC is
          * (re)applied from the per-mode store in the unified DSP block below. */
         rx.setFMDeEmphasis(1);
+        /* Bring up RDS on this FM tune. RdsInit clears the chip's RDS buffers;
+         * setRdsConfig(RDSEN=1, block-error thresholds 2 = accept up to ~5 bit
+         * errors, matching the reference) enables decode. Then wipe our snapshot. */
+        rx.RdsInit();
+        rx.setRdsConfig(1, 2, 2, 2, 2);
+        rds_reset_locked();
         radio_ssb_loaded = false;  /* SSB patch is dropped when we leave SSB */
         radio_bfo = 0;
     } else {  /* AM (MW / SW broadcast) */
         rx.setAM(b->minFreq, b->maxFreq, freq, stepsForMode(mode)[sidx].step);
         radio_ssb_loaded = false;  /* SSB patch is dropped when we leave SSB */
         radio_bfo = 0;
+        rds_reset_locked();  /* no RDS off FM: drop any stale snapshot */
     }
     /* A mode change can reset the chip volume to its power-on default AND clear the
      * DSP soft-mute. Skip pushing volume to the chip while MAIN-muted; the value is
@@ -1418,6 +1499,10 @@ static void radio_register_routes(AsyncWebServer &server) {
              * matching the ref's doAgc(0)). */
             rx.setFMDeEmphasis(1);
             apply_agc_locked(RADIO_MODE_FM);
+            /* Enable RDS decode for this FM station (see apply_band_locked). */
+            rx.RdsInit();
+            rx.setRdsConfig(1, 2, 2, 2, 2);
+            rds_reset_locked();
             xSemaphoreGive(radio_mtx);
             radio_ssb_loaded = false;  /* SSB patch is dropped when we leave SSB */
         } else if (strcmp(mode_str, "AM") == 0) {
@@ -1434,6 +1519,7 @@ static void radio_register_routes(AsyncWebServer &server) {
             }
             xSemaphoreTake(radio_mtx, portMAX_DELAY);
             rx.setAM(RADIO_AM_MIN, RADIO_AM_MAX, (uint16_t)freq, 10);
+            rds_reset_locked();  /* no RDS off FM: drop any stale snapshot */
             xSemaphoreGive(radio_mtx);
             radio_ssb_loaded = false;  /* SSB patch is dropped when we leave SSB */
         } else if (strcmp(mode_str, "LSB") == 0 || strcmp(mode_str, "USB") == 0) {
@@ -1461,6 +1547,7 @@ static void radio_register_routes(AsyncWebServer &server) {
              * calibration folded in) runs in the common block below, once radio_mode
              * names the new sideband so apply_cal_locked() picks the right cal slot. */
             radio_bfo = req_bfo;
+            rds_reset_locked();  /* no RDS off FM: drop any stale snapshot */
             xSemaphoreGive(radio_mtx);
         } else {
             req->send(400, "application/json", "{\"error\":\"mode must be FM, AM, LSB or USB\"}");
@@ -2033,6 +2120,13 @@ static void radio_register_routes(AsyncWebServer &server) {
                                ? (lmode == RADIO_MODE_USB ? band_usb_cal[radio_band_idx]
                                                           : band_lsb_cal[radio_band_idx])
                                : 0;
+        /* RDS snapshot, copied under the same hold (FM only; reported below). char[]
+         * copies keep ArduinoJson from aliasing the file-local buffers. */
+        char rds_ps_snap[9]; char rds_rt_snap[65];
+        strncpy(rds_ps_snap, rds_ps, sizeof(rds_ps_snap)); rds_ps_snap[8] = 0;
+        strncpy(rds_rt_snap, rds_rt, sizeof(rds_rt_snap)); rds_rt_snap[64] = 0;
+        uint16_t rds_pi_snap = rds_pi;
+        uint8_t  rds_pty_snap = rds_pty;
         xSemaphoreGive(radio_mtx);
 
         char freq_display[24];
@@ -2065,6 +2159,14 @@ static void radio_register_routes(AsyncWebServer &server) {
         if (!lmode_fm) {
             doc["avc"] = avc_snap;
             doc["softmute"] = sm_snap;
+        }
+        /* RDS is an FM-broadcast feature; report the decoded fields only in FM. pi is
+         * the numeric 16-bit Program Identification, pty the 5-bit Program Type. */
+        if (lmode_fm) {
+            doc["rds_ps"] = rds_ps_snap;
+            doc["rds_rt"] = rds_rt_snap;
+            doc["pi"] = rds_pi_snap;
+            doc["pty"] = rds_pty_snap;
         }
         String response;
         serializeJson(doc, response);
@@ -2518,6 +2620,13 @@ static void radio_tick() {
                 }
                 radio_freq = rx.getFrequency();
                 radio_mark_dirty();  /* encoder retune -> schedule a debounced persist */
+                /* Leaving the old frequency: the station name/RadioText no longer
+                 * apply. Clear our snapshot and the chip's group buffers so a stale
+                 * PS can't linger while the new station's RDS refills. */
+                if (radio_mode == RADIO_MODE_FM) {
+                    rds_reset_locked();
+                    rx.clearRdsTextFixed();
+                }
             }
         } else {
             /* Volume follows the raw count for precise +/-1 steps. */
@@ -2563,6 +2672,34 @@ static void radio_tick() {
             else if (val < thr && !mute_squelch)  radio_set_mute(MUTE_SQUELCH, true);
         } else if (mute_squelch) {
             radio_set_mute(MUTE_SQUELCH, false);  /* threshold cleared -> unmute */
+        }
+        xSemaphoreGive(radio_mtx);
+    }
+
+    /* 3c) RDS: throttled decode poll, FM only. Hard-gated on radio_mode == FM so
+     * getRdsStatus/get* are never issued on AM/SSB (RDS is an FM-broadcast feature).
+     * One radio_mtx hold, no delay(): read signal quality, skip the whole poll on a
+     * weak signal (SNR < 12 dB) — cheap RDS on noise is garbage and wastes I2C — then
+     * pull the RDS status and, only when the decoder reports sync + a fresh group,
+     * copy out PS / RadioText / PI / PTY into the local snapshot. */
+    static uint32_t last_rds_ms = 0;
+    if (radio_ok && radio_mode == RADIO_MODE_FM && millis() - last_rds_ms > RADIO_RDS_POLL_MS) {
+        last_rds_ms = millis();
+        xSemaphoreTake(radio_mtx, portMAX_DELAY);
+        rx.getCurrentReceivedSignalQuality();
+        if (rx.getCurrentSNR() >= 12) {  /* gate: weak signal => skip (saves I2C, cuts garbage) */
+            rx.getRdsStatus();
+            if (rx.getRdsReceived() && rx.getRdsSync() && rx.getRdsSyncFound()) {
+                const char *ps = rx.getRdsStationName();
+                if (ps) { strncpy(rds_ps, ps, 8); rds_ps[8] = 0; got_rds = true; }
+                /* RadioText: version B carries it in getRdsText2B, version A in the
+                 * program-information (2A) buffer. */
+                const char *rt = rx.getRdsVersionCode() ? rx.getRdsText2B()
+                                                        : rx.getRdsProgramInformation();
+                if (rt) { strncpy(rds_rt, rt, 64); rds_rt[64] = 0; }
+                rds_pi  = rx.getRdsPIFixed();
+                rds_pty = rx.getRdsPTYFixed();
+            }
         }
         xSemaphoreGive(radio_mtx);
     }
@@ -2789,6 +2926,12 @@ static void skill_radio_init() {
      * index 0 = AGC on, no attenuation). Single-tasked at boot: no lock needed. */
     rx.setFMDeEmphasis(1);
     apply_agc_locked(RADIO_MODE_FM);
+    /* Enable RDS decode for the boot FM band (see apply_band_locked). Single-tasked
+     * here, so rds_reset_locked() runs without the mutex. radio_restore_state() below
+     * re-runs apply_band_locked, which re-inits RDS if the saved band is FM. */
+    rx.RdsInit();
+    rx.setRdsConfig(1, 2, 2, 2, 2);
+    rds_reset_locked();
     radio_freq = 10000;
     radio_mode = RADIO_MODE_FM;
 
