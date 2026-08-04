@@ -163,7 +163,13 @@ static const char *serial_describe() {
            "read and write over HTTP; the device sees an ordinary serial port.\n";
 
     if (hw.cap_lora1262) {
-        char gnss[512];
+        // 1024 and not 512. At 512 this snprintf needed 777 bytes and silently
+        // wrote 511, and because this section is the last thing in GET /skill
+        // the whole tail of the document went missing on any node with the cap
+        // fitted — which is the only kind of node that reaches this branch at
+        // all. The live node was serving a file that ended mid-word. The
+        // compiler had been reporting it as -Wformat-truncation the whole time.
+        char gnss[1024];
         snprintf(gnss, sizeof(gnss),
                  "\n### There is a GNSS on this node right now\n\n"
                  "A Cap LoRa-1262 was detected at boot, and its ATGM336H sits on\n"

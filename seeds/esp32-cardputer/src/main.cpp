@@ -132,11 +132,15 @@
 // key event. That makes the pin externally driven, which is why the gpio skill
 // refuses it — two chips pushing one net is not a thing to expose over HTTP.
 //
-// The ESP32 side, however, does NOT listen. M5Cardputer's Keyboard_Class::begin()
-// constructs TCA8418KeyboardReader with its interrupt_pin argument defaulted, and
-// the default is -1; the reader's begin() only calls pinMode()/attachInterruptArg()
-// when that value is >= 0. So nothing here configures GPIO11 or attaches an ISR to
-// it, and no earlier claim that M5Cardputer "claims" this pin was correct.
+// The ESP32 side DOES listen, and an earlier revision of this file claimed
+// twice that it does not. The claim came from reading only the declaration:
+// TCA8418KeyboardReader's interrupt_pin argument defaults to -1 in the header,
+// but the constructor BODY replaces any negative value with the library's
+// DEFAULT_TCA8418_INT_PIN, which is 11 — this pin. The reader's begin() then
+// takes the >= 0 branch and does pinMode(INPUT) plus attachInterruptArg() on
+// CHANGE. Reading a line that another chip drives is not contention, and it is
+// how key events get here at all; the gpio skill's refusal above is about
+// WRITING it, which is still the right call.
 #define PIN_KB_INT      11
 
 // ES8311 audio codec, I2S side. Nothing here drives I2S: M5Unified only
@@ -168,6 +172,13 @@
 // defaults to 0, so the pin is idle at runtime. Idle, not free: the supply
 // behind it is gated by GPIO38 and anything that lights the LED takes the pin
 // back, which is why it is not on the safe list below.
+//
+// The #undef is not tidying: the generic esp32s3 variant's pins_arduino.h, which
+// Arduino.h drags in above, already defines this name as 48 for a devkit's
+// on-board LED. Redefining it over the top is what we want — 48 is meaningless
+// here — but doing it silently is not, so the collision is acknowledged rather
+// than left as a compiler warning that trains everyone to ignore warnings.
+#undef PIN_RGB_LED
 #define PIN_RGB_LED     21
 
 // UART broken out on the EXT 2.54-14P expansion header. Nothing on the
@@ -593,6 +604,10 @@ static bool ap_active = false;
 static String ap_password = "";
 static bool ap_temporary = false;
 static unsigned long ap_expires_at = 0;
+// Set when a keyboard-raised AP failed to come up, so the menu entry can say so
+// instead of reading "off" as though nothing had been asked. Cleared by the
+// next successful raise.
+static bool ap_start_failed = false;
 
 // Whole minutes left on a time-boxed session, rounded up so it never reads 0
 // while the AP is still up. Zero means a session that does not expire.
@@ -609,13 +624,37 @@ static unsigned long ap_minutes_left() {
 // before the UI section below. Written from loop() context only.
 static bool ui_force = false;
 
-static String wifi_ssid = "";
-static String wifi_pass = "";
+// Stored WiFi credentials.
+//
+// FIXED BUFFERS, NOT String, AND THAT IS THE WHOLE POINT. These are written on
+// the AsyncTCP task by handle_wifi_post() and read on the loop task by
+// ui_field() and the reconnect timer, and ui_field() is itself also called from
+// AsyncTCP by handle_ui() — three readers, one of them concurrent with the
+// writer by construction, since provisioning is exactly when the panel is
+// showing the network screen. As Strings, `wifi_ssid = ssid` frees the old
+// heap buffer and installs a new one, so a reader holding the pointer that
+// c_str() handed it a moment earlier reads freed memory. Sized to the protocol
+// maxima: SSID 32 octets, WPA2 passphrase 63, plus a terminator each.
+//
+// A fixed array cannot move and is never freed, so a reader can at worst catch
+// a half-written value and print a garbled line for one 200ms tick. Every
+// writer below goes through snprintf() into the full array, which keeps a
+// terminator inside the bounds at all times, so even that case stays a string.
+// Copying out per call would not have been better: the copy would race the same
+// way, and it would put 96 bytes on the stack of a task that has to be frugal.
+static char wifi_ssid[33] = "";
+static char wifi_pass[65] = "";
 
 // OTA state
 static bool firmware_confirmed = false;
 static bool firmware_confirm_attempted = false;
-static bool ota_in_progress = false;
+// Written on the AsyncTCP task, in handle_firmware_upload_body(), and read on
+// the loop task, by the stall watchdog at the bottom of loop(). Hence volatile:
+// without it the compiler is entitled to hoist the read out of loop() and cache
+// it in a register, since nothing in loop()'s own control flow can change it,
+// and the watchdog would then be testing a snapshot taken at an arbitrary
+// earlier time. The same applies to ota_last_chunk_ms below.
+static volatile bool ota_in_progress = false;
 static bool ota_upload_started = false;
 static bool ota_upload_ok = false;
 static bool ota_upload_error = false;
@@ -626,8 +665,10 @@ static size_t ota_bytes_written = 0;
 // on their own.
 static AsyncWebServerRequest *ota_owner = nullptr;
 // millis() of the last body chunk received, for the abandoned-upload watchdog
-// in loop(). Only meaningful while ota_in_progress.
-static unsigned long ota_last_chunk_ms = 0;
+// in loop(). Only meaningful while ota_in_progress. Volatile for the reason
+// given above, and additionally because the watchdog's comparison must read it
+// exactly once: see the signed subtraction there.
+static volatile unsigned long ota_last_chunk_ms = 0;
 static volatile bool pending_restart = false;
 static volatile bool pending_rollback = false;
 
@@ -767,8 +808,12 @@ static void wifi_load_config() {
     if (json.length() == 0) return;
     JsonDocument doc;
     if (deserializeJson(doc, json) != DeserializationError::Ok) return;
-    wifi_ssid = doc["ssid"].as<String>();
-    wifi_pass = doc["password"].as<String>();
+    // as<const char*>() answers null for a missing or non-string key, which
+    // snprintf would happily render as "(null)" into the credential itself.
+    const char *ssid = doc["ssid"].as<const char *>();
+    const char *pass = doc["password"].as<const char *>();
+    snprintf(wifi_ssid, sizeof(wifi_ssid), "%s", ssid ? ssid : "");
+    snprintf(wifi_pass, sizeof(wifi_pass), "%s", pass ? pass : "");
 }
 
 static bool wifi_save_config(const String &ssid, const String &pass) {
@@ -868,6 +913,7 @@ static void ap_start(bool manual) {
         return;
     }
     ap_active = true;
+    ap_start_failed = false;
     ap_temporary = manual;
     ap_expires_at = millis() + AP_SESSION_MS;
     ap_seen_sta_down = (WiFi.status() != WL_CONNECTED);
@@ -930,8 +976,8 @@ static void wifi_setup() {
     configTzTime(tz_string.c_str(), "pool.ntp.org", "time.nist.gov");
 
     wifi_load_config();
-    if (wifi_ssid.length() > 0) {
-        WiFi.begin(wifi_ssid.c_str(), wifi_pass.c_str());
+    if (wifi_ssid[0]) {
+        WiFi.begin(wifi_ssid, wifi_pass);
         int attempts = 0;
         while (WiFi.status() != WL_CONNECTED && attempts < 20) {
             delay(500);
@@ -1074,19 +1120,38 @@ static_assert(UI_MENU_COUNT <= UI_ROWS, "menu does not scroll: keep it within UI
 // All of it single-word scalars, written from loop() and read from loop() plus
 // the AsyncTCP task in handle_ui(). Aligned word loads and stores do not tear,
 // so the endpoint's worst case is a value one tick (200ms) out of date, which
-// for a status report is a non-problem. Nothing here is a pointer or a String
-// that a reader could catch mid-reassignment — see ui_field()'s `redact`
-// argument for the one value that would have been.
+// for a status report is a non-problem.
+//
+// This block used to claim that nothing anywhere on the /ui path was a String a
+// reader could catch mid-reassignment. That was wrong, and it was wrong in the
+// dangerous direction: ui_field() reads the stored WiFi credentials, which the
+// provisioning POST rewrites from the AsyncTCP task. Strings there are now fixed
+// buffers — see wifi_ssid above — precisely so the claim can be true. What is
+// still NOT covered is ap_ssid and ap_password, which ui_field() also reads as
+// Strings; those are only ever written from loop(), in ap_start()/ap_stop(), so
+// the /ui reader on AsyncTCP is the only cross-task reader of them and a raise
+// or drop concurrent with a report remains a real (if narrow) window. Recorded
+// rather than claimed away.
 static bool ui_ready = false;          // panel initialised and drawable
-static bool ui_board_detected = false; // M5 identified this board as an ADVANCE
+// What M5GFX's panel autodetection actually answered, as opposed to what
+// M5.getBoard() reports after cfg.fallback_board has papered over a failure.
+// See ui_begin() for why only one of those two can report a failure at all.
+static bool ui_board_detected = false;
+// Whether a keyboard reader was installed. Deliberately a separate flag from
+// the one above: the reader is chosen by M5.getBoard(), so it is installed
+// whenever the fallback applies, INCLUDING when detection failed. Folding the
+// two together would mean an honest "not detected" silently disabled a keyboard
+// that works.
+static bool ui_keyboard_enabled = false;
 static ui_screen_t ui_screen = UI_STATUS;
 static int ui_menu_index = 0;
 static uint8_t ui_brightness = UI_BRIGHT_DEFAULT;
 // What "on" means for the backlight toggle, so turning it off and on again
 // returns to the brightness the user had chosen rather than to the default.
 static uint8_t ui_brightness_on = UI_BRIGHT_DEFAULT;
-static char ui_last_key = 0;
-static unsigned long ui_last_key_ms = 0;
+// Written on the loop task by ui_handle_key(), read on AsyncTCP by handle_ui().
+static volatile char ui_last_key = 0;
+static volatile unsigned long ui_last_key_ms = 0;
 
 // Per-field render caches: what is currently on the glass, so a tick that
 // changes nothing costs no SPI.
@@ -1114,11 +1179,25 @@ static void ui_uptime(char *out, size_t n) {
 }
 
 // One line summarising where the node can be reached, for the header.
+//
+// The octets are formatted by hand rather than through IPAddress::toString().
+// That method builds and returns a String — a heap allocation, a copy and a
+// free every time — and this function runs on every UI tick, twice per tick on
+// the STATUS screen, which is the header plus the "net" row. At 5Hz that was
+// roughly ten allocate/free pairs a second for the life of the boot, on a board
+// with no PSRAM and a single 300-odd KB heap that also has to find a contiguous
+// 6KB block whenever GET /skill is called. Nothing here needs the heap at all.
 static void ui_net_summary(char *out, size_t n) {
     if (WiFi.status() == WL_CONNECTED) {
-        snprintf(out, n, "%s", WiFi.localIP().toString().c_str());
+        uint32_t ip = (uint32_t)WiFi.localIP();
+        snprintf(out, n, "%u.%u.%u.%u", (unsigned)(ip & 0xFF),
+                 (unsigned)((ip >> 8) & 0xFF), (unsigned)((ip >> 16) & 0xFF),
+                 (unsigned)((ip >> 24) & 0xFF));
     } else if (ap_active) {
-        snprintf(out, n, "AP %s", WiFi.softAPIP().toString().c_str());
+        uint32_t ip = (uint32_t)WiFi.softAPIP();
+        snprintf(out, n, "AP %u.%u.%u.%u", (unsigned)(ip & 0xFF),
+                 (unsigned)((ip >> 8) & 0xFF), (unsigned)((ip >> 16) & 0xFF),
+                 (unsigned)((ip >> 24) & 0xFF));
     } else {
         snprintf(out, n, "offline");
     }
@@ -1132,11 +1211,13 @@ static void ui_menu_state(int i, char *out, size_t n) {
     switch (ui_menu[i].action) {
         case UI_ACT_AP:
             if (!ap_active) {
-                snprintf(out, n, "off");
+                // The two are different things and the user needs to tell them
+                // apart: never asked for, versus asked for and refused.
+                snprintf(out, n, "%s", ap_start_failed ? "failed" : "off");
             } else if (ap_temporary) {
-                snprintf(out, n, "up %lum", ap_minutes_left());
+                snprintf(out, n, "%lum left", ap_minutes_left());
             } else {
-                snprintf(out, n, "up");
+                snprintf(out, n, "up, open");
             }
             break;
         case UI_ACT_BACKLIGHT:
@@ -1195,7 +1276,16 @@ static bool ui_field(ui_screen_t screen, int idx, char *label, size_t label_n,
         case 3:
             if (ap_active) {
                 snprintf(label, label_n, "ap");
-                snprintf(value, value_n, "%s", ap_ssid.c_str());
+                // Which kind of session this is, next to the SSID, because the
+                // two behave differently and the difference matters to somebody
+                // standing here: a keyboard-raised AP closes on a timer, the
+                // boot AP stays up until the node is actually provisioned.
+                if (ap_temporary) {
+                    snprintf(value, value_n, "%s  %lum left", ap_ssid.c_str(),
+                             ap_minutes_left());
+                } else {
+                    snprintf(value, value_n, "%s  stays up", ap_ssid.c_str());
+                }
             } else {
                 snprintf(label, label_n, "heap");
                 snprintf(value, value_n, "%lu KB free",
@@ -1207,10 +1297,11 @@ static bool ui_field(ui_screen_t screen, int idx, char *label, size_t label_n,
                 snprintf(label, label_n, "pw");
                 if (redact) {
                     snprintf(value, value_n, "(on the panel only)");
-                } else if (ap_temporary) {
-                    snprintf(value, value_n, "%s  %lum", ap_password.c_str(),
-                             ap_minutes_left());
                 } else {
+                    // Nothing but the password on this row. The session's
+                    // remaining time moved up to the "ap" row above, where it
+                    // does not compete for width with the one string on this
+                    // screen that has to be transcribed without a typo.
                     snprintf(value, value_n, "%s", ap_password.c_str());
                 }
             } else {
@@ -1228,9 +1319,16 @@ static bool ui_field(ui_screen_t screen, int idx, char *label, size_t label_n,
         case 0:
             snprintf(label, label_n, "ssid");
             if (WiFi.status() == WL_CONNECTED) {
-                snprintf(value, value_n, "%s", WiFi.SSID().c_str());
-            } else if (wifi_ssid.length() > 0) {
-                snprintf(value, value_n, "%s (down)", wifi_ssid.c_str());
+                // Our own copy in preference to WiFi.SSID(), which returns a
+                // String and so allocates on every tick this screen is up. The
+                // two cannot disagree: the only thing that ever associates this
+                // node is WiFi.begin(wifi_ssid, ...). The call is kept as a
+                // fallback purely for the case of a link established by
+                // something other than this firmware.
+                snprintf(value, value_n, "%s",
+                         wifi_ssid[0] ? wifi_ssid : WiFi.SSID().c_str());
+            } else if (wifi_ssid[0]) {
+                snprintf(value, value_n, "%s (down)", wifi_ssid);
             } else {
                 snprintf(value, value_n, "not configured");
             }
@@ -1254,12 +1352,12 @@ static bool ui_field(ui_screen_t screen, int idx, char *label, size_t label_n,
         case 4:
             snprintf(label, label_n, "ap");
             if (!ap_active) {
-                snprintf(value, value_n, "off");
+                snprintf(value, value_n, "%s", ap_start_failed ? "failed to start" : "off");
             } else if (ap_temporary) {
-                snprintf(value, value_n, "%s  %lum", ap_ssid.c_str(),
+                snprintf(value, value_n, "%s  %lum left", ap_ssid.c_str(),
                          ap_minutes_left());
             } else {
-                snprintf(value, value_n, "%s", ap_ssid.c_str());
+                snprintf(value, value_n, "%s  stays up", ap_ssid.c_str());
             }
             return true;
         default:
@@ -1308,14 +1406,25 @@ static bool ui_field(ui_screen_t screen, int idx, char *label, size_t label_n,
             snprintf(value, value_n, "%s", hw.board);
             return true;
         case 1:
-            // M5's own verdict, kept separate from ours on purpose. hw.board
-            // above is this firmware's I2C probe; this row is what
-            // M5.getBoard() answered, and it is what decides whether the
-            // keyboard is read over I2C or scanned as a GPIO matrix. When the
-            // two disagree, that disagreement is the bug report.
+            // M5's own verdict, kept separate from ours on purpose, and stated
+            // as the reading it comes from rather than as a bare verdict.
+            //
+            // Row 0 above is this firmware's answer: an I2C probe that saw, or
+            // did not see, the keyboard controller reply at 0x34. This row is
+            // M5GFX's panel autodetection. They are genuinely independent — one
+            // is the I2C bus, the other is the SPI panel — so when they
+            // disagree, the disagreement is the bug report, and the pair is
+            // worth more than either alone.
+            //
+            // Specifically NOT M5.getBoard(): cfg.fallback_board overwrites an
+            // unknown result with the right answer before that is readable, so
+            // it agrees with us even when nothing was detected at all. See
+            // ui_begin().
             snprintf(label, label_n, "m5");
-            snprintf(value, value_n, "%s",
-                     ui_board_detected ? "CardputerADV" : "NOT DETECTED");
+            snprintf(value, value_n, "%s%s",
+                     ui_board_detected ? "panel: CardputerADV"
+                                       : "panel: NOT DETECTED",
+                     ui_keyboard_enabled ? "" : ", no keys");
             return true;
         case 2:
             snprintf(label, label_n, "cap");
@@ -1341,6 +1450,10 @@ static bool ui_field(ui_screen_t screen, int idx, char *label, size_t label_n,
                 used += snprintf(value + used, value_n - used, "%sG%d",
                                  used ? " " : "", gpio_safe_pins[i]);
             }
+            // Same fallback as the i2c row above. An empty value renders as a
+            // blank cell, which reads as "this row failed to load" rather than
+            // as the real answer, which is that there are no free pins.
+            if (used == 0) snprintf(value, value_n, "none");
             return true;
         }
         default:
@@ -1408,10 +1521,19 @@ static void ui_draw_frame() {
 // scratch: rows carry different labels, the menu paints a coloured selection
 // bar, and painting a new screen over the old one field by field would leave
 // whichever rows the new screen does not use showing the old screen's text.
+// Defined further down with the rest of the keyboard handling; declared here
+// because every screen transition has to flush input and the transitions come
+// first in this file.
+static void ui_input_flush();
+
 static void ui_goto(ui_screen_t screen) {
     if (screen == ui_screen) return;
     ui_screen = screen;
     ui_force = true;
+    // Arrive with no input owing. Anything the controller buffered while the
+    // action that brought us here was running was aimed at the previous screen,
+    // and must not move a selection on this one.
+    ui_input_flush();
 }
 
 static void ui_set_brightness(int value) {
@@ -1430,16 +1552,36 @@ static void ui_activate(int index) {
         ui_goto((ui_screen_t)item.arg);
         break;
     case UI_ACT_AP:
-        // The press-to-raise gesture the AP was always waiting for. Physical
-        // presence at the keyboard authorises provisioning; nothing over the
-        // network can ask for the AP back. Raised this way it is time-boxed.
+        // RAISE ONLY. There is deliberately no user-reachable path to
+        // ap_stop() anywhere in this firmware, and this entry must not become
+        // one again. It used to be a toggle, which on a first boot with no
+        // working credentials was a way to strand the node: the boot AP is then
+        // the only way in and is deliberately never time-boxed (see the note on
+        // AP_SESSION_MS), so one keystroke closed the only door, and re-raising
+        // it from here marks the new session temporary — ten minutes later the
+        // node has neither STA nor AP and only a power cycle recovers it.
+        //
+        // The AP goes down two ways, both automatic and both in ap_poll(): the
+        // STA link coming up after having been down, which means provisioning
+        // succeeded, and a time-boxed session expiring. Pressing this while the
+        // AP is already up is therefore a no-op that just shows the credentials
+        // again, which is what somebody who pressed it wanted anyway.
+        //
+        // Physical presence at the keyboard authorises provisioning; nothing
+        // over the network can ask for the AP back.
+        if (!ap_active) ap_start(true);
         if (ap_active) {
-            ap_stop();
-        } else {
-            ap_start(true);
             // The password is now on the STATUS screen and nowhere else, so go
             // show it rather than leaving the user in the menu.
             ui_goto(UI_STATUS);
+        } else {
+            // ap_start() has two early returns that leave the AP down: the
+            // subnet pin failing and softAP() itself refusing. Navigating
+            // regardless used to land the user on a screen reading "ap: off"
+            // with nothing to say the key had been seen at all. Stay in the
+            // menu, where the entry's own state column now reads "failed".
+            ap_start_failed = true;
+            event_add("setup AP requested from keyboard, but it did not come up");
         }
         break;
     case UI_ACT_BACKLIGHT:
@@ -1466,6 +1608,15 @@ static void ui_activate(int index) {
 //                              keyboard, and because every letter has to stay
 //                              free for a screen that takes text later.
 static void ui_handle_key(char key) {
+    // Only printable ASCII and Enter are recorded or acted on. GET /ui puts
+    // this byte straight into a JSON string, and a mis-decoded FIFO read — a
+    // dropped I2C bit turns one row/column pair into another, and the key map
+    // has entries above 0x7F for the Fn layer — would otherwise emit a lone
+    // high byte, which is not valid UTF-8 and makes the whole document
+    // unparseable for every client, not just that field. Nothing in the
+    // navigation set below is outside this range.
+    if (key != '\n' && (key < 0x20 || key > 0x7E)) return;
+
     ui_last_key = key;
     ui_last_key_ms = millis();
 
@@ -1501,40 +1652,109 @@ static void ui_handle_key(char key) {
     }
 }
 
+// ---- Keyboard edge detection ----
+//
+// THE LIBRARY'S "SOMETHING CHANGED" FLAG IS NOT USABLE AND IS NOT USED HERE.
+// Keyboard_Class::isChange() compares the COUNT of currently-pressed keys
+// against the count it saw last time and nothing else. Two consequences, both
+// reachable by ordinary typing:
+//
+//   1. Press A, then press B while A is still down, then release B. The count
+//      goes 1 -> 2 -> 1, so the release is reported as a change; isPressed() is
+//      still true because A is down; and the last character in the state buffer
+//      is now A. A fires a second time, on a key-up, having never been touched.
+//   2. Any release event the controller drops leaves the count permanently one
+//      too high. From then on every press-release pair looks like the case
+//      above and every keystroke double-fires, for the life of the boot.
+//
+// So this seed keeps its own record of which key codes are currently down and
+// derives the edges itself. A key acts exactly once, when it first appears in
+// the down set, and cannot act again until it has genuinely been released. That
+// also makes a dropped release cost one stuck key rather than corrupting every
+// keystroke that follows.
+#define UI_KEYS_MAX 8
+static char ui_keys_down[UI_KEYS_MAX];
+static uint8_t ui_keys_down_count = 0;
+
+static bool ui_key_was_down(char c) {
+    for (uint8_t i = 0; i < ui_keys_down_count; i++) {
+        if (ui_keys_down[i] == c) return true;
+    }
+    return false;
+}
+
+// Collect the key codes the library currently reports as held, in the same
+// character space ui_handle_key() switches on. Enter is a flag rather than a
+// member of the word buffer, so it is folded in as the newline it is elsewhere.
+static uint8_t ui_keys_snapshot(char *out) {
+    Keyboard_Class::KeysState &state = M5Cardputer.Keyboard.keysState();
+    uint8_t n = 0;
+    if (state.enter && n < UI_KEYS_MAX) out[n++] = '\n';
+    for (auto c : state.word) {
+        if (n >= UI_KEYS_MAX) break;
+        bool dup = false;
+        for (uint8_t i = 0; i < n; i++) {
+            if (out[i] == c) dup = true;
+        }
+        if (!dup) out[n++] = c;
+    }
+    return n;
+}
+
+// Discard whatever the keyboard has queued and re-baseline the down set to what
+// is held right now, so that nothing typed before this moment can act after it.
+//
+// This exists because ui_activate() can block for a long time — raising the
+// softAP is hundreds of milliseconds — and the controller buffers key events in
+// a hardware FIFO throughout. Without this, keys pressed while the node was busy
+// arrive afterwards and drive whichever screen the action navigated to. The
+// drain is bounded: the TCA8418's FIFO holds ten events, update() retires at
+// most one per call, and a call with nothing pending is a flag test.
+static void ui_input_flush() {
+    if (!ui_keyboard_enabled) return;
+    for (int i = 0; i < 12; i++) M5Cardputer.update();
+    ui_keys_down_count = ui_keys_snapshot(ui_keys_down);
+}
+
 // Read the keyboard. Cheap to call every loop: the reader only touches I2C when
 // its ISR flag is set, so an idle keyboard costs a flag test.
 //
-// KNOWN DEFECT, recorded here rather than fixed, because fixing it is a change
-// to the keyboard and not to anything this commit adds. That flag is never set.
-// M5Cardputer's Keyboard_Class::begin() builds its TCA8418 reader with the
-// interrupt pin defaulted to -1 (see PIN_KB_INT above), so the reader attaches
-// no ISR; its update() returns early on !_isr_flag forever, the key list it
-// feeds is never written, and keysState() therefore stays empty. The chip does
-// assert its INT line — the driver enables that — but nothing on this side is
-// watching it, so no key press reaches ui_handle_key() and the on-device menu
-// cannot be driven. The fix is to install the reader explicitly with the pin,
-// and it needs somebody at the device to verify, since a key has to be pressed.
-// /ui reporting an empty last_key on a node that has been used is the symptom.
+// On the interrupt, which an earlier revision of this file got wrong twice:
+// the reader DOES listen. TCA8418KeyboardReader's constructor takes the pin as
+// a defaulted argument, but the default is not the -1 the header shows — the
+// constructor body normalises any negative value to DEFAULT_TCA8418_INT_PIN,
+// which the library defines as 11 and which is exactly PIN_KB_INT on this
+// board. So begin() does run pinMode()/attachInterruptArg() on GPIO11, the ISR
+// does set the flag, and installing the reader by hand to pass the same pin
+// would change nothing. Reading an externally driven line is not contention;
+// nothing here drives it.
 static void ui_key_poll() {
-    // No reader was installed at all if the board did not identify — see
+    // No reader was installed at all if M5 did not identify the board — see
     // ui_begin() for why that is on purpose.
-    if (!ui_board_detected) return;
+    if (!ui_keyboard_enabled) return;
     M5Cardputer.update();
-    // isChange() also fires on release, where isPressed() is 0 — that is the
-    // test that stops a held key from repeating on every tick.
-    if (!M5Cardputer.Keyboard.isChange()) return;
-    if (!M5Cardputer.Keyboard.isPressed()) return;
 
-    Keyboard_Class::KeysState &state = M5Cardputer.Keyboard.keysState();
-    char key = 0;
-    if (state.enter) {
-        key = '\n';
-    } else if (!state.word.empty()) {
-        // The last character in the buffer is the one just added, which matters
-        // when a second key goes down before the first comes up.
-        key = state.word.back();
+    char now[UI_KEYS_MAX];
+    uint8_t n = ui_keys_snapshot(now);
+
+    // Down edges only: a code present now that was absent last pass. Key-up
+    // edges fall out of the same diff and are simply not acted on yet.
+    //
+    // Collected before anything is dispatched, and the new baseline committed
+    // before that too, because a handler can call ui_input_flush() by way of
+    // ui_goto() — and a flush that re-baselines the down set must be the last
+    // word on it. Writing the baseline after the dispatch loop instead would
+    // silently undo the flush with this pass's now-stale snapshot.
+    char fired[UI_KEYS_MAX];
+    uint8_t f = 0;
+    for (uint8_t i = 0; i < n; i++) {
+        if (!ui_key_was_down(now[i])) fired[f++] = now[i];
     }
-    if (key) ui_handle_key(key);
+
+    ui_keys_down_count = n;
+    for (uint8_t i = 0; i < n; i++) ui_keys_down[i] = now[i];
+
+    for (uint8_t i = 0; i < f; i++) ui_handle_key(fired[i]);
 }
 
 // One pass of screen work. Everything below is change-detected, so a tick where
@@ -1635,8 +1855,15 @@ static void ui_begin() {
     // and a dark LED at once, with nothing to show that anything went wrong.
     //
     // This does not make detection succeed — it decides what happens when it
-    // does not. ui_board_detected below records which of the two it was, and
-    // /ui and the Hardware screen both report it rather than assuming.
+    // does not. It also destroys the obvious way of asking which happened, and
+    // an earlier revision of this file walked straight into that: M5Unified
+    // substitutes the fallback for an unknown autodetect result BEFORE it
+    // assigns _board, so M5.getBoard() answers board_M5CardputerADV in both
+    // cases and a flag built on it can never report the failure it is named
+    // after. The reading that survives is M5.Display.getBoard(), which is the
+    // raw autodetect answer M5Unified itself is substituting for, and which
+    // stays board_unknown when the panel never replied. That is what
+    // ui_board_detected is taken from below.
     cfg.fallback_board = m5::board_t::board_M5CardputerADV;
 
     // Left at its default of 0 deliberately, which is the value that makes
@@ -1666,14 +1893,34 @@ static void ui_begin() {
     // it returns immediately once _board is set — so it does nothing here but
     // pass the keyboard flag through.
     M5.begin(cfg);
-    ui_board_detected = (M5.getBoard() == m5::board_t::board_M5CardputerADV);
-    M5Cardputer.begin(cfg, ui_board_detected);
+
+    // Two different questions, and they must not share an answer.
+    //
+    // Did autodetection actually work? Only the display can say — see the
+    // fallback note above. This is the flag that is reported, and the one
+    // allowed to say no.
+    ui_board_detected =
+        (M5.Display.getBoard() == m5::board_t::board_M5CardputerADV);
+    // Which reader will Keyboard_Class::begin() install? It asks M5.getBoard(),
+    // so the answer is the TCA8418 reader whenever the fallback applies, which
+    // is always on this build. Gating the keyboard on ui_board_detected instead
+    // would mean a failed panel probe also cost the keys, for no reason: the
+    // keyboard is on I2C and has nothing to do with the panel.
+    ui_keyboard_enabled = (M5.getBoard() == m5::board_t::board_M5CardputerADV);
+    M5Cardputer.begin(cfg, ui_keyboard_enabled);
 
     // width() reads a member and is safe even when autodetection left no panel
     // behind, which is exactly the case that must not reach setRotation().
     ui_ready = (M5.Display.width() > 0 && M5.Display.height() > 0);
-    Serial.printf("[ui] m5 board id %d (%s), panel %s\n", (int)M5.getBoard(),
-                  ui_board_detected ? "CardputerADV" : "NOT the expected board",
+    // Both readings by name, not one verdict. They differ exactly when
+    // autodetection failed and the fallback covered for it, which is the case
+    // worth being able to see from a console.
+    Serial.printf("[ui] m5 display autodetect %d (%s), effective board %d, "
+                  "keyboard %s, panel %s\n",
+                  (int)M5.Display.getBoard(),
+                  ui_board_detected ? "CardputerADV" : "NOT DETECTED, using fallback",
+                  (int)M5.getBoard(),
+                  ui_keyboard_enabled ? "reader installed" : "no reader",
                   ui_ready ? "up" : "NOT initialised");
     if (!ui_ready) return;
 
@@ -1981,7 +2228,13 @@ static void handle_ui(AsyncWebServerRequest *request) {
     JsonDocument doc;
     doc["screen"] = ui_screen_name[ui_screen];
     doc["panel_ready"] = ui_ready;
+    // The panel's own autodetect answer, which is the only one that can come
+    // back negative — M5.getBoard() is covered by cfg.fallback_board. Reported
+    // alongside the independent I2C probe's verdict in board_probed, so that a
+    // caller can see the two agree rather than take one on trust.
     doc["board_detected"] = ui_board_detected;
+    doc["board_probed"] = hw.board;
+    doc["keyboard"] = ui_keyboard_enabled;
     doc["width"] = (int)M5.Display.width();
     doc["height"] = (int)M5.Display.height();
     doc["brightness"] = ui_brightness;
@@ -2016,7 +2269,14 @@ static void handle_ui(AsyncWebServerRequest *request) {
     if (ui_last_key) {
         char k[2] = {ui_last_key, '\0'};
         key["key"] = ui_last_key == '\n' ? "enter" : k;
-        key["ms_ago"] = (unsigned long)(millis() - ui_last_key_ms);
+        // Same cross-task shape as the OTA watchdog, and signed for the same
+        // reason: ui_last_key_ms is stamped on the loop task and read here on
+        // AsyncTCP, so a key pressed between the two reads would otherwise
+        // report an age of about 4.29 billion milliseconds instead of zero.
+        // Only the report is at stake here, not a decision, but a field that
+        // occasionally prints 49 days for a key just pressed is still wrong.
+        long age = (long)(millis() - ui_last_key_ms);
+        key["ms_ago"] = (unsigned long)(age < 0 ? 0 : age);
     }
 
     // The bare keys navigation is on, repeated here so an agent reading /ui can
@@ -2311,7 +2571,20 @@ static void handle_skill(AsyncWebServerRequest *request) {
     String ip = WiFi.status() == WL_CONNECTED
         ? WiFi.localIP().toString() : WiFi.softAPIP().toString();
 
-    String s = "# ESP32 Seed — M5Stack Cardputer ADVANCE\n\n";
+    String s;
+    // Sized from what this actually produces, not from a guess: the live node
+    // answers GET /skill with 14308 bytes today, and the two skills' describe()
+    // blocks below are most of it. Without this the document is assembled by
+    // about 125 successive += on an empty String, and Arduino's String::concat
+    // reserves the exact new length every time, so each one is a realloc that
+    // copies everything written so far and leaves the old block behind. On a
+    // board with no PSRAM and one heap this is the most fragmentation-prone
+    // path in the firmware — it is also the one that then needs a contiguous
+    // 14KB block to hand to the response. One allocation up front instead.
+    // Raise this if the answer outgrows it; overshooting costs a transient
+    // 16KB against a free heap that measures around 195KB.
+    s.reserve(16384);
+    s = "# ESP32 Seed — M5Stack Cardputer ADVANCE\n\n";
     s += "Host: " + ip + ":" + String(HTTP_PORT) + "\n";
     s += "mDNS: " + mdns_name + ".local\n";
     if (ap_active) s += "AP: " + ap_ssid + " (setup mode; the password is on the node's screen)\n";
@@ -2543,13 +2816,15 @@ static void handle_wifi_post(AsyncWebServerRequest *request) {
         return;
     }
     wifi_save_config(ssid, pass);
-    wifi_ssid = ssid;
-    wifi_pass = pass;
+    // Into the fixed buffers rather than at them: see the declaration for why
+    // assigning a String here was a use-after-free for the panel's reader.
+    snprintf(wifi_ssid, sizeof(wifi_ssid), "%s", ssid.c_str());
+    snprintf(wifi_pass, sizeof(wifi_pass), "%s", pass.c_str());
     request->send(200, "text/html",
         "<h2>Saved. Connecting...</h2><p>" + html_escape(ssid) +
         "</p><a href='/'>Back</a>");
     delay(1000);
-    WiFi.begin(wifi_ssid.c_str(), wifi_pass.c_str());
+    WiFi.begin(wifi_ssid, wifi_pass);
 }
 
 // ===== Skills =====
@@ -2725,7 +3000,16 @@ void loop() {
     // genuinely dead upload frees the flash long before anyone retries by
     // hand. A healthy upload puts chunks milliseconds apart and never comes
     // near it.
-    if (ota_in_progress && millis() - ota_last_chunk_ms > OTA_STALL_TIMEOUT_MS) {
+    // The cast is load-bearing and must not be tidied away. ota_last_chunk_ms
+    // is stamped on the AsyncTCP task, which preempts this one: a chunk landing
+    // between the millis() call and the subtraction leaves the stamp NEWER than
+    // the reading it is subtracted from. In unsigned arithmetic that difference
+    // does not go negative, it wraps to about 4.29 billion, sails past the
+    // timeout and aborts a perfectly healthy upload. Evaluated as signed, the
+    // same case is a small negative number and correctly reads as "not stalled".
+    // The signed form is also what survives the millis() rollover at 49.7 days.
+    if (ota_in_progress &&
+        (long)(millis() - ota_last_chunk_ms) > (long)OTA_STALL_TIMEOUT_MS) {
         Update.abort();
         ota_in_progress = false;
         // Releases the slot for the next uploader. The dead request is gone; a
@@ -2742,9 +3026,9 @@ void loop() {
 
     // WiFi reconnect
     static unsigned long last_wifi = 0;
-    if (wifi_ssid.length() > 0 && WiFi.status() != WL_CONNECTED &&
+    if (wifi_ssid[0] && WiFi.status() != WL_CONNECTED &&
         millis() - last_wifi > 30000) {
-        WiFi.begin(wifi_ssid.c_str(), wifi_pass.c_str());
+        WiFi.begin(wifi_ssid, wifi_pass);
         last_wifi = millis();
     }
 
