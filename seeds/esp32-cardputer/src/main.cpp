@@ -3,10 +3,16 @@
 // The Cardputer port of the ESP32 seed: just enough to boot, connect, and let
 // an AI agent grow it via OTA firmware uploads.
 //
-// This is the bring-up commit. The ST7789 panel, the TCA8418 keyboard and the
-// on-device UI are deliberately NOT driven here — they are the next step, and
-// the gpio/serial skills the one after that. What is here is the HTTP API, the
-// security baseline (token, provisioning AP, exact route matching) and OTA.
+// The HTTP API, the security baseline (token, provisioning AP, exact route
+// matching), OTA, and the on-device UI: the ST7789 panel and the TCA8418
+// keyboard are driven through M5Cardputer/M5Unified. The gpio and serial skills
+// are the next step and are not here yet.
+//
+// The node has no camera and nobody can see its screen remotely, so GET /ui
+// exists to make the panel's state answerable over the network: which screen is
+// up, which fields it is showing and what they read, the backlight, and the last
+// key pressed. It is the only way this firmware's display can be verified at all
+// from off the device.
 //
 // Board specifics vs the other ESP32 seeds in this tree:
 //   - ADVANCE, not v1.1. Nothing from the v1.1 pinout transfers: the keyboard
@@ -33,6 +39,7 @@
 //   GET  /config.md         — node description
 //   POST /config.md         — update description
 //   GET  /events            — event log (?since=unix_ts)
+//   GET  /ui                — what the panel is showing right now
 //   GET  /clock             — local time, timezone, NTP sync state
 //   POST /clock/tz          — set the POSIX TZ string
 //   GET  /firmware/version  — version, partition, uptime
@@ -50,7 +57,10 @@
 #include <WiFi.h>
 #include <ESPmDNS.h>
 #include <SPIFFS.h>
-#include <Wire.h>
+// Pulls in M5Unified and M5GFX. Note what is NOT here: <Wire.h>. This seed has
+// exactly one I2C owner and it is M5Unified's m5::In_I2C — see the ownership
+// note above hw_probe() before reaching for Wire again.
+#include <M5Cardputer.h>
 #include <ESPAsyncWebServer.h>
 #include <ArduinoJson.h>
 #include <Update.h>
@@ -75,10 +85,21 @@
 // ===== Cardputer ADVANCE pin map =====
 //
 // From the M5Stack Cardputer-Adv documentation. Everything below is claimed by
-// something on the mainboard; nothing here is driven by this commit.
+// something on the mainboard. The panel, the I2C bus and the keyboard
+// controller ARE driven now, but not from these numbers — M5GFX and M5Unified
+// carry their own copies of the pinmap and configure those pins themselves. The
+// defines stay as documentation and as the single source /capabilities formats
+// its pin lists from; the rest of the map is still untouched by this firmware.
 
 // ST7789V2 240x135 IPS on SPI. GPIO38 is the backlight enable and also gates
 // the RGB LED supply, so it has to go HIGH before either can light up.
+//
+// These six are documentation only now: M5GFX owns the panel and configures
+// every one of them itself from its own autodetect table, and nothing in this
+// file drives them. They stay because /capabilities reports them and because a
+// skill added later needs to know they are taken. GPIO38 in particular is not a
+// plain output any more — M5GFX attaches it to an LEDC channel and dims it, so
+// the backlight is a brightness value rather than a pin level.
 #define PIN_TFT_RST     33
 #define PIN_TFT_DC      34
 #define PIN_TFT_MOSI    35
@@ -99,14 +120,30 @@
 // platformio.ini for why this must never be left to pins_arduino.h. The same
 // two lines are brought out on the EXT 2.54-14P header (pins 8 and 10), which
 // is how a cap joins this bus.
+//
+// These two are also documentation only. M5.begin() brings this bus up itself
+// as m5::In_I2C on I2C_NUM_1 with exactly these pins, and that is the seed's
+// only I2C owner; see the ownership note above hw_probe().
 #define PIN_I2C_SDA      8
 #define PIN_I2C_SCL      9
-#define PIN_KB_INT      11  // TCA8418 interrupt, active low
+#define PIN_KB_INT      11  // TCA8418 interrupt, active low; claimed by M5Cardputer
 
-// ES8311 audio codec, I2S side
+// ES8311 audio codec, I2S side. Nothing here drives I2S: M5Unified only
+// *configures* its Speaker and Mic at begin() and touches no pin until one of
+// them is actually started, which this firmware never does.
 #define PIN_I2S_SCLK    41
 #define PIN_I2S_DSDIN   42
 #define PIN_I2S_LRCK    43
+// The codec's data line out, i.e. the ESP32's input — M5Unified configures it
+// as the microphone's pin_data_in for this board.
+//
+// One surprise to record rather than rediscover: M5.begin() drives GPIO46 HIGH
+// as an output before it has worked out what board it is on. It is the power
+// hold for the Capsule/Dial/DinMeter and the code is guarded on the target
+// being an ESP32-S3, not on the board, so every S3 board gets it — including
+// this one, where 46 is not a power latch. It is harmless here only because
+// this firmware never starts the microphone; a later commit that does must
+// expect the pin to have been an output first.
 #define PIN_I2S_ASDOUT  46
 
 #define PIN_IR_TX       44
@@ -180,7 +217,11 @@
 // truth — /capabilities and the gpio skill both derive from it.
 //
 //   1, 2   HY2.0-4P Grove port. The only external connector with nothing of
-//          the board's own on it.
+//          the board's own on it. M5Unified knows these two as Ex_I2C (SCL=1,
+//          SDA=2) and assigns them I2C_NUM_0, but it only calls setPort() —
+//          which stores the numbers and starts nothing — so the pins stay idle
+//          and stay safe. They stop being safe the moment anything calls
+//          Ex_I2C.begin().
 //   7      Assigned to nothing on the mainboard. It is also not brought out to
 //          any connector, so it is safe to drive and does nothing visible.
 //
@@ -393,20 +434,56 @@ struct HWProbe {
 
 static HWProbe hw;
 
-static void i2c_scan(TwoWire &bus, I2CFound *results, int &count) {
+// Highest 7-bit address the scan covers, exclusive. Also the size the result
+// buffer must have: m5::I2C_Class::scanID() indexes it by address.
+#define I2C_SCAN_LIMIT 0x78
+
+// Scan the one I2C bus through M5Unified.
+//
+// scanID() fills result[0x08 .. 0x77] and leaves 0x00..0x07 alone — the reserved
+// low addresses are skipped deliberately, because probing them wedges an
+// ESP32-S3 — so the buffer is zeroed first rather than trusted.
+static void i2c_scan(I2CFound *results, int &count) {
+    bool present[I2C_SCAN_LIMIT];
+    memset(present, 0, sizeof(present));
+    m5::In_I2C.scanID(present, 400000);
+
     count = 0;
-    for (uint8_t addr = 0x08; addr < 0x78; addr++) {
-        bus.beginTransmission(addr);
-        if (bus.endTransmission() == 0 && count < MAX_I2C_FOUND) {
-            const I2CDevice *known = i2c_identify(addr);
-            results[count].addr = addr;
-            results[count].name = known ? known->name : NULL;
-            results[count].confirmed = known ? known->confirmed : false;
-            count++;
-        }
+    for (uint8_t addr = 0x08; addr < I2C_SCAN_LIMIT; addr++) {
+        if (!present[addr] || count >= MAX_I2C_FOUND) continue;
+        const I2CDevice *known = i2c_identify(addr);
+        results[count].addr = addr;
+        results[count].name = known ? known->name : NULL;
+        results[count].confirmed = known ? known->confirmed : false;
+        count++;
     }
 }
 
+// I2C OWNERSHIP — read this before adding a bus user.
+//
+// There is one I2C bus on this board and exactly one driver allowed to own it:
+// m5::In_I2C, brought up by M5.begin() on I2C_NUM_1 with SDA=8/SCL=9. Arduino's
+// Wire is deliberately not used anywhere in this seed, and restoring it would
+// break the bus in a way that produces no error anywhere.
+//
+// Why: M5Unified::begin() calls _setup_i2c() unconditionally — there is no
+// config flag to turn it off — and that ends in In_I2C.begin(I2C_NUM_1, 8, 9).
+// Bringing up a second controller on the same two pads re-points their output
+// selector, and a pad has only one. Whichever controller was pointed at them
+// first is left electrically disconnected while its driver still reports itself
+// initialised: Wire.begin(8, 9) returns true, beginTransmission()/
+// endTransmission() keep returning success codes, and every device answers
+// nothing. An I2C scan through the disconnected bus finds zero devices, which
+// this firmware would read as "not an ADVANCE" — a silent, total misdetection
+// with no failed call anywhere to point at.
+//
+// Ordering around the problem does not fix it. Scanning through Wire before
+// M5.begin() would work exactly once, at boot, and leave a Wire object behind
+// that looks usable and is not — a trap for the gpio and serial skills that
+// come next. One bus, one owner, and the owner is M5.
+//
+// Calling this needs M5.begin() to have run. ui_begin() does that, and setup()
+// calls it first for this reason.
 static void hw_probe() {
     memset(&hw, 0, sizeof(hw));
 
@@ -418,11 +495,11 @@ static void hw_probe() {
     hw.psram_size = ESP.getPsramSize();  // zero on this board, reported anyway
     hw.temp_c = temperatureRead();
 
-    // Single I2C bus, pins given explicitly: the generic esp32s3 variant has no
-    // opinion about SDA/SCL, and the m5stack_cardputer variant has the wrong one.
-    Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL);
-    Wire.setClock(400000);
-    i2c_scan(Wire, hw.i2c0, hw.i2c0_count);
+    // Single I2C bus, already up and already on 8/9 because M5.begin() put it
+    // there. Nothing here configures pins: the pin numbers come from
+    // M5Unified's own table for board_M5CardputerADV, which is the same 8/9 the
+    // #defines above record.
+    i2c_scan(hw.i2c0, hw.i2c0_count);
 
     // Two independent questions, answered from the same scan.
     //
@@ -473,9 +550,34 @@ static String mdns_name = "";
 static unsigned long boot_time = 0;
 
 // Provisioning AP state. The password is rolled on every raise and exists only
-// in this variable — never persisted, never sent anywhere over the network.
+// in this variable and on the panel — never persisted, never sent anywhere over
+// the network, and specifically never through /ui.
+//
+// A session raised by hand from the keyboard is time-boxed: somebody may have
+// leaned on the key, or walked away mid-provisioning, and an open AP with a
+// known-to-someone password must not then stay up until the next reboot. The
+// boot-time session is NOT time-boxed, because when the stored credentials do
+// not work it is the only way into the node at all.
+#define AP_SESSION_MS (10UL * 60UL * 1000UL)
 static bool ap_active = false;
 static String ap_password = "";
+static bool ap_temporary = false;
+static unsigned long ap_expires_at = 0;
+
+// Whole minutes left on a time-boxed session, rounded up so it never reads 0
+// while the AP is still up. Zero means a session that does not expire.
+static unsigned long ap_minutes_left() {
+    if (!ap_temporary) return 0;
+    long remaining = (long)(ap_expires_at - millis());
+    if (remaining <= 0) return 0;
+    return ((unsigned long)remaining + 59999UL) / 60000UL;
+}
+
+// Ask the next UI tick to repaint everything rather than trusting its per-field
+// caches. Declared up here because state changes that the screen must show
+// immediately — the AP coming up with a fresh password on it — happen well
+// before the UI section below. Written from loop() context only.
+static bool ui_force = false;
 
 static String wifi_ssid = "";
 static String wifi_pass = "";
@@ -700,14 +802,17 @@ static void mdns_restart() {
     }
 }
 
-// Raise the provisioning softAP. `manual` is reserved for the press-to-raise
-// gesture that arrives with the keyboard: this commit drives no input device,
-// so there is no way to ask for the AP and this is called only from
-// wifi_setup() when the stored credentials fail. That also means an AP raised
-// here is not time-boxed — with no working credentials it is the only way in.
+// Raise the provisioning softAP.
+//
+// `manual` means the keyboard asked for it — the Setup AP entry in the on-device
+// menu. Two things follow from that and only from that. The session is
+// time-boxed (see AP_SESSION_MS), because unlike the boot-time raise it is not
+// the last way into the node: the node is on WiFi, so closing the window costs
+// nothing and leaving it open costs a standing invitation. And it means the
+// password has to reach a human with no cable attached, which is what the panel
+// is for; setup() no longer prints it to the console.
 static void ap_start(bool manual) {
     if (ap_active) return;  // idempotent: a re-raise must not re-roll the password
-    (void)manual;
     // RF is up by now (wifi_setup() has run), which is what makes esp_random()
     // a hardware RNG rather than a seeded PRNG — same reason token_load() is
     // deferred until after wifi_setup().
@@ -733,9 +838,13 @@ static void ap_start(bool manual) {
         return;
     }
     ap_active = true;
+    ap_temporary = manual;
+    ap_expires_at = millis() + AP_SESSION_MS;
     ap_seen_sta_down = (WiFi.status() != WL_CONNECTED);
-    event_add("setup AP up: %s", ap_ssid.c_str());  // SSID only, never the password
+    event_add("setup AP up: %s%s", ap_ssid.c_str(),
+              manual ? " (time-boxed)" : "");  // SSID only, never the password
     mdns_restart();
+    ui_force = true;  // the password exists nowhere but on the screen
 }
 
 static void ap_stop() {
@@ -744,9 +853,11 @@ static void ap_stop() {
     WiFi.mode(WIFI_STA);
     ap_active = false;
     ap_password = "";
+    ap_temporary = false;
     ap_seen_sta_down = false;
     event_add("setup AP down");
     mdns_restart();
+    ui_force = true;
 }
 
 // Provisioning is finished the moment the STA link comes up, so the AP goes
@@ -757,6 +868,13 @@ static void ap_poll() {
     if (WiFi.status() != WL_CONNECTED) {
         ap_seen_sta_down = true;
     } else if (ap_seen_sta_down) {
+        ap_stop();
+        return;
+    }
+    // Nobody used the window the keyboard opened: close it. The subtraction
+    // stays in signed arithmetic so it survives the millis() rollover.
+    if (ap_temporary && (long)(millis() - ap_expires_at) >= 0) {
+        event_add("setup AP expired");
         ap_stop();
     }
 }
@@ -796,6 +914,738 @@ static void wifi_setup() {
     if (WiFi.status() != WL_CONNECTED) ap_start(false);
 
     mdns_restart();
+}
+
+// ===== On-device UI =====
+//
+// A 240x135 panel and a 56-key QWERTY, driven through M5Cardputer. Three rules
+// hold this together and none of them is optional.
+//
+// 1. THE DISPLAY IS TOUCHED FROM loop() AND NOWHERE ELSE. Every HTTP handler in
+//    this file runs on the AsyncTCP task — core 1, priority 10, higher than the
+//    Arduino loop — and will preempt a half-finished draw. M5GFX keeps mutable
+//    state (the active font, the text datum, padding, the SPI transaction) that
+//    a second writer corrupts silently: the symptom is garbled glyphs and a
+//    hung bus, not a crash with a stack trace. The sibling ats-mini port added a
+//    mutex to make two writers safe; here there is only ever one writer, which
+//    is cheaper and cannot be got wrong by a later handler that forgets to take
+//    the lock. GET /ui therefore READS ui state and never draws.
+//
+// 2. NO CANVAS, NO SPRITE. A full-screen 240x135 16bpp sprite is 64 800 bytes.
+//    This board has no PSRAM at all, so that comes out of roughly 320KB of DRAM
+//    — alongside AsyncTCP's 16KB stack, the TLS-free but still hungry web
+//    server, and the OTA path, which has to survive a 3.3MB image streaming
+//    through it. Instead every field remembers what it last rendered and a tick
+//    that changes nothing costs no SPI at all. See ui_draw_field().
+//
+// 3. WHAT IS ON THE SCREEN IS ANSWERABLE OVER HTTP. There is no camera on this
+//    node. GET /ui and the panel derive every value from the same ui_field()
+//    calls, so the endpoint reports the screen's real content rather than a
+//    second, parallel description of it that can drift.
+
+// Layout, in pixels, for the 240x135 panel in landscape.
+//
+//   0..18    header: screen title left, network summary right
+//   20       rule
+//   26..114  five rows, 18px apart
+//   116      rule
+//   121..129 footer: the key legend for the current screen
+#define UI_ROWS         5
+#define UI_HDR_Y        2
+#define UI_RULE1_Y     20
+#define UI_ROW0_Y      26
+#define UI_ROW_PITCH   18
+#define UI_ROW_H       18
+#define UI_RULE2_Y    116
+#define UI_FOOT_Y     121
+// Two columns on a data row: a dim label, then the value.
+#define UI_LABEL_X      4
+#define UI_LABEL_W     50
+#define UI_VALUE_X     56
+#define UI_VALUE_W    182
+#define UI_MENU_X       8
+#define UI_MENU_R_X   232
+
+// How often the screen is allowed to reconsider itself. Everything on it
+// changes at 1Hz at most (the clock), and the tick is cheap only because of the
+// per-field caches, so five times a second is responsive without being busy.
+#define UI_TICK_MS    200
+
+// Backlight. 0 is a legitimate value and means the panel is dark but still
+// being drawn to — the state survives into /ui so a dark screen is
+// distinguishable from a dead one.
+#define UI_BRIGHT_DEFAULT 96
+#define UI_BRIGHT_STEP    32
+
+// 16-bit 565 colour, computed here rather than pulled from a library constant
+// so the palette is legible in one place.
+static constexpr uint16_t ui_rgb(uint8_t r, uint8_t g, uint8_t b) {
+    return (uint16_t)(((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3));
+}
+static const uint16_t COL_BG     = ui_rgb(0, 0, 0);
+static const uint16_t COL_TEXT   = ui_rgb(220, 220, 220);
+static const uint16_t COL_DIM    = ui_rgb(120, 120, 120);
+static const uint16_t COL_RULE   = ui_rgb(60, 60, 60);
+static const uint16_t COL_ACCENT = ui_rgb(60, 200, 110);
+
+// Text anchors. Spelled out here because M5GFX keeps them in a namespace that
+// no using-directive drags into global scope, and the short TL_DATUM spellings
+// are only reachable from inside the library's own namespaces.
+static const uint8_t UI_TL = lgfx::textdatum::top_left;
+static const uint8_t UI_TR = lgfx::textdatum::top_right;
+
+enum ui_screen_t {
+    UI_STATUS = 0,
+    UI_MENU,
+    UI_NETWORK,
+    UI_SYSTEM,
+    UI_HARDWARE,
+    UI_SCREEN_COUNT
+};
+
+static const char *ui_screen_name[UI_SCREEN_COUNT] = {
+    "status", "menu", "network", "system", "hardware"
+};
+static const char *ui_screen_title[UI_SCREEN_COUNT] = {
+    "STATUS", "MENU", "NETWORK", "SYSTEM", "HARDWARE"
+};
+
+// What the menu can do. Everything here is reachable from the keyboard alone,
+// which is the point: the AP entry in particular has to work on a node whose
+// network nobody can reach.
+enum ui_action_t {
+    UI_ACT_SCREEN = 0,   // arg is the ui_screen_t to open
+    UI_ACT_AP,           // raise or drop the provisioning AP
+    UI_ACT_BACKLIGHT     // panel dark / panel lit
+};
+
+struct UiMenuItem {
+    const char *title;
+    ui_action_t action;
+    int arg;
+};
+
+static const UiMenuItem ui_menu[] = {
+    {"Network",   UI_ACT_SCREEN,    UI_NETWORK},
+    {"System",    UI_ACT_SCREEN,    UI_SYSTEM},
+    {"Hardware",  UI_ACT_SCREEN,    UI_HARDWARE},
+    {"Setup AP",  UI_ACT_AP,        0},
+    {"Backlight", UI_ACT_BACKLIGHT, 0}
+};
+#define UI_MENU_COUNT ((int)(sizeof(ui_menu) / sizeof(ui_menu[0])))
+// The menu does not scroll, so it must fit the rows it has. Growing it past
+// five entries is a real change — a window offset and a scroll indicator — not
+// a one-line edit, and this is what stops that from being discovered on the
+// device.
+static_assert(UI_MENU_COUNT <= UI_ROWS, "menu does not scroll: keep it within UI_ROWS");
+
+// ---- UI state ----
+//
+// All of it single-word scalars, written from loop() and read from loop() plus
+// the AsyncTCP task in handle_ui(). Aligned word loads and stores do not tear,
+// so the endpoint's worst case is a value one tick (200ms) out of date, which
+// for a status report is a non-problem. Nothing here is a pointer or a String
+// that a reader could catch mid-reassignment — see ui_field()'s `redact`
+// argument for the one value that would have been.
+static bool ui_ready = false;          // panel initialised and drawable
+static bool ui_board_detected = false; // M5 identified this board as an ADVANCE
+static ui_screen_t ui_screen = UI_STATUS;
+static int ui_menu_index = 0;
+static uint8_t ui_brightness = UI_BRIGHT_DEFAULT;
+// What "on" means for the backlight toggle, so turning it off and on again
+// returns to the brightness the user had chosen rather than to the default.
+static uint8_t ui_brightness_on = UI_BRIGHT_DEFAULT;
+static char ui_last_key = 0;
+static unsigned long ui_last_key_ms = 0;
+
+// Per-field render caches: what is currently on the glass, so a tick that
+// changes nothing costs no SPI.
+static char ui_cache_hdr[16];
+static char ui_cache_net[24];
+// Sized to hold a whole value rather than a prefix of one: the change test is a
+// strncmp against the cache, so a cache shorter than the strings it stores
+// would silently stop repainting fields that differ only past its end.
+static char ui_cache_label[UI_ROWS][16];
+static char ui_cache_value[UI_ROWS][48];
+static char ui_cache_foot[48];
+static int ui_cache_sel = -1;
+
+// ---- Field values ----
+
+static void ui_uptime(char *out, size_t n) {
+    unsigned long s = (millis() - boot_time) / 1000;
+    unsigned long d = s / 86400;
+    s %= 86400;
+    if (d > 0) {
+        snprintf(out, n, "%lud %02lu:%02lu:%02lu", d, s / 3600, (s / 60) % 60, s % 60);
+    } else {
+        snprintf(out, n, "%02lu:%02lu:%02lu", s / 3600, (s / 60) % 60, s % 60);
+    }
+}
+
+// One line summarising where the node can be reached, for the header.
+static void ui_net_summary(char *out, size_t n) {
+    if (WiFi.status() == WL_CONNECTED) {
+        snprintf(out, n, "%s", WiFi.localIP().toString().c_str());
+    } else if (ap_active) {
+        snprintf(out, n, "AP %s", WiFi.softAPIP().toString().c_str());
+    } else {
+        snprintf(out, n, "offline");
+    }
+}
+
+// The right-hand half of a menu row: what the entry's state is right now, so
+// "Setup AP" says whether the AP is up without having to be selected.
+static void ui_menu_state(int i, char *out, size_t n) {
+    out[0] = '\0';
+    if (i < 0 || i >= UI_MENU_COUNT) return;
+    switch (ui_menu[i].action) {
+        case UI_ACT_AP:
+            if (!ap_active) {
+                snprintf(out, n, "off");
+            } else if (ap_temporary) {
+                snprintf(out, n, "up %lum", ap_minutes_left());
+            } else {
+                snprintf(out, n, "up");
+            }
+            break;
+        case UI_ACT_BACKLIGHT:
+            snprintf(out, n, "%u", (unsigned)ui_brightness);
+            break;
+        case UI_ACT_SCREEN:
+        default:
+            break;
+    }
+}
+
+// The single source of truth for what a screen shows. The panel calls this to
+// draw a row; GET /ui calls it to report one. Both get their own buffers, so
+// there is no shared string for the two tasks to race over, and the two can
+// never describe the screen differently.
+//
+// `redact` is the whole reason this takes an argument at all. The provisioning
+// AP's password is on the STATUS screen while the AP is up, because the screen
+// is its only channel — setup() no longer prints it and it is never persisted.
+// It must not leave the device. /ui passes redact=true and gets a placeholder;
+// the panel passes false. Anything secret added here must go the same way.
+//
+// Returns false when the screen has no row at that index (the menu has no
+// fields at all — it has entries, which GET /ui reports separately).
+static bool ui_field(ui_screen_t screen, int idx, char *label, size_t label_n,
+                     char *value, size_t value_n, bool redact) {
+    label[0] = '\0';
+    value[0] = '\0';
+    if (idx < 0 || idx >= UI_ROWS) return false;
+
+    switch (screen) {
+    case UI_STATUS: {
+        // While the AP is up the bottom two rows become the credentials
+        // somebody standing in front of the node needs to type into a phone.
+        // That is a deliberate swap, not an extra screen: those two rows are
+        // worth less than the only copy of a password that exists.
+        switch (idx) {
+        case 0: {
+            snprintf(label, label_n, "time");
+            struct tm now;
+            if (clock_local_time(now)) {
+                strftime(value, value_n, "%Y-%m-%d %H:%M:%S", &now);
+            } else {
+                snprintf(value, value_n, "waiting for NTP");
+            }
+            return true;
+        }
+        case 1:
+            snprintf(label, label_n, "net");
+            ui_net_summary(value, value_n);
+            return true;
+        case 2:
+            snprintf(label, label_n, "up");
+            ui_uptime(value, value_n);
+            return true;
+        case 3:
+            if (ap_active) {
+                snprintf(label, label_n, "ap");
+                snprintf(value, value_n, "%s", ap_ssid.c_str());
+            } else {
+                snprintf(label, label_n, "heap");
+                snprintf(value, value_n, "%lu KB free",
+                         (unsigned long)(ESP.getFreeHeap() / 1024));
+            }
+            return true;
+        case 4:
+            if (ap_active) {
+                snprintf(label, label_n, "pw");
+                if (redact) {
+                    snprintf(value, value_n, "(on the panel only)");
+                } else if (ap_temporary) {
+                    snprintf(value, value_n, "%s  %lum", ap_password.c_str(),
+                             ap_minutes_left());
+                } else {
+                    snprintf(value, value_n, "%s", ap_password.c_str());
+                }
+            } else {
+                snprintf(label, label_n, "seed");
+                snprintf(value, value_n, "v%s", SEED_VERSION);
+            }
+            return true;
+        default:
+            return false;
+        }
+    }
+
+    case UI_NETWORK:
+        switch (idx) {
+        case 0:
+            snprintf(label, label_n, "ssid");
+            if (WiFi.status() == WL_CONNECTED) {
+                snprintf(value, value_n, "%s", WiFi.SSID().c_str());
+            } else if (wifi_ssid.length() > 0) {
+                snprintf(value, value_n, "%s (down)", wifi_ssid.c_str());
+            } else {
+                snprintf(value, value_n, "not configured");
+            }
+            return true;
+        case 1:
+            snprintf(label, label_n, "ip");
+            ui_net_summary(value, value_n);
+            return true;
+        case 2:
+            snprintf(label, label_n, "rssi");
+            if (WiFi.status() == WL_CONNECTED) {
+                snprintf(value, value_n, "%d dBm", (int)WiFi.RSSI());
+            } else {
+                snprintf(value, value_n, "-");
+            }
+            return true;
+        case 3:
+            snprintf(label, label_n, "host");
+            snprintf(value, value_n, "%s.local:%d", mdns_name.c_str(), HTTP_PORT);
+            return true;
+        case 4:
+            snprintf(label, label_n, "ap");
+            if (!ap_active) {
+                snprintf(value, value_n, "off");
+            } else if (ap_temporary) {
+                snprintf(value, value_n, "%s  %lum", ap_ssid.c_str(),
+                         ap_minutes_left());
+            } else {
+                snprintf(value, value_n, "%s", ap_ssid.c_str());
+            }
+            return true;
+        default:
+            return false;
+        }
+
+    case UI_SYSTEM:
+        switch (idx) {
+        case 0:
+            snprintf(label, label_n, "seed");
+            snprintf(value, value_n, "v%s", SEED_VERSION);
+            return true;
+        case 1: {
+            snprintf(label, label_n, "slot");
+            const esp_partition_t *running = esp_ota_get_running_partition();
+            snprintf(value, value_n, "%s %s", running ? running->label : "unknown",
+                     firmware_confirmed ? "confirmed" : "pending");
+            return true;
+        }
+        case 2:
+            snprintf(label, label_n, "heap");
+            snprintf(value, value_n, "%lu KB / %lu min",
+                     (unsigned long)(ESP.getFreeHeap() / 1024),
+                     (unsigned long)(ESP.getMinFreeHeap() / 1024));
+            return true;
+        case 3:
+            snprintf(label, label_n, "flash");
+            snprintf(value, value_n, "%lu MB, no psram",
+                     (unsigned long)(hw.flash_size / 1024 / 1024));
+            return true;
+        case 4:
+            // The boot reading, the same number /capabilities reports. Nothing
+            // re-reads the sensor here: temperatureRead() is not documented as
+            // safe to call from two tasks, and /ui runs on the server's.
+            snprintf(label, label_n, "temp");
+            snprintf(value, value_n, "%.1f C at boot", (double)hw.temp_c);
+            return true;
+        default:
+            return false;
+        }
+
+    case UI_HARDWARE:
+        switch (idx) {
+        case 0:
+            snprintf(label, label_n, "board");
+            snprintf(value, value_n, "%s", hw.board);
+            return true;
+        case 1:
+            // M5's own verdict, kept separate from ours on purpose. hw.board
+            // above is this firmware's I2C probe; this row is what
+            // M5.getBoard() answered, and it is what decides whether the
+            // keyboard is read over I2C or scanned as a GPIO matrix. When the
+            // two disagree, that disagreement is the bug report.
+            snprintf(label, label_n, "m5");
+            snprintf(value, value_n, "%s",
+                     ui_board_detected ? "CardputerADV" : "NOT DETECTED");
+            return true;
+        case 2:
+            snprintf(label, label_n, "cap");
+            snprintf(value, value_n, "%s",
+                     hw.cap_lora1262 ? "LoRa-1262" : "none");
+            return true;
+        case 3: {
+            snprintf(label, label_n, "i2c");
+            // Addresses only, no names: at 8px a glyph the row holds about
+            // twenty characters and /capabilities carries the identifications.
+            size_t used = 0;
+            for (int i = 0; i < hw.i2c0_count && used + 5 < value_n; i++) {
+                used += snprintf(value + used, value_n - used, "%s%02X",
+                                 used ? " " : "", hw.i2c0[i].addr);
+            }
+            if (used == 0) snprintf(value, value_n, "none");
+            return true;
+        }
+        case 4: {
+            snprintf(label, label_n, "free");
+            size_t used = 0;
+            for (int i = 0; i < gpio_safe_pins_count && used + 4 < value_n; i++) {
+                used += snprintf(value + used, value_n - used, "%sG%d",
+                                 used ? " " : "", gpio_safe_pins[i]);
+            }
+            return true;
+        }
+        default:
+            return false;
+        }
+
+    case UI_MENU:
+    default:
+        return false;
+    }
+}
+
+// The key legend, which is the only documentation a user standing in front of
+// the node gets. Kept in sync with ui_handle_key() by being right next to it.
+static void ui_footer(ui_screen_t screen, char *out, size_t n) {
+    switch (screen) {
+    case UI_STATUS:
+        snprintf(out, n, "ENT menu   , / dim/bright");
+        break;
+    case UI_MENU:
+        snprintf(out, n, "; . move  ENT select  ` back");
+        break;
+    default:
+        snprintf(out, n, "` back  ENT menu  , / dim/bright");
+        break;
+    }
+}
+
+// ---- Drawing ----
+
+// Repaint one text field, and only if its content changed.
+//
+// The opaque background plus a fixed padding width is what erases the previous
+// value, so nothing here ever needs fillScreen and nothing ever flickers. The
+// cache keys on the text alone: a field whose colours change but whose string
+// does not needs ui_force, and every caller that moves a field onto or off a
+// coloured ground is a screen transition that already sets it.
+static void ui_draw_field(char *cache, size_t cache_n, const char *text,
+                          int32_t x, int32_t y, const lgfx::IFont *font,
+                          uint16_t color, uint8_t datum, uint16_t padding,
+                          uint16_t bg) {
+    if (!ui_force && strncmp(cache, text, cache_n - 1) == 0) return;
+    snprintf(cache, cache_n, "%s", text);
+    M5.Display.setFont(font);
+    M5.Display.setTextDatum(datum);
+    M5.Display.setTextColor(color, bg);
+    M5.Display.setTextPadding(padding);
+    M5.Display.drawString(text, x, y);
+    M5.Display.setTextPadding(0);
+}
+
+static int32_t ui_row_y(int row) {
+    return UI_ROW0_Y + row * UI_ROW_PITCH;
+}
+
+// Everything the frame owns rather than a field: the two rules. Drawn on a full
+// repaint only, because nothing ever erases them.
+static void ui_draw_frame() {
+    M5.Display.fillScreen(COL_BG);
+    M5.Display.drawFastHLine(0, UI_RULE1_Y, M5.Display.width(), COL_RULE);
+    M5.Display.drawFastHLine(0, UI_RULE2_Y, M5.Display.width(), COL_RULE);
+}
+
+// Leave the current screen for another one. The frame is repainted from
+// scratch: rows carry different labels, the menu paints a coloured selection
+// bar, and painting a new screen over the old one field by field would leave
+// whichever rows the new screen does not use showing the old screen's text.
+static void ui_goto(ui_screen_t screen) {
+    if (screen == ui_screen) return;
+    ui_screen = screen;
+    ui_force = true;
+}
+
+static void ui_set_brightness(int value) {
+    if (value < 0) value = 0;
+    if (value > 255) value = 255;
+    ui_brightness = (uint8_t)value;
+    if (ui_brightness > 0) ui_brightness_on = ui_brightness;
+    if (ui_ready) M5.Display.setBrightness(ui_brightness);
+}
+
+static void ui_activate(int index) {
+    if (index < 0 || index >= UI_MENU_COUNT) return;
+    const UiMenuItem &item = ui_menu[index];
+    switch (item.action) {
+    case UI_ACT_SCREEN:
+        ui_goto((ui_screen_t)item.arg);
+        break;
+    case UI_ACT_AP:
+        // The press-to-raise gesture the AP was always waiting for. Physical
+        // presence at the keyboard authorises provisioning; nothing over the
+        // network can ask for the AP back. Raised this way it is time-boxed.
+        if (ap_active) {
+            ap_stop();
+        } else {
+            ap_start(true);
+            // The password is now on the STATUS screen and nowhere else, so go
+            // show it rather than leaving the user in the menu.
+            ui_goto(UI_STATUS);
+        }
+        break;
+    case UI_ACT_BACKLIGHT:
+        ui_set_brightness(ui_brightness > 0 ? 0 : ui_brightness_on);
+        break;
+    }
+    ui_force = true;
+}
+
+// Navigation is on the BARE `;` `.` `,` `/` keys and Enter, with no Fn chord
+// anywhere.
+//
+// Those four keys are the inverted-T printed on the keycaps, and the device is
+// held in two hands with both thumbs on the keyboard: an Fn chord to move one
+// row down is a two-handed operation on a thing designed to be used with two
+// thumbs. It also means this seed needs nothing from the library's Fn layer.
+//
+//   ;  /  .     up / down      move the selection in the menu
+//   ,  /  /     left / right   dim / brighten the panel, on every screen
+//   Enter                      open the menu, or activate the selected entry
+//   `                          back: a screen returns to the menu, the menu to
+//                              status. Backtick and not `q`, because it is the
+//                              top-left key where Escape lives on a full
+//                              keyboard, and because every letter has to stay
+//                              free for a screen that takes text later.
+static void ui_handle_key(char key) {
+    ui_last_key = key;
+    ui_last_key_ms = millis();
+
+    switch (key) {
+    case ';':
+        if (ui_screen == UI_MENU) {
+            ui_menu_index = (ui_menu_index + UI_MENU_COUNT - 1) % UI_MENU_COUNT;
+        }
+        break;
+    case '.':
+        if (ui_screen == UI_MENU) {
+            ui_menu_index = (ui_menu_index + 1) % UI_MENU_COUNT;
+        }
+        break;
+    case ',':
+        ui_set_brightness((int)ui_brightness - UI_BRIGHT_STEP);
+        break;
+    case '/':
+        ui_set_brightness((int)ui_brightness + UI_BRIGHT_STEP);
+        break;
+    case '\n':
+        if (ui_screen == UI_MENU) {
+            ui_activate(ui_menu_index);
+        } else {
+            ui_goto(UI_MENU);
+        }
+        break;
+    case '`':
+        ui_goto(ui_screen == UI_MENU ? UI_STATUS : UI_MENU);
+        break;
+    default:
+        break;
+    }
+}
+
+// Read the keyboard. Cheap to call every loop: the TCA8418 raises an interrupt
+// and the reader only touches I2C when its ISR flag is set, so an idle keyboard
+// costs a flag test.
+static void ui_key_poll() {
+    // No reader was installed at all if the board did not identify — see
+    // ui_begin() for why that is on purpose.
+    if (!ui_board_detected) return;
+    M5Cardputer.update();
+    // isChange() also fires on release, where isPressed() is 0 — that is the
+    // test that stops a held key from repeating on every tick.
+    if (!M5Cardputer.Keyboard.isChange()) return;
+    if (!M5Cardputer.Keyboard.isPressed()) return;
+
+    Keyboard_Class::KeysState &state = M5Cardputer.Keyboard.keysState();
+    char key = 0;
+    if (state.enter) {
+        key = '\n';
+    } else if (!state.word.empty()) {
+        // The last character in the buffer is the one just added, which matters
+        // when a second key goes down before the first comes up.
+        key = state.word.back();
+    }
+    if (key) ui_handle_key(key);
+}
+
+// One pass of screen work. Everything below is change-detected, so a tick where
+// nothing moved issues no SPI at all.
+static void ui_tick() {
+    if (!ui_ready) return;
+
+    static unsigned long last_tick = 0;
+    if (!ui_force && millis() - last_tick < UI_TICK_MS) return;
+    last_tick = millis();
+
+    if (ui_force) {
+        ui_draw_frame();
+        ui_cache_sel = -1;
+    }
+
+    // Header.
+    ui_draw_field(ui_cache_hdr, sizeof(ui_cache_hdr), ui_screen_title[ui_screen],
+                  UI_LABEL_X, UI_HDR_Y, &fonts::Font2, COL_ACCENT,
+                  UI_TL, 110, COL_BG);
+    char buf[48];
+    ui_net_summary(buf, sizeof(buf));
+    ui_draw_field(ui_cache_net, sizeof(ui_cache_net), buf,
+                  M5.Display.width() - UI_LABEL_X, UI_HDR_Y, &fonts::Font2,
+                  COL_DIM, UI_TR, 124, COL_BG);
+
+    if (ui_screen == UI_MENU) {
+        for (int row = 0; row < UI_ROWS; row++) {
+            int32_t y = ui_row_y(row);
+            bool selected = (row == ui_menu_index);
+            // The selection bar is not a field, so it is painted from an
+            // explicit test: only the row that gained the highlight and the one
+            // that lost it are touched.
+            bool moved = ui_force || (ui_cache_sel != ui_menu_index &&
+                                      (selected || row == ui_cache_sel));
+            uint16_t bg = selected ? COL_ACCENT : COL_BG;
+            uint16_t fg = selected ? COL_BG : COL_TEXT;
+            if (moved) {
+                M5.Display.fillRect(0, y - 1, M5.Display.width(), UI_ROW_H, bg);
+                ui_cache_label[row][0] = '\0';
+                ui_cache_value[row][0] = '\0';
+            }
+            const char *title = row < UI_MENU_COUNT ? ui_menu[row].title : "";
+            ui_draw_field(ui_cache_label[row], sizeof(ui_cache_label[row]), title,
+                          UI_MENU_X, y, &fonts::Font2, fg, UI_TL,
+                          140, bg);
+            ui_menu_state(row, buf, sizeof(buf));
+            ui_draw_field(ui_cache_value[row], sizeof(ui_cache_value[row]), buf,
+                          UI_MENU_R_X, y, &fonts::Font2,
+                          selected ? COL_BG : COL_DIM, UI_TR, 80, bg);
+        }
+        ui_cache_sel = ui_menu_index;
+    } else {
+        char label[16], value[48];
+        for (int row = 0; row < UI_ROWS; row++) {
+            int32_t y = ui_row_y(row);
+            ui_field(ui_screen, row, label, sizeof(label), value, sizeof(value),
+                     false);
+            ui_draw_field(ui_cache_label[row], sizeof(ui_cache_label[row]), label,
+                          UI_LABEL_X, y, &fonts::Font2, COL_DIM,
+                          UI_TL, UI_LABEL_W, COL_BG);
+            ui_draw_field(ui_cache_value[row], sizeof(ui_cache_value[row]), value,
+                          UI_VALUE_X, y, &fonts::Font2, COL_TEXT,
+                          UI_TL, UI_VALUE_W, COL_BG);
+        }
+    }
+
+    ui_footer(ui_screen, buf, sizeof(buf));
+    ui_draw_field(ui_cache_foot, sizeof(ui_cache_foot), buf, UI_LABEL_X,
+                  UI_FOOT_Y, &fonts::Font0, COL_DIM, UI_TL,
+                  236, COL_BG);
+
+    ui_force = false;
+}
+
+// Bring up M5Unified, the panel and the keyboard. Must run before hw_probe(),
+// which scans the I2C bus this call is what opens.
+static void ui_begin() {
+    m5::M5Unified::config_t cfg = M5.config();
+
+    // Autodetection failing has to fail into the RIGHT board, and on this chip
+    // the default is not merely unhelpful, it is a different device: M5Unified
+    // falls back to board_M5AtomS3Lite on every ESP32-S3, silently, with a
+    // pinmap that shares nothing with this one. Two things ride on getting it
+    // right.
+    //
+    // The keyboard: Keyboard_Class::begin() picks its reader from
+    // M5.getBoard() at runtime. board_M5CardputerADV gets the TCA8418 reader
+    // that talks I2C; board_M5Cardputer — the v1.1 — gets a reader that strobes
+    // GPIO 8, 9 and 11 as a scan matrix, which on this board is the I2C bus and
+    // the keyboard controller's own interrupt line. Anything else gets a
+    // do-nothing reader and a printf.
+    //
+    // The screen: begin() reads the current brightness, sets it to 0 so the
+    // panel does not flash garbage while it initialises, and restores it only
+    // if the display's own autodetect came back with a board. GPIO38 gates the
+    // backlight AND the RGB LED supply, so a detection failure is a dark screen
+    // and a dark LED at once, with nothing to show that anything went wrong.
+    //
+    // This does not make detection succeed — it decides what happens when it
+    // does not. ui_board_detected below records which of the two it was, and
+    // /ui and the Hardware screen both report it rather than assuming.
+    cfg.fallback_board = m5::board_t::board_M5CardputerADV;
+
+    // Left at its default of 0 deliberately, which is the value that makes
+    // M5Unified not call Serial.begin() at all. setup() has already opened the
+    // console at 115200 and prints the node's token through it; letting M5
+    // reopen the port would cut the banner off mid-boot.
+    cfg.serial_baudrate = 0;
+
+    // internal_imu / internal_mic / internal_spk are left on. M5Unified only
+    // CONFIGURES those at begin() — it stores pin numbers and drives nothing —
+    // and none of them is started anywhere in this firmware, so the I2S pins in
+    // the map above stay idle.
+
+    // Split deliberately into two calls rather than the one M5Cardputer.begin()
+    // that does both, so that what the board turned out to be is known BEFORE
+    // anything installs a keyboard reader.
+    //
+    // Keyboard_Class::begin() is not defensive: board_M5Cardputer — the v1.1 —
+    // gets a reader that immediately strobes GPIO 8, 9 and 11 as a scan matrix,
+    // and on this board those are the live I2C bus and the keyboard
+    // controller's interrupt. Asking for the reader only once the board has
+    // answered means a misidentification costs a keyboard that does not work,
+    // which is visible and harmless, instead of a bus that is being driven by
+    // two things at once.
+    //
+    // The second call is safe because M5Unified::begin() refuses to run twice —
+    // it returns immediately once _board is set — so it does nothing here but
+    // pass the keyboard flag through.
+    M5.begin(cfg);
+    ui_board_detected = (M5.getBoard() == m5::board_t::board_M5CardputerADV);
+    M5Cardputer.begin(cfg, ui_board_detected);
+
+    // width() reads a member and is safe even when autodetection left no panel
+    // behind, which is exactly the case that must not reach setRotation().
+    ui_ready = (M5.Display.width() > 0 && M5.Display.height() > 0);
+    Serial.printf("[ui] m5 board id %d (%s), panel %s\n", (int)M5.getBoard(),
+                  ui_board_detected ? "CardputerADV" : "NOT the expected board",
+                  ui_ready ? "up" : "NOT initialised");
+    if (!ui_ready) return;
+
+    M5.Display.setRotation(1);  // 240x135 landscape, keyboard toward the user
+    M5.Display.setBrightness(ui_brightness);
+    ui_force = true;
+    ui_draw_frame();
+    ui_draw_field(ui_cache_hdr, sizeof(ui_cache_hdr), "SEED", UI_LABEL_X,
+                  UI_HDR_Y, &fonts::Font2, COL_ACCENT, UI_TL,
+                  110, COL_BG);
+    ui_draw_field(ui_cache_value[0], sizeof(ui_cache_value[0]), "starting...",
+                  UI_VALUE_X, ui_row_y(0), &fonts::Font2, COL_TEXT,
+                  UI_TL, UI_VALUE_W, COL_BG);
 }
 
 // ===== HTTP Handlers =====
@@ -863,13 +1713,19 @@ static void handle_capabilities(AsyncWebServerRequest *request) {
     // in the one endpoint an agent trusts to describe hardware it cannot see.
     char peri[256];
     snprintf(peri, sizeof(peri),
-             "ST7789V2 240x135 IPS (not driven: RST=%d,DC=%d,MOSI=%d,SCLK=%d,CS=%d,BL=%d)",
+             "ST7789V2 240x135 IPS, driven via M5GFX (RST=%d,DC=%d,MOSI=%d,"
+             "SCLK=%d,CS=%d,BL=%d PWM). %s; see GET /ui for what it is showing",
              PIN_TFT_RST, PIN_TFT_DC, PIN_TFT_MOSI, PIN_TFT_SCLK, PIN_TFT_CS,
-             PIN_TFT_BL);
+             PIN_TFT_BL,
+             ui_ready ? "panel up" : "panel NOT initialised, autodetect failed");
     doc["display"] = peri;
     snprintf(peri, sizeof(peri),
-             "TCA8418 matrix controller on I2C 0x%02X (INT=%d, not driven)",
-             TCA8418_ADDR, PIN_KB_INT);
+             "TCA8418 matrix controller on I2C 0x%02X (INT=%d), driven via "
+             "M5Cardputer; %s",
+             TCA8418_ADDR, PIN_KB_INT,
+             ui_board_detected
+                 ? "board identified as CardputerADV, so the I2C reader is in use"
+                 : "board NOT identified, keys are not being read");
     doc["keyboard"] = peri;
     snprintf(peri, sizeof(peri), "CS=%d,MOSI=%d,MISO=%d,SCLK=%d",
              PIN_SD_CS, PIN_SD_MOSI, PIN_SD_MISO, PIN_SD_SCLK);
@@ -928,8 +1784,10 @@ static void handle_capabilities(AsyncWebServerRequest *request) {
 
     // I2C, spec-named: descriptions, one per bus.
     JsonArray buses = doc["i2c_buses"].to<JsonArray>();
-    char busdesc[48];
-    snprintf(busdesc, sizeof(busdesc), "i2c0 SDA=%d SCL=%d 400kHz",
+    char busdesc[96];
+    snprintf(busdesc, sizeof(busdesc),
+             "i2c0 SDA=%d SCL=%d 400kHz (M5Unified In_I2C on I2C_NUM_1; Wire is "
+             "not used by this firmware)",
              PIN_I2C_SDA, PIN_I2C_SCL);
     buses.add(busdesc);
 
@@ -982,7 +1840,7 @@ static void handle_capabilities(AsyncWebServerRequest *request) {
     // disagree, the spec wins. Keep this in step with setup_routes().
     JsonArray ep = doc["endpoints"].to<JsonArray>();
     const char *eps[] = {
-        "/", "/health", "/capabilities", "/config.md", "/events",
+        "/", "/health", "/capabilities", "/config.md", "/events", "/ui",
         "/clock", "/clock/tz",
         "/firmware/version", "/firmware/upload", "/firmware/apply",
         "/firmware/confirm", "/firmware/rollback",
@@ -1048,6 +1906,82 @@ static void handle_events(AsyncWebServerRequest *request) {
             e["msg"] = events_buf[idx].message;
         }
     }
+    String response;
+    serializeJson(doc, response);
+    request->send(200, "application/json", response);
+}
+
+// --- GET /ui ---
+//
+// What the panel is showing, for a caller who cannot see it. This node has no
+// camera and no second channel to the screen, so without this endpoint the
+// display is unverifiable from anywhere but in front of it.
+//
+// What it proves: which screen is active, which fields that screen is composed
+// of and what each one currently reads, whether the panel came up at all,
+// whether M5 identified the board (and therefore whether the keyboard is being
+// read over I2C rather than not at all), the backlight level, and the last key
+// the firmware saw. That is enough to confirm that keys arrive, that navigation
+// moves between screens, and that the values are the right values.
+//
+// What it does NOT prove: anything about pixels. Layout, legibility, whether a
+// value overflows its column, whether the selection bar lands on the right row
+// — none of that is observable here, and this endpoint agreeing with
+// expectations is not a substitute for somebody looking at the glass.
+//
+// This handler runs on the AsyncTCP task and therefore draws NOTHING; see the
+// note at the top of the UI section. It reads word-sized scalars and calls
+// ui_field() into its own buffers, which is why there is no lock and nothing to
+// tear. It passes redact=true, so the provisioning AP's password — which lives
+// only in RAM and on the panel — does not travel the network.
+static void handle_ui(AsyncWebServerRequest *request) {
+    if (!require_auth(request)) return;
+
+    JsonDocument doc;
+    doc["screen"] = ui_screen_name[ui_screen];
+    doc["panel_ready"] = ui_ready;
+    doc["board_detected"] = ui_board_detected;
+    doc["width"] = (int)M5.Display.width();
+    doc["height"] = (int)M5.Display.height();
+    doc["brightness"] = ui_brightness;
+    doc["backlight"] = ui_brightness > 0;
+
+    JsonArray fields = doc["fields"].to<JsonArray>();
+    char label[16], value[48];
+    for (int row = 0; row < UI_ROWS; row++) {
+        if (!ui_field(ui_screen, row, label, sizeof(label), value, sizeof(value),
+                      true)) {
+            break;
+        }
+        JsonObject f = fields.add<JsonObject>();
+        f["label"] = label;
+        f["value"] = value;
+    }
+
+    // The menu goes out on every screen, not just while it is open: it is the
+    // list of what the keyboard can reach, and an agent asking what this node
+    // can be told to do should not have to navigate there first.
+    JsonObject menu = doc["menu"].to<JsonObject>();
+    menu["selected"] = ui_menu_index;
+    JsonArray items = menu["items"].to<JsonArray>();
+    for (int i = 0; i < UI_MENU_COUNT; i++) {
+        JsonObject it = items.add<JsonObject>();
+        it["title"] = ui_menu[i].title;
+        ui_menu_state(i, value, sizeof(value));
+        it["state"] = value;
+    }
+
+    JsonObject key = doc["last_key"].to<JsonObject>();
+    if (ui_last_key) {
+        char k[2] = {ui_last_key, '\0'};
+        key["key"] = ui_last_key == '\n' ? "enter" : k;
+        key["ms_ago"] = (unsigned long)(millis() - ui_last_key_ms);
+    }
+
+    // The bare keys navigation is on, repeated here so an agent reading /ui can
+    // work out what to tell somebody standing at the device.
+    doc["keys"] = "; up, . down, , dim, / bright, Enter select, ` back";
+
     String response;
     serializeJson(doc, response);
     request->send(200, "application/json", response);
@@ -1339,14 +2273,16 @@ static void handle_skill(AsyncWebServerRequest *request) {
     String s = "# ESP32 Seed — M5Stack Cardputer ADVANCE\n\n";
     s += "Host: " + ip + ":" + String(HTTP_PORT) + "\n";
     s += "mDNS: " + mdns_name + ".local\n";
-    if (ap_active) s += "AP: " + ap_ssid + " (setup mode; password is on the serial console)\n";
+    if (ap_active) s += "AP: " + ap_ssid + " (setup mode; the password is on the node's screen)\n";
     s += "\n";
     s += "Auth: `Authorization: Bearer <token>` (except /health)\n";
     s += "The token is a 32-char hex string, generated on the node's first boot and\n";
     s += "kept for its life. Two places give it to you: the serial console prints it\n";
     s += "at every boot (115200 8N1, `Token: ...`), and the setup AP's page at `/`\n";
-    s += "shows it while the node is being provisioned. Once the node is on WiFi the\n";
-    s += "AP is gone, so the serial console is the only remaining source\n\n";
+    s += "shows it while the node is being provisioned. The AP is down whenever the\n";
+    s += "node is on WiFi, so on a provisioned node the serial console is the only\n";
+    s += "source — the AP can be raised again from the keyboard (Enter, Setup AP),\n";
+    s += "but that needs somebody at the device\n\n";
     s += "## Grow cycle\n\n";
     s += "ESP32 has no compiler. Build on host, upload binary:\n\n";
     s += "1. GET /capabilities\n";
@@ -1388,13 +2324,23 @@ static void handle_skill(AsyncWebServerRequest *request) {
     s += "- GPIO16,17,18,21 are not on the safe list either, and not because they are\n";
     s += "  known to be taken: M5Stack's pinmap simply does not mention them, while the\n";
     s += "  board has a microphone and an NS4150B amplifier documented on no pins at all\n";
-    s += "- GPIO38 is the display backlight and also gates the RGB LED supply\n";
+    s += "- GPIO38 is the display backlight and also gates the RGB LED supply. It is\n";
+    s += "  not a plain output here: M5GFX attaches it to an LEDC channel and dims it,\n";
+    s += "  so the backlight is the brightness value in GET /ui rather than a pin\n";
+    s += "  level. A brightness of 0 also cuts the RGB LED's supply\n";
     s += "- The mainboard I2C bus (SDA=8/SCL=9) carries exactly three devices: TCA8418\n";
     s += "  keyboard controller 0x34, ES8311 codec 0x18, BMI270 IMU 0x69. Anything else\n";
     s += "  in /capabilities' i2c_devices came from a cap or the Grove port. Entries\n";
     s += "  there are keyed `device` when the part is documented or probed for this\n";
     s += "  board and `device_guess` when it is only a common part at that address —\n";
     s += "  do not treat a guess as an identification\n";
+    s += "- That bus has exactly ONE owner and it is M5Unified's `In_I2C` (I2C_NUM_1),\n";
+    s += "  brought up by M5.begin(). Do not add an Arduino `Wire` on 8/9: a second\n";
+    s += "  controller re-points the pads' output selector, and whichever driver loses\n";
+    s += "  keeps reporting success while talking to nothing. It fails silently, with\n";
+    s += "  no error anywhere. Use `M5.In_I2C` (or `m5::In_I2C`) for anything on this\n";
+    s += "  bus. The Grove port on G1/G2 is a separate bus, `Ex_I2C`, and is NOT\n";
+    s += "  started — it is yours if you begin() it\n";
     s += "- Flashing: `pio run -e cardputer -t upload` is one call and needs nothing\n";
     s += "  extra — platformio.ini already sets board_upload.after_reset=watchdog_reset\n";
     s += "- Only if you drive esptool directly: with its default `--after hard_reset`\n";
@@ -1403,14 +2349,38 @@ static void handle_skill(AsyncWebServerRequest *request) {
     s += "  nothing. `--after watchdog_reset` boots it. The remedy is reliable; the\n";
     s += "  mechanism is not documented well enough to assert one here\n";
     s += "- The clock runs on UTC until POST /clock/tz stores a POSIX TZ string in SPIFFS\n";
-    s += "- The setup AP is only up while the node has no working WiFi credentials, with\n";
-    s += "  a fresh random password per raise. It tears itself down the moment the STA\n";
-    s += "  link comes up and does not come back if WiFi is lost later\n";
+    s += "- The setup AP comes up on its own only while the node has no working WiFi\n";
+    s += "  credentials, with a fresh random password per raise. It tears itself down\n";
+    s += "  the moment the STA link comes up and does not come back if WiFi is lost\n";
+    s += "  later. It can also be raised by hand from the on-device menu, and a session\n";
+    s += "  raised that way expires after 10 minutes. The password is shown on the\n";
+    s += "  node's screen and NOWHERE else: it is never persisted, never printed to the\n";
+    s += "  console, and GET /ui redacts it\n";
     s += "- POST /wifi/config needs the token unless the request comes over that AP\n";
     s += "- Paths match exactly: `/health/` is not `/health` and returns 404. Nothing\n";
     s += "  here generates a trailing slash, but a client that appends one will break\n";
     s += "- An OTA upload whose connection dies is torn down after 30s without data,\n";
     s += "  so a dropped transfer no longer blocks every later one until reboot\n\n";
+    s += "## On-device UI\n\n";
+    s += "The 240x135 panel and the QWERTY are driven. Five screens: status, menu,\n";
+    s += "network, system, hardware. Navigation is on the BARE keys, no Fn chord:\n\n";
+    s += "| Key | Does |\n";
+    s += "|-----|------|\n";
+    s += "| `;` / `.` | move the selection up / down in the menu |\n";
+    s += "| `,` / `/` | dim / brighten the panel, on any screen |\n";
+    s += "| Enter | open the menu, or activate the selected entry |\n";
+    s += "| `` ` `` | back — a screen returns to the menu, the menu to status |\n\n";
+    s += "Menu entries: Network, System, Hardware, Setup AP (raise or drop the\n";
+    s += "provisioning AP), Backlight (panel dark / lit).\n\n";
+    s += "You cannot see this screen. GET /ui answers what is on it: the active\n";
+    s += "screen, every field it is showing with its current value, the menu and\n";
+    s += "which entry is selected, the backlight level, whether the panel came up,\n";
+    s += "whether M5 identified the board, and the last key the firmware saw. It\n";
+    s += "reports content, not pixels — it says nothing about layout or legibility,\n";
+    s += "and the AP password is redacted there even though it is on the screen.\n\n";
+    s += "The display is written only from loop(). If you add a handler, it may READ\n";
+    s += "UI state and must never draw: handlers run on the AsyncTCP task and will\n";
+    s += "preempt a half-finished paint, corrupting M5GFX's font/datum/SPI state.\n\n";
     s += "## API\n\n";
     s += "| Method | Path | Description |\n";
     s += "|--------|------|-------------|\n";
@@ -1419,6 +2389,7 @@ static void handle_skill(AsyncWebServerRequest *request) {
     s += "| GET | /config.md | Node config |\n";
     s += "| POST | /config.md | Update config |\n";
     s += "| GET | /events | Event log |\n";
+    s += "| GET | /ui | What the panel is showing right now |\n";
     s += "| GET | /clock | Local time, timezone, NTP sync state |\n";
     s += "| POST | /clock/tz | Set POSIX TZ, raw body e.g. `CET-1CEST,M3.5.0,M10.5.0/3` |\n";
     s += "| GET | /firmware/version | Version |\n";
@@ -1567,6 +2538,7 @@ static void setup_routes() {
     server.on(AsyncURIMatcher::exact("/config.md"), HTTP_GET, handle_config_get);
     server.on(AsyncURIMatcher::exact("/config.md"), HTTP_POST, handle_config_post, NULL, handle_body_collect);
     server.on(AsyncURIMatcher::exact("/events"), HTTP_GET, handle_events);
+    server.on(AsyncURIMatcher::exact("/ui"), HTTP_GET, handle_ui);
     server.on(AsyncURIMatcher::exact("/clock"), HTTP_GET, handle_clock_get);
     server.on(AsyncURIMatcher::exact("/clock/tz"), HTTP_POST, handle_clock_tz, NULL, handle_body_collect);
     server.on(AsyncURIMatcher::exact("/firmware/version"), HTTP_GET, handle_firmware_version);
@@ -1595,7 +2567,11 @@ void setup() {
         Serial.println("[!] SPIFFS failed");
     }
 
-    hw_probe();       // I2C scan
+    // First, and before hw_probe(): M5.begin() is what brings the I2C bus up,
+    // and it is the seed's only I2C owner. See the ownership note above
+    // hw_probe() for what happens to a second one.
+    ui_begin();
+    hw_probe();       // I2C scan, through M5's bus
     tz_load();        // before wifi_setup(): configTzTime() needs the TZ string
     wifi_setup();     // RF up first; also raises the setup AP if STA fails
     token_load();     // after wifi_setup(): needs RF up for a real hardware RNG
@@ -1607,14 +2583,22 @@ void setup() {
     // The token IS printed, and unlike the AP password below this line is not a
     // bring-up crutch to be removed once the panel is driven.
     //
-    // The setup AP is torn down for good the moment the STA link comes up, and
-    // this commit drives no input device, so there is no gesture to raise it
-    // again. After a successful provisioning the page that hands out the token
-    // behind from_setup_ap() is therefore unreachable, permanently; /capabilities
-    // sits behind require_auth() like every route but /health, so it cannot hand
-    // it out either. Without this line the node's whole grow cycle —
-    // /capabilities, /firmware/upload, /firmware/apply, /firmware/confirm — is
-    // locked away from the node's own owner.
+    // The setup AP is torn down the moment the STA link comes up, and the only
+    // way to raise it again is the gesture on the node's own keyboard. So after
+    // a successful provisioning the page that hands out the token behind
+    // from_setup_ap() is unreachable to anyone not standing at the device;
+    // /capabilities sits behind require_auth() like every route but /health, so
+    // it cannot hand it out either. Without this line the node's whole grow
+    // cycle — /capabilities, /firmware/upload, /firmware/apply,
+    // /firmware/confirm — is locked away from the node's own owner.
+    //
+    // The panel now exists and could carry it, and that is precisely the
+    // argument for leaving this here rather than moving it: the screen is the
+    // WEAKER channel of the two. It is readable across a room, over a shoulder
+    // and by any camera pointed at the desk, where Serial costs a USB cable
+    // physically attached. And the token's consumer is not a person reading a
+    // panel — it is an agent pasting 32 hex characters into a header, off a
+    // console it is already connected to.
     //
     // Reading Serial costs a USB cable physically attached to the board, and
     // whoever has that can already reflash the chip wholesale through the ROM
@@ -1628,21 +2612,25 @@ void setup() {
     if (WiFi.status() == WL_CONNECTED)
         Serial.printf("http://%s:%d/health\n", WiFi.localIP().toString().c_str(), HTTP_PORT);
     if (ap_active) {
-        // The AP password IS printed, and only until this commit grows a screen.
-        // It is raised at boot when no stored credentials work, so with no
-        // display and no keyboard there would otherwise be no way to read it and
-        // no way to join the AP the node just brought up. Serial needs a USB
-        // cable physically attached, which is the same physical-presence
-        // argument the screen makes. REMOVE THIS once the panel is driven and
-        // can carry the password instead. The token print above stays, and the
-        // difference is not that one secret is graver than the other: the
-        // password is re-rolled per raise, and a later commit can raise the AP
-        // by keyboard gesture with no cable anywhere near the board, so it needs
-        // a channel that does not assume one. The token is minted once, on a
-        // first boot that by definition happens on a cable.
-        Serial.printf("http://%s:%d/health  (setup AP: %s, password: %s)\n",
-            WiFi.softAPIP().toString().c_str(), HTTP_PORT,
-            ap_ssid.c_str(), ap_password.c_str());
+        // The AP password is NOT printed. It used to be, as a bring-up crutch
+        // with an explicit note to remove it once the panel could carry it
+        // instead; the panel carries it now, on the STATUS screen, for as long
+        // as the AP is up. That is the channel the password needs, because the
+        // AP can now be raised from the keyboard with no cable anywhere near
+        // the board — and a secret whose only copy is behind a USB port is
+        // useless to the person standing in front of the device.
+        //
+        // The one exception, and it is not a hedge: if the panel never came up,
+        // the reason for taking the print away has not happened. A node with a
+        // dead screen and no stored credentials that also refuses to say its
+        // AP password is a node nobody can provision at all.
+        Serial.printf("http://%s:%d/health  (setup AP: %s, password is on the "
+                      "node's screen)\n",
+            WiFi.softAPIP().toString().c_str(), HTTP_PORT, ap_ssid.c_str());
+        if (!ui_ready) {
+            Serial.printf("[!] panel not initialised; AP password: %s\n",
+                          ap_password.c_str());
+        }
     }
 
     event_add("seed started v%s", SEED_VERSION);
@@ -1710,8 +2698,15 @@ void loop() {
         last_wifi = millis();
     }
 
-    // Retire the provisioning AP once it has done its job. Non-blocking.
+    // Retire the provisioning AP once it has done its job, or once the window
+    // a keyboard-raised session opened has run out. Non-blocking.
     ap_poll();
+
+    // The keyboard and the screen, in that order and only from here. Every
+    // HTTP handler runs on the AsyncTCP task and must never draw; see the note
+    // at the top of the UI section for what a second writer does to M5GFX.
+    ui_key_poll();
+    ui_tick();
 
     delay(10);
 }
