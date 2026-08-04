@@ -27,9 +27,16 @@
 //   - There is no power-latch pin to hold. The T-Embed seed drives GPIO15 HIGH
 //     first thing in setup() to stay alive on battery; on this board GPIO15 is
 //     an expansion-header UART line, and doing that would be actively wrong.
-//   - No sub-GHz radio and no fuel gauge on the mainboard: the CC1101 and
-//     BQ27220 probes the T-Embed seed runs have nothing to find here. Battery
-//     voltage is an ADC on GPIO10, left unread until its divider is verified.
+//   - No sub-GHz radio. The CC1101 probe the T-Embed seed runs has nothing to
+//     find on this mainboard.
+//   - No fuel gauge. The T-Embed's BQ27220 computes a charge percentage and
+//     hands it over I2C, which is what its status screen displays; there is no
+//     such chip here, so there is no percentage to display.
+//   - There IS a battery. It is sensed as a plain voltage divider on the ADC at
+//     GPIO10, and it is left unread because the divider ratio is documented
+//     nowhere: a guessed ratio would put a fabricated voltage in /capabilities,
+//     which states the pin number and stops there. Settling the ratio takes a
+//     meter across the cell, not a code change.
 //   - The mainboard I2C bus carries exactly three devices — the keyboard
 //     controller, the audio codec and the IMU — so it is scanned and reported
 //     but never reconfigured. A fourth address answering, 0x43, means a
@@ -357,9 +364,17 @@ static void event_add(const char *fmt, ...) {
 
 // ===== Skill/plugin interface =====
 //
-// Two skills ship: gpio and serial, both at the bottom of this file. Everything
-// a skill needs — the PIN_* map, gpio_is_safe(), require_auth(), event_add(),
+// Three skills ship: notify, #included above the UI section because the screens
+// read its store, and gpio and serial at the bottom of this file. Everything a
+// skill needs — the PIN_* map, gpio_is_safe(), require_auth(), event_add(),
 // handle_body_collect() — is declared above the #includes that pull them in.
+//
+// handle_body_collect() is the one that needs a declaration rather than a
+// definition: it is defined with the other HTTP handlers, below the UI section
+// and so below the notify include, and a skill registering a POST route hands
+// it to server.on() as a body callback.
+static void handle_body_collect(AsyncWebServerRequest *request, uint8_t *data,
+                                size_t len, size_t index, size_t total);
 
 struct SkillEndpoint {
     const char *method;       // "GET", "POST"
@@ -650,8 +665,47 @@ static unsigned long ap_minutes_left() {
 // Ask the next UI tick to repaint everything rather than trusting its per-field
 // caches. Declared up here because state changes that the screen must show
 // immediately — the AP coming up with a fresh password on it — happen well
-// before the UI section below. Written from loop() context only.
-static bool ui_force = false;
+// before the UI section below.
+//
+// `volatile` is not a fix. Every writer of THIS flag runs in setup() or loop()
+// context, so nothing here is broken without it and nothing here is made
+// correct by it — `volatile` is not a synchronisation primitive and this is a
+// single-byte flag, not shared state that needs one. What it buys is the one
+// thing it is actually for: a store cannot be optimised away or hoisted out of
+// reach of the loop task that polls it in ui_tick(). The firmware this is
+// ported from already marks its equivalent volatile, so this is parity with it
+// and not an invention.
+//
+// See ui_tick() for the other half of that — where the flag is cleared, and
+// why it is not where the source firmware clears it.
+static volatile bool ui_force = false;
+
+// The same request, raised from the web server task instead, and it is a
+// SEPARATE FLAG PRECISELY SO THAT IT CANNOT REACH THE TICK GATE.
+//
+// A repaint costs a fillScreen() of the whole 240x135 panel plus every field
+// redrawn — tens of thousands of pixels of SPI, on the loop task, in one
+// uninterruptible run. ui_force short-circuits the 200ms gate in ui_tick(),
+// which is right for a keypress: a user who pressed a key and waited a fifth
+// of a second for the screen to answer would call the device slow. It is
+// wrong for anything the network raises, because the network sets the rate.
+// POST /notify at 20/s through ui_force is 20 full-frame repaints a second,
+// each one of them time the loop task is not spending in ui_key_poll() — which
+// retires at most one keyboard event per pass. That is the same starvation
+// NOTIFY_CRIT_MIN_GAP_MS exists to keep the flash writer out of, arriving by
+// the other door, and /skill tells agents the queue is rate-limited to protect
+// the keyboard.
+//
+// So network raises wait for the gate. They are folded into `force` inside
+// ui_tick() and appear nowhere in the expression that decides whether this
+// tick runs at all, which bounds the panel at one repaint per UI_TICK_MS no
+// matter what arrives. The cost is up to 200ms of latency on a message card,
+// on a node with no buzzer and no LED where the panel is not the thing that
+// makes an arrival urgent.
+//
+// Raised only from skills/notify.cpp, and there only on the endpoint paths.
+// notify_poll() runs on the loop task and correctly uses ui_force.
+static volatile bool ui_force_net = false;
 
 // Stored WiFi credentials.
 //
@@ -766,12 +820,56 @@ static String read_spiffs_file(const char *path) {
     return content;
 }
 
+// A SHORT WRITE IS A FAILED WRITE AND HAS TO BE REPORTED AS ONE. File::print()
+// reaches fwrite() through VFSFileImpl::write(), and fwrite() answers a full-
+// filesystem partition with a short count, not an error: 400 bytes of a 900
+// byte snapshot land on flash and the call comes back. The partition here is
+// 1.5 MB and the notification store is exactly the kind of file that grows into
+// it, so this is a case that will be reached rather than a theoretical one.
+// Comparing the count against the string is what turns it into a false return,
+// and every safety the callers have rests on that false.
 static bool write_spiffs_file(const char *path, const String &content) {
     File f = SPIFFS.open(path, FILE_WRITE);
     if (!f) return false;
-    f.print(content);
+    size_t written = f.print(content);
     f.close();
-    return true;
+    return written == content.length();
+}
+
+// Same, for a file whose previous contents are worth more than the write.
+//
+// FILE_WRITE truncates on open, so an ordinary write spends its whole duration
+// with the file empty: power lost in there takes the old snapshot with the new
+// one. Writing beside it and renaming afterwards narrows that to the remove
+// plus the rename, and even in there the complete new snapshot is still on
+// flash under the temp name.
+//
+// THAT LAST PART IS ONLY HALF A MECHANISM AND THIS FUNCTION IS THE OTHER HALF
+// OF NOTHING WITHOUT IT. The crash that this narrows the window on is exactly
+// the one that leaves the real name gone or empty and the whole snapshot
+// sitting under the temp name. A caller that reads the real name, gets an
+// empty string and gives up has bought nothing at all: every caller must fall
+// back to reading tmp_path when path comes back empty, or this is decoration.
+//
+// THAT FALLBACK COVERS THE CRASH WINDOW AND NOTHING ELSE. It is keyed on the
+// real name coming back empty, so it can only answer a power loss between the
+// remove and the rename. It is no answer at all to a write that ran out of
+// room, because the real name would not be empty then — it would hold a
+// truncated snapshot that parses as nothing, under a call that returned true.
+// A failed write is therefore not allowed to reach the remove: it has to stop
+// at the guard below, which is why write_spiffs_file() checks its byte count
+// and why this returns early instead of taking the old file down first.
+//
+// SPIFFS.rename() will not clobber an existing name, hence the remove.
+//
+// The notification store is the caller, and notify_load() holds up the other
+// half: it reads NOTIFY_FILE, and falls back to NOTIFY_FILE_TMP when that comes
+// back empty. Any future caller owes the same fallback.
+static bool write_spiffs_file_atomic(const char *path, const char *tmp_path,
+                                     const String &content) {
+    if (!write_spiffs_file(tmp_path, content)) return false;
+    SPIFFS.remove(path);
+    return SPIFFS.rename(tmp_path, path);
 }
 
 // ===== Timezone =====
@@ -1059,6 +1157,21 @@ static void wifi_setup() {
     mdns_restart();
 }
 
+// ===== The notification store =====
+//
+// #included HERE rather than at the bottom with gpio and serial, and the
+// position is load-bearing: the two screens below read this store directly.
+// They need the NotifyView type complete — each renderer declares one on its
+// own stack — so a forward declaration cannot stand in for the definition, and
+// the include has to precede the UI section rather than follow it.
+//
+// The one thing it needs from further down the file is handle_body_collect(),
+// which is declared just above and defined with the other handlers. Everything
+// else it uses — event_add(), require_auth(), read_spiffs_file(),
+// write_spiffs_file_atomic(), skill_register(), SkillEndpoint, ui_force,
+// ui_force_net — is already defined above this line.
+#include "skills/notify.cpp"
+
 // ===== On-device UI =====
 //
 // A 240x135 panel and a 56-key QWERTY, driven through M5Cardputer. Three rules
@@ -1109,6 +1222,85 @@ static void wifi_setup() {
 #define UI_MENU_X       8
 #define UI_MENU_R_X   232
 
+// ---- Notification geometry ----
+//
+// THE SOURCE FIRMWARE'S NUMBERS DO NOT SURVIVE THE TRIP AND M5GFX WILL NOT SAY
+// SO. It clips a rect or a string that leaves the panel silently — no error, no
+// return value, no assert — so a straight port of a 320x170 layout onto this
+// 240x135 one produces a wrong screen and a clean build. Every constant below
+// was re-fitted rather than copied. For the record, what the originals do here:
+// the selection bar runs 74px off the right edge, list row 4 lands at y=136 on
+// a panel whose last row is 134, the selection band for row 3 paints over the
+// footer rule, the age column's erase band (264..310) is entirely off-panel,
+// the card is 68px too wide, its fade envelope leaves the panel on both axes,
+// and its 276px text column is wider than this whole display.
+//
+// WHAT DOES CARRY OVER IS THE PIXEL BUDGET PER CHARACTER. M5GFX ships the same
+// font tables as TFT_eSPI — verified in lgfx/Fonts/: Font2 is 16px tall with a
+// widest glyph of 10px ('M' and 'W'), Font4 is 26px tall with a widest of 25px
+// ('@'; 'M' is 21). So the columns are re-fitted and the glyph widths are not
+// re-derived.
+
+// The list reuses the seed's own rows — ui_row_y() and UI_ROW_H, the same
+// geometry the menu draws on — rather than porting a second row pitch that
+// would not fit. Only the columns within a row are new.
+//
+// Three of them, and 240px does not stretch to a worst case in all three. The
+// age column does get one: 32px against a measured 24px for the widest string
+// it can hold ("59m"; "99d" is 23px). The other two are fitted to what actually
+// appears and ellipsise beyond it — 74px of source takes "! home-rig" at 62px
+// and around ten ordinary characters, 118px of title takes about sixteen. A
+// 16-character source of nothing but 'M' would need 169px and is cut; the JSON
+// still carries it whole, which is the division of labour this seed already
+// has between the panel and GET /notify.
+#define MSG_SRC_X      4
+#define MSG_SRC_W     74
+#define MSG_TITLE_X   82
+#define MSG_TITLE_W  118
+#define MSG_AGE_R    236   /* right-aligned to this edge */
+#define MSG_AGE_W     32
+// Longest string a list cell holds: a 40-character title plus an ellipsis.
+#define MSG_CELL_LEN  45
+
+// Card geometry: 224x92 at (8,21), between the header rule and the footer.
+//
+// THE WIDTH SHRANK AND THE HEIGHT VERY NEARLY DID NOT, and that asymmetry is
+// forced by the fonts. The card's contents are one Font2 line, one Font4 line
+// and two more Font2 lines — 16+26+16+16 = 74px of glyphs that do not scale
+// with the panel. Scaling the source's 100px card down in proportion with the
+// panel gives 89px, which after borders and gaps cannot hold its own text. So
+// the card keeps its stack and gives up width, which is the axis where a
+// smaller panel really does mean less room for characters.
+//
+// The vertical budget is exact and there is nothing spare in it. The header
+// rule is at UI_RULE1_Y=20 and the footer text at UI_FOOT_Y=121, so the card
+// owns rows 21..120 — 100 rows. The fade envelope is MSG_CARD_H + 4*MSG_PEEK
+// tall (see ui_draw_card for where the 4 comes from), which is exactly 100 at
+// these values. Raising either constant paints over the footer.
+#define MSG_CARD_X     8
+#define MSG_CARD_Y    21
+#define MSG_CARD_W   224
+#define MSG_CARD_H    92
+#define MSG_PAD_L     10   /* clears the 3px accent bar with 7px to spare */
+#define MSG_PAD_R      8
+#define MSG_ACCENT_W   3
+#define MSG_PEEK       2   /* offset of each card peeking out behind */
+// The stack inside the card, as offsets from its top edge. Font heights are
+// fixed; these gaps are the only slack there is, and they are what pays for the
+// 8px the card lost against the source's 100.
+#define MSG_SRC_Y      4   /* Font2, so rows +4..+19  */
+#define MSG_TITLE_Y   24   /* Font4, so rows +24..+49 */
+#define MSG_BODY1_Y   54   /* Font2, so rows +54..+69 */
+#define MSG_BODY2_Y   72   /* Font2, so rows +72..+87, leaving a 4px margin */
+
+// Arrival: three frames of rising blend plus a few pixels of upward travel.
+// 40ms a frame, so the whole thing is over in 120ms — present enough to read as
+// an arrival, short enough that it never delays the first look.
+#define MSG_FADE_STEPS 3
+#define MSG_FADE_MS   40
+#define MSG_TINT_A    26   /* card fill: level colour at ~10% over black */
+#define MSG_BORDER_A 102   /* card border: the same colour at ~40% */
+
 // How often the screen is allowed to reconsider itself. Everything on it
 // changes at 1Hz at most (the clock), and the tick is cheap only because of the
 // per-field caches, so five times a second is responsive without being busy.
@@ -1131,11 +1323,62 @@ static const uint16_t COL_DIM    = ui_rgb(120, 120, 120);
 static const uint16_t COL_RULE   = ui_rgb(60, 60, 60);
 static const uint16_t COL_ACCENT = ui_rgb(60, 200, 110);
 
+// One colour per notification level. The palette above is monochrome apart from
+// the single accent, so these three are the only saturated things this firmware
+// puts on the glass and they only ever appear on a notification — which is what
+// makes a red card mean something from across a room.
+static const uint16_t COL_INFO = ui_rgb(80, 150, 225);
+static const uint16_t COL_WARN = ui_rgb(230, 175, 55);
+static const uint16_t COL_CRIT = ui_rgb(235, 75, 60);
+
+static uint16_t ui_level_color(uint8_t level) {
+    switch (level) {
+    case NOTIFY_CRIT: return COL_CRIT;
+    case NOTIFY_WARN: return COL_WARN;
+    default:          return COL_INFO;
+    }
+}
+
+// Composite `fg` over `bg` at `alpha`/255 and hand back the RGB565 result.
+//
+// M5GFX has no equivalent — there is no alphaBlend anywhere in the library
+// tree — so a seed that wants a tint or a fade has to bring its own. The
+// argument order is the one TFT_eSPI uses, alpha first, so a call reads the
+// same here as in the firmware this is ported from.
+//
+// It is NOT bit-identical to TFT_eSPI's, on purpose. That one works on the
+// packed value and scales red and blue by `alpha >> 2` over 64, which makes
+// alpha 255 return 30/62/30 out of a possible 31/63/31 — the endpoint of a
+// fade is not quite the colour the fade was aimed at, and any test asserting
+// "fully opaque means fg" fails against it. Unpacking the three channels and
+// blending each as a weighted sum costs nothing at the sizes involved, cannot
+// underflow, rounds to nearest, and lands exactly on bg at alpha 0 and exactly
+// on fg at alpha 255. Everything in between differs from TFT_eSPI by at most
+// one step per channel, which is below what the panel resolves.
+//
+// ui_rgb() above already packs 5/6/5 in the order M5GFX expects, so the two
+// halves of the palette agree and nothing converts anything.
+//
+// Called by ui_draw_card(), for the tint, the border, the accent bar and both
+// text colours — five blends a fade frame.
+static uint16_t ui_blend(uint8_t alpha, uint16_t fg, uint16_t bg) {
+    uint32_t a = alpha;
+    uint32_t ia = 255u - a;
+    uint32_t r = ((((uint32_t)fg >> 11) & 0x1F) * a +
+                  (((uint32_t)bg >> 11) & 0x1F) * ia + 127u) / 255u;
+    uint32_t g = ((((uint32_t)fg >>  5) & 0x3F) * a +
+                  (((uint32_t)bg >>  5) & 0x3F) * ia + 127u) / 255u;
+    uint32_t b = (( (uint32_t)fg        & 0x1F) * a +
+                  ( (uint32_t)bg        & 0x1F) * ia + 127u) / 255u;
+    return (uint16_t)((r << 11) | (g << 5) | b);
+}
+
 // Text anchors. Spelled out here because M5GFX keeps them in a namespace that
 // no using-directive drags into global scope, and the short TL_DATUM spellings
 // are only reachable from inside the library's own namespaces.
 static const uint8_t UI_TL = lgfx::textdatum::top_left;
 static const uint8_t UI_TR = lgfx::textdatum::top_right;
+static const uint8_t UI_TC = lgfx::textdatum::top_center;
 
 enum ui_screen_t {
     UI_STATUS = 0,
@@ -1143,15 +1386,28 @@ enum ui_screen_t {
     UI_NETWORK,
     UI_SYSTEM,
     UI_HARDWARE,
+    UI_MESSAGES,   // the queue as a scrolling list
+    UI_MESSAGE,    // one message as a card
     UI_SCREEN_COUNT
 };
 
-static const char *ui_screen_name[UI_SCREEN_COUNT] = {
-    "status", "menu", "network", "system", "hardware"
+// DECLARED WITHOUT A BOUND SO THAT A MISSING ENTRY IS A COMPILE ERROR. Written
+// `[UI_SCREEN_COUNT]`, as these were, a short initialiser is perfectly legal
+// C++ — the remaining elements are value-initialised to null pointers — so
+// adding a screen and forgetting its name here builds clean under -Wall -Wextra
+// and then hands a null to snprintf's %s on the first tick that draws the
+// header. Letting the initialiser set the size and asserting the size is what
+// makes the two tables and the enum impossible to get out of step.
+static const char *ui_screen_name[] = {
+    "status", "menu", "network", "system", "hardware", "messages", "message"
 };
-static const char *ui_screen_title[UI_SCREEN_COUNT] = {
-    "STATUS", "MENU", "NETWORK", "SYSTEM", "HARDWARE"
+static const char *ui_screen_title[] = {
+    "STATUS", "MENU", "NETWORK", "SYSTEM", "HARDWARE", "MESSAGES", "MESSAGE"
 };
+static_assert(sizeof(ui_screen_name) / sizeof(ui_screen_name[0]) == UI_SCREEN_COUNT,
+              "ui_screen_name is missing an entry for a screen in ui_screen_t");
+static_assert(sizeof(ui_screen_title) / sizeof(ui_screen_title[0]) == UI_SCREEN_COUNT,
+              "ui_screen_title is missing an entry for a screen in ui_screen_t");
 
 // What the menu can do. Everything here is reachable from the keyboard alone,
 // which is the point: the AP entry in particular has to work on a node whose
@@ -1168,7 +1424,24 @@ struct UiMenuItem {
     int arg;
 };
 
+// MESSAGES WENT IN AT THE TOP, NOT ON THE END, and that is a change to a menu
+// that already existed rather than an addition beside it: every entry below
+// moved down one, and the cursor a fresh boot starts on is now Messages where
+// it used to be Network. Deliberate, and worth the disruption for one reason —
+// this is the only row on the device that carries an unread count. There is no
+// badge on the status screen, no buzzer and no LED, so the queue gets noticed
+// here or not at all, and a row that has to be scrolled past five others to be
+// seen is not a notification. Everything below it is configuration a user goes
+// looking for; this is the row that has something to say without being asked.
+//
+// Nothing keys off the old numbering. The indices are used in exactly three
+// places and all three take them from this table: ui_activate() by lookup,
+// ui_window() by position, and GET /ui's menu.selected, which reports whatever
+// is here. The one literal index in the file — ui_handle_key()'s Back row,
+// which puts the cursor on Messages — is written against this order and
+// commented with the name it means.
 static const UiMenuItem ui_menu[] = {
+    {"Messages",  UI_ACT_SCREEN,    UI_MESSAGES},
     {"Network",   UI_ACT_SCREEN,    UI_NETWORK},
     {"System",    UI_ACT_SCREEN,    UI_SYSTEM},
     {"Hardware",  UI_ACT_SCREEN,    UI_HARDWARE},
@@ -1176,11 +1449,13 @@ static const UiMenuItem ui_menu[] = {
     {"Backlight", UI_ACT_BACKLIGHT, 0}
 };
 #define UI_MENU_COUNT ((int)(sizeof(ui_menu) / sizeof(ui_menu[0])))
-// The menu does not scroll, so it must fit the rows it has. Growing it past
-// five entries is a real change — a window offset and a scroll indicator — not
-// a one-line edit, and this is what stops that from being discovered on the
-// device.
-static_assert(UI_MENU_COUNT <= UI_ROWS, "menu does not scroll: keep it within UI_ROWS");
+// THE MENU SCROLLS NOW. It used to carry a static_assert that it must fit
+// UI_ROWS, whose whole job was to make growing it past five entries fail at
+// compile time rather than by quietly dropping the sixth off the bottom of a
+// five-row screen. Messages is that sixth entry, so the assert has been paid
+// off rather than deleted: ui_menu_first below is the window offset it demanded
+// and the footer carries the position counter. There is no longer an upper
+// bound on this table.
 
 // ---- UI state ----
 //
@@ -1218,6 +1493,36 @@ static bool ui_board_detected = false;
 static bool ui_keyboard_enabled = false;
 static ui_screen_t ui_screen = UI_STATUS;
 static int ui_menu_index = 0;
+// Where the menu's visible window starts, and where it started when the panel
+// was last painted.
+//
+// THE SECOND ONE IS NOT REDUNDANT AND THE SCREEN IS WRONG WITHOUT IT. The menu
+// repaints only the two rows whose highlight changed, and that optimisation
+// compares against the selected ROW rather than the selected entry. A window
+// that scrolls moves five entries under five rows while the selected row stays
+// exactly where it was — the sixth entry arriving under a cursor already on the
+// bottom row is the ordinary case — so the row test alone sees nothing moving,
+// skips the repaint, and leaves the previous window's text on the glass under a
+// correctly-placed bar. Comparing the window against what was drawn is what
+// catches it.
+static int ui_menu_first = 0;
+static int ui_menu_first_drawn = -1;
+// The message list's selection and window. The list is the messages followed by
+// a Back row, so the selection runs 0..notify_count() inclusive.
+static int ui_msg_sel = 0;
+static int ui_msg_sel_drawn = -1;
+static int ui_msg_first = 0;
+static int ui_msg_first_drawn = -1;
+// How many messages were in the list when it was last painted. A message
+// arriving or expiring shifts every row's content without moving the selection
+// or the window, so this is the third thing that has to force a relayout.
+static int ui_msg_items_drawn = -1;
+// THE CARD HOLDS AN ID, NOT AN INDEX. Messages arrive and expire while it is on
+// screen and every one of those shifts the list under it; an index would
+// silently start pointing at a different message. Zero means no subject.
+static uint32_t ui_msg_id = 0;
+// How far into the arrival fade the card is. MSG_FADE_STEPS means settled.
+static uint8_t ui_card_fade = MSG_FADE_STEPS;
 static uint8_t ui_brightness = UI_BRIGHT_DEFAULT;
 // What "on" means for the backlight toggle, so turning it off and on again
 // returns to the brightness the user had chosen rather than to the default.
@@ -1236,7 +1541,42 @@ static char ui_cache_net[24];
 static char ui_cache_label[UI_ROWS][16];
 static char ui_cache_value[UI_ROWS][48];
 static char ui_cache_foot[48];
+// Which ROW currently carries the menu's selection bar, or -1. A row and not an
+// entry index: with a window the two stopped being the same number, and the
+// only question this answers is which row has to be un-highlighted.
 static int ui_cache_sel = -1;
+// The message list's three columns per row, and the card's two wrapped body
+// lines. Separate from the caches above rather than sharing them: a list row
+// has three fields where a data row has two, and a 40-character title plus an
+// ellipsis does not fit ui_cache_label's 16 bytes.
+//
+// Nothing needs clearing when a screen changes. Every transition goes through
+// ui_goto(), which raises ui_force, which repaints the frame and forces every
+// field on the new screen — so whatever the previous screen left in here is
+// overwritten before it can be compared against.
+static char ui_msg_cell[UI_ROWS][3][MSG_CELL_LEN];
+static char ui_card_row[3][48];                    // source, age, title
+// The empty-queue notice, which needs its own cache because it is centred
+// across columns the row fields also write to. See ui_draw_msglist().
+static char ui_cache_note[16];
+// THE WRAPPED BODY LINES ARE ALSO WHAT GET /ui REPORTS. The raw body is 96
+// characters and every buffer on the /ui path is 48, so reporting the body
+// through ui_field() would cut it at 47 while the panel showed all of it over
+// two lines — a report that disagrees with the glass. These two are what the
+// glass actually has on it. See handle_ui() for why the endpoint reads this
+// cache instead of wrapping the body itself.
+static char ui_card_body[2][NOTIFY_BODY_LEN + 4];
+// WHICH MESSAGE THOSE TWO LINES BELONG TO, and the report is worthless without
+// it. The cache is only ever refilled by a draw, and a draw happens on the tick
+// after the card opens — so between ui_enter_card() and the first
+// ui_draw_card(), and again on every `;`/`.` step from one card to the next,
+// ui_card_body still holds the PREVIOUS message's wrapped lines. A GET /ui
+// landing in that window would pair this card's id and title with another
+// card's body, which is worse than reporting no body at all: a reader has no
+// way to tell the two apart. ui_draw_card() stamps this with the id it just
+// wrapped, and handle_ui() emits the lines only while the stamp still matches.
+// Zero is not a valid notification id, so an unstamped cache matches nothing.
+static uint32_t ui_card_body_id = 0;
 
 // ---- Field values ----
 
@@ -1297,6 +1637,22 @@ static void ui_menu_state(int i, char *out, size_t n) {
             snprintf(out, n, "%u", (unsigned)ui_brightness);
             break;
         case UI_ACT_SCREEN:
+            // The Messages row carries the queue's state, and it is the only
+            // place on this firmware that an unread count is visible without
+            // navigating to it. There is no badge on the status screen and no
+            // buzzer and no LED on this node, so the menu is where a message
+            // gets noticed.
+            //
+            // Both calls take the store's spinlock and are safe from any task,
+            // which matters because GET /ui calls this from AsyncTCP.
+            if (ui_menu[i].arg == UI_MESSAGES) {
+                int total = notify_count();
+                int unread = notify_unread_count();
+                if (total == 0)      snprintf(out, n, "empty");
+                else if (unread > 0) snprintf(out, n, "%d new / %d", unread, total);
+                else                 snprintf(out, n, "%d read", total);
+            }
+            break;
         default:
             break;
     }
@@ -1533,7 +1889,14 @@ static bool ui_field(ui_screen_t screen, int idx, char *label, size_t label_n,
             return false;
         }
 
+    // Three screens have no label/value rows at all. The menu has entries, the
+    // list has messages and the card has one message, and GET /ui reports each
+    // of them through its own object rather than through fields[]. An empty
+    // fields[] on those three is therefore not a screen failing to describe
+    // itself; doc["content"] names where its content actually is.
     case UI_MENU:
+    case UI_MESSAGES:
+    case UI_MESSAGE:
     default:
         return false;
     }
@@ -1541,18 +1904,285 @@ static bool ui_field(ui_screen_t screen, int idx, char *label, size_t label_n,
 
 // The key legend, which is the only documentation a user standing in front of
 // the node gets. Kept in sync with ui_handle_key() by being right next to it.
+//
+// THE SCROLL COUNTER LIVES HERE AND NOT IN THE HEADER. The source firmware puts
+// its `n/m` in the header bar, which on this panel is already full: the title
+// field runs 0..114 and the network summary 112..236, and those two overlap by
+// 2px as it is. The footer has the room, but not much of it — Font0 is fixed
+// at 6px a glyph, so the 236px field holds 39 characters, and the longest
+// legend below is the card's at exactly 39 with a two-digit counter on it:
+// "; . next  ENT ack  ` keep unread  20/20" measures 234px into 236. Two
+// pixels of slack, so a legend that grows by one character does not fit.
+//
+// A THREE-DIGIT COUNTER IS THE WAY THAT HAPPENS, and it is asserted rather
+// than left to the panel. The counters come from NOTIFY_MAX and UI_MENU_COUNT;
+// raising the queue to three digits pushes that legend to 246px, which the
+// field does not clip and the 240px panel silently cuts off at the right edge
+// — the user loses the end of the sentence that tells them backtick keeps a
+// message unread. Fail the build instead and let whoever raises the cap shorten
+// the legend in the same commit.
+static_assert(NOTIFY_MAX <= 99,
+              "the card's footer legend is 39 of the 39 characters Font0 fits "
+              "across 236px with a two-digit counter; a three-digit queue "
+              "overflows it off the panel — shorten the legend first");
+static_assert(UI_MENU_COUNT <= 99,
+              "the menu's footer legend needs a two-digit counter to fit");
+//
+// The card's legend is where the difference between the two ways of leaving it
+// is documented, because it is the only place it can be. Enter acknowledges and
+// backtick does not, and a user who cannot be told that will assume looking at
+// a message is what marks it read.
 static void ui_footer(ui_screen_t screen, char *out, size_t n) {
     switch (screen) {
     case UI_STATUS:
         snprintf(out, n, "ENT menu   , / dim/bright");
         break;
     case UI_MENU:
-        snprintf(out, n, "; . move  ENT select  ` back");
+        snprintf(out, n, "; . move  ENT select  ` back  %d/%d",
+                 ui_menu_index + 1, UI_MENU_COUNT);
         break;
+    case UI_MESSAGES: {
+        int items = notify_count();
+        // The Back row is not a message and must not be counted as one. Sitting
+        // on it reports the last message's position rather than a position one
+        // past the end, which is what the source does and reads correctly as
+        // "you are at the bottom of this many".
+        snprintf(out, n, "; . move  ENT open  ` back  %d/%d",
+                 items == 0 ? 0 : (ui_msg_sel < items ? ui_msg_sel + 1 : items),
+                 items);
+        break;
+    }
+    case UI_MESSAGE: {
+        int idx = notify_index_of(ui_msg_id);
+        snprintf(out, n, "; . next  ENT ack  ` keep unread  %d/%d",
+                 idx < 0 ? 0 : idx + 1, notify_count());
+        break;
+    }
     default:
         snprintf(out, n, "` back  ENT menu  , / dim/bright");
         break;
     }
+}
+
+// ---- Scrolling a list longer than the screen ----
+
+// Where the visible window starts, given where the selection is. Move it only
+// when the selection would otherwise leave it, which keeps a step inside the
+// window down to a two-row repaint instead of a full one.
+//
+// The source firmware spells this against a pair of file-scope globals. Here it
+// takes the position and returns the new one, because the seed has no such
+// globals and inventing them would land dead state in this commit for the sake
+// of a four-line function; whichever screen grows a scrolling list can then own
+// its own pair rather than sharing one with every other screen.
+//
+// The four clamps run in the source's order and the order is load-bearing. The
+// two selection clamps go first so the window follows the cursor; the
+// end-of-list clamp then pulls a window that ran off the bottom back on; and
+// the floor at zero runs last because it is the one that has to win — when
+// `count` is smaller than `rows` the previous line computes a negative start,
+// and this is what turns that into a list pinned at the top rather than one
+// indexed from before its own beginning.
+//
+// Two callers now, each with its own pair of offsets exactly as this comment
+// anticipated: the menu (ui_menu_first) and the message list (ui_msg_first).
+static int ui_window(int sel, int first, int count, int rows) {
+    if (sel < first) first = sel;
+    if (sel >= first + rows) first = sel - rows + 1;
+    if (first > count - rows) first = count - rows;
+    if (first < 0) first = 0;
+    return first;
+}
+
+// ---- Fitting text to a column ----
+//
+// Columns are pixel budgets, and what goes in them is whatever an agent put in
+// the JSON. Everything below measures with M5GFX's own font tables — the same
+// ones drawString() renders from — so a string is cut where it actually stops
+// fitting rather than at a character count guessed from an average glyph.
+//
+// TWO M5GFX CALLS DO THE WHOLE JOB AND NEITHER IS OBVIOUS FROM ITS NAME:
+//
+//   textWidth(str, font)  — measures against `font` without disturbing the
+//                           live one. Takes the font as an argument and works
+//                           on a copy of the metrics, so it leaves no font
+//                           state behind. It still runs the display's shared
+//                           UTF-8 decoder, so "no font state" is not the same
+//                           as "safe from any task" — see the warning below.
+//
+//   textLength(str, width) — returns THE BYTE OFFSET OF THE FIRST CHARACTER
+//                           THAT DOES NOT FIT in `width`. That offset is the
+//                           cut point, already UTF-8 decoded with real per
+//                           glyph advances, and already on a code-point
+//                           boundary because the library captures the start of
+//                           each character before it decodes it. There is no
+//                           reason to walk a string a character at a time and
+//                           add up widths; this is that loop, written by people
+//                           who own the font tables.
+//
+// textLength() has two edges worth writing down. It takes NO font argument — it
+// measures with the live `_font` and rewrites the display's own metrics in
+// place — so the font has to be installed around the call and put back after.
+// And it advances the display's shared UTF-8 decoder, which is fine on a
+// complete well-formed string and is why nothing below ever hands it a
+// fragment.
+//
+// EVERYTHING IN THIS SECTION IS FOR THE loop() TASK AND NOTHING ELSE MAY CALL
+// IT. There is one M5.Display and these borrow its state: ui_fit_bytes()
+// installs a font on it, measures, and puts the caller's font back, and both
+// measuring calls advance its shared UTF-8 decoder. ui_ellipsis() and
+// ui_wrap2() inherit all of that. None of it is guarded by anything.
+//
+// The task that will want to break these rules is the AsyncTCP one, because
+// that is where a notification arrives and where formatting its card text is
+// the obvious thing to do. Do not. Run it there while loop() is inside
+// ui_draw_field() and the draw picks up whichever font was installed last,
+// which is not the one it asked for. THE PANEL DOES NOT RECOVER FROM THAT ON
+// ITS OWN: ui_draw_field() writes the string it was given into the field cache
+// whether or not it came out right, so the next tick compares equal, skips the
+// repaint, and the mis-rendered field stays mis-rendered until something
+// changes its text. A garbled row that never redraws is the symptom; a fit
+// call from the wrong task is the cause.
+//
+// The rule for the notification store, then: the web task owns the data and
+// nothing else, and every one of these calls happens inside ui_tick().
+
+// Copy at most `len` bytes of `src` into `dst`, bounded by the buffer, and
+// never split a well-formed UTF-8 sequence at the end: back off over any
+// continuation bytes at the cut. Returns how many bytes were written.
+//
+// The buffer bound is the one that needs this. Cut points from textLength() are
+// already on a boundary; a destination that simply ran out of room is not.
+//
+// WELL-FORMED IS A PRECONDITION, NOT SOMETHING THIS CHECKS. The back-off looks
+// at the byte AT the cut and stops when that byte is not a continuation byte,
+// which says nothing about whether the sequence before the cut was ever
+// complete. ui_copy_utf8(dst, n, "ab\xC3", 3) copies all three bytes and hands
+// back a string ending in a lone lead byte, because src[3] is the terminator
+// rather than a continuation byte. Malformed input passes through.
+//
+// It is left that way deliberately, because validating here would not buy the
+// thing it looks like it buys. The damage a bad sequence does is to the
+// display's shared UTF-8 decoder, which setFont() pointedly does not reset
+// (LGFXBase.cpp:2539) — but ui_ellipsis() and ui_wrap2() both measure the RAW
+// `src` with textWidth()/textLength() before a byte is ever copied, and those
+// run the same decodeUTF8() over the same bad bytes. The decoder is already
+// mid-sequence by the time control reaches here; a clean copy afterwards
+// cannot undo it. The reach of that is also short: decodeUTF8() only enters
+// its state machine for bytes with the high bit set, and any ASCII byte drops
+// it straight back to state0, so a stranded decoder is corrected by the very
+// next plain character and only ever mangles a following string that itself
+// begins non-ASCII. Rejecting malformed input belongs where it enters, at the
+// JSON, not in a copy helper three layers down.
+static size_t ui_copy_utf8(char *dst, size_t n, const char *src, size_t len) {
+    if (n == 0) return 0;
+    if (len > n - 1) len = n - 1;
+    while (len > 0 && ((unsigned char)src[len] & 0xC0) == 0x80) len--;
+    memcpy(dst, src, len);
+    dst[len] = '\0';
+    return len;
+}
+
+// Measure where `src` stops fitting in `width`, with `font` installed for the
+// duration and the caller's font restored afterwards.
+static size_t ui_fit_bytes(const char *src, const lgfx::IFont *font,
+                           int32_t width) {
+    const lgfx::IFont *prev = M5.Display.getFont();
+    M5.Display.setFont(font);
+    int32_t cut = M5.Display.textLength(src, width);
+    M5.Display.setFont(prev);
+    return cut < 0 ? 0 : (size_t)cut;
+}
+
+// Copy `src` into `dst`, cut to `max_px` with a trailing ellipsis if it does
+// not fit. A column too narrow for the ellipsis itself is hard-truncated
+// instead — three dots and nothing else says less than two real characters.
+static void ui_ellipsis(char *dst, size_t n, const char *src,
+                        const lgfx::IFont *font, int32_t max_px) {
+    if (n == 0) return;
+    dst[0] = '\0';
+    if (!src || !src[0]) return;
+
+    if (M5.Display.textWidth(src, font) <= max_px) {
+        ui_copy_utf8(dst, n, src, strlen(src));
+        return;
+    }
+
+    int32_t ell_w = M5.Display.textWidth("...", font);
+    bool with_ellipsis = (ell_w < max_px);
+    size_t cut = ui_fit_bytes(src, font,
+                              with_ellipsis ? max_px - ell_w : max_px);
+
+    // The ellipsis needs room in the destination as well as on the panel.
+    size_t cap = with_ellipsis ? (n >= 5 ? n - 4 : 0) : n - 1;
+    if (cut > cap) cut = cap;
+
+    size_t out = ui_copy_utf8(dst, n, src, cut);
+    // Hang the ellipsis off a word rather than off a gap.
+    while (out > 0 && dst[out - 1] == ' ') out--;
+    dst[out] = '\0';
+    if (with_ellipsis) snprintf(dst + out, n - out, "...");
+}
+
+// Break `src` over two lines of `max_px`, on a space where there is one. The
+// second line carries the ellipsis, so a body too long for the card ends
+// visibly rather than just stopping.
+//
+// LINE TWO RESUMES FROM WHAT LINE ONE ACTUALLY TOOK, NOT FROM WHERE THE PIXELS
+// RAN OUT. Those are two different offsets and confusing them drops text on the
+// floor. `brk` is a panel measurement; ui_copy_utf8() answers to the buffer as
+// well, and clamps to n1 - 1 when the buffer is the tighter of the two. Resume
+// at src + brk after that and the bytes between what l1 could hold and what the
+// column could show appear on neither line, with no ellipsis anywhere to admit
+// it — a narrow l1 against a wide column silently eats a run of characters out
+// of the middle of the body. Using the return value costs nothing and is
+// already on a code-point boundary. ui_ellipsis() handles the same collision
+// with its `cap` clamp; this is that idea applied to the other helper.
+//
+// Called by ui_draw_card() for the message body, and by nothing else. The two
+// lines it produces are cached in ui_card_body[] and are what GET /ui reports,
+// because they are what is on the glass.
+static void ui_wrap2(const char *src, char *l1, size_t n1, char *l2, size_t n2,
+                     const lgfx::IFont *font, int32_t max_px) {
+    if (n1) l1[0] = '\0';
+    if (n2) l2[0] = '\0';
+    if (!src || !src[0] || n1 == 0) return;
+
+    // Fits the column, which says nothing about fitting l1: a short buffer
+    // still overflows onto line two, and it is line two's ellipsis that keeps
+    // the overflow honest.
+    if (M5.Display.textWidth(src, font) <= max_px) {
+        size_t took = ui_copy_utf8(l1, n1, src, strlen(src));
+        const char *tail = src + took;
+        while (*tail == ' ') tail++;
+        if (*tail) ui_ellipsis(l2, n2, tail, font, max_px);
+        return;
+    }
+
+    size_t fit = ui_fit_bytes(src, font, max_px);
+    // Break on the last space at or before the cut. The scan stops short of
+    // index zero on purpose: breaking on a leading space would put nothing at
+    // all on the first line. A single word wider than the line has no space to
+    // break on either way, and is cut where it stopped fitting.
+    //
+    // THE SCAN INCLUDES src[fit] AND MUST. `fit` is the offset of the first
+    // character that does NOT fit, so a word ending exactly at the column edge
+    // puts a space right there — and that space is the ideal break, because the
+    // line then ends exactly where the word does. Starting the scan at fit - 1
+    // steps over it and falls back to the previous space, dropping a whole word
+    // onto the next line for no reason. This was written that way and only
+    // became visible when the card gave ui_wrap2() its first caller: a 206px
+    // body line was rendering "412 GB transferred to the" and pushing "array"
+    // down, having measured 205px of the 206 it was allowed.
+    size_t brk = fit;
+    for (size_t i = fit + 1; i > 1; i--) {
+        if (src[i - 1] == ' ') { brk = i - 1; break; }
+    }
+
+    size_t took = ui_copy_utf8(l1, n1, src, brk);
+    const char *rest = src + took;
+    while (*rest == ' ') rest++;
+    ui_ellipsis(l2, n2, rest, font, max_px);
 }
 
 // ---- Drawing ----
@@ -1561,14 +2191,29 @@ static void ui_footer(ui_screen_t screen, char *out, size_t n) {
 //
 // The opaque background plus a fixed padding width is what erases the previous
 // value, so nothing here ever needs fillScreen and nothing ever flickers. The
-// cache keys on the text alone: a field whose colours change but whose string
-// does not needs ui_force, and every caller that moves a field onto or off a
-// coloured ground is a screen transition that already sets it.
-static void ui_draw_field(char *cache, size_t cache_n, const char *text,
+// cache keys on the text alone, so a field whose colours change but whose
+// string does not will not repaint on its own — MOVING A FIELD ONTO OR OFF A
+// COLOURED GROUND IS THE CALLER'S PROBLEM TO SOLVE, and there are two answers
+// to it in this file. A screen transition sets ui_force and every field
+// repaints. The menu selection bar does not: it slides one row on every arrow
+// key with no transition and no ui_force, and pays for that with the explicit
+// `moved` test below, which fills the new ground and blanks the two affected
+// rows' caches by hand so the fields draw themselves back over it.
+//
+// `force` is a PARAMETER AND NOT A READ OF ui_force, and that is the whole
+// reason ui_tick() can clear the flag before it draws instead of after. One
+// pass has to see one value throughout: the pass repaints the frame when it is
+// forced, which blanks the panel, and every field it then draws has to be told
+// to repaint over that blank ground. A field that consulted the global would
+// find it already cleared, find its cache still matching what it drew before
+// the fillScreen, and return without drawing — a black panel with two rules on
+// it and no text anywhere.
+static void ui_draw_field(bool force, char *cache, size_t cache_n,
+                          const char *text,
                           int32_t x, int32_t y, const lgfx::IFont *font,
                           uint16_t color, uint8_t datum, uint16_t padding,
                           uint16_t bg) {
-    if (!ui_force && strncmp(cache, text, cache_n - 1) == 0) return;
+    if (!force && strncmp(cache, text, cache_n - 1) == 0) return;
     snprintf(cache, cache_n, "%s", text);
     M5.Display.setFont(font);
     M5.Display.setTextDatum(datum);
@@ -1584,10 +2229,258 @@ static int32_t ui_row_y(int row) {
 
 // Everything the frame owns rather than a field: the two rules. Drawn on a full
 // repaint only, because nothing ever erases them.
-static void ui_draw_frame() {
+//
+// The card is the exception and takes the lower rule with it. That rule sits at
+// y=116, inside the rows the card's fade envelope repaints (21..120), so on the
+// card screen it would survive only as an 8px stub either side of the card. A
+// rule with a hole in it reads as a drawing bug; the footer below is perfectly
+// legible without one.
+static void ui_draw_frame(ui_screen_t screen) {
     M5.Display.fillScreen(COL_BG);
     M5.Display.drawFastHLine(0, UI_RULE1_Y, M5.Display.width(), COL_RULE);
-    M5.Display.drawFastHLine(0, UI_RULE2_Y, M5.Display.width(), COL_RULE);
+    if (screen != UI_MESSAGE) {
+        M5.Display.drawFastHLine(0, UI_RULE2_Y, M5.Display.width(), COL_RULE);
+    }
+}
+
+// ---- The message list ----
+//
+// The queue newest first, then a Back row, over the seed's ordinary five rows.
+//
+// Unlike every other screen this one repaints without any input, because the
+// age column moves on its own. The split is: the bars and every cell are forced
+// whenever the selection, the window or the item count moved — a solid bar
+// inverts the ground under text ui_draw_field() would otherwise consider
+// unchanged — and on every other pass the per-field caches decide, which in
+// practice means the ages, once a minute, and nothing else.
+static void ui_draw_msglist(bool force) {
+    int items = notify_count();
+    int count = items + 1;  // the messages, then Back
+
+    // The selection has to be clamped here and not only where the keys move it,
+    // because the list shrinks on its own. Messages expire and get evicted with
+    // nobody touching the keyboard, and ui_window() clamps the WINDOW without
+    // ever looking at the selection it was given — so a cursor left past the
+    // end produces a screen with no bar on it at all and a footer counting past
+    // the total. `items` is the Back row, which is always a valid position.
+    if (ui_msg_sel > items) ui_msg_sel = items;
+    if (ui_msg_sel < 0) ui_msg_sel = 0;
+
+    ui_msg_first = ui_window(ui_msg_sel, ui_msg_first, count, UI_ROWS);
+
+    // The item count is in this test because a message arriving or expiring
+    // shifts every row's content by one without touching the selection or the
+    // window. It is also what keeps the empty-queue notice below honest.
+    bool relayout = force || ui_msg_sel != ui_msg_sel_drawn ||
+                    ui_msg_first != ui_msg_first_drawn ||
+                    items != ui_msg_items_drawn;
+    if (relayout) {
+        for (int r = 0; r < UI_ROWS; r++) {
+            int32_t y = ui_row_y(r);
+            M5.Display.fillRect(0, y - 1, M5.Display.width(), UI_ROW_H,
+                                (ui_msg_first + r == ui_msg_sel) ? COL_ACCENT
+                                                                 : COL_BG);
+        }
+        // THE LOCAL, NEVER ui_force. The source firmware assigns its global
+        // display_force here, which works there because its fields read that
+        // global. Ours cannot: ui_tick() takes and clears ui_force before any
+        // drawing and every field reads the local copy, so assigning the global
+        // would do nothing on this pass and buy a redundant full repaint on the
+        // next one. Every cell below is now on a ground it did not have, and
+        // this is what tells them so.
+        force = true;
+    }
+
+    for (int r = 0; r < UI_ROWS; r++) {
+        int i = ui_msg_first + r;
+        int32_t y = ui_row_y(r);
+        bool sel = (i == ui_msg_sel);
+        uint16_t bg = sel ? COL_ACCENT : COL_BG;
+        // Sized from the cache they end up in, so the pixel budget stays the
+        // only thing that decides where a string is cut.
+        char src[MSG_CELL_LEN], title[MSG_CELL_LEN], age[MSG_CELL_LEN];
+        bool unread = false;
+
+        src[0] = title[0] = age[0] = '\0';
+        if (i == items) {
+            snprintf(src, sizeof(src), "Back");
+        } else if (i < items) {
+            NotifyView v;
+            if (notify_view(i, v)) {
+                unread = v.unread;
+                // An unread critical is the one thing that has to be findable
+                // without reading the rows, and a leading mark does it without
+                // spending a fourth colour on a list that has no colour.
+                //
+                // The source uppercases the whole column here. Not ported: this
+                // firmware's screens are mixed case throughout, and the sender
+                // chose the string.
+                char mark[NOTIFY_SOURCE_LEN + 2];
+                if (v.level == NOTIFY_CRIT && v.unread) {
+                    snprintf(mark, sizeof(mark), "! %s", v.source);
+                } else {
+                    snprintf(mark, sizeof(mark), "%s", v.source);
+                }
+                ui_ellipsis(src, sizeof(src), mark, &fonts::Font2, MSG_SRC_W);
+                ui_ellipsis(title, sizeof(title), v.title, &fonts::Font2,
+                            MSG_TITLE_W);
+                notify_age_str(v.age_s, age, sizeof(age));
+            }
+        }
+
+        // Black on the bar; off it, unread messages are primary text and read
+        // ones have already had their turn.
+        uint16_t c_pri = sel ? COL_BG : (unread ? COL_TEXT : COL_DIM);
+        uint16_t c_sec = sel ? COL_BG : COL_DIM;
+        ui_draw_field(force, ui_msg_cell[r][0], sizeof(ui_msg_cell[r][0]), src,
+                      MSG_SRC_X, y, &fonts::Font2, c_sec, UI_TL, MSG_SRC_W, bg);
+        ui_draw_field(force, ui_msg_cell[r][1], sizeof(ui_msg_cell[r][1]), title,
+                      MSG_TITLE_X, y, &fonts::Font2, c_pri, UI_TL, MSG_TITLE_W, bg);
+        ui_draw_field(force, ui_msg_cell[r][2], sizeof(ui_msg_cell[r][2]), age,
+                      MSG_AGE_R, y, &fonts::Font2, c_sec, UI_TR, MSG_AGE_W, bg);
+    }
+
+    // An empty queue says so instead of showing a screen with one Back row on
+    // it. Drawn on row 1, which the loop above has just blanked.
+    //
+    // The else branch clears the cache rather than drawing an empty string over
+    // it, and the difference matters. This field is centred with a 200px pad,
+    // so drawing "" through it would erase 20..220 of row 1 — straight through
+    // the "Back" that lands there the moment the queue is no longer empty.
+    // Every transition out of empty changes `items`, which forces the relayout
+    // above, which has already refilled that row: the pixels are gone, and all
+    // that is left to do is stop the cache from claiming otherwise.
+    if (items == 0) {
+        ui_draw_field(force, ui_cache_note, sizeof(ui_cache_note), "no messages",
+                      M5.Display.width() / 2, ui_row_y(1), &fonts::Font2,
+                      COL_DIM, UI_TC, 200, COL_BG);
+    } else {
+        ui_cache_note[0] = '\0';
+    }
+
+    ui_msg_sel_drawn = ui_msg_sel;
+    ui_msg_first_drawn = ui_msg_first;
+    ui_msg_items_drawn = items;
+}
+
+// ---- One message, as tinted glass ----
+//
+// The fill is the level colour blended onto black at about a tenth and the
+// border at about four tenths — real compositing through ui_blend(), so the
+// card sits over the ground rather than replacing it. The 3px bar down the left
+// edge is the level colour at full strength and is the only saturated thing on
+// the screen.
+//
+// During the fade the whole block is repainted, because the card is also
+// moving; once settled nothing repaints but the age, and that goes through
+// ui_draw_field() against the tint rather than against black.
+//
+// NO SPRITE, and there must not be one. The whole thing is fillRect, drawRect
+// and drawString straight to the panel — about 50 400 pixels a frame at this
+// size, which is ~20ms of a 40ms frame on this board's 40MHz panel bus, and not
+// one byte of it allocates. See rule 2 at the top of this section for why a
+// canvas is not available to reach for.
+static void ui_draw_card(bool force) {
+    NotifyView v;
+    int idx = 0, total = 0;
+    // ENTRY, POSITION AND DEPTH OUT OF ONE ACQUISITION, and it must stay that
+    // way. Resolving the id to an index and then reading at that index is two
+    // acquisitions with a gap, and a message arriving in the gap shifts the
+    // list — so the card would draw one message's text under another message's
+    // counter. The false return is "gone", expired or evicted while it was on
+    // screen; ui_tick() has already left for the list on this same pass, so
+    // there is nothing to draw.
+    if (!notify_view_by_id(ui_msg_id, v, &idx, &total)) return;
+
+    uint16_t level = ui_level_color(v.level);
+
+    bool fading = (ui_card_fade < MSG_FADE_STEPS);
+    uint8_t step = fading ? (uint8_t)(ui_card_fade + 1) : (uint8_t)MSG_FADE_STEPS;
+    int32_t x = MSG_CARD_X;
+    int32_t y = MSG_CARD_Y + (MSG_FADE_STEPS - step) * MSG_PEEK;
+
+    // Everything the card draws ramps together, so it arrives as one object
+    // rather than as a border that appears before its contents.
+    uint16_t tint   = ui_blend((uint8_t)(MSG_TINT_A * step / MSG_FADE_STEPS), level, COL_BG);
+    uint16_t edge   = ui_blend((uint8_t)(MSG_BORDER_A * step / MSG_FADE_STEPS), level, COL_BG);
+    uint16_t accent = ui_blend((uint8_t)(255 * step / MSG_FADE_STEPS), level, COL_BG);
+    uint16_t c_pri  = ui_blend((uint8_t)(255 * step / MSG_FADE_STEPS), COL_TEXT, tint);
+    uint16_t c_sec  = ui_blend((uint8_t)(255 * step / MSG_FADE_STEPS), COL_DIM, tint);
+
+    if (fading || force) {
+        // Erase the travel envelope: the card's footprint plus the two peeks
+        // behind it and the travel it still has to rise. The height is
+        // MSG_CARD_H + 4*MSG_PEEK because the deepest pixel over the whole fade
+        // is the p=2 card on the first frame — that frame starts 2*MSG_PEEK
+        // low and the peek is another 2*MSG_PEEK down from its own top edge.
+        // 228x100 once per fade frame and then never again while this card is
+        // up, which is exactly the 21..120 the geometry note budgets for it.
+        M5.Display.fillRect(MSG_CARD_X, MSG_CARD_Y, MSG_CARD_W + 2 * MSG_PEEK,
+                            MSG_CARD_H + 4 * MSG_PEEK, COL_BG);
+
+        // Two more cards behind, when there are two more to be behind: the
+        // stack `;` and `.` rotate through. Outlines only, dimmer with depth.
+        if (total > 1) {
+            for (int p = 2; p >= 1; p--) {
+                uint8_t a = (uint8_t)(MSG_BORDER_A / (p + 1) * step / MSG_FADE_STEPS);
+                M5.Display.drawRect(x + p * MSG_PEEK, y + p * MSG_PEEK,
+                                    MSG_CARD_W, MSG_CARD_H,
+                                    ui_blend(a, level, COL_BG));
+            }
+        }
+
+        M5.Display.fillRect(x, y, MSG_CARD_W, MSG_CARD_H, tint);
+        M5.Display.drawRect(x, y, MSG_CARD_W, MSG_CARD_H, edge);
+        M5.Display.fillRect(x, y, MSG_ACCENT_W, MSG_CARD_H, accent);
+        // The local again, for the same reason as in the list above: the fill
+        // took the text with it and every field below has to be told.
+        force = true;
+    }
+
+    int32_t tx = x + MSG_PAD_L;
+    int32_t rx = x + MSG_CARD_W - MSG_PAD_R;
+    int32_t text_w = MSG_CARD_W - MSG_PAD_L - MSG_PAD_R;
+    // What is left of the top line once the age has taken its right-hand end,
+    // with a 6px gap between them. 168px, which is wider than a 16-character
+    // source at the widest glyph Font2 has, so this column never ellipsises.
+    int32_t src_w = text_w - MSG_AGE_W - 6;
+
+    char src[NOTIFY_SOURCE_LEN + 4], age[16];
+    ui_ellipsis(src, sizeof(src), v.source[0] ? v.source : "device",
+                &fonts::Font2, src_w);
+    notify_age_str(v.age_s, age, sizeof(age));
+    ui_draw_field(force, ui_card_row[0], sizeof(ui_card_row[0]), src,
+                  tx, y + MSG_SRC_Y, &fonts::Font2, c_sec, UI_TL,
+                  (uint16_t)src_w, tint);
+    ui_draw_field(force, ui_card_row[1], sizeof(ui_card_row[1]), age,
+                  rx, y + MSG_SRC_Y, &fonts::Font2, c_sec, UI_TR,
+                  MSG_AGE_W, tint);
+
+    char title[48];
+    ui_ellipsis(title, sizeof(title), v.title, &fonts::Font4, text_w);
+    ui_draw_field(force, ui_card_row[2], sizeof(ui_card_row[2]), title,
+                  tx, y + MSG_TITLE_Y, &fonts::Font4, c_pri, UI_TL,
+                  (uint16_t)text_w, tint);
+
+    // The two lines the panel actually shows, and the two lines GET /ui
+    // reports. ui_wrap2() borrows the one M5.Display to measure and may only be
+    // called from this task; the endpoint reads the cache these fill instead of
+    // wrapping anything itself.
+    char b1[NOTIFY_BODY_LEN + 4], b2[NOTIFY_BODY_LEN + 4];
+    ui_wrap2(v.body, b1, sizeof(b1), b2, sizeof(b2), &fonts::Font2, text_w);
+    ui_draw_field(force, ui_card_body[0], sizeof(ui_card_body[0]), b1,
+                  tx, y + MSG_BODY1_Y, &fonts::Font2, c_sec, UI_TL,
+                  (uint16_t)text_w, tint);
+    ui_draw_field(force, ui_card_body[1], sizeof(ui_card_body[1]), b2,
+                  tx, y + MSG_BODY2_Y, &fonts::Font2, c_sec, UI_TL,
+                  (uint16_t)text_w, tint);
+    // AFTER both, never before. The stamp is the promise that the cache holds
+    // this message's lines, and it must not be made until they are in it —
+    // GET /ui runs on the AsyncTCP task and preempts this one, so a stamp
+    // written first would be true for a reader arriving between the two.
+    ui_card_body_id = v.id;
+
+    if (fading) ui_card_fade++;
 }
 
 // Leave the current screen for another one. The frame is repainted from
@@ -1615,6 +2508,30 @@ static void ui_set_brightness(int value) {
     ui_brightness = (uint8_t)value;
     if (ui_brightness > 0) ui_brightness_on = ui_brightness;
     if (ui_ready) M5.Display.setBrightness(ui_brightness);
+}
+
+// Open one message. The card is given the id rather than the row, because the
+// list moves under it; see ui_msg_id.
+//
+// ui_goto() is not enough on its own here and the extra raise is not
+// belt-and-braces. Stepping from one card to the next leaves ui_screen already
+// UI_MESSAGE, so ui_goto() returns early without forcing anything — and a fade
+// that is not forced repaints nothing on its first frame. Raising the flag
+// afterwards covers both cases. The one thing ui_goto() does that must NOT
+// happen on a step within the stack is the input flush, and it correctly does
+// not: there was no screen transition to flush for.
+static void ui_enter_card(uint32_t id) {
+    ui_msg_id = id;
+    ui_card_fade = 0;
+    ui_goto(UI_MESSAGE);
+    ui_force = true;
+}
+
+// Leave the card for the list, putting the cursor on the message that was being
+// read rather than at the top.
+static void ui_leave_card(int idx) {
+    ui_msg_sel = idx < 0 ? 0 : idx;
+    ui_goto(UI_MESSAGES);
 }
 
 static void ui_activate(int index) {
@@ -1664,6 +2581,55 @@ static void ui_activate(int index) {
     ui_force = true;
 }
 
+// One step of `;` or `.`, on whichever screen has something to step through.
+//
+// All three wrap rather than clamp, which is the behaviour the menu already
+// had. On the card that wrap is through the message stack itself: the card
+// holds an id, so a step has to resolve that id to its current position first,
+// move from there, and adopt the id at the new position.
+//
+// THE CARD BRANCH TAKES THREE SEPARATE ACQUISITIONS — the depth, the position
+// and the entry at the new one — and a message arriving on the web server task
+// between any two of them makes them disagree. That is tolerated here and
+// nowhere else in this file, because the worst outcome is a step that lands on
+// a neighbour of the intended message or does not move at all: notify_view()
+// fails and the branch simply breaks, leaving the card where it was for the
+// user to press the key again. What is NOT tolerated is drawing from a split
+// read, and nothing here draws — ui_draw_card() gets entry, position and depth
+// out of one fused acquisition of its own, so whatever id this function
+// settles on is rendered self-consistently or not at all. If the message has
+// gone by then, ui_tick() leaves for the list on the next pass.
+static void ui_move(int step) {
+    switch (ui_screen) {
+    case UI_MENU: {
+        ui_menu_index = (ui_menu_index + UI_MENU_COUNT + step) % UI_MENU_COUNT;
+        break;
+    }
+    case UI_MESSAGES: {
+        int count = notify_count() + 1;  // the messages, then Back
+        ui_msg_sel = (ui_msg_sel + count + step) % count;
+        break;
+    }
+    case UI_MESSAGE: {
+        int count = notify_count();
+        int idx = notify_index_of(ui_msg_id);
+        if (count <= 0 || idx < 0) break;
+        int n = (idx + count + step) % count;
+        NotifyView v;
+        // Re-fade on the way in, so moving through the stack reads as one card
+        // replacing another rather than as text changing inside a frame that
+        // never moved.
+        if (notify_view(n, v)) {
+            ui_msg_sel = n;
+            ui_enter_card(v.id);
+        }
+        break;
+    }
+    default:
+        break;
+    }
+}
+
 // Navigation is on the BARE `;` `.` `,` `/` keys and Enter, with no Fn chord
 // anywhere.
 //
@@ -1695,14 +2661,10 @@ static void ui_handle_key(char key) {
 
     switch (key) {
     case ';':
-        if (ui_screen == UI_MENU) {
-            ui_menu_index = (ui_menu_index + UI_MENU_COUNT - 1) % UI_MENU_COUNT;
-        }
+        ui_move(-1);
         break;
     case '.':
-        if (ui_screen == UI_MENU) {
-            ui_menu_index = (ui_menu_index + 1) % UI_MENU_COUNT;
-        }
+        ui_move(1);
         break;
     case ',':
         ui_set_brightness((int)ui_brightness - UI_BRIGHT_STEP);
@@ -1713,12 +2675,41 @@ static void ui_handle_key(char key) {
     case '\n':
         if (ui_screen == UI_MENU) {
             ui_activate(ui_menu_index);
+        } else if (ui_screen == UI_MESSAGES) {
+            int items = notify_count();
+            if (ui_msg_sel < items) {
+                NotifyView v;
+                if (notify_view(ui_msg_sel, v)) ui_enter_card(v.id);
+            } else {
+                // The Back row. Put the menu cursor on the entry this screen
+                // hangs off rather than wherever it happened to be left — a
+                // card raised by an arrival can reach this list without the
+                // menu ever having been open.
+                ui_menu_index = 0;  // Messages
+                ui_goto(UI_MENU);
+            }
+        } else if (ui_screen == UI_MESSAGE) {
+            // ENTER IS THE ACKNOWLEDGEMENT AND BACKTICK IS NOT, which is the
+            // whole reason this screen reads two keys instead of one. Having
+            // looked at a message is not the same as having dealt with it, and
+            // an unread critical outlives its ttl until it is acknowledged — so
+            // a user who wants to look at one now and act on it later needs a
+            // way out that leaves it unread. The footer says which is which.
+            int idx = notify_index_of(ui_msg_id);
+            notify_ack_id(ui_msg_id);
+            ui_leave_card(idx);
         } else {
             ui_goto(UI_MENU);
         }
         break;
     case '`':
-        ui_goto(ui_screen == UI_MENU ? UI_STATUS : UI_MENU);
+        if (ui_screen == UI_MESSAGE) {
+            ui_leave_card(notify_index_of(ui_msg_id));
+        } else if (ui_screen == UI_MESSAGES) {
+            ui_goto(UI_MENU);
+        } else {
+            ui_goto(ui_screen == UI_MENU ? UI_STATUS : UI_MENU);
+        }
         break;
     default:
         break;
@@ -1835,33 +2826,123 @@ static void ui_key_poll() {
 static void ui_tick() {
     if (!ui_ready) return;
 
+    // THE TICK IS NO LONGER A SINGLE FIXED GATE. The arrival fade is three
+    // frames that have to land 40ms apart to read as motion, and a 200ms gate
+    // would stretch them over 600ms and turn the animation into three separate
+    // redraws. The card asks for the faster interval only while it is actually
+    // fading and drops back to the ordinary tick the moment it has settled, so
+    // nothing else on this device pays for it.
     static unsigned long last_tick = 0;
-    if (!ui_force && millis() - last_tick < UI_TICK_MS) return;
+    unsigned long interval =
+        (ui_screen == UI_MESSAGE && ui_card_fade < MSG_FADE_STEPS)
+            ? MSG_FADE_MS : UI_TICK_MS;
+    // ui_force AND NOT ui_force_net. The whole difference between the two
+    // flags is this line: a keypress skips the gate because the user is
+    // standing there waiting, and a POST does not because the poster sets the
+    // rate. See the declaration of ui_force_net.
+    if (!ui_force && millis() - last_tick < interval) return;
     last_tick = millis();
 
-    if (ui_force) {
-        ui_draw_frame();
+    // Both of these change the screen, so both run BEFORE the force flag is
+    // taken below — a ui_goto() after the take raises a flag this pass has
+    // already cleared, and the repaint it asks for would not happen until the
+    // next tick.
+
+    // An arrival, handed over by the endpoint on the AsyncTCP task and consumed
+    // here because loop() owns every screen change.
+    //
+    // ONLY FROM THE STATUS SCREEN. A card that shoves itself in front of
+    // whatever was being read is a screen that cannot be trusted to stay still
+    // while it is being used, and the queue is not so urgent that it is worth
+    // that: an unacknowledged message keeps, and the Messages row in the menu
+    // carries its count. Status is the idle screen, so raising a card from it
+    // interrupts nobody. The flag is consumed either way, so a message that
+    // arrives while somebody is navigating cannot surface as a card several
+    // screens later when they happen to return to status.
+    uint32_t arrived = 0;
+    if (notify_take_arrival(&arrived) && arrived != 0 &&
+        ui_screen == UI_STATUS) {
+        ui_msg_sel = 0;
+        ui_msg_first = 0;
+        ui_enter_card(arrived);
+    }
+
+    // The card's subject, expired or evicted out from under it. Checked here
+    // rather than left to ui_draw_card()'s own false return, because that
+    // return draws nothing at all and would leave the last card frozen on the
+    // glass for as long as the screen stayed up. This is a bare existence test
+    // and deliberately not the beginning of an index-then-read: everything the
+    // card actually draws still comes out of the single fused acquisition in
+    // ui_draw_card(), so no two fields can ever disagree about which message
+    // they belong to.
+    if (ui_screen == UI_MESSAGE && notify_index_of(ui_msg_id) < 0) {
+        ui_leave_card(0);
+    }
+
+    // Take the flag and clear it BEFORE any drawing, then work from the copy.
+    //
+    // This is deliberately not what the source firmware does. That one clears
+    // its flag at the END of a pass, in eight separate places, and an
+    // end-of-pass clear is a one-way door: a writer that raises the flag from
+    // another task while the pass is in flight has its request overwritten by
+    // the clear that follows, and the repaint it asked for never happens. Not a
+    // hypothetical there either — its flag is already written from its web
+    // server task. Clearing first inverts which way that race falls. A flag
+    // raised after the take survives into the next tick and costs one redundant
+    // repaint, instead of being swallowed and costing a screen that does not
+    // show what the device knows. The window is not closed, only cut down to
+    // the two instructions between the take and the clear — a raise landing in
+    // there is still lost, where before the whole SPI-bound pass was exposed.
+    // This is an improvement over the firmware this was ported from, not parity
+    // with it.
+    //
+    // Everything below therefore reads `force` and never ui_force.
+    //
+    // The network flag is folded in HERE and nowhere else. Having survived the
+    // gate above it is worth exactly as much as a local raise from this point
+    // on — a repaint is a repaint — so the two merge into one local and the
+    // rest of this function never learns which side asked.
+    bool force = ui_force || ui_force_net;
+    ui_force = false;
+    ui_force_net = false;
+
+    if (force) {
+        ui_draw_frame(ui_screen);
         ui_cache_sel = -1;
     }
 
     // Header.
-    ui_draw_field(ui_cache_hdr, sizeof(ui_cache_hdr), ui_screen_title[ui_screen],
+    ui_draw_field(force, ui_cache_hdr, sizeof(ui_cache_hdr),
+                  ui_screen_title[ui_screen],
                   UI_LABEL_X, UI_HDR_Y, &fonts::Font2, COL_ACCENT,
                   UI_TL, 110, COL_BG);
     char buf[48];
     ui_net_summary(buf, sizeof(buf));
-    ui_draw_field(ui_cache_net, sizeof(ui_cache_net), buf,
+    ui_draw_field(force, ui_cache_net, sizeof(ui_cache_net), buf,
                   M5.Display.width() - UI_LABEL_X, UI_HDR_Y, &fonts::Font2,
                   COL_DIM, UI_TR, 124, COL_BG);
 
     if (ui_screen == UI_MENU) {
+        ui_menu_first = ui_window(ui_menu_index, ui_menu_first, UI_MENU_COUNT,
+                                  UI_ROWS);
+        // A row, not an entry. Since the menu started scrolling these are two
+        // different numbers, and every test below is about which ROW carries
+        // the bar.
+        int sel_row = ui_menu_index - ui_menu_first;
+        // A scrolled window changes what every row says while the bar can stay
+        // exactly where it is, so the two-row optimisation below has to be
+        // switched off wholesale when it moves. Without this the entries slide
+        // under a stationary bar and the rows that are not repainted keep the
+        // previous window's text.
+        bool scrolled = force || ui_menu_first != ui_menu_first_drawn;
         for (int row = 0; row < UI_ROWS; row++) {
             int32_t y = ui_row_y(row);
-            bool selected = (row == ui_menu_index);
+            int item = ui_menu_first + row;
+            bool selected = (row == sel_row);
             // The selection bar is not a field, so it is painted from an
             // explicit test: only the row that gained the highlight and the one
             // that lost it are touched.
-            bool moved = ui_force || (ui_cache_sel != ui_menu_index &&
+            bool moved = scrolled || (ui_cache_sel != sel_row &&
                                       (selected || row == ui_cache_sel));
             uint16_t bg = selected ? COL_ACCENT : COL_BG;
             uint16_t fg = selected ? COL_BG : COL_TEXT;
@@ -1870,37 +2951,44 @@ static void ui_tick() {
                 ui_cache_label[row][0] = '\0';
                 ui_cache_value[row][0] = '\0';
             }
-            const char *title = row < UI_MENU_COUNT ? ui_menu[row].title : "";
-            ui_draw_field(ui_cache_label[row], sizeof(ui_cache_label[row]), title,
+            const char *title = item < UI_MENU_COUNT ? ui_menu[item].title : "";
+            ui_draw_field(force, ui_cache_label[row],
+                          sizeof(ui_cache_label[row]), title,
                           UI_MENU_X, y, &fonts::Font2, fg, UI_TL,
                           140, bg);
-            ui_menu_state(row, buf, sizeof(buf));
-            ui_draw_field(ui_cache_value[row], sizeof(ui_cache_value[row]), buf,
+            ui_menu_state(item, buf, sizeof(buf));
+            ui_draw_field(force, ui_cache_value[row],
+                          sizeof(ui_cache_value[row]), buf,
                           UI_MENU_R_X, y, &fonts::Font2,
                           selected ? COL_BG : COL_DIM, UI_TR, 80, bg);
         }
-        ui_cache_sel = ui_menu_index;
+        ui_cache_sel = sel_row;
+        ui_menu_first_drawn = ui_menu_first;
+    } else if (ui_screen == UI_MESSAGES) {
+        ui_draw_msglist(force);
+    } else if (ui_screen == UI_MESSAGE) {
+        ui_draw_card(force);
     } else {
         char label[16], value[48];
         for (int row = 0; row < UI_ROWS; row++) {
             int32_t y = ui_row_y(row);
             ui_field(ui_screen, row, label, sizeof(label), value, sizeof(value),
                      false);
-            ui_draw_field(ui_cache_label[row], sizeof(ui_cache_label[row]), label,
+            ui_draw_field(force, ui_cache_label[row],
+                          sizeof(ui_cache_label[row]), label,
                           UI_LABEL_X, y, &fonts::Font2, COL_DIM,
                           UI_TL, UI_LABEL_W, COL_BG);
-            ui_draw_field(ui_cache_value[row], sizeof(ui_cache_value[row]), value,
+            ui_draw_field(force, ui_cache_value[row],
+                          sizeof(ui_cache_value[row]), value,
                           UI_VALUE_X, y, &fonts::Font2, COL_TEXT,
                           UI_TL, UI_VALUE_W, COL_BG);
         }
     }
 
     ui_footer(ui_screen, buf, sizeof(buf));
-    ui_draw_field(ui_cache_foot, sizeof(ui_cache_foot), buf, UI_LABEL_X,
+    ui_draw_field(force, ui_cache_foot, sizeof(ui_cache_foot), buf, UI_LABEL_X,
                   UI_FOOT_Y, &fonts::Font0, COL_DIM, UI_TL,
                   236, COL_BG);
-
-    ui_force = false;
 }
 
 // Bring up M5Unified, the panel and the keyboard. Must run before hw_probe(),
@@ -1999,12 +3087,19 @@ static void ui_begin() {
 
     M5.Display.setRotation(1);  // 240x135 landscape, keyboard toward the user
     M5.Display.setBrightness(ui_brightness);
+    // The splash draws itself with a literal `true` rather than by leaning on
+    // the flag: these two fields have to land on the frame that was just
+    // blanked above them, and ui_draw_field() no longer reads the global. The
+    // flag is still raised, and still for its own reason — the first ui_tick()
+    // after setup() has to repaint the real screen over this splash rather than
+    // diff against the two strings it left in the caches.
     ui_force = true;
-    ui_draw_frame();
-    ui_draw_field(ui_cache_hdr, sizeof(ui_cache_hdr), "SEED", UI_LABEL_X,
+    ui_draw_frame(ui_screen);
+    ui_draw_field(true, ui_cache_hdr, sizeof(ui_cache_hdr), "SEED", UI_LABEL_X,
                   UI_HDR_Y, &fonts::Font2, COL_ACCENT, UI_TL,
                   110, COL_BG);
-    ui_draw_field(ui_cache_value[0], sizeof(ui_cache_value[0]), "starting...",
+    ui_draw_field(true, ui_cache_value[0], sizeof(ui_cache_value[0]),
+                  "starting...",
                   UI_VALUE_X, ui_row_y(0), &fonts::Font2, COL_TEXT,
                   UI_TL, UI_VALUE_W, COL_BG);
 }
@@ -2214,10 +3309,28 @@ static void handle_capabilities(AsyncWebServerRequest *request) {
     };
     for (int i = 0; eps[i]; i++) ep.add(eps[i]);
 
-    // Skill endpoints
+    // Skill endpoints, each path at most once.
+    //
+    // A skill's endpoint table has one row per METHOD, because that is what
+    // /skill renders as its API table and GET /notify and POST /notify are two
+    // different things to document. This array is a list of PATHS — the spec
+    // above says "all HTTP paths the node handles" — and a path repeated here
+    // is not extra detail, it is a false statement about the surface: a client
+    // counting entries to size a probe list finds one endpoint that does not
+    // exist. So the dedup belongs here, at the point where rows become paths,
+    // and NOT in the skill tables, which are right as they stand.
+    //
+    // Linear scan over a list this length is cheaper than anything cleverer,
+    // and /capabilities is not a hot path.
     for (int i = 0; i < g_skill_count; i++) {
         const SkillEndpoint *se = g_skills[i]->endpoints;
-        for (int j = 0; se[j].path; j++) ep.add(se[j].path);
+        for (int j = 0; se[j].path; j++) {
+            bool seen = false;
+            for (JsonVariant v : ep) {
+                if (strcmp(v.as<const char*>(), se[j].path) == 0) { seen = true; break; }
+            }
+            if (!seen) ep.add(se[j].path);
+        }
     }
 
     String response;
@@ -2355,6 +3468,19 @@ static void handle_ui(AsyncWebServerRequest *request) {
     doc["brightness"] = ui_brightness;
     doc["backlight"] = ui_brightness > 0;
 
+    // WHICH KEY BELOW CARRIES THIS SCREEN'S CONTENT. Four screens fill
+    // fields[]; the menu, the message list and the card have no label/value
+    // rows at all and report through "menu", "messages" and "card" instead. An
+    // empty fields[] is a true statement about those three, but only if
+    // something says where to look instead — otherwise a caller reasonably
+    // reads it as a screen that failed to describe itself.
+    switch (ui_screen) {
+    case UI_MENU:     doc["content"] = "menu";     break;
+    case UI_MESSAGES: doc["content"] = "messages"; break;
+    case UI_MESSAGE:  doc["content"] = "card";     break;
+    default:          doc["content"] = "fields";   break;
+    }
+
     JsonArray fields = doc["fields"].to<JsonArray>();
     char label[16], value[48];
     for (int row = 0; row < UI_ROWS; row++) {
@@ -2370,14 +3496,90 @@ static void handle_ui(AsyncWebServerRequest *request) {
     // The menu goes out on every screen, not just while it is open: it is the
     // list of what the keyboard can reach, and an agent asking what this node
     // can be told to do should not have to navigate there first.
+    //
+    // It scrolls now, so where the window sits is part of what is on the glass:
+    // "selected" alone no longer says which entries are visible.
     JsonObject menu = doc["menu"].to<JsonObject>();
     menu["selected"] = ui_menu_index;
+    menu["first"] = ui_menu_first;
+    menu["rows"] = UI_ROWS;
     JsonArray items = menu["items"].to<JsonArray>();
     for (int i = 0; i < UI_MENU_COUNT; i++) {
         JsonObject it = items.add<JsonObject>();
         it["title"] = ui_menu[i].title;
         ui_menu_state(i, value, sizeof(value));
         it["state"] = value;
+    }
+
+    // The message list's position, on every screen for the same reason the menu
+    // is: it is retained state, and it is where the list will be when it is
+    // next opened.
+    JsonObject msgs = doc["messages"].to<JsonObject>();
+    msgs["count"] = notify_count();
+    msgs["unread"] = notify_unread_count();
+    msgs["selected"] = ui_msg_sel;
+    msgs["first"] = ui_msg_first;
+    msgs["rows"] = UI_ROWS;
+
+    // The card, only while it is up, because only then is there a subject.
+    //
+    // THE BODY GOES OUT AS THE TWO LINES THE PANEL WRAPPED, NOT AS THE RAW
+    // STRING, and that is the difference between a report and a description of
+    // one. NOTIFY_BODY_LEN is 97 and every buffer on this path is 48, so a body
+    // pushed through ui_field() would be cut at 47 characters while the panel
+    // showed all 96 over two lines.
+    //
+    // Neither line can truncate, and the reason is the BUFFER and not the
+    // column. ui_card_body[] is sized from NOTIFY_BODY_LEN, so each line has
+    // room for a whole 96-byte body on its own and the wrap is free to put the
+    // break wherever the pixels fall. It is emphatically NOT that a 206px
+    // column holds 48 characters: Font2's narrowest advance is 3px — `.` `,`
+    // `:` `;` `!` `|` — so 206px takes up to 68 of them, and a buffer sized to
+    // the column rather than to the body would cut a punctuation-heavy line in
+    // the middle. Nothing here shrinks with the column.
+    //
+    // They are READ FROM THE DRAW CACHE AND NOT WRAPPED HERE. Wrapping calls
+    // ui_wrap2(), which installs a font on the one shared M5.Display and
+    // advances its UTF-8 decoder; this handler runs on the AsyncTCP task, which
+    // preempts loop(), and doing it here would corrupt whatever draw was in
+    // flight — with the field cache then recording the mis-rendered string as
+    // correct, so the row would stay wrong. The cache is what loop() already
+    // computed and already drew.
+    if (ui_screen == UI_MESSAGE) {
+        JsonObject card = doc["card"].to<JsonObject>();
+        // ONE READ OF ui_msg_id FOR THE WHOLE OBJECT. The card can step to the
+        // next message on the loop task while this handler runs, and an id
+        // reported from one read beside a lookup made from another would
+        // describe two different messages under one heading.
+        uint32_t id = ui_msg_id;
+        card["id"] = id;
+        NotifyView v;
+        int idx = 0, total = 0;
+        if (notify_view_by_id(id, v, &idx, &total)) {
+            card["present"] = true;
+            card["source"] = v.source;
+            card["title"] = v.title;
+            card["level"] = notify_level_name(v.level);
+            card["unread"] = v.unread;
+            card["age_s"] = v.age_s;
+            card["index"] = idx;
+            card["total"] = total;
+        } else {
+            // The next tick leaves for the list; until then the screen is still
+            // the card and saying so is more honest than omitting the object.
+            card["present"] = false;
+        }
+        // ONLY WHILE THE CACHE BELONGS TO THIS CARD. See ui_card_body_id: the
+        // draw that fills those two lines happens a tick after the card opens
+        // and a tick after every step through the stack, so an ungated read
+        // publishes the previous message's body under this message's id. The
+        // fields are omitted rather than emptied, because an absent key reads
+        // as "not known yet" while an empty string reads as "this message has
+        // no body", and those are different facts.
+        if (ui_card_body_id == id) {
+            card["body1"] = ui_card_body[0];
+            card["body2"] = ui_card_body[1];
+        }
     }
 
     JsonObject key = doc["last_key"].to<JsonObject>();
@@ -2396,7 +3598,18 @@ static void handle_ui(AsyncWebServerRequest *request) {
 
     // The bare keys navigation is on, repeated here so an agent reading /ui can
     // work out what to tell somebody standing at the device.
-    doc["keys"] = "; up, . down, , dim, / bright, Enter select, ` back";
+    //
+    // IT DESCRIBED THE MENU AND ONLY THE MENU. Two screens have since given
+    // the same keys different jobs — `;` and `.` step through the message
+    // stack on a card, and Enter there acknowledges while backtick deliberately
+    // does not — and telling an agent "Enter select" when the person in front
+    // of the device is looking at a card is telling them the wrong thing about
+    // the one key whose two exits mean different things. /skill was brought up
+    // to date when the card shipped and this string was not, so the two
+    // documents an agent has disagreed about the device.
+    doc["keys"] = "; up, . down (menu, message list, or previous/next card), "
+                  ", dim, / bright, Enter select — on a card it ACKNOWLEDGES "
+                  "the message, ` back — on a card it leaves it UNREAD";
 
     String response;
     serializeJson(doc, response);
@@ -2827,23 +4040,43 @@ static void handle_skill(AsyncWebServerRequest *request) {
     s += "- An OTA upload whose connection dies is torn down after 30s without data,\n";
     s += "  so a dropped transfer no longer blocks every later one until reboot\n\n";
     s += "## On-device UI\n\n";
-    s += "The 240x135 panel and the QWERTY are driven. Five screens: status, menu,\n";
-    s += "network, system, hardware. Navigation is on the BARE keys, no Fn chord:\n\n";
+    s += "The 240x135 panel and the QWERTY are driven. Seven screens: status, menu,\n";
+    s += "network, system, hardware, messages (the notification queue as a\n";
+    s += "scrolling list) and message (one notification as a card). Navigation is\n";
+    s += "on the BARE keys, no Fn chord:\n\n";
     s += "| Key | Does |\n";
     s += "|-----|------|\n";
-    s += "| `;` / `.` | move the selection up / down in the menu |\n";
+    // One table row per line: a markdown row that wraps is not a row.
+    s += "| `;` / `.` | move the selection in the menu or the message list; on a card, step to the previous / next message |\n";
     s += "| `,` / `/` | dim / brighten the panel, on any screen |\n";
-    s += "| Enter | open the menu, or activate the selected entry |\n";
-    s += "| `` ` `` | back — a screen returns to the menu, the menu to status |\n\n";
-    s += "Menu entries: Network, System, Hardware, Setup AP (raise the\n";
-    s += "provisioning AP; it comes down on its own, there is no keyboard path to\n";
-    s += "drop it), Backlight (panel dark / lit).\n\n";
+    s += "| Enter | open the menu, activate the selected entry, or — on a card — acknowledge the message and return to the list |\n";
+    s += "| `` ` `` | back — a card returns to the list LEAVING IT UNREAD, a screen returns to the menu, the menu to status |\n\n";
+    s += "The menu scrolls: it has six entries and five rows, and the footer\n";
+    s += "carries the position. Entries, in order: Messages FIRST, carrying the\n";
+    s += "queue's state beside it — \"empty\", \"3 new / 8\" or \"8 read\" — then\n";
+    s += "Network, System, Hardware, Setup AP (raise the provisioning AP; it comes\n";
+    s += "down on its own, there is no keyboard path to drop it), Backlight (panel\n";
+    s += "dark / lit).\n\n";
+    s += "A notification arriving while the node sits on its status screen raises\n";
+    s += "its own card, fading in over three 40ms frames. It does NOT interrupt any\n";
+    s += "other screen — the unread count in the menu is how it gets noticed then.\n\n";
     s += "You cannot see this screen. GET /ui answers what is on it: the active\n";
-    s += "screen, every field it is showing with its current value, the menu and\n";
-    s += "which entry is selected, the backlight level, whether the panel came up,\n";
-    s += "whether M5 identified the board, and the last key the firmware saw. It\n";
-    s += "reports content, not pixels — it says nothing about layout or legibility,\n";
-    s += "and the AP password is redacted there even though it is on the screen.\n\n";
+    s += "screen, the backlight level, whether the panel came up, whether M5\n";
+    s += "identified the board, and the last key the firmware saw. Its `content`\n";
+    s += "field names where that screen's content is reported, because not every\n";
+    s += "screen has rows: four fill `fields[]`, the menu fills `menu` (entries,\n";
+    s += "selection and window offset, since it scrolls), the message list fills\n";
+    s += "`messages` (count, unread, selection and window), and the card fills\n";
+    s += "`card`. An empty `fields[]` on those three is correct, not a failure.\n\n";
+    s += "The card reports its subject by id, plus `body1` and `body2` — THE TWO\n";
+    s += "LINES THE PANEL ACTUALLY WRAPPED, not the raw body. A body is 96\n";
+    s += "characters and the report buffers are 48, so the raw string would be cut\n";
+    s += "in half while the panel showed all of it; these two are what is on the\n";
+    s += "glass. `present: false` means the message expired out from under the card\n";
+    s += "and the next tick returns to the list.\n\n";
+    s += "It reports content, not pixels — it says nothing about layout or\n";
+    s += "legibility, and the AP password is redacted there even though it is on\n";
+    s += "the screen.\n\n";
     s += "The display is written only from loop(). If you add a handler, it may READ\n";
     s += "UI state and must never draw: handlers run on the AsyncTCP task and will\n";
     s += "preempt a half-finished paint, corrupting M5GFX's font/datum/SPI state.\n\n";
@@ -2997,6 +4230,9 @@ static void handle_wifi_post(AsyncWebServerRequest *request) {
 static void skills_init() {
     skill_gpio_init();
     skill_serial_init();
+    // Reads the stored queue off SPIFFS, so it has to run after SPIFFS.begin()
+    // in setup() — which it does, skills_init() being called well below it.
+    skill_notify_init();
 }
 
 // ===== Routes =====
@@ -3227,6 +4463,14 @@ void loop() {
     // Retire the provisioning AP once it has done its job, or once the window
     // a keyboard-raised session opened has run out. Non-blocking.
     ap_poll();
+
+    // Expiry and the coalesced SPIFFS write. Above ui_tick() on purpose: an
+    // expiry handled on this pass raises ui_force, and the ui_tick() below then
+    // acts on it in the same pass instead of leaving the screen stale for the
+    // delay(10). Arrivals raise the flag too, but from the AsyncTCP task and at
+    // any point in the pass — notify_poll() handles none of them — so their
+    // latency owes nothing to this placement.
+    notify_poll();
 
     // The keyboard and the screen, in that order and only from here. Every
     // HTTP handler runs on the AsyncTCP task and must never draw; see the note

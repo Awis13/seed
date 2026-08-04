@@ -72,9 +72,10 @@ seeds/                          <- bootloaders
     src/main.cpp                     1252 lines, PlatformIO, Heltec V3
     src/skills/gpio.cpp              GPIO control skill (360 lines)
   esp32-cardputer/
-    src/main.cpp                     3170 lines, PlatformIO, M5Stack Cardputer ADVANCE
-    src/skills/gpio.cpp              GPIO control skill (615 lines)
-    src/skills/serial.cpp            WiFi-to-serial bridge skill (535 lines)
+    src/main.cpp                     4475 lines, PlatformIO, M5Stack Cardputer ADVANCE
+    src/skills/gpio.cpp              GPIO control skill (652 lines)
+    src/skills/notify.cpp            Notification queue skill (1093 lines)
+    src/skills/serial.cpp            WiFi-to-serial bridge skill (576 lines)
   pdp11/seed.c                      550 lines, K&R C, 2.11BSD
 
 firmware/                       <- grown from seeds
