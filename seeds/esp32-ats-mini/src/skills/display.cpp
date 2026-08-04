@@ -33,6 +33,11 @@ uint8_t radio_get_rssi();
 uint8_t radio_get_volume();
 uint8_t radio_get_tune_target();
 void radio_get_signal(uint8_t *rssi, uint8_t *snr);
+/* RDS snapshot (radio.cpp). Takes radio_mtx briefly; any out pointer may be NULL.
+ * Must be called BEFORE display_mtx to keep the radio_mtx -> display_mtx order.
+ * *valid is true only on FM once a PS name has been captured on this station. */
+void radio_get_rds(char *ps, size_t ps_len, char *rt, size_t rt_len,
+                   uint16_t *pi, uint8_t *pty, bool *valid);
 /* Menu accessors (radio.cpp). radio_get_menu_item wraps its index modulo the
  * active level's count, so the caller can ask for idx-2..idx+2 directly. */
 uint8_t radio_get_ui_mode();
@@ -142,8 +147,16 @@ static const char *display_describe() {
  *   band    FONT2  y= 10  (~16 px tall ->  2..18, clears the freq box)
  *   freq    FONT7  y= 48  (~48 px tall -> 24..72)
  *   unit    FONT4  y= 90  (~26 px tall -> 77..103)
+ *   name    FONT2  y=106  (~16 px tall -> 98..114, FM RDS PS only, else blank)
  *   signal  FONT2  y=120  (~16 px tall -> 112..128)
  *   volume  FONT4  y=150  (~26 px tall -> 137..163, still inside 170)
+ *
+ * The station-name row sits between the unit and signal rows; it is painted only
+ * when rds_show is set (FM with a decoded PS name), otherwise the row stays blank.
+ * Its FONT2 box (98..114) tucks into the narrow gap under the unit box (..103) and
+ * over the signal box (112..). The boxes kiss by a few px, but FONT2/FONT4 glyphs
+ * sit padded well inside their boxes, so the drawn glyph rows do not actually
+ * collide — the centred short strings (unit "MHz", up to 8-char PS) stay legible.
  *
  * Frequency and volume are drawn bright (cyan) when each is the encoder's target
  * and dim (dark grey) otherwise, so the screen shows what the button selected.
@@ -152,7 +165,7 @@ static const char *display_describe() {
  */
 static void draw_radio_screen(const char *band, const char *mode, uint16_t freq,
                               uint8_t rssi, uint8_t snr, uint8_t volume,
-                              uint8_t target) {
+                              uint8_t target, const char *rds_ps, bool rds_show) {
     uint16_t freq_color =
         (target == DISPLAY_TUNE_FREQ) ? TFT_CYAN : TFT_DARKGREY;
     uint16_t vol_color =
@@ -180,6 +193,15 @@ static void draw_radio_screen(const char *band, const char *mode, uint16_t freq,
     gfx->drawString(freq_str, DISPLAY_CX, 48, 7);
     gfx->setTextColor(TFT_WHITE, TFT_BLACK);
     gfx->drawString(unit, DISPLAY_CX, 90, 4);
+
+    /* RDS station name (FM only): the decoded PS name in yellow, in the narrow row
+     * between the unit and the signal line. Painted only when the caller resolved a
+     * name to show (FM + valid RDS + non-empty PS); on AM/SSB or before any RDS is
+     * decoded rds_show is false and this row stays blank. 8 chars fit — no trunc. */
+    if (rds_show && rds_ps && rds_ps[0]) {
+        gfx->setTextColor(TFT_YELLOW, TFT_BLACK);
+        gfx->drawString(rds_ps, DISPLAY_CX, 106, 2);
+    }
 
     /* Exactly one signal line: mode, RSSI in dBuV, S/N — no duplicate dBuV. */
     char status_line[48];
@@ -258,10 +280,17 @@ void display_show_status() {
     uint8_t target = radio_get_tune_target();
     uint8_t rssi = 0, snr = 0;
     radio_get_signal(&rssi, &snr);
+    /* RDS snapshot (radio_mtx taken/released inside, before display_mtx). Show the
+     * station name only on FM once a valid PS name is present; got_rds is false off
+     * FM, but gate on the mode string too so the intent is explicit. */
+    char rds_ps[9];
+    bool rds_valid = false;
+    radio_get_rds(rds_ps, sizeof(rds_ps), NULL, 0, NULL, NULL, &rds_valid);
+    bool rds_show = (strcmp(mode, "FM") == 0) && rds_valid && rds_ps[0];
 
     xSemaphoreTake(display_mtx, portMAX_DELAY);
     display_mode = DISPLAY_STATUS;
-    draw_radio_screen(band, mode, freq, rssi, snr, volume, target);
+    draw_radio_screen(band, mode, freq, rssi, snr, volume, target, rds_ps, rds_show);
     display_flush();
     xSemaphoreGive(display_mtx);
 }
@@ -293,6 +322,12 @@ void display_tick_render() {
     int menu_idx = radio_get_menu_idx();
     uint8_t rssi = 0, snr = 0;
     radio_get_signal(&rssi, &snr);
+    /* RDS snapshot up front (radio_mtx internal, released before display_mtx). Only
+     * FM with a decoded PS name shows a station name; off FM rds_valid is false. */
+    char rds_ps[9];
+    bool rds_valid = false;
+    radio_get_rds(rds_ps, sizeof(rds_ps), NULL, 0, NULL, NULL, &rds_valid);
+    bool rds_show = (strcmp(mode, "FM") == 0) && rds_valid && rds_ps[0];
 
     /* Test-and-set display_mode under the same lock that guards the repaint, so a
      * concurrent POST /display can't flip to CUSTOM between our check and draw. */
@@ -310,17 +345,25 @@ void display_tick_render() {
                    prev_target = 0xFF, prev_ui = 0xFF, prev_menu_level = 0xFF;
     static int prev_menu_idx = -1;
     static const char *prev_mode = nullptr;
+    /* The shown station name (empty when no name). strcmp against it so a PS name
+     * appearing, changing or clearing forces a fresh frame instead of waiting for
+     * the idle fallback. rds_ps is a stack buffer here, so keep our own copy. */
+    static char prev_rds_ps[9] = "";
     static uint32_t last_push_ms = 0;
     const uint32_t DISPLAY_MAX_IDLE_MS = 2000;
 
     uint32_t now = millis();
+    /* The name the frame would show right now: the PS on FM, else empty. Compared
+     * against prev_rds_ps below so it joins the change set. */
+    const char *shown_ps = rds_show ? rds_ps : "";
     /* The menu fields (ui/level/idx) join the change set so scrolling the menu, or
      * entering/leaving it, forces a fresh frame instead of being read as unchanged. */
     bool unchanged = freq == prev_freq && rssi == prev_rssi && snr == prev_snr &&
                      volume == prev_volume && target == prev_target &&
                      ui == prev_ui && menu_level == prev_menu_level &&
                      menu_idx == prev_menu_idx &&
-                     prev_mode != nullptr && strcmp(mode, prev_mode) == 0;
+                     prev_mode != nullptr && strcmp(mode, prev_mode) == 0 &&
+                     strcmp(shown_ps, prev_rds_ps) == 0;
     if (unchanged && (now - last_push_ms) < DISPLAY_MAX_IDLE_MS) {
         xSemaphoreGive(display_mtx);
         return;
@@ -334,12 +377,14 @@ void display_tick_render() {
     prev_menu_level = menu_level;
     prev_menu_idx = menu_idx;
     prev_mode = mode;
+    strncpy(prev_rds_ps, shown_ps, sizeof(prev_rds_ps) - 1);
+    prev_rds_ps[sizeof(prev_rds_ps) - 1] = 0;
     last_push_ms = now;
 
     if (ui == DISPLAY_UI_MENU) {
         draw_menu_screen(radio_get_menu_title(), menu_idx);
     } else {
-        draw_radio_screen(band, mode, freq, rssi, snr, volume, target);
+        draw_radio_screen(band, mode, freq, rssi, snr, volume, target, rds_ps, rds_show);
     }
     display_flush();
     xSemaphoreGive(display_mtx);

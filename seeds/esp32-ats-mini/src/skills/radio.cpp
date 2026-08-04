@@ -236,11 +236,14 @@ static uint8_t bwCount(uint8_t mode) {
 /* --- Receiver + state (file-local) --- */
 /*
  * Thin subclass over the vendor driver to fix two RDS getters that are broken in
- * this library version (2.1.8): getRdsPI() returns only the low byte and
- * getRdsProgramType() only 3 bits, because the full Block A/B words live in the
- * protected currentRdsStatus struct. We reach into it directly (public inheritance,
- * the field is protected) and assemble the correct 16-bit PI and 5-bit PTY. No
- * IRAM footprint: this is plain flash/DRAM code, no IRAM_ATTR. */
+ * this library version (2.1.8). getRdsPI() is the real bug: it returns only the
+ * low byte of the Program Identification. getRdsProgramType() reads the raw union
+ * bitfield, so we recompute PTY explicitly from Block B bits [9:5] for portability
+ * rather than trust the compiler/endianness-dependent union layout. Both need the
+ * full Block A/B words, which live in the protected currentRdsStatus struct: we
+ * reach into it directly (public inheritance, the field is protected) and assemble
+ * the correct 16-bit PI and 5-bit PTY. No IRAM footprint: this is plain flash/DRAM
+ * code, no IRAM_ATTR. */
 class RadioSI4735 : public SI4735 {
 public:
     /* Full 16-bit Program Identification from Block A (valid only once Block A has
@@ -271,7 +274,8 @@ static int      radio_bfo = 0;           /* current BFO offset in Hz (SSB only) 
  * RDS decode state (FM only; ephemeral, never persisted). Filled by the throttled
  * RDS poll in radio_tick() under radio_mtx, read out by radio_get_rds() and
  * /radio/status. rds_ps is the 8-char station name, rds_rt the 64-char RadioText.
- * got_rds latches true once any RDS group has been decoded on the current station;
+ * got_rds latches true once a PS name segment (group 0A) has been captured on the
+ * current station;
  * all fields are cleared on every retune / band change / mode change via
  * rds_reset_locked() so a stale name can never survive a move off the frequency.
  * Written only under radio_mtx (or single-tasked at boot). */
@@ -279,7 +283,7 @@ static char     rds_ps[9]  = "";         /* PS station name (8 chars + NUL) */
 static char     rds_rt[65] = "";         /* RadioText (64 chars + NUL) */
 static uint16_t rds_pi     = 0;          /* Program Identification (16-bit) */
 static uint8_t  rds_pty    = 0;          /* Program Type (5-bit) */
-static bool     got_rds    = false;      /* true once any RDS group decoded here */
+static bool     got_rds    = false;      /* set once a PS name segment (group 0A) has been captured since the last reset */
 
 /* Clear the local RDS snapshot. Caller holds radio_mtx (or is single-tasked at
  * boot), same contract as apply_*_locked — never nests another lock. */
