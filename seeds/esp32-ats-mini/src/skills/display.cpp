@@ -42,6 +42,10 @@ void radio_get_signal(uint8_t *rssi, uint8_t *snr);
  * *valid is true only on FM once a PS name has been captured on this station. */
 void radio_get_rds(char *ps, size_t ps_len, char *rt, size_t rt_len,
                    uint16_t *pi, uint8_t *pty, bool *valid);
+/* EIBI "now broadcasting" snapshot (radio.cpp). No lock — filled and read on the same
+ * loopTask. *valid is true only on AM/SSB when the loaded schedule matched the current
+ * frequency; on FM (RDS is used instead) it is always false/empty. buf may be NULL. */
+void radio_get_eibi_now(char *buf, size_t len, bool *valid);
 /* Menu accessors (radio.cpp). radio_get_menu_item wraps its index modulo the
  * active level's count, so the caller can ask for idx-2..idx+2 directly. */
 uint8_t radio_get_ui_mode();
@@ -634,7 +638,7 @@ static void draw_smeter(const char *mode, uint8_t rssi, uint8_t snr, bool is_fm,
 
 static void draw_radio_screen(const char *band, const char *mode, uint16_t freq,
                               uint8_t rssi, uint8_t snr, uint8_t volume,
-                              uint8_t target, const char *rds_ps, bool rds_show,
+                              uint8_t target, const char *station, bool station_show,
                               const char *hhmm) {
     ColorTheme t; theme_load(&t);
     uint16_t freq_color =
@@ -705,13 +709,17 @@ static void draw_radio_screen(const char *band, const char *mode, uint16_t freq,
     gfx->setTextColor(t.unit, t.bg);
     gfx->drawString(unit, DISPLAY_CX, 90, 4);
 
-    /* RDS station name (FM only): the decoded PS name in yellow, in the narrow row
-     * between the unit and the signal line. Painted only when the caller resolved a
-     * name to show (FM + valid RDS + non-empty PS); on AM/SSB or before any RDS is
-     * decoded rds_show is false and this row stays blank. 8 chars fit — no trunc. */
-    if (rds_show && rds_ps && rds_ps[0]) {
+    /* Station name row, in the narrow band between the unit and the signal line: the
+     * decoded RDS PS name on FM, or the EIBI "now broadcasting" name on AM/SSB. One
+     * shared row — the two sources never coexist (mode-exclusive), and the caller has
+     * already resolved which one to show, so this branch is source-agnostic. Painted
+     * in the station-name colour role (t.rds) only when a name is present; otherwise
+     * the row stays blank. The whole frame is display_clear()-ed each repaint, so no
+     * per-row fill is needed to avoid ghosting. EIBI names can be long — 8 chars is
+     * the RDS case, the ~24-char EIBI case clips at the panel edge if it overruns. */
+    if (station_show && station && station[0]) {
         gfx->setTextColor(t.rds, t.bg);
-        gfx->drawString(rds_ps, DISPLAY_CX, 106, 2);
+        gfx->drawString(station, DISPLAY_CX, 106, 2);
     }
 
     /* Signal zone (y~116..130): the two layouts diverge only here. Layout 0
@@ -858,12 +866,25 @@ void display_tick_render() {
     int menu_idx = radio_get_menu_idx();
     uint8_t rssi = 0, snr = 0;
     radio_get_signal(&rssi, &snr);
-    /* RDS snapshot up front (radio_mtx internal, released before display_mtx). Only
-     * FM with a decoded PS name shows a station name; off FM rds_valid is false. */
+    /* Station-name snapshot up front (radio_mtx internal, released before display_mtx).
+     * One shared row shows the station: FM uses the decoded RDS PS name, AM/SSB use the
+     * EIBI "now broadcasting" name from the offline schedule. The two are mutually
+     * exclusive by mode, so they collapse into a single `station` string + show flag
+     * that draw_radio_screen renders on the shared row regardless of mode. */
+    bool is_fm = (strcmp(mode, "FM") == 0);
     char rds_ps[9];
     bool rds_valid = false;
     radio_get_rds(rds_ps, sizeof(rds_ps), NULL, 0, NULL, NULL, &rds_valid);
-    bool rds_show = (strcmp(mode, "FM") == 0) && rds_valid && rds_ps[0];
+    bool rds_show = is_fm && rds_valid && rds_ps[0];
+    char eibi_ps[24];
+    bool eibi_valid = false;
+    radio_get_eibi_now(eibi_ps, sizeof(eibi_ps), &eibi_valid);
+    bool eibi_show = !is_fm && eibi_valid && eibi_ps[0];
+    char station[24];
+    station[0] = 0;
+    if (rds_show)       { strncpy(station, rds_ps, sizeof(station) - 1); station[sizeof(station) - 1] = 0; }
+    else if (eibi_show) { strncpy(station, eibi_ps, sizeof(station) - 1); station[sizeof(station) - 1] = 0; }
+    bool station_show = rds_show || eibi_show;
     /* Wall clock snapshot (no mutex — pure time()), taken alongside the radio
      * fields so change-detection below compares the same string the frame draws.
      * "--:--" until NTP syncs; then it flips to HH:MM and the strcmp forces a
@@ -887,10 +908,11 @@ void display_tick_render() {
                    prev_target = 0xFF, prev_ui = 0xFF, prev_menu_level = 0xFF;
     static int prev_menu_idx = -1;
     static const char *prev_mode = nullptr;
-    /* The shown station name (empty when no name). strcmp against it so a PS name
-     * appearing, changing or clearing forces a fresh frame instead of waiting for
-     * the idle fallback. rds_ps is a stack buffer here, so keep our own copy. */
-    static char prev_rds_ps[9] = "";
+    /* The shown station name (empty when no name), RDS on FM or EIBI on AM/SSB.
+     * strcmp against it so a name appearing, changing or clearing forces a fresh frame
+     * instead of waiting for the idle fallback. `station` is a stack buffer here, so
+     * keep our own copy; sized for the wider EIBI name (23 chars). */
+    static char prev_station[24] = "";
     /* Last clock string drawn (starts empty so the first paint always fires). The
      * minute rolling over changes hhmm and forces a fresh frame within a tick of
      * the change instead of waiting on the idle fallback. */
@@ -899,9 +921,9 @@ void display_tick_render() {
     const uint32_t DISPLAY_MAX_IDLE_MS = 2000;
 
     uint32_t now = millis();
-    /* The name the frame would show right now: the PS on FM, else empty. Compared
-     * against prev_rds_ps below so it joins the change set. */
-    const char *shown_ps = rds_show ? rds_ps : "";
+    /* The name the frame would show right now: RDS on FM or EIBI on AM/SSB, else
+     * empty. Compared against prev_station below so it joins the change set. */
+    const char *shown_ps = station_show ? station : "";
     /* The menu fields (ui/level/idx) join the change set so scrolling the menu, or
      * entering/leaving it, forces a fresh frame instead of being read as unchanged. */
     bool unchanged = freq == prev_freq && rssi == prev_rssi && snr == prev_snr &&
@@ -909,7 +931,7 @@ void display_tick_render() {
                      ui == prev_ui && menu_level == prev_menu_level &&
                      menu_idx == prev_menu_idx &&
                      prev_mode != nullptr && strcmp(mode, prev_mode) == 0 &&
-                     strcmp(shown_ps, prev_rds_ps) == 0 &&
+                     strcmp(shown_ps, prev_station) == 0 &&
                      strcmp(hhmm, prev_hhmm) == 0;
     /* force_redraw (set by display_set_theme) bypasses the change-detector so a theme
      * switch repaints the live screen at once, even when no radio field moved. */
@@ -927,8 +949,8 @@ void display_tick_render() {
     prev_menu_level = menu_level;
     prev_menu_idx = menu_idx;
     prev_mode = mode;
-    strncpy(prev_rds_ps, shown_ps, sizeof(prev_rds_ps) - 1);
-    prev_rds_ps[sizeof(prev_rds_ps) - 1] = 0;
+    strncpy(prev_station, shown_ps, sizeof(prev_station) - 1);
+    prev_station[sizeof(prev_station) - 1] = 0;
     strncpy(prev_hhmm, hhmm, sizeof(prev_hhmm) - 1);
     prev_hhmm[sizeof(prev_hhmm) - 1] = 0;
     last_push_ms = now;
@@ -936,7 +958,7 @@ void display_tick_render() {
     if (ui == DISPLAY_UI_MENU) {
         draw_menu_screen(radio_get_menu_title(), menu_idx);
     } else {
-        draw_radio_screen(band, mode, freq, rssi, snr, volume, target, rds_ps, rds_show, hhmm);
+        draw_radio_screen(band, mode, freq, rssi, snr, volume, target, station, station_show, hhmm);
     }
     display_flush();
     xSemaphoreGive(display_mtx);

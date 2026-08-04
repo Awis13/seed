@@ -68,6 +68,20 @@ uint16_t    display_get_sleep();
 const char *display_dim_state();
 
 /*
+ * EIBI schedule helpers, defined later in eibi.cpp (included right after this file in
+ * the unity build, so these forward decls let radio_tick / the menu reach forward to
+ * them). All run on the loopTask only: the tick polls the loaded offline schedule to
+ * show "who is broadcasting" on AM/SSB, and the "EIBI Load" menu action kicks a
+ * background download. eibi_now_name / eibi_lookup do SPIFFS reads serialised on the
+ * skill's own eibi_mtx — never called from an ISR or under radio_mtx/display_mtx.
+ */
+static bool eibi_available();
+static bool eibi_utc_now(int &h, int &m);
+static bool eibi_now_name(uint16_t freq, int utc_h, int utc_m, char *out, size_t len);
+static bool eibi_start_load();
+static void eibi_menu_label(char *buf, size_t len);
+
+/*
  * Mode constants follow the ref ats-mini numbering so the SSB mode value doubles
  * as setSSB()'s usblsb argument (1=LSB, 2=USB) — no separate mapping needed.
  * FM stays 0 (SI4735 defaultFunction for setup()); AM moved 1 -> 3. Modes travel
@@ -116,6 +130,14 @@ const char *display_dim_state();
  * without hammering the bus or fighting the squelch poll for the mutex.
  */
 #define RADIO_RDS_POLL_MS 250
+
+/*
+ * EIBI "now broadcasting" poll cadence (AM/SSB only). eibi_now_name() does a SPIFFS
+ * binary search + forward scan — a flash read, an order of magnitude costlier than
+ * the RDS I2C poll — so it runs far less often: 2.5 s keeps the station name
+ * responsive to a retune without hammering the filesystem.
+ */
+#define RADIO_EIBI_POLL_MS 2500
 
 /*
  * Radio-state persistence. The last-tuned mode/freq/volume/bfo are stashed in a
@@ -337,6 +359,16 @@ static void rds_reset_locked() {
     rds_pi = 0;
     rds_pty = 0;
 }
+
+/* EIBI "now broadcasting" cache (AM/SSB only; ephemeral, never persisted). Filled by
+ * the throttled EIBI poll in radio_tick() from the loaded offline schedule, read out
+ * by radio_get_eibi_now() for the display. Both the poll and the accessor run on the
+ * loopTask, so no lock guards these (the schedule file itself is serialised on
+ * eibi_mtx inside the lookup). The poll clears them whenever its gate fails (FM, no
+ * schedule, no NTP, or no match on the current frequency), so a stale name can never
+ * survive a retune or a mode change — mirroring rds_reset_locked() for the PS name. */
+static char eibi_now[24]     = "";
+static bool eibi_now_valid   = false;
 
 /*
  * Layered audio mute + squelch state. See radio_set_mute() for the OR layering.
@@ -682,13 +714,13 @@ enum MainItem { MI_BAND = 0, MI_MEMORY, MI_MODE, MI_STEP, MI_BW, MI_SQUELCH, MI_
  * Brightness/Theme/Layout drop into their adjust editors; About is not a leaf yet;
  * Back exits.
  */
-enum SettingsItem { SI_AGC = 0, SI_AVC, SI_SOFTMUTE, SI_CAL, SI_BRIGHTNESS, SI_THEME, SI_LAYOUT, SI_ABOUT, SI_BACK };
+enum SettingsItem { SI_AGC = 0, SI_AVC, SI_SOFTMUTE, SI_CAL, SI_BRIGHTNESS, SI_THEME, SI_LAYOUT, SI_EIBI, SI_ABOUT, SI_BACK };
 
 static const char *const menu_main_items[] = {
     "Band", "Memory", "Mode", "Step", "Bandwidth", "Squelch", "Mute", "Settings"
 };
 static const char *const menu_settings_items[] = {
-    "AGC", "AVC", "SoftMute", "Calibration", "Brightness", "Theme", "Layout", "About", "Back"
+    "AGC", "AVC", "SoftMute", "Calibration", "Brightness", "Theme", "Layout", "EIBI Load", "About", "Back"
 };
 #define MENU_MAIN_COUNT     ((int)(sizeof(menu_main_items) / sizeof(menu_main_items[0])))
 #define MENU_SETTINGS_COUNT ((int)(sizeof(menu_settings_items) / sizeof(menu_settings_items[0])))
@@ -1043,7 +1075,18 @@ const char *radio_get_menu_item(int i) {
     }
     if (menu_level == MENU_SETTINGS) {
         int n = MENU_SETTINGS_COUNT;
-        return menu_settings_items[((i % n) + n) % n];
+        int wi = ((i % n) + n) % n;
+        /* The EIBI row reflects load state (idle/loading/loaded-count/error) instead
+         * of a fixed label, so the offline-of-HTTP user gets feedback on the action.
+         * eibi_menu_label reads only RAM (no flash), safe under the caller's display_mtx.
+         * The window shows <=5 rows over a 10-entry list, so SI_EIBI appears at most
+         * once per draw — one static buffer cannot be clobbered mid-frame. */
+        if (wi == SI_EIBI) {
+            static char eibi_label[16];
+            eibi_menu_label(eibi_label, sizeof(eibi_label));
+            return eibi_label;
+        }
+        return menu_settings_items[wi];
     }
     if (menu_level == MENU_MEMORY) {
         /* Slot row: "NN <freq>" for an occupied slot (freq reuses radio_format_freq,
@@ -1108,6 +1151,18 @@ void radio_get_rds(char *ps, size_t ps_len, char *rt, size_t rt_len,
     if (pty)   *pty   = rds_pty;
     if (valid) *valid = got_rds;
     xSemaphoreGive(radio_mtx);
+}
+
+/*
+ * Copy out the current EIBI "now broadcasting" station name for the display (AM/SSB
+ * only). Unlike radio_get_rds this takes NO lock: eibi_now is filled/cleared solely
+ * by radio_tick's throttled poll, and this accessor is called from the same loopTask
+ * (display_tick_render), so the read is single-threaded. *valid is true only when a
+ * schedule match was resolved on the current frequency. buf may be NULL.
+ */
+void radio_get_eibi_now(char *buf, size_t len, bool *valid) {
+    if (buf && len) { strncpy(buf, eibi_now, len - 1); buf[len - 1] = 0; }
+    if (valid) *valid = eibi_now_valid;
 }
 
 /*
@@ -2747,6 +2802,16 @@ static void radio_tick() {
                         menu_level = MENU_ADJUST;
                         adjust_target = ADJ_LAYOUT;
                         break;
+                    case SI_EIBI:
+                        /* ACTION, not a value editor (mirrors the Memory save/recall
+                         * clicks): kick the EIBI schedule download on a background
+                         * worker task and stay in the Settings list. eibi_start_load()
+                         * returns immediately — false if WiFi is down or a load is
+                         * already running — and progress is observable via
+                         * /radio/eibi/status. Menu state is single-threaded on the
+                         * loopTask, so no lock is taken here. */
+                        eibi_start_load();
+                        break;
                     default:
                         /* SI_ABOUT placeholder (TODO: wire a real leaf) and SI_BACK
                          * both step back up to the MAIN list. */
@@ -3039,6 +3104,34 @@ static void radio_tick() {
             }
         }
         xSemaphoreGive(radio_mtx);
+    }
+
+    /* 3d) EIBI "now broadcasting": throttled offline-schedule lookup on AM/SSB (FM
+     * uses RDS instead, gated out here). Gated on a loaded schedule AND a non-FM mode
+     * AND a valid NTP clock; when any gate fails the cache is cleared so no stale name
+     * lingers past a retune or mode change. Throttled to RADIO_EIBI_POLL_MS because
+     * eibi_now_name() reads SPIFFS. This takes NO radio_mtx: freq/mode come from the
+     * lock-free file-statics (the same values the eibi_handle_get accessors expose),
+     * and the file read serialises on eibi_mtx inside eibi_now_name. loopTask only. */
+    static uint32_t last_eibi_ms = 0;
+    if (millis() - last_eibi_ms > RADIO_EIBI_POLL_MS) {
+        last_eibi_ms = millis();
+        int uh, um;
+        if (radio_mode != RADIO_MODE_FM && eibi_available() && eibi_utc_now(uh, um)) {
+            uint16_t f = radio_freq;
+            char name[sizeof(eibi_now)];
+            if (eibi_now_name(f, uh, um, name, sizeof(name))) {
+                strncpy(eibi_now, name, sizeof(eibi_now) - 1);
+                eibi_now[sizeof(eibi_now) - 1] = 0;
+                eibi_now_valid = true;
+            } else {
+                eibi_now[0] = 0;
+                eibi_now_valid = false;
+            }
+        } else {
+            eibi_now[0] = 0;
+            eibi_now_valid = false;
+        }
     }
 
     /* 4) Throttled repaint (~10 Hz). display_tick_render() itself leaves a custom
