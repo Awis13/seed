@@ -78,9 +78,10 @@
 #define RADIO_STATE_FILE    "/radio.json"
 /* v2 added the selected band-plan index; v3 adds the active band's live demod mode
  * and its step/bandwidth cursors so a mode switch and tuning-step/bandwidth choice
- * survive a reboot. An older-version file is rejected by the version check in
- * radio_restore_state() and falls back to the FM defaults. */
-#define RADIO_STATE_VERSION 3
+ * survive a reboot; v4 adds the packed squelch byte (threshold + metric select) so
+ * the signal gate survives too. An older-version file is rejected by the version
+ * check in radio_restore_state() and falls back to the FM defaults. */
+#define RADIO_STATE_VERSION 4
 #define RADIO_STORE_IDLE_MS 10000
 
 /*
@@ -233,8 +234,9 @@ static int      radio_bfo = 0;           /* current BFO offset in Hz (SSB only) 
  * radio_squelch packs the signal gate: the low 7 bits (&0x7f) are the threshold
  * 0..127 (0 = squelch off), the top bit (0x80) selects the metric (1 = SNR, else
  * RSSI). All are written only under radio_mtx (mute_squelch also from the loop-task
- * squelch poll), same discipline as the receiver state above. Not persisted in this
- * cut: a reboot lands with mute off and squelch disabled.
+ * squelch poll), same discipline as the receiver state above. radio_squelch (the
+ * threshold + metric) is persisted as of v4; mute_main is not — a reboot lands with
+ * manual mute off but the saved squelch gate restored.
  */
 enum MuteLayer { MUTE_MAIN, MUTE_SQUELCH, MUTE_TEMP };
 static bool     mute_main = false;       /* user/HTTP mute toggle (MUTE_MAIN layer) */
@@ -453,9 +455,10 @@ static int     menu_settings_idx = 0; /* cursor in the SETTINGS sublist */
  * rows. There is no separate cursor: the encoder scrolls the value itself (the
  * active band's band_step_idx/band_bw_idx, or its band_mode), which the render
  * accessors expose so the same draw_menu_screen window shows the choices.
- * adjust_target says which of the three we are editing. ADJ_MODE is reachable only
- * on a non-FM band (mode is locked on VHF). */
-enum AdjustTarget { ADJ_STEP, ADJ_BW, ADJ_MODE };
+ * adjust_target says which of the four we are editing. ADJ_MODE is reachable only
+ * on a non-FM band (mode is locked on VHF). ADJ_SQUELCH is a numeric 0..127 gate
+ * threshold — clamped at the ends, not a table wrap like the others. */
+enum AdjustTarget { ADJ_STEP, ADJ_BW, ADJ_MODE, ADJ_SQUELCH };
 static uint8_t adjust_target = ADJ_STEP;
 /* Cursor in the BAND picker (indexes bands[]). Re-seeded from radio_get_band_idx()
  * each time MENU_BAND is entered, so the list always opens on the active band. */
@@ -466,10 +469,10 @@ static uint8_t menu_band_idx = 0;
  * click handler can switch on the raw cursor (menu_idx) instead of strcmp-ing the
  * label — the label is display text, the index is the contract.
  */
-enum MainItem { MI_BAND = 0, MI_MODE, MI_STEP, MI_BW, MI_SETTINGS };
+enum MainItem { MI_BAND = 0, MI_MODE, MI_STEP, MI_BW, MI_SQUELCH, MI_MUTE, MI_SETTINGS };
 
 static const char *const menu_main_items[] = {
-    "Band", "Mode", "Step", "Bandwidth", "Settings"
+    "Band", "Mode", "Step", "Bandwidth", "Squelch", "Mute", "Settings"
 };
 static const char *const menu_settings_items[] = {
     "Brightness", "Theme", "About", "Back"
@@ -617,6 +620,9 @@ int radio_get_menu_idx() {
                 return clamp_idx(band_step_idx[radio_band_idx], stepCount(m));
             if (adjust_target == ADJ_BW)
                 return clamp_idx(band_bw_idx[radio_band_idx], bwCount(m));
+            /* ADJ_SQUELCH: cursor IS the numeric threshold (0..127), low 7 bits. */
+            if (adjust_target == ADJ_SQUELCH)
+                return radio_squelch & 0x7f;
             /* ADJ_MODE: cursor is the band's mode position within modeCycle. */
             return mode_cycle_pos(band_mode[radio_band_idx]);
         }
@@ -631,6 +637,7 @@ int radio_get_menu_count() {
         case MENU_ADJUST:
             if (adjust_target == ADJ_STEP) return stepCount(band_table_mode());
             if (adjust_target == ADJ_BW)   return bwCount(band_table_mode());
+            if (adjust_target == ADJ_SQUELCH) return 128;  /* 0..127 threshold */
             return MODE_CYCLE_COUNT;
         default:            return MENU_MAIN_COUNT;
     }
@@ -646,6 +653,7 @@ const char *radio_get_menu_title() {
         case MENU_ADJUST:
             if (adjust_target == ADJ_STEP) return "Step";
             if (adjust_target == ADJ_BW)   return "Bandwidth";
+            if (adjust_target == ADJ_SQUELCH) return "Squelch";
             return "Mode";
         default:            return "Menu";
     }
@@ -655,6 +663,17 @@ const char *radio_get_menu_item(int i) {
         if (adjust_target == ADJ_MODE) {
             int n = MODE_CYCLE_COUNT;
             return radio_mode_str(modeCycle[((i % n) + n) % n]);
+        }
+        if (adjust_target == ADJ_SQUELCH) {
+            /* Numeric threshold window. `i` is the absolute candidate value
+             * (draw_menu_screen passes cursor+offset, cursor = the threshold),
+             * so render it directly, blanking the edges past the 0..127 clamp
+             * instead of wrapping. draw_menu_screen consumes each returned string
+             * immediately before asking for the next, so one static buffer is safe. */
+            static char buf[8];
+            if (i < 0 || i > 127) return "";
+            snprintf(buf, sizeof(buf), "%d", i);
+            return buf;
         }
         /* Menu window items come from the band's own table mode, not radio_mode. */
         uint8_t m = band_table_mode();
@@ -817,8 +836,10 @@ static void apply_band_locked(uint8_t idx, uint16_t freq) {
         radio_bfo = 0;
     }
     /* A mode change can reset the chip volume to its power-on default AND clear the
-     * DSP soft-mute. Re-push the volume only while MAIN mute is off (a setVolume while
-     * muted would unmute), and always reassert the physical mute — setFM/setAM/setSSB
+     * DSP soft-mute. Skip pushing volume to the chip while MAIN-muted; the value is
+     * kept and re-pushed on unmute (deferring the write avoids a needless RX_VOLUME
+     * round-trip, not because it would unmute — mute is RX_HARD_MUTE via setAudioMute,
+     * independent of RX_VOLUME). Always reassert the physical mute — setFM/setAM/setSSB
      * drop the soft-mute, so it must be reapplied to keep the layers honoured. */
     if (!mute_main) rx.setVolume(radio_volume);
     rx.setAudioMute(audio_muted);
@@ -1217,9 +1238,10 @@ static void radio_register_routes(AsyncWebServer &server) {
                  * while muted); still a no-op audio-wise if squelch keeps it muted. */
                 if (!mute_main) rx.setVolume(radio_volume);
             }
-            /* Step/bw/mode are persisted (v3); squelch/mute are not, so only a change
-             * to the persisted parameters schedules a flash write. */
-            if (has_step || has_bw || has_mode) radio_mark_dirty();
+            /* Step/bw/mode and the squelch gate (threshold + metric) are persisted
+             * (v4); MAIN mute is ephemeral, so only a change to a persisted parameter
+             * schedules a flash write. */
+            if (has_step || has_bw || has_mode || has_squelch || has_sqmetric) radio_mark_dirty();
         }
         /* Snapshot the resulting labels under the lock, clamped defensively; the
          * .desc pointers are flash-resident constants, safe to use after release. */
@@ -1309,8 +1331,9 @@ static void radio_register_routes(AsyncWebServer &server) {
          * write and the setVolume() can't interleave with an encoder step. */
         xSemaphoreTake(radio_mtx, portMAX_DELAY);
         radio_volume = (uint8_t)v;
-        /* Store the level always, but push it to the chip only when MAIN mute is off
-         * — a setVolume while muted would unmute. It is re-pushed on unmute. */
+        /* Store the level always, but defer pushing it to the chip while MAIN-muted;
+         * the value is kept and re-pushed on unmute. (Mute is RX_HARD_MUTE via
+         * setAudioMute, independent of RX_VOLUME — setVolume does not lift it.) */
         if (!mute_main) rx.setVolume(radio_volume);
         radio_mark_dirty();  /* real volume change -> schedule a debounced persist */
         xSemaphoreGive(radio_mtx);
@@ -1452,6 +1475,11 @@ static void radio_register_routes(AsyncWebServer &server) {
         uint8_t rssi = rx.getCurrentRSSI();
         uint8_t snr = rx.getCurrentSNR();
         bool mute_snap = radio_is_muted(MUTE_MAIN);
+        /* Squelch-layer state, read under the same hold: `squelched` exposes whether
+         * the signal gate is muting RIGHT NOW (status.mute only reports MAIN), and
+         * `audio_muted` is the effective physical soft-mute (MAIN OR squelch). */
+        bool squelched_snap = radio_is_muted(MUTE_SQUELCH);
+        bool audio_muted_snap = audio_muted;
         uint8_t sq_snap = radio_squelch;
         xSemaphoreGive(radio_mtx);
 
@@ -1477,6 +1505,8 @@ static void radio_register_routes(AsyncWebServer &server) {
         doc["mute"] = mute_snap;
         doc["squelch"] = sq_snap & 0x7f;
         doc["squelch_metric"] = (sq_snap & 0x80) ? "snr" : "rssi";
+        doc["squelched"] = squelched_snap;
+        doc["audio_muted"] = audio_muted_snap;
         String response;
         serializeJson(doc, response);
         req->send(200, "application/json", response);
@@ -1551,6 +1581,24 @@ static void radio_tick() {
                             adjust_target = ADJ_MODE;
                         }
                         break;
+                    case MI_SQUELCH:
+                        /* Drop into the numeric squelch-threshold value-editor. */
+                        menu_level = MENU_ADJUST;
+                        adjust_target = ADJ_SQUELCH;
+                        break;
+                    case MI_MUTE:
+                        /* Manual MAIN-mute toggle (the knob/menu equivalent of the
+                         * ref's clickVolume mute) — a toggle, not a value editor, so
+                         * flip it under radio_mtx and drop straight back to the VFO.
+                         * Re-push the held volume on unmute (writes are skipped while
+                         * muted). Mute is ephemeral (not persisted): no mark_dirty. */
+                        xSemaphoreTake(radio_mtx, portMAX_DELAY);
+                        radio_set_mute(MUTE_MAIN, !mute_main);
+                        if (!mute_main) rx.setVolume(radio_volume);
+                        xSemaphoreGive(radio_mtx);
+                        ui_mode = UI_VFO;
+                        menu_level = MENU_MAIN;
+                        break;
                     default:
                         /* No other MAIN row is a leaf yet — bounce back to the VFO. */
                         ui_mode = UI_VFO;
@@ -1616,6 +1664,19 @@ static void radio_tick() {
                     /* Mode cycle takes radio_mtx itself and handles the FM-lock,
                      * step/bw reset and full band reapply (SSB patch load/unload). */
                     radio_cycle_mode(d > 0 ? 1 : -1);
+                } else if (adjust_target == ADJ_SQUELCH) {
+                    /* Numeric threshold edit: CLAMP the low 7 bits to 0..127 (not a
+                     * table wrap), preserving the metric-select bit. The throttled
+                     * squelch poll re-evaluates the gate at the new threshold within
+                     * one RADIO_SQUELCH_POLL_MS, so no explicit re-apply here. The
+                     * threshold is persisted (v4), so mark the state dirty. */
+                    xSemaphoreTake(radio_mtx, portMAX_DELAY);
+                    int thr = (int)(radio_squelch & 0x7f) + d;
+                    if (thr < 0)   thr = 0;
+                    if (thr > 127) thr = 127;
+                    radio_squelch = (uint8_t)((radio_squelch & 0x80) | (thr & 0x7f));
+                    radio_mark_dirty();
+                    xSemaphoreGive(radio_mtx);
                 } else {
                     /* The value editor scrolls the parameter itself, not a cursor:
                      * bump the active band's step/bandwidth row and apply it live so
@@ -1666,8 +1727,9 @@ static void radio_tick() {
             if (d != 0) {
                 int v = constrain((int)radio_volume + d, 0, 63);
                 radio_volume = (uint8_t)v;
-                /* Store always; push to the chip only when MAIN mute is off (a
-                 * setVolume while muted would unmute — see radio_set_mute). */
+                /* Store always; defer the chip write while MAIN-muted, re-pushed on
+                 * unmute. (Mute is RX_HARD_MUTE via setAudioMute, independent of
+                 * RX_VOLUME — setVolume does not lift it. See radio_set_mute.) */
                 if (!mute_main) rx.setVolume(radio_volume);
                 radio_mark_dirty();  /* encoder volume change -> schedule a debounced persist */
             }
@@ -1724,7 +1786,7 @@ static void radio_tick() {
      * concurrent status/tune. Clearing radio_dirty inside the lock closes the
      * window where a change during the write would be lost. */
     if (radio_dirty && millis() - radio_last_change_ms > RADIO_STORE_IDLE_MS) {
-        uint16_t f; uint8_t v, bnd, bmode, bstep, bbw; int b;
+        uint16_t f; uint8_t v, bnd, bmode, bstep, bbw, sq; int b;
         xSemaphoreTake(radio_mtx, portMAX_DELAY);
         f = radio_freq; v = radio_volume; b = radio_bfo; bnd = radio_band_idx;
         /* v3: persist the active band's live demod mode and step/bw cursors so a mode
@@ -1732,6 +1794,8 @@ static void radio_tick() {
          * via apply_band_locked). The old "mode" key held radio_mode but restore never
          * read it; it now carries band_mode[bnd], which restore does use. */
         bmode = band_mode[bnd]; bstep = band_step_idx[bnd]; bbw = band_bw_idx[bnd];
+        /* v4: the packed squelch byte (threshold + metric bit) is global, not per-band. */
+        sq = radio_squelch;
         radio_dirty = false;
         xSemaphoreGive(radio_mtx);
         JsonDocument doc;
@@ -1743,6 +1807,7 @@ static void radio_tick() {
         doc["band"] = bnd;
         doc["step"] = bstep;
         doc["bw"] = bbw;
+        doc["squelch"] = sq;
         String out;
         serializeJson(doc, out);
         write_spiffs_file(RADIO_STATE_FILE, out);  /* blocking flash write + encoder detach, outside the mutex */
@@ -1770,8 +1835,9 @@ static const Skill radio_skill = {
  * band's own min/max — which is what lets an SW or SSB frequency survive a reboot
  * (the old fixed-window check rejected them and fell back to FM). v3 additionally
  * restores the band's live demod mode and its step/bandwidth cursors (set BEFORE the
- * reapply so apply_band_locked reads them). An older-version file is rejected by the
- * version check above, resetting to the FM defaults.
+ * reapply so apply_band_locked reads them); v4 also restores the global squelch byte
+ * (threshold + metric). An older-version file is rejected by the version check above,
+ * resetting to the FM defaults.
  */
 static void radio_restore_state() {
     String raw = read_spiffs_file(RADIO_STATE_FILE);
@@ -1788,6 +1854,7 @@ static void radio_restore_state() {
     int smode  = doc["mode"]   | -1;
     int sstep  = doc["step"]   | -1;
     int sbw    = doc["bw"]     | -1;
+    int ssq    = doc["squelch"] | -1;  /* v4: packed threshold + metric bit */
 
     /* Reject anything malformed — a single bad field falls back to the defaults. */
     if (band < 0 || band >= BAND_COUNT) return;
@@ -1817,6 +1884,12 @@ static void radio_restore_state() {
                               ? (uint8_t)sstep : defaultStepIdx[rmode];
     band_bw_idx[band]   = (sbw  >= 0 && sbw  < bwCount(rmode))
                               ? (uint8_t)sbw  : defaultBwIdx[rmode];
+
+    /* Restore the packed squelch byte (threshold + metric bit). Any 0..255 value is
+     * valid on the wire — the low 7 bits are the threshold (always <=127) and 0x80 is
+     * the metric select. The throttled squelch poll applies the gate after boot; a
+     * missing/negative field leaves radio_squelch at its 0 (off) default. */
+    if (ssq >= 0 && ssq <= 255) radio_squelch = (uint8_t)ssq;
 
     /* Volume must be set before apply_band_locked, which reapplies it to the chip. */
     radio_volume  = (uint8_t)volume;
