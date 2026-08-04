@@ -80,8 +80,9 @@
  * and its step/bandwidth cursors so a mode switch and tuning-step/bandwidth choice
  * survive a reboot; v4 adds the packed squelch byte (threshold + metric select) so
  * the signal gate survives too. An older-version file is rejected by the version
- * check in radio_restore_state() and falls back to the FM defaults. */
-#define RADIO_STATE_VERSION 4
+ * check in radio_restore_state() and falls back to the FM defaults. v5 adds the
+ * seven per-mode DSP scalars (AGC/AVC/SoftMute), all global (not per-band). */
+#define RADIO_STATE_VERSION 5
 #define RADIO_STORE_IDLE_MS 10000
 
 /*
@@ -243,6 +244,27 @@ static bool     mute_main = false;       /* user/HTTP mute toggle (MUTE_MAIN lay
 static bool     mute_squelch = false;    /* signal-gate mute (MUTE_SQUELCH layer) */
 static bool     audio_muted = false;     /* current physical DSP soft-mute state */
 static uint8_t  radio_squelch = 0;       /* packed: [7]=metric(1=SNR), [6:0]=threshold */
+
+/*
+ * Per-mode DSP tuning: AGC (attenuator index), AVC (max gain) and SoftMute (max
+ * attenuation). One scalar per mode family, so switching mode automatically picks
+ * up that family's stored value (apply_*_locked read the live mode). All persisted
+ * as of v5 (global, not per-band). Written only under radio_mtx (or single-tasked
+ * at boot), same discipline as the receiver state above.
+ *
+ *  - AGC index: 0 = AGC on (no attenuation); >0 = manual attenuator step. Range is
+ *    per mode (ref doAgc): FM 0..27, AM 0..37, SSB 0..1 — see agc_max_for_mode().
+ *    Applies to every mode, FM included; a default of 0 reproduces the old FM AGC.
+ *  - AVC (AM/SSB only, never FM): setAvcAmMaxGain max gain, even values 12..90.
+ *  - SoftMute (AM/SSB only, never FM): max attenuation 0..32.
+ */
+static int8_t   fm_agc  = 0;             /* FM AGC/attenuator index, 0..27 (0 = AGC on) */
+static int8_t   am_agc  = 0;             /* AM AGC/attenuator index, 0..37 (0 = AGC on) */
+static int8_t   ssb_agc = 0;             /* SSB AGC/attenuator index, 0..1 (0 = AGC on) */
+static int8_t   am_avc  = 48;            /* AM AVC max gain, even 12..90 */
+static int8_t   ssb_avc = 48;            /* SSB AVC max gain, even 12..90 */
+static int8_t   am_sm   = 4;             /* AM soft-mute max attenuation, 0..32 */
+static int8_t   ssb_sm  = 4;             /* SSB soft-mute max attenuation, 0..32 */
 
 /*
  * Band-plan cursor and the per-band "where was I" store. radio_band_idx indexes
@@ -457,8 +479,10 @@ static int     menu_settings_idx = 0; /* cursor in the SETTINGS sublist */
  * accessors expose so the same draw_menu_screen window shows the choices.
  * adjust_target says which of the four we are editing. ADJ_MODE is reachable only
  * on a non-FM band (mode is locked on VHF). ADJ_SQUELCH is a numeric 0..127 gate
- * threshold — clamped at the ends, not a table wrap like the others. */
-enum AdjustTarget { ADJ_STEP, ADJ_BW, ADJ_MODE, ADJ_SQUELCH };
+ * threshold — clamped at the ends, not a table wrap like the others. ADJ_AGC/AVC/
+ * SOFTMUTE are likewise numeric (cursor IS the value): AGC on every mode, AVC and
+ * SoftMute on AM/SSB only (a no-op editor showing blanks on an FM band). */
+enum AdjustTarget { ADJ_STEP, ADJ_BW, ADJ_MODE, ADJ_SQUELCH, ADJ_AGC, ADJ_AVC, ADJ_SOFTMUTE };
 static uint8_t adjust_target = ADJ_STEP;
 /* Cursor in the BAND picker (indexes bands[]). Re-seeded from radio_get_band_idx()
  * each time MENU_BAND is entered, so the list always opens on the active band. */
@@ -471,11 +495,19 @@ static uint8_t menu_band_idx = 0;
  */
 enum MainItem { MI_BAND = 0, MI_MODE, MI_STEP, MI_BW, MI_SQUELCH, MI_MUTE, MI_SETTINGS };
 
+/*
+ * SETTINGS-sublist dispatch keys. The order MUST match menu_settings_items[] below,
+ * exactly like MainItem/menu_main_items[]: the click handler switches on the raw
+ * cursor (menu_settings_idx), never the label text. AGC/AVC/SoftMute drop into a
+ * numeric adjust editor; Brightness/Theme/About are not leaves yet; Back exits.
+ */
+enum SettingsItem { SI_AGC = 0, SI_AVC, SI_SOFTMUTE, SI_BRIGHTNESS, SI_THEME, SI_ABOUT, SI_BACK };
+
 static const char *const menu_main_items[] = {
     "Band", "Mode", "Step", "Bandwidth", "Squelch", "Mute", "Settings"
 };
 static const char *const menu_settings_items[] = {
-    "Brightness", "Theme", "About", "Back"
+    "AGC", "AVC", "SoftMute", "Brightness", "Theme", "About", "Back"
 };
 #define MENU_MAIN_COUNT     ((int)(sizeof(menu_main_items) / sizeof(menu_main_items[0])))
 #define MENU_SETTINGS_COUNT ((int)(sizeof(menu_settings_items) / sizeof(menu_settings_items[0])))
@@ -494,7 +526,7 @@ static int menu_wrap(int idx, int delta, int count) {
 static const SkillEndpoint radio_endpoints[] = {
     {"POST", "/radio/tune",   "Tune: {mode:\"FM\"|\"AM\"|\"LSB\"|\"USB\", freq:<int>, bfo?:<int>}"},
     {"POST", "/radio/band",   "Jump to a band-plan preset: {idx:<int>}"},
-    {"POST", "/radio/config", "Set mode/step/bandwidth/squelch/mute: {mode?:\"AM\"|\"LSB\"|\"USB\", step_idx?:<int>, bw_idx?:<int>, squelch?:0-127, squelch_snr?:<bool>, mute?:<bool>}"},
+    {"POST", "/radio/config", "Set mode/step/bandwidth/squelch/mute/DSP: {mode?:\"AM\"|\"LSB\"|\"USB\", step_idx?:<int>, bw_idx?:<int>, squelch?:0-127, squelch_snr?:<bool>, mute?:<bool>, agc?:<int>, avc?:<even 12-90>, softmute?:0-32}"},
     {"POST", "/radio/volume", "Set volume: {volume:0-63}"},
     {"POST", "/radio/scan",   "Sweep current-mode band: {from,to,step,min_rssi?} -> RSSI/SNR per step"},
     {"GET",  "/radio/status", "Current freq/mode/RSSI/SNR (+bfo in SSB)"},
@@ -509,7 +541,7 @@ static const char *radio_describe() {
            "|--------|------|-------------|\n"
            "| POST | /radio/tune | Tune: `{\"mode\":\"FM|AM|LSB|USB\",\"freq\":<int>,\"bfo\":<int>}` |\n"
            "| POST | /radio/band | Jump to a band-plan preset: `{\"idx\":<int>}` |\n"
-           "| POST | /radio/config | Set mode/step/bandwidth + squelch/mute: `{\"mode\":\"AM|LSB|USB\",\"step_idx\":<int>,\"bw_idx\":<int>,\"squelch\":<0..127>,\"squelch_snr\":<bool>,\"mute\":<bool>}` |\n"
+           "| POST | /radio/config | Set mode/step/bandwidth + squelch/mute + DSP: `{\"mode\":\"AM|LSB|USB\",\"step_idx\":<int>,\"bw_idx\":<int>,\"squelch\":<0..127>,\"squelch_snr\":<bool>,\"mute\":<bool>,\"agc\":<int>,\"avc\":<even 12..90>,\"softmute\":<0..32>}` |\n"
            "| POST | /radio/volume | Set volume: `{\"volume\":<0..63>}` |\n"
            "| POST | /radio/scan | Blocking band sweep in the current mode: `{\"from\":<int>,\"to\":<int>,\"step\":<int>,\"min_rssi\":<int>}` |\n"
            "| GET | /radio/status | Current freq, mode, RSSI, SNR (+bfo in SSB) |\n\n"
@@ -529,6 +561,13 @@ static const char *radio_describe() {
            "### Volume\n\n"
            "- `POST /radio/volume` `{\"volume\":<0..63>}` sets the receiver volume\n"
            "  (same value reported by `/radio/status` and driven by the encoder).\n\n"
+           "### DSP tuning (AGC / AVC / SoftMute)\n\n"
+           "Set per-mode via `POST /radio/config`; each is stored per mode family and\n"
+           "reported by `/radio/status` for the active mode.\n\n"
+           "- `agc` (all modes): 0 = AGC on (no attenuation); higher = manual attenuator.\n"
+           "  Range is per mode: FM 0..27, AM 0..37, SSB 0..1.\n"
+           "- `avc` (AM/SSB only): AVC max gain, even values 12..90. Rejected in FM.\n"
+           "- `softmute` (AM/SSB only): soft-mute max attenuation 0..32. Rejected in FM.\n\n"
            "### Scan\n\n"
            "`POST /radio/scan` sweeps `from`..`to` (inclusive) with the given `step`,\n"
            "measuring RSSI/SNR at each point. It stays in the current mode and does\n"
@@ -562,6 +601,14 @@ static const char *radio_describe() {
 /* Return true when the mode is one of the two SSB sidebands. */
 static bool radio_is_ssb(uint8_t mode) {
     return mode == RADIO_MODE_LSB || mode == RADIO_MODE_USB;
+}
+
+/* Per-mode AGC index ceiling (ref doAgc): FM 0..27, AM 0..37, SSB 0..1. The index
+ * is an attenuator step, 0 meaning "AGC on, no attenuation". */
+static uint8_t agc_max_for_mode(uint8_t mode) {
+    if (mode == RADIO_MODE_FM) return 27;
+    if (radio_is_ssb(mode))    return 1;
+    return 37;  /* AM */
 }
 
 /* Map a mode constant to its wire string (FM|LSB|USB|AM). */
@@ -623,6 +670,15 @@ int radio_get_menu_idx() {
             /* ADJ_SQUELCH: cursor IS the numeric threshold (0..127), low 7 bits. */
             if (adjust_target == ADJ_SQUELCH)
                 return radio_squelch & 0x7f;
+            /* ADJ_AGC/AVC/SOFTMUTE: cursor IS the per-mode value. On an FM band AVC/
+             * SoftMute are inapplicable — the value is still returned but item()
+             * blanks every row, so the editor reads as empty. */
+            if (adjust_target == ADJ_AGC)
+                return (m == RADIO_MODE_FM) ? fm_agc : (radio_is_ssb(m) ? ssb_agc : am_agc);
+            if (adjust_target == ADJ_AVC)
+                return radio_is_ssb(m) ? ssb_avc : am_avc;
+            if (adjust_target == ADJ_SOFTMUTE)
+                return radio_is_ssb(m) ? ssb_sm : am_sm;
             /* ADJ_MODE: cursor is the band's mode position within modeCycle. */
             return mode_cycle_pos(band_mode[radio_band_idx]);
         }
@@ -638,6 +694,9 @@ int radio_get_menu_count() {
             if (adjust_target == ADJ_STEP) return stepCount(band_table_mode());
             if (adjust_target == ADJ_BW)   return bwCount(band_table_mode());
             if (adjust_target == ADJ_SQUELCH) return 128;  /* 0..127 threshold */
+            if (adjust_target == ADJ_AGC) return agc_max_for_mode(band_table_mode()) + 1;
+            if (adjust_target == ADJ_AVC) return 91;   /* 0..90 window; even-only in item()/scroll */
+            if (adjust_target == ADJ_SOFTMUTE) return 33;  /* 0..32 */
             return MODE_CYCLE_COUNT;
         default:            return MENU_MAIN_COUNT;
     }
@@ -654,6 +713,9 @@ const char *radio_get_menu_title() {
             if (adjust_target == ADJ_STEP) return "Step";
             if (adjust_target == ADJ_BW)   return "Bandwidth";
             if (adjust_target == ADJ_SQUELCH) return "Squelch";
+            if (adjust_target == ADJ_AGC) return "AGC";
+            if (adjust_target == ADJ_AVC) return "AVC";
+            if (adjust_target == ADJ_SOFTMUTE) return "SoftMute";
             return "Mode";
         default:            return "Menu";
     }
@@ -672,6 +734,27 @@ const char *radio_get_menu_item(int i) {
              * immediately before asking for the next, so one static buffer is safe. */
             static char buf[8];
             if (i < 0 || i > 127) return "";
+            snprintf(buf, sizeof(buf), "%d", i);
+            return buf;
+        }
+        if (adjust_target == ADJ_AGC) {
+            /* Numeric AGC index window; blank past the per-mode ceiling. */
+            static char buf[8];
+            if (i < 0 || i > (int)agc_max_for_mode(band_table_mode())) return "";
+            snprintf(buf, sizeof(buf), "%d", i);
+            return buf;
+        }
+        if (adjust_target == ADJ_AVC) {
+            /* Even values 12..90; blank odd neighbours and the FM band (no AVC there). */
+            static char buf[8];
+            if (band_table_mode() == RADIO_MODE_FM || i < 12 || i > 90 || (i % 2)) return "";
+            snprintf(buf, sizeof(buf), "%d", i);
+            return buf;
+        }
+        if (adjust_target == ADJ_SOFTMUTE) {
+            /* Values 0..32; blank past the ends and the FM band (no soft-mute there). */
+            static char buf[8];
+            if (band_table_mode() == RADIO_MODE_FM || i < 0 || i > 32) return "";
             snprintf(buf, sizeof(buf), "%d", i);
             return buf;
         }
@@ -789,6 +872,45 @@ static void apply_bandwidth_locked(uint8_t mode, uint8_t bidx) {
 }
 
 /*
+ * Push the mode's stored AGC index to the chip. Ref doAgc: index 0 => AGC on with no
+ * attenuation (AGCDIS=0, AGCIDX=0); index n>0 => AGC disabled with attenuator n-1.
+ * One setAutomaticGainControl call covers every mode — the driver routes it to the FM
+ * or AM AGC property by the current opmode. Caller must hold radio_mtx. A default
+ * index of 0 reproduces the receiver's power-on AGC exactly (so replacing the old
+ * hardcoded setAutomaticGainControl(0,0) is behaviour-preserving).
+ */
+static void apply_agc_locked(uint8_t mode) {
+    int8_t idx = (mode == RADIO_MODE_FM) ? fm_agc
+               : (radio_is_ssb(mode) ? ssb_agc : am_agc);
+    uint8_t dis = idx > 0 ? 1 : 0;
+    uint8_t ndx = idx > 1 ? (uint8_t)(idx - 1) : 0;
+    rx.setAutomaticGainControl(dis, ndx);
+}
+
+/*
+ * Push the mode's stored AVC (automatic volume control) max gain to the chip. AVC is
+ * an AM/SSB feature — FM has none, so this is a no-op there. The SI4735 driver uses
+ * the AM property for SSB too (ref calls setAvcAmMaxGain in both). Caller holds
+ * radio_mtx. SSB AVC enablement (setSSBAutomaticVolumeControl) stays in the SSB
+ * set-up branch; this only sets the max-gain ceiling.
+ */
+static void apply_avc_locked(uint8_t mode) {
+    if (mode == RADIO_MODE_FM) return;
+    rx.setAvcAmMaxGain((uint8_t)(radio_is_ssb(mode) ? ssb_avc : am_avc));
+}
+
+/*
+ * Push the mode's stored soft-mute max attenuation to the chip. AM and SSB have
+ * separate SI4735 properties; FM soft-mute is left alone (no-op). Caller holds
+ * radio_mtx.
+ */
+static void apply_softmute_locked(uint8_t mode) {
+    if (mode == RADIO_MODE_FM) return;
+    if (radio_is_ssb(mode)) rx.setSsbSoftMuteMaxAttenuation((uint8_t)ssb_sm);
+    else                    rx.setAmSoftMuteMaxAttenuation((uint8_t)am_sm);
+}
+
+/*
  * Drive the receiver onto band `idx` at frequency `freq` (already clipped to the
  * band's window, in that band's units). Shared by radio_select_band() and the
  * boot restore so the chip-config sequence lives in one place.
@@ -825,9 +947,9 @@ static void apply_band_locked(uint8_t idx, uint16_t freq) {
         rx.setSSBBfo(0);
     } else if (mode == RADIO_MODE_FM) {
         rx.setFM(b->minFreq, b->maxFreq, freq, stepsForMode(mode)[sidx].step);
-        /* Match /radio/tune's post-setFM config: 50 us de-emphasis + FM AGC. */
+        /* Match /radio/tune's post-setFM config: 50 us de-emphasis. The FM AGC is
+         * (re)applied from the per-mode store in the unified DSP block below. */
         rx.setFMDeEmphasis(1);
-        rx.setAutomaticGainControl(0, 0);
         radio_ssb_loaded = false;  /* SSB patch is dropped when we leave SSB */
         radio_bfo = 0;
     } else {  /* AM (MW / SW broadcast) */
@@ -849,6 +971,14 @@ static void apply_band_locked(uint8_t idx, uint16_t freq) {
      * currentStep aligned for AM/FM and is a no-op for SSB. */
     apply_step_locked(mode, sidx);
     apply_bandwidth_locked(mode, bidx);
+
+    /* Reapply the per-mode DSP tuning: setFM/setAM/setSSB reset AGC/AVC/soft-mute to
+     * chip defaults, so — like volume/mute above — push the stored values back on top.
+     * AGC covers every mode (index 0 reproduces the old FM default); AVC/soft-mute are
+     * no-ops on FM. */
+    apply_agc_locked(mode);
+    apply_avc_locked(mode);
+    apply_softmute_locked(mode);
 
     radio_band_idx = idx;
     radio_freq = freq;
@@ -982,10 +1112,11 @@ static void radio_register_routes(AsyncWebServer &server) {
             /* Match the reference firmware's post-setFM config so the chip
              * reports FM RSSI/SNR. setFM alone leaves de-emphasis and AGC at
              * power-on defaults; the SI4735 driver applies these as properties.
-             * De-emphasis 1 = 50 us (EU/JP/AU); AGC enabled with no attenuation
-             * (AGCDIS=0, AGCIDX=0) mirrors the ref's doAgc(0) at FM AGC index 0. */
+             * De-emphasis 1 = 50 us (EU/JP/AU); the FM AGC comes from the per-mode
+             * store via apply_agc_locked (default index 0 = AGC on, no attenuation,
+             * matching the ref's doAgc(0)). */
             rx.setFMDeEmphasis(1);
-            rx.setAutomaticGainControl(0, 0);
+            apply_agc_locked(RADIO_MODE_FM);
             xSemaphoreGive(radio_mtx);
             radio_ssb_loaded = false;  /* SSB patch is dropped when we leave SSB */
         } else if (strcmp(mode_str, "AM") == 0) {
@@ -1158,6 +1289,16 @@ static void radio_register_routes(AsyncWebServer &server) {
         bool sq_snr       = input["squelch_snr"] | false;
         bool mute_on      = input["mute"]        | false;
 
+        /* Optional per-mode DSP: "agc" (0..per-mode max), "avc" (even 12..90, AM/SSB
+         * only), "softmute" (0..32, AM/SSB only). Ranges validated under the lock once
+         * the effective mode is known. */
+        bool has_agc = !input["agc"].isNull();
+        bool has_avc = !input["avc"].isNull();
+        bool has_sm  = !input["softmute"].isNull();
+        int  agc_v   = input["agc"]      | -1;
+        int  avc_v   = input["avc"]      | -1;
+        int  sm_v    = input["softmute"] | -1;
+
         /* Parse the optional demod mode. Only AM/LSB/USB are settable here: FM is a
          * broadcast demod locked to the VHF band (a native-FM band is rejected under
          * the lock below), so it is never a valid config target. */
@@ -1172,9 +1313,10 @@ static void radio_register_routes(AsyncWebServer &server) {
 
         free(body); req->_tempObject = nullptr;
 
-        if (!has_step && !has_bw && !has_mode && !has_squelch && !has_mute) {
+        if (!has_step && !has_bw && !has_mode && !has_squelch && !has_mute &&
+            !has_agc && !has_avc && !has_sm) {
             req->send(400, "application/json",
-                "{\"error\":\"provide step_idx, bw_idx, mode, squelch and/or mute\"}");
+                "{\"error\":\"provide step_idx, bw_idx, mode, squelch, mute, agc, avc and/or softmute\"}");
             return;
         }
         if (mode_str_bad) {
@@ -1202,7 +1344,16 @@ static void radio_register_routes(AsyncWebServer &server) {
         bool step_bad = has_step && (step_idx < 0 || step_idx >= step_max);
         bool bw_bad   = has_bw   && (bw_idx   < 0 || bw_idx   >= bw_max);
         bool squelch_bad = has_squelch && (squelch < 0 || squelch > 127);
-        if (!mode_locked && !step_bad && !bw_bad && !squelch_bad) {
+        /* DSP validation against the effective mode. AVC/SoftMute are AM/SSB-only:
+         * requesting them on an FM band is rejected (like a mode lock), not ignored. */
+        uint8_t agc_max = agc_max_for_mode(mode);
+        bool agc_bad = has_agc && (agc_v < 0 || agc_v > (int)agc_max);
+        bool avc_fm  = has_avc && mode == RADIO_MODE_FM;
+        bool avc_bad = has_avc && (avc_v < 12 || avc_v > 90 || (avc_v % 2));
+        bool sm_fm   = has_sm  && mode == RADIO_MODE_FM;
+        bool sm_bad  = has_sm  && (sm_v < 0 || sm_v > 32);
+        if (!mode_locked && !step_bad && !bw_bad && !squelch_bad &&
+            !agc_bad && !avc_fm && !avc_bad && !sm_fm && !sm_bad) {
             if (has_mode) {
                 /* Mode switch: reset step/bw cursors to the new mode's defaults (the
                  * old indices belong to a different table), zero the BFO, and reapply
@@ -1238,10 +1389,28 @@ static void radio_register_routes(AsyncWebServer &server) {
                  * while muted); still a no-op audio-wise if squelch keeps it muted. */
                 if (!mute_main) rx.setVolume(radio_volume);
             }
-            /* Step/bw/mode and the squelch gate (threshold + metric) are persisted
-             * (v4); MAIN mute is ephemeral, so only a change to a persisted parameter
-             * schedules a flash write. */
-            if (has_step || has_bw || has_mode || has_squelch || has_sqmetric) radio_mark_dirty();
+            /* Per-mode DSP: store into the effective mode's family slot and apply now. */
+            if (has_agc) {
+                if (mode == RADIO_MODE_FM)   fm_agc  = (int8_t)agc_v;
+                else if (radio_is_ssb(mode)) ssb_agc = (int8_t)agc_v;
+                else                         am_agc  = (int8_t)agc_v;
+                apply_agc_locked(mode);
+            }
+            if (has_avc) {
+                if (radio_is_ssb(mode)) ssb_avc = (int8_t)avc_v;
+                else                    am_avc  = (int8_t)avc_v;
+                apply_avc_locked(mode);
+            }
+            if (has_sm) {
+                if (radio_is_ssb(mode)) ssb_sm = (int8_t)sm_v;
+                else                    am_sm  = (int8_t)sm_v;
+                apply_softmute_locked(mode);
+            }
+            /* Step/bw/mode, the squelch gate (threshold + metric) and the per-mode DSP
+             * scalars are persisted (v4/v5); MAIN mute is ephemeral, so only a change to
+             * a persisted parameter schedules a flash write. */
+            if (has_step || has_bw || has_mode || has_squelch || has_sqmetric ||
+                has_agc || has_avc || has_sm) radio_mark_dirty();
         }
         /* Snapshot the resulting labels under the lock, clamped defensively; the
          * .desc pointers are flash-resident constants, safe to use after release. */
@@ -1250,6 +1419,11 @@ static void radio_register_routes(AsyncWebServer &server) {
         const char *mode_desc = radio_mode_str(mode);
         uint8_t sq_snap = radio_squelch;
         bool mute_snap = mute_main;
+        int8_t agc_snap = (mode == RADIO_MODE_FM) ? fm_agc
+                        : (radio_is_ssb(mode) ? ssb_agc : am_agc);
+        int8_t avc_snap = radio_is_ssb(mode) ? ssb_avc : am_avc;
+        int8_t sm_snap  = radio_is_ssb(mode) ? ssb_sm  : am_sm;
+        bool mode_is_fm = (mode == RADIO_MODE_FM);
         xSemaphoreGive(radio_mtx);
 
         if (mode_locked) {
@@ -1276,6 +1450,28 @@ static void radio_register_routes(AsyncWebServer &server) {
                 "{\"error\":\"squelch out of range (0..127)\"}");
             return;
         }
+        if (agc_bad) {
+            char err[80];
+            snprintf(err, sizeof(err),
+                "{\"error\":\"agc out of range (0..%d)\"}", agc_max);
+            req->send(400, "application/json", err);
+            return;
+        }
+        if (avc_fm || sm_fm) {
+            req->send(400, "application/json",
+                "{\"error\":\"avc/softmute not available in FM\"}");
+            return;
+        }
+        if (avc_bad) {
+            req->send(400, "application/json",
+                "{\"error\":\"avc out of range (even 12..90)\"}");
+            return;
+        }
+        if (sm_bad) {
+            req->send(400, "application/json",
+                "{\"error\":\"softmute out of range (0..32)\"}");
+            return;
+        }
 
         event_add("radio: config mode=%s step=%s bw=%s", mode_desc, step_desc, bw_desc);
         display_show_status();
@@ -1288,6 +1484,12 @@ static void radio_register_routes(AsyncWebServer &server) {
         doc["squelch"] = sq_snap & 0x7f;
         doc["squelch_metric"] = (sq_snap & 0x80) ? "snr" : "rssi";
         doc["mute"] = mute_snap;
+        doc["agc"] = agc_snap;
+        /* AVC/SoftMute apply to AM/SSB only; report them only when not in FM. */
+        if (!mode_is_fm) {
+            doc["avc"] = avc_snap;
+            doc["softmute"] = sm_snap;
+        }
         String response;
         serializeJson(doc, response);
         req->send(200, "application/json", response);
@@ -1481,6 +1683,12 @@ static void radio_register_routes(AsyncWebServer &server) {
         bool squelched_snap = radio_is_muted(MUTE_SQUELCH);
         bool audio_muted_snap = audio_muted;
         uint8_t sq_snap = radio_squelch;
+        /* Per-mode DSP for the live radio_mode. AVC/SoftMute are AM/SSB only. */
+        uint8_t lmode = radio_mode;
+        bool lmode_fm = (lmode == RADIO_MODE_FM);
+        int8_t agc_snap = lmode_fm ? fm_agc : (radio_is_ssb(lmode) ? ssb_agc : am_agc);
+        int8_t avc_snap = radio_is_ssb(lmode) ? ssb_avc : am_avc;
+        int8_t sm_snap  = radio_is_ssb(lmode) ? ssb_sm  : am_sm;
         xSemaphoreGive(radio_mtx);
 
         char freq_display[24];
@@ -1507,6 +1715,12 @@ static void radio_register_routes(AsyncWebServer &server) {
         doc["squelch_metric"] = (sq_snap & 0x80) ? "snr" : "rssi";
         doc["squelched"] = squelched_snap;
         doc["audio_muted"] = audio_muted_snap;
+        doc["agc"] = agc_snap;
+        /* AVC/SoftMute apply to AM/SSB only; report them only when not in FM. */
+        if (!lmode_fm) {
+            doc["avc"] = avc_snap;
+            doc["softmute"] = sm_snap;
+        }
         String response;
         serializeJson(doc, response);
         req->send(200, "application/json", response);
@@ -1615,8 +1829,29 @@ static void radio_tick() {
                 ui_mode = UI_VFO;
                 menu_level = MENU_MAIN;  /* next menu entry opens at the top level */
             } else {
-                /* SETTINGS: "Back" and every other placeholder return to MAIN. */
-                menu_level = MENU_MAIN;
+                /* SETTINGS: dispatch on the sublist cursor (SettingsItem order matches
+                 * menu_settings_items[]). AGC/AVC/SoftMute descend into their numeric
+                 * value-editors; Brightness/Theme/About are not leaves yet and, with
+                 * Back, return to MAIN. */
+                switch (menu_settings_idx) {
+                    case SI_AGC:
+                        menu_level = MENU_ADJUST;
+                        adjust_target = ADJ_AGC;
+                        break;
+                    case SI_AVC:
+                        menu_level = MENU_ADJUST;
+                        adjust_target = ADJ_AVC;
+                        break;
+                    case SI_SOFTMUTE:
+                        menu_level = MENU_ADJUST;
+                        adjust_target = ADJ_SOFTMUTE;
+                        break;
+                    default:
+                        /* SI_BRIGHTNESS/SI_THEME/SI_ABOUT placeholders (TODO: wire real
+                         * editors) and SI_BACK all step back up to the MAIN list. */
+                        menu_level = MENU_MAIN;
+                        break;
+                }
             }
         } else {
             /* Any press under 2s toggles the encoder's target: frequency <->
@@ -1676,6 +1911,51 @@ static void radio_tick() {
                     if (thr > 127) thr = 127;
                     radio_squelch = (uint8_t)((radio_squelch & 0x80) | (thr & 0x7f));
                     radio_mark_dirty();
+                    xSemaphoreGive(radio_mtx);
+                } else if (adjust_target == ADJ_AGC) {
+                    /* Numeric AGC index edit: clamp to the live mode's 0..max and apply
+                     * immediately (unlike squelch, no poll re-applies it). Persisted (v5). */
+                    xSemaphoreTake(radio_mtx, portMAX_DELAY);
+                    uint8_t m = band_table_mode();
+                    int8_t *slot = (m == RADIO_MODE_FM) ? &fm_agc
+                                 : (radio_is_ssb(m) ? &ssb_agc : &am_agc);
+                    int v = (int)*slot + d;
+                    int hi = (int)agc_max_for_mode(m);
+                    if (v < 0)  v = 0;
+                    if (v > hi) v = hi;
+                    *slot = (int8_t)v;
+                    if (radio_ok) apply_agc_locked(m);
+                    radio_mark_dirty();
+                    xSemaphoreGive(radio_mtx);
+                } else if (adjust_target == ADJ_AVC) {
+                    /* Numeric AVC edit (AM/SSB only; no-op on FM). Even step of 2, clamped
+                     * to 12..90, applied immediately. Persisted (v5). */
+                    xSemaphoreTake(radio_mtx, portMAX_DELAY);
+                    uint8_t m = band_table_mode();
+                    if (m != RADIO_MODE_FM) {
+                        int8_t *slot = radio_is_ssb(m) ? &ssb_avc : &am_avc;
+                        int v = (int)*slot + (int)d * 2;
+                        if (v < 12) v = 12;
+                        if (v > 90) v = 90;
+                        *slot = (int8_t)v;
+                        if (radio_ok) apply_avc_locked(m);
+                        radio_mark_dirty();
+                    }
+                    xSemaphoreGive(radio_mtx);
+                } else if (adjust_target == ADJ_SOFTMUTE) {
+                    /* Numeric soft-mute edit (AM/SSB only; no-op on FM). Clamp 0..32,
+                     * applied immediately. Persisted (v5). */
+                    xSemaphoreTake(radio_mtx, portMAX_DELAY);
+                    uint8_t m = band_table_mode();
+                    if (m != RADIO_MODE_FM) {
+                        int8_t *slot = radio_is_ssb(m) ? &ssb_sm : &am_sm;
+                        int v = (int)*slot + d;
+                        if (v < 0)  v = 0;
+                        if (v > 32) v = 32;
+                        *slot = (int8_t)v;
+                        if (radio_ok) apply_softmute_locked(m);
+                        radio_mark_dirty();
+                    }
                     xSemaphoreGive(radio_mtx);
                 } else {
                     /* The value editor scrolls the parameter itself, not a cursor:
@@ -1787,6 +2067,7 @@ static void radio_tick() {
      * window where a change during the write would be lost. */
     if (radio_dirty && millis() - radio_last_change_ms > RADIO_STORE_IDLE_MS) {
         uint16_t f; uint8_t v, bnd, bmode, bstep, bbw, sq; int b;
+        int8_t fagc, aagc, sagc, aavc, savc, asmv, ssmv;
         xSemaphoreTake(radio_mtx, portMAX_DELAY);
         f = radio_freq; v = radio_volume; b = radio_bfo; bnd = radio_band_idx;
         /* v3: persist the active band's live demod mode and step/bw cursors so a mode
@@ -1796,6 +2077,9 @@ static void radio_tick() {
         bmode = band_mode[bnd]; bstep = band_step_idx[bnd]; bbw = band_bw_idx[bnd];
         /* v4: the packed squelch byte (threshold + metric bit) is global, not per-band. */
         sq = radio_squelch;
+        /* v5: the seven per-mode DSP scalars (AGC/AVC/SoftMute), all global. */
+        fagc = fm_agc; aagc = am_agc; sagc = ssb_agc;
+        aavc = am_avc; savc = ssb_avc; asmv = am_sm; ssmv = ssb_sm;
         radio_dirty = false;
         xSemaphoreGive(radio_mtx);
         JsonDocument doc;
@@ -1808,6 +2092,13 @@ static void radio_tick() {
         doc["step"] = bstep;
         doc["bw"] = bbw;
         doc["squelch"] = sq;
+        doc["fm_agc"] = fagc;
+        doc["am_agc"] = aagc;
+        doc["ssb_agc"] = sagc;
+        doc["am_avc"] = aavc;
+        doc["ssb_avc"] = savc;
+        doc["am_sm"] = asmv;
+        doc["ssb_sm"] = ssmv;
         String out;
         serializeJson(doc, out);
         write_spiffs_file(RADIO_STATE_FILE, out);  /* blocking flash write + encoder detach, outside the mutex */
@@ -1891,6 +2182,18 @@ static void radio_restore_state() {
      * missing/negative field leaves radio_squelch at its 0 (off) default. */
     if (ssq >= 0 && ssq <= 255) radio_squelch = (uint8_t)ssq;
 
+    /* v5: per-mode DSP scalars (AGC/AVC/SoftMute). Each is validated to its own range;
+     * anything missing or out of range keeps the compiled-in default. Set BEFORE
+     * apply_band_locked, which reapplies the active mode's values to the chip. */
+    int j;
+    j = doc["fm_agc"]  | -1; if (j >= 0  && j <= 27)               fm_agc  = (int8_t)j;
+    j = doc["am_agc"]  | -1; if (j >= 0  && j <= 37)               am_agc  = (int8_t)j;
+    j = doc["ssb_agc"] | -1; if (j >= 0  && j <= 1)                ssb_agc = (int8_t)j;
+    j = doc["am_avc"]  | -1; if (j >= 12 && j <= 90 && !(j % 2))   am_avc  = (int8_t)j;
+    j = doc["ssb_avc"] | -1; if (j >= 12 && j <= 90 && !(j % 2))   ssb_avc = (int8_t)j;
+    j = doc["am_sm"]   | -1; if (j >= 0  && j <= 32)               am_sm   = (int8_t)j;
+    j = doc["ssb_sm"]  | -1; if (j >= 0  && j <= 32)               ssb_sm  = (int8_t)j;
+
     /* Volume must be set before apply_band_locked, which reapplies it to the chip. */
     radio_volume  = (uint8_t)volume;
     band_freq[band] = f;
@@ -1941,9 +2244,10 @@ static void skill_radio_init() {
     /* FM 64..108 MHz, start 100.0 MHz, 100 kHz step. */
     rx.setFM(RADIO_FM_MIN, RADIO_FM_MAX, 10000, 10);
     /* Post-setFM config to match the reference firmware (see /radio/tune):
-     * de-emphasis 1 = 50 us (EU/JP/AU), AGC enabled with no attenuation. */
+     * de-emphasis 1 = 50 us (EU/JP/AU); FM AGC from the per-mode store (default
+     * index 0 = AGC on, no attenuation). Single-tasked at boot: no lock needed. */
     rx.setFMDeEmphasis(1);
-    rx.setAutomaticGainControl(0, 0);
+    apply_agc_locked(RADIO_MODE_FM);
     radio_freq = 10000;
     radio_mode = RADIO_MODE_FM;
 
