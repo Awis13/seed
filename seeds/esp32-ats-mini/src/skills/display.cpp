@@ -138,6 +138,22 @@ static const char *display_describe() {
 }
 
 /*
+ * Format the local wall clock as "HH:MM" into buf (size >= 6). Before the first
+ * NTP sync clock_local_time() returns false (time() is still near the epoch) and
+ * we show "--:--" rather than a bogus 1970 time. clock_local_time is defined in
+ * main.cpp ahead of this file in the same translation unit (TZ already applied),
+ * and takes no mutex — pure libc time() — so it is safe to call from either the
+ * snapshot block or the draw path without touching radio_mtx.
+ */
+static void display_format_clock(char *buf, size_t len) {
+    struct tm t;
+    if (clock_local_time(t))
+        snprintf(buf, len, "%02d:%02d", t.tm_hour, t.tm_min);
+    else
+        snprintf(buf, len, "--:--");
+}
+
+/*
  * Paint the whole receiver readout into the draw target `gfx`. This is the single
  * home of the screen layout: the event-driven repaint (display_show_status) and
  * the tick repaint (display_tick_render) both call it, so the two paths can never
@@ -165,7 +181,8 @@ static const char *display_describe() {
  */
 static void draw_radio_screen(const char *band, const char *mode, uint16_t freq,
                               uint8_t rssi, uint8_t snr, uint8_t volume,
-                              uint8_t target, const char *rds_ps, bool rds_show) {
+                              uint8_t target, const char *rds_ps, bool rds_show,
+                              const char *hhmm) {
     uint16_t freq_color =
         (target == DISPLAY_TUNE_FREQ) ? TFT_CYAN : TFT_DARKGREY;
     uint16_t vol_color =
@@ -177,6 +194,17 @@ static void draw_radio_screen(const char *band, const char *mode, uint16_t freq,
     /* Current band name across the top, above the frequency. */
     gfx->setTextColor(TFT_YELLOW, TFT_BLACK);
     gfx->drawString(band, DISPLAY_CX, 10, 2);
+
+    /* NTP wall clock in the free right-top corner. The band name is centred on
+     * DISPLAY_CX (short: "VHF"/"MW"/"20M"), so the right edge (x~280..318) is
+     * clear. TR_DATUM anchors the string by its top-right at x=318 (2 px inset),
+     * drawn dim grey so it never competes with the big frequency. Shown on every
+     * mode (time is mode-independent, unlike the FM-only RDS row). The datum is
+     * restored to MC_DATUM right after so the rows below still centre correctly. */
+    gfx->setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+    gfx->setTextDatum(TR_DATUM);
+    gfx->drawString(hhmm, 318, 4, 2);
+    gfx->setTextDatum(MC_DATUM);
 
     /* Big frequency: MHz for FM (freq is 10 kHz units), kHz otherwise. FONT7 is
      * the 7-segment face — digits and '.' only, all a frequency needs. */
@@ -287,10 +315,14 @@ void display_show_status() {
     bool rds_valid = false;
     radio_get_rds(rds_ps, sizeof(rds_ps), NULL, 0, NULL, NULL, &rds_valid);
     bool rds_show = (strcmp(mode, "FM") == 0) && rds_valid && rds_ps[0];
+    /* Wall clock snapshot (no mutex — pure time()), taken with the radio fields so
+     * the drawn frame is self-consistent. "--:--" until the first NTP sync. */
+    char hhmm[6];
+    display_format_clock(hhmm, sizeof(hhmm));
 
     xSemaphoreTake(display_mtx, portMAX_DELAY);
     display_mode = DISPLAY_STATUS;
-    draw_radio_screen(band, mode, freq, rssi, snr, volume, target, rds_ps, rds_show);
+    draw_radio_screen(band, mode, freq, rssi, snr, volume, target, rds_ps, rds_show, hhmm);
     display_flush();
     xSemaphoreGive(display_mtx);
 }
@@ -328,6 +360,12 @@ void display_tick_render() {
     bool rds_valid = false;
     radio_get_rds(rds_ps, sizeof(rds_ps), NULL, 0, NULL, NULL, &rds_valid);
     bool rds_show = (strcmp(mode, "FM") == 0) && rds_valid && rds_ps[0];
+    /* Wall clock snapshot (no mutex — pure time()), taken alongside the radio
+     * fields so change-detection below compares the same string the frame draws.
+     * "--:--" until NTP syncs; then it flips to HH:MM and the strcmp forces a
+     * frame. Minutes-only: seconds are not shown, so no per-second churn. */
+    char hhmm[6];
+    display_format_clock(hhmm, sizeof(hhmm));
 
     /* Test-and-set display_mode under the same lock that guards the repaint, so a
      * concurrent POST /display can't flip to CUSTOM between our check and draw. */
@@ -349,6 +387,10 @@ void display_tick_render() {
      * appearing, changing or clearing forces a fresh frame instead of waiting for
      * the idle fallback. rds_ps is a stack buffer here, so keep our own copy. */
     static char prev_rds_ps[9] = "";
+    /* Last clock string drawn (starts empty so the first paint always fires). The
+     * minute rolling over changes hhmm and forces a fresh frame within a tick of
+     * the change instead of waiting on the idle fallback. */
+    static char prev_hhmm[6] = "";
     static uint32_t last_push_ms = 0;
     const uint32_t DISPLAY_MAX_IDLE_MS = 2000;
 
@@ -363,7 +405,8 @@ void display_tick_render() {
                      ui == prev_ui && menu_level == prev_menu_level &&
                      menu_idx == prev_menu_idx &&
                      prev_mode != nullptr && strcmp(mode, prev_mode) == 0 &&
-                     strcmp(shown_ps, prev_rds_ps) == 0;
+                     strcmp(shown_ps, prev_rds_ps) == 0 &&
+                     strcmp(hhmm, prev_hhmm) == 0;
     if (unchanged && (now - last_push_ms) < DISPLAY_MAX_IDLE_MS) {
         xSemaphoreGive(display_mtx);
         return;
@@ -379,12 +422,14 @@ void display_tick_render() {
     prev_mode = mode;
     strncpy(prev_rds_ps, shown_ps, sizeof(prev_rds_ps) - 1);
     prev_rds_ps[sizeof(prev_rds_ps) - 1] = 0;
+    strncpy(prev_hhmm, hhmm, sizeof(prev_hhmm) - 1);
+    prev_hhmm[sizeof(prev_hhmm) - 1] = 0;
     last_push_ms = now;
 
     if (ui == DISPLAY_UI_MENU) {
         draw_menu_screen(radio_get_menu_title(), menu_idx);
     } else {
-        draw_radio_screen(band, mode, freq, rssi, snr, volume, target, rds_ps, rds_show);
+        draw_radio_screen(band, mode, freq, rssi, snr, volume, target, rds_ps, rds_show, hhmm);
     }
     display_flush();
     xSemaphoreGive(display_mtx);
