@@ -202,12 +202,14 @@
  * The loop task owns the I2S channel, the buffer's write cursor and every
  * counter. The endpoints read; they never enable a channel, never allocate and
  * never write flash. `GET /mic/last` streams from the buffer on the AsyncTCP
- * task, which is the one genuine sharing in the file, and it is handled by
- * refusing to start a recording while a download is in flight — see
- * mic_rec_start(). Memory safety does not rest on that flag: every offset the
- * filler computes is bounded by a length snapshot taken when the response was
- * created, and the allocation is fixed, so the worst a lost race can produce
- * is a garbled take rather than a read out of bounds.
+ * task, and voice.cpp's uploader reads it from a third task, which is the one
+ * genuine sharing in the file. It is handled by refusing to start a recording
+ * while any transfer is in flight — see mic_rec_start(), and mic_serving, which
+ * counts holders rather than flagging one because two of them can overlap.
+ * Memory safety does not rest on that count: every offset a reader computes is
+ * bounded by a length snapshot it took for itself, and the allocation is fixed,
+ * so the worst a lost race can produce is a garbled take rather than a read out
+ * of bounds.
  *
  *
  * Sensitivity, honestly
@@ -220,6 +222,8 @@
  * it was specified at. Measure first — `peak` and `dc_offset` in `GET /mic`
  * exist so that "quiet" is a number rather than an impression.
  */
+
+#include <atomic>
 
 #include "driver/i2s_pdm.h"
 #include "esp_heap_caps.h"
@@ -355,11 +359,45 @@ static uint32_t mic_dc_n = 0;
 static int32_t mic_take_peak = 0;
 static int32_t mic_peak_live = 0;
 
-/* Serving. Stamped and cleared on the web-server task, read on the loop task,
-   which is why both are volatile and why the timeout below is compared as a
-   signed difference. */
-static volatile bool mic_serving = false;
+/* Serving: how many readers hold the buffer right now, not whether one does.
+ *
+ * A bool was wrong as soon as two transfers could overlap — two downloads, or a
+ * download and voice.cpp's upload. Whichever finished first cleared the flag
+ * while the other was still reading, so mic_rec_start() would then accept a
+ * gesture over a buffer being sent and its refusal became a lie. Memory safety
+ * never depended on it (every reader carries its own length snapshot and the
+ * allocation is fixed), but a refusal that is not true is worse than no refusal
+ * at all, because it is believed.
+ *
+ * Atomic rather than volatile because this one has WRITERS ON TWO TASKS — the
+ * web server's fillers and the uploader's task. `mic_serving++` on a volatile is
+ * exactly the read-modify-write the overrun callback below explains the standard
+ * will not define, and unlike that counter this one would genuinely lose a
+ * decrement and hold the buffer for the life of the boot.
+ *
+ * The stamp stays a plain volatile scalar and stays SHARED: it is the last time
+ * ANY holder made progress, so the watchdog releases the buffer only once every
+ * holder has gone quiet. Written on the reading tasks, read on the loop task,
+ * which is why the timeout below is compared as a signed difference. */
+static std::atomic<int> mic_serving{0};
 static volatile unsigned long mic_serve_at = 0;
+
+/* Take a hold. The stamp goes first: mic_poll() only looks at the stamp once
+   the count is non-zero, so stamping afterwards leaves a window in which a
+   brand-new reader is judged against whenever the PREVIOUS one last moved. */
+static void mic_serve_acquire(unsigned long now) {
+    mic_serve_at = now;
+    mic_serving.fetch_add(1);
+}
+
+/* Release one, and never below zero. The watchdog can zero the count out from
+   under a reader that then finishes anyway; a negative count would leave the
+   buffer permanently held against every later recording, which is the exact
+   failure the watchdog exists to prevent. */
+static void mic_serve_release() {
+    int n = mic_serving.load();
+    while (n > 0 && !mic_serving.compare_exchange_weak(n, n - 1)) { }
+}
 
 /* Counters. sound.cpp keeps its set because 0.6.0 shipped silent behind a
    healthy-looking counter; this set is that discipline pointed at the input,
@@ -554,12 +592,13 @@ static void mic_rec_stop() {
 static void mic_rec_start(unsigned long now) {
     if (!mic_ready || mic_rec) return;
 
-    /* A download is reading the buffer this would overwrite. Declining is the
-       only honest answer: there is one buffer, and truncating somebody's
-       in-flight take to start another is worse than making them press again. */
-    if (mic_serving) {
+    /* Somebody is reading the buffer this would overwrite — a download, an
+       upload, or several at once. Declining is the only honest answer: there is
+       one buffer, and truncating somebody's in-flight take to start another is
+       worse than making them press again. */
+    if (mic_serving.load() > 0) {
         mic_refusals++;
-        event_add("mic: recording declined, a download still holds the buffer");
+        event_add("mic: recording declined, a transfer still holds the buffer");
         return;
     }
 
@@ -697,17 +736,20 @@ static void mic_poll() {
 
     unsigned long now = millis();
 
-    /* A download whose connection died never reaches the filler's last call
-       and would hold the buffer against every later recording. Signed, because
-       mic_serve_at is stamped on the web-server task: a slice served between
-       the millis() reading and the subtraction makes the stamp NEWER than the
-       reading, and in unsigned arithmetic those few milliseconds read as about
-       4.29 billion — which would clear the timeout instantly and release the
-       buffer out from under a perfectly healthy transfer. That is the same
-       shape as the bug that made 0.6.0 silent. */
-    if (mic_serving && (long)(now - mic_serve_at) > (long)MIC_SERVE_STALL_MS) {
-        mic_serving = false;
-        event_add("mic: download abandoned, buffer released");
+    /* A transfer whose connection died never reaches its last call and would
+       hold the buffer against every later recording. The stamp is shared by
+       every holder, so this fires only when they have ALL gone quiet — one
+       stalled reader alongside a healthy one keeps the buffer held, which is
+       the conservative answer and the right one.
+       Signed, because mic_serve_at is stamped on the reading tasks: a slice
+       served between the millis() reading and the subtraction makes the stamp
+       NEWER than the reading, and in unsigned arithmetic those few milliseconds
+       read as about 4.29 billion — which would clear the timeout instantly and
+       release the buffer out from under a perfectly healthy transfer. That is
+       the same shape as the bug that made 0.6.0 silent. */
+    if (mic_serving.load() > 0 && (long)(now - mic_serve_at) > (long)MIC_SERVE_STALL_MS) {
+        mic_serving.store(0);
+        event_add("mic: transfer abandoned, buffer released");
     }
 
     mic_key_poll(now);
@@ -807,9 +849,10 @@ static const char *mic_describe() {
            "not enabled at boot and there is no way to start one over the\n"
            "network: recording takes a hand on the device.\n\n"
            "Each take replaces the last. There is one buffer, so starting a\n"
-           "recording while `GET /mic/last` is still streaming is declined\n"
-           "rather than allowed to overwrite what is being sent — `refusals`\n"
-           "counts that, and pressing again once the download finishes works.\n\n"
+           "recording while a transfer is still reading it — `GET /mic/last`,\n"
+           "or the voice skill's upload — is declined rather than allowed to\n"
+           "overwrite what is being sent. `refusals` counts that, and pressing\n"
+           "again once the transfer finishes works.\n\n"
            "### Telling silence from failure\n\n"
            "A recording of nothing and a microphone that never ran produce the\n"
            "same file, so four numbers separate them. Read them in order.\n\n"
@@ -950,14 +993,20 @@ static void mic_register_routes(AsyncWebServer &server) {
         }
 
         mic_serves++;
-        mic_serve_at = millis();
-        mic_serving = true;
+        mic_serve_acquire(millis());
 
         const size_t total = (size_t)MIC_WAV_HDR_LEN + len;
+        /* `held` is per-response state, which is what makes the release happen
+           exactly once. The library stops calling the filler the moment the
+           declared content length has been filled, so the index >= total branch
+           below is defensive — but with a counter rather than a flag, releasing
+           twice would take somebody else's hold with it. Mutable, because a
+           std::function invokes its target as non-const. */
         AsyncWebServerResponse *res = req->beginResponse("audio/wav", total,
-            [len, total](uint8_t *buf, size_t max_len, size_t index) -> size_t {
+            [len, total, held = true](uint8_t *buf, size_t max_len,
+                                      size_t index) mutable -> size_t {
                 if (index >= total) {
-                    mic_serving = false;
+                    if (held) { held = false; mic_serve_release(); }
                     return 0;
                 }
                 mic_serve_at = millis();
@@ -979,7 +1028,7 @@ static void mic_register_routes(AsyncWebServer &server) {
                     memcpy(buf, mic_buf + (index - MIC_WAV_HDR_LEN), n);
                 }
 
-                if (index + n >= total) mic_serving = false;
+                if (index + n >= total && held) { held = false; mic_serve_release(); }
                 return n;
             });
         res->addHeader("Content-Disposition", "attachment; filename=\"mic.wav\"");

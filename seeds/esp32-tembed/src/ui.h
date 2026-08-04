@@ -243,8 +243,10 @@ enum {
     UI_AP,
     UI_INFO,
     /* Appended at the END, and anything added later must be too: this enum and
-       ui_titles[] below are parallel arrays with no static assert to catch a
-       value inserted in the middle. */
+       ui_titles[] below are parallel arrays, so a value inserted in the middle
+       silently shifts every title after it onto the wrong screen. The assert
+       below catches a missing entry; nothing can catch a reordering, which is
+       why the rule is "append". */
     UI_REC
 };
 
@@ -254,6 +256,9 @@ static const char *ui_titles[] = {
     "", "MENU", "MESSAGES", "MESSAGES", "TV-B-GONE", "BY BRAND", "TV-B-GONE",
     "SETUP AP", "INFO", "RECORDING"
 };
+
+static_assert(sizeof(ui_titles) / sizeof(ui_titles[0]) == UI_REC + 1,
+              "ui_titles[] must have one entry per screen, in enum order");
 
 /* Top level. The marker on a selected row is also ">", so a submenu is spelled
    out with a trailing one rather than by a different marker. Messages leads
@@ -368,7 +373,12 @@ static int ui_first_drawn = -1;
 #define MSG_PAD_L     14
 #define MSG_PAD_R     10
 #define MSG_ACCENT_W   3
-#define MSG_PEEK       3   /* offset of each card peeking out behind */
+/* Offset of each card peeking out behind. Named MSG_CARD_PEEK rather than the
+   obvious MSG_PEEK because lwIP's <sys/socket.h> already owns that name — it
+   arrived in this translation unit the day skills/voice.cpp started including
+   esp_http_client.h, and the firmware is one translation unit, so a UI layout
+   constant and a socket recv() flag were suddenly the same macro. */
+#define MSG_CARD_PEEK  3
 #define MSG_HINT_Y   140
 
 /* Arrival: three frames of rising blend plus a few pixels of upward travel.
@@ -720,7 +730,7 @@ static void ui_draw_card() {
     bool fading = (ui_card_fade < MSG_FADE_STEPS);
     uint8_t step = fading ? (uint8_t)(ui_card_fade + 1) : (uint8_t)MSG_FADE_STEPS;
     int32_t x = MSG_CARD_X;
-    int32_t y = MSG_CARD_Y + (MSG_FADE_STEPS - step) * MSG_PEEK;
+    int32_t y = MSG_CARD_Y + (MSG_FADE_STEPS - step) * MSG_CARD_PEEK;
 
     /* Everything the card draws ramps together, so the whole thing arrives as
        one object instead of a border appearing before its contents. */
@@ -734,15 +744,15 @@ static void ui_draw_card() {
         /* Erase the travel envelope — the card's own footprint plus the two
            peeks and the three pixels it still has to rise. 306x112 once per
            fade frame and then never again while this card is up. */
-        tft.fillRect(MSG_CARD_X, MSG_CARD_Y, MSG_CARD_W + 2 * MSG_PEEK,
-                     MSG_CARD_H + 4 * MSG_PEEK, COL_BG);
+        tft.fillRect(MSG_CARD_X, MSG_CARD_Y, MSG_CARD_W + 2 * MSG_CARD_PEEK,
+                     MSG_CARD_H + 4 * MSG_CARD_PEEK, COL_BG);
 
         /* Two more cards behind, when there are two more to be behind: the
            stack the knob can rotate through. Outlines only, dimmer with depth. */
         if (total > 1) {
             for (int p = 2; p >= 1; p--) {
                 uint8_t a = (uint8_t)(MSG_BORDER_A / (p + 1) * step / MSG_FADE_STEPS);
-                tft.drawRect(x + p * MSG_PEEK, y + p * MSG_PEEK,
+                tft.drawRect(x + p * MSG_CARD_PEEK, y + p * MSG_CARD_PEEK,
                              MSG_CARD_W, MSG_CARD_H,
                              tft.alphaBlend(a, level, COL_BG));
             }

@@ -218,7 +218,13 @@
    96k; they are refused because the DMA cushion below is a fixed frame count,
    so its duration halves as the rate doubles, and a notification cue has
    nothing to gain from either. */
-/* host-test:begin rates — sliced out by tools/test_wav_parse.sh */
+/* Sliced out by BOTH tools/test_wav_parse.sh and tools/test_wav_header.sh —
+   the second one arrived when the microphone's header writer had to be
+   round-tripped through the parser below. Each compiles this region verbatim,
+   so the begin marker has to stay on a line of its own: the slicer drops the
+   marker line and copies everything after it, and a comment that spilled onto
+   a second line would land in the generated source as code. */
+/* host-test:begin rates */
 static const uint32_t snd_rates_ok[] = {8000, 16000, 32000, 44100, 48000};
 static const int snd_rates_ok_count =
     (int)(sizeof(snd_rates_ok) / sizeof(snd_rates_ok[0]));

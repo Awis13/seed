@@ -26,6 +26,11 @@
 //     well as visible (skills/sound.cpp). The amplifier has no enable pin — it
 //     is released by stopping the clock — and the firmware ships only
 //     synthesised beeps; real cues are uploaded to SPIFFS at runtime.
+//   - A PDM microphone on I2S0 makes it an input as well: hold the knob to
+//     record (skills/mic.cpp), and skills/voice.cpp POSTs the take to a
+//     configured endpoint. That upload is the seed's first OUTBOUND request,
+//     and it runs on the firmware's first dedicated task — pinned to core 0,
+//     because the IDF's HTTP client blocks and loop() cannot afford to.
 //
 // Endpoints:
 //   GET  /health            — alive check (no auth)
@@ -59,7 +64,7 @@
 #include <TFT_eSPI.h>
 
 // ===== Configuration =====
-#define SEED_VERSION        "0.7.0"
+#define SEED_VERSION        "0.8.0"
 #define HTTP_PORT           8080
 #define TOKEN_FILE          "/auth_token.txt"
 #define WIFI_CONFIG_FILE    "/wifi.json"
@@ -1496,7 +1501,11 @@ static void handle_skill(AsyncWebServerRequest *request) {
     s += "- The amplifier clocks only 8k/16k/32k/44.1k/48k/88.2k/96k. A 22.05kHz WAV\n";
     s += "  produces silence, not an error, which is why POST /sound/upload rejects it\n";
     s += "- arduino-esp32 3.x deprecated `driver/i2s.h`; this builds on driver/i2s_std.h\n";
-    s += "  (the ESP_I2S library's I2SClass wraps the same calls with a blocking write)\n\n";
+    s += "  (the ESP_I2S library's I2SClass wraps the same calls with a blocking write)\n";
+    s += "- The voice skill is the only thing here that makes an OUTBOUND request, and it\n";
+    s += "  runs on its own FreeRTOS task pinned to core 0. The IDF's HTTP client blocks,\n";
+    s += "  and a blocking call on the loop task would stall the IR machine, the ring's\n";
+    s += "  frame and the audio DMA for however long a dead host takes to time out\n\n";
     s += "## API\n\n";
     s += "| Method | Path | Description |\n";
     s += "|--------|------|-------------|\n";
@@ -1613,6 +1622,11 @@ static void handle_wifi_post(AsyncWebServerRequest *request) {
    that must not also read as a click — and mic_is_recording(), to put the
    recording screen up while a take runs. */
 #include "skills/mic.cpp"
+/* After mic.cpp, and it could not be anywhere else: it reads the capture
+   buffer, the take length and the buffer's hold counter directly. The direction
+   of that dependency is the point — the microphone knows nothing about an
+   uploader, so capture stays diagnosable on its own. */
+#include "skills/voice.cpp"
 
 static void skills_init() {
     skill_gpio_init();
@@ -1633,6 +1647,11 @@ static void skills_init() {
        asks for real memory asks for it after everything else has what it
        needs. */
     skill_mic_init();
+    /* Last of all, and the only one that creates a task. It needs mic.cpp's
+       buffer to already exist — the uploader is blocked on a notification from
+       the moment it starts, so nothing can ask it to read a buffer that has not
+       been allocated, but the ordering is the reason that is true. */
+    skill_voice_init();
 }
 
 // ===== On-device UI =====
@@ -1825,6 +1844,15 @@ void loop() {
     // pin level directly, the way ap_key_poll() does, and shares nothing with
     // the click state machine but the pin itself. Idle cost is a digitalRead.
     mic_poll();
+
+    // The uploader's loop-task half, and only that half: the transfer itself
+    // runs on its own task on core 0, because the IDF's HTTP client blocks and
+    // a single connect() to an unreachable host would freeze everything above
+    // and below this line for seconds. What is left here is the flash write the
+    // endpoints are not allowed to do, and the falling edge of a recording that
+    // fires an auto-upload. After mic_poll(), so the take it reacts to has
+    // already published its length.
+    voice_poll();
 
     // Encoder and buttons, every pass: input latency is what makes the knob
     // feel attached to the screen. This owns the panel whenever the UI is on a
