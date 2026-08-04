@@ -18,6 +18,7 @@
  *
  * Endpoints:
  *   POST /radio/tune    — tune: {mode:"FM"|"AM"|"LSB"|"USB", freq:<int>, bfo?:<int>}
+ *   POST /radio/band    — jump to a band-plan preset: {idx:<int>}
  *   POST /radio/scan    — blocking band sweep in the current mode: {from,to,step,min_rssi?}
  *   GET  /radio/status  — current freq/mode/RSSI/SNR (+bfo in SSB)
  */
@@ -67,8 +68,68 @@
  * keeps the blocking flash write off the settle-critical tuning path.
  */
 #define RADIO_STATE_FILE    "/radio.json"
-#define RADIO_STATE_VERSION 1
+/* v2 adds the selected band-plan index; a v1 file (no "band") is rejected by the
+ * version check in radio_restore_state() and falls back to the FM defaults. */
+#define RADIO_STATE_VERSION 2
 #define RADIO_STORE_IDLE_MS 10000
+
+/*
+ * Band plan. A flat list of presets covering the FM broadcast band, MW, the SW
+ * broadcast segments and the amateur SSB allocations. The table is `static const`
+ * so it lives in flash (.rodata) — it is never mutated at runtime; the per-band
+ * "where was I last" frequency lives in the separate band_freq[] RAM array.
+ *
+ * Frequency units follow the receiver's own convention, so a preset feeds the
+ * chip set-call directly: FM in 10 kHz units (10390 = 103.9 MHz); everything
+ * else (MW/SW/SSB) in kHz, which uint16_t holds up to 30000 = 30 MHz. `mode`
+ * reuses the RADIO_MODE_* constants; `type` only picks the AM tuning step and
+ * groups rows for the menu that lands in the next cut.
+ *
+ * Frequencies are portered from the reference ats-mini band table, rounded to the
+ * broadcast/amateur segment edges. Editing this list changes both the menu order
+ * (C2) and the persisted-index meaning, so append rather than reorder once state
+ * files exist in the wild.
+ */
+#define BAND_TYPE_FM  0
+#define BAND_TYPE_MW  1
+#define BAND_TYPE_SW  2
+#define BAND_TYPE_SSB 3
+
+struct RadioBand {
+    const char *name;   /* short label shown in the menu / band response */
+    uint8_t     type;   /* BAND_TYPE_* — selects AM step, groups the menu */
+    uint8_t     mode;   /* RADIO_MODE_FM | _LSB | _USB | _AM */
+    uint16_t    minFreq;/* lower edge (FM: 10 kHz units, else kHz) */
+    uint16_t    maxFreq;/* upper edge (same units as minFreq) */
+    uint16_t    defFreq;/* power-on frequency for this band (same units) */
+};
+
+static const RadioBand bands[] = {
+    /* FM broadcast: 10 kHz units. */
+    {"VHF",    BAND_TYPE_FM,  RADIO_MODE_FM,   6400, 10800, 10390},
+    /* MW (AM), kHz. */
+    {"MW",     BAND_TYPE_MW,  RADIO_MODE_AM,    520,  1710,   900},
+    /* SW broadcast segments (AM), kHz. */
+    {"49M",    BAND_TYPE_SW,  RADIO_MODE_AM,   5900,  6200,  6050},
+    {"41M",    BAND_TYPE_SW,  RADIO_MODE_AM,   7200,  7450,  7325},
+    {"31M",    BAND_TYPE_SW,  RADIO_MODE_AM,   9400,  9900,  9650},
+    {"25M",    BAND_TYPE_SW,  RADIO_MODE_AM,  11600, 12100, 11850},
+    {"22M",    BAND_TYPE_SW,  RADIO_MODE_AM,  13570, 13870, 13720},
+    {"19M",    BAND_TYPE_SW,  RADIO_MODE_AM,  15100, 15830, 15465},
+    {"16M",    BAND_TYPE_SW,  RADIO_MODE_AM,  17480, 17900, 17690},
+    {"13M",    BAND_TYPE_SW,  RADIO_MODE_AM,  21450, 21850, 21650},
+    {"SW-ALL", BAND_TYPE_SW,  RADIO_MODE_AM,   1710, 30000,  9600},
+    /* Amateur SSB allocations, kHz. LSB below 10 MHz, USB above (convention). */
+    {"160M",   BAND_TYPE_SSB, RADIO_MODE_LSB,  1800,  2000,  1900},
+    {"80M",    BAND_TYPE_SSB, RADIO_MODE_LSB,  3500,  4000,  3750},
+    {"40M",    BAND_TYPE_SSB, RADIO_MODE_LSB,  7000,  7300,  7150},
+    {"30M",    BAND_TYPE_SSB, RADIO_MODE_USB, 10100, 10150, 10125},
+    {"20M",    BAND_TYPE_SSB, RADIO_MODE_USB, 14000, 14350, 14175},
+    {"17M",    BAND_TYPE_SSB, RADIO_MODE_USB, 18068, 18168, 18118},
+    {"15M",    BAND_TYPE_SSB, RADIO_MODE_USB, 21000, 21450, 21225},
+    {"10M",    BAND_TYPE_SSB, RADIO_MODE_USB, 28000, 29700, 28850},
+};
+#define BAND_COUNT ((uint8_t)(sizeof(bands) / sizeof(bands[0])))
 
 /* --- Receiver + state (file-local) --- */
 static SI4735 rx;
@@ -78,6 +139,17 @@ static uint8_t  radio_volume = 40;       /* 0..63 */
 static bool     radio_ok = false;        /* true once the SI4732 answered on I2C */
 static bool     radio_ssb_loaded = false;/* true while the SSB patch is live in chip RAM */
 static int      radio_bfo = 0;           /* current BFO offset in Hz (SSB only) */
+
+/*
+ * Band-plan cursor and the per-band "where was I" store. radio_band_idx indexes
+ * bands[]; band_freq[i] remembers the last frequency tuned on band i so a
+ * round-trip through the band list lands each one back where the user left it.
+ * band_freq[] is seeded from each band's defFreq in skill_radio_init() before the
+ * saved state is restored. Both are written only under radio_mtx (or single-tasked
+ * at boot), same as radio_freq.
+ */
+static uint8_t  radio_band_idx = 0;      /* index into bands[]; 0 = FM VHF */
+static uint16_t band_freq[BAND_COUNT];   /* per-band saved frequency (band's units) */
 
 /*
  * Persistence bookkeeping. radio_dirty is set on a genuine state change (a tune,
@@ -242,6 +314,7 @@ static int menu_wrap(int idx, int delta, int count) {
 /* --- Endpoints --- */
 static const SkillEndpoint radio_endpoints[] = {
     {"POST", "/radio/tune",   "Tune: {mode:\"FM\"|\"AM\"|\"LSB\"|\"USB\", freq:<int>, bfo?:<int>}"},
+    {"POST", "/radio/band",   "Jump to a band-plan preset: {idx:<int>}"},
     {"POST", "/radio/volume", "Set volume: {volume:0-63}"},
     {"POST", "/radio/scan",   "Sweep current-mode band: {from,to,step,min_rssi?} -> RSSI/SNR per step"},
     {"GET",  "/radio/status", "Current freq/mode/RSSI/SNR (+bfo in SSB)"},
@@ -255,6 +328,7 @@ static const char *radio_describe() {
            "| Method | Path | Description |\n"
            "|--------|------|-------------|\n"
            "| POST | /radio/tune | Tune: `{\"mode\":\"FM|AM|LSB|USB\",\"freq\":<int>,\"bfo\":<int>}` |\n"
+           "| POST | /radio/band | Jump to a band-plan preset: `{\"idx\":<int>}` |\n"
            "| POST | /radio/volume | Set volume: `{\"volume\":<0..63>}` |\n"
            "| POST | /radio/scan | Blocking band sweep in the current mode: `{\"from\":<int>,\"to\":<int>,\"step\":<int>,\"min_rssi\":<int>}` |\n"
            "| GET | /radio/status | Current freq, mode, RSSI, SNR (+bfo in SSB) |\n\n"
@@ -265,6 +339,12 @@ static const char *radio_describe() {
            "### SSB fine-tuning\n\n"
            "- `bfo` (optional, SSB only): BFO offset in Hz, range -14000..14000, default 0.\n"
            "  Sending `bfo` in FM or AM is a 400 — it only applies in LSB/USB.\n\n"
+           "### Band presets\n\n"
+           "- `POST /radio/band` `{\"idx\":<int>}` jumps to a preset from the band plan\n"
+           "  (FM VHF, MW, the SW broadcast segments and the amateur SSB bands). It\n"
+           "  sets the mode, band edges and tuning step for you and restores the last\n"
+           "  frequency used on that band. `idx` runs `0`..(band count - 1); an\n"
+           "  out-of-range index is a 400. Response: `{\"ok\",\"band\",\"mode\",\"freq\",\"freq_display\"}`.\n\n"
            "### Volume\n\n"
            "- `POST /radio/volume` `{\"volume\":<0..63>}` sets the receiver volume\n"
            "  (same value reported by `/radio/status` and driven by the encoder).\n\n"
@@ -388,6 +468,92 @@ void radio_get_signal(uint8_t *rssi, uint8_t *snr) {
     if (rssi) *rssi = rx.getCurrentRSSI();
     if (snr)  *snr  = rx.getCurrentSNR();
     xSemaphoreGive(radio_mtx);
+}
+
+/* AM tuning step for a band: MW keeps 10 kHz channel spacing, SW broadcast uses
+ * 5 kHz. FM is fixed at 10 (10 kHz units) and SSB at 0 (BFO does the fine work). */
+static uint8_t band_am_step(uint8_t type) {
+    return (type == BAND_TYPE_MW) ? 10 : 5;
+}
+
+/*
+ * Drive the receiver onto band `idx` at frequency `freq` (already clipped to the
+ * band's window, in that band's units). Shared by radio_select_band() and the
+ * boot restore so the chip-config sequence lives in one place.
+ *
+ * The caller must hold radio_mtx (or be single-tasked at boot) — this touches the
+ * SI4735 directly and does not lock. It applies the band's own min/max/step (not
+ * the fixed RADIO_*_MIN/MAX that manual /radio/tune uses), lazily uploads/clears
+ * the SSB patch through the shared radio_ssb_loaded flag, resets the BFO to 0 on
+ * every band change, and reapplies the current volume (a mode switch can reset the
+ * chip's volume). It updates radio_band_idx/radio_freq/radio_mode to match; it does
+ * NOT mark the state dirty — that is the caller's call.
+ */
+static void apply_band_locked(uint8_t idx, uint16_t freq) {
+    const RadioBand *b = &bands[idx];
+    uint8_t mode = b->mode;
+
+    if (radio_is_ssb(mode)) {
+        /* Lazily upload the SSB patch (audiobw=1 -> 2.2 kHz) on first SSB use. */
+        if (!radio_ssb_loaded) {
+            rx.loadPatch(ssb_patch_content, sizeof(ssb_patch_content), 1);
+            radio_ssb_loaded = true;
+        }
+        /* mode value doubles as usblsb (1=LSB, 2=USB); step 0 in SSB. */
+        rx.setSSB(b->minFreq, b->maxFreq, freq, 0, mode);
+        rx.setSSBAutomaticVolumeControl(1);
+        radio_bfo = 0;
+        rx.setSSBBfo(0);
+    } else if (mode == RADIO_MODE_FM) {
+        rx.setFM(b->minFreq, b->maxFreq, freq, 10);
+        /* Match /radio/tune's post-setFM config: 50 us de-emphasis + FM AGC. */
+        rx.setFMDeEmphasis(1);
+        rx.setAutomaticGainControl(0, 0);
+        radio_ssb_loaded = false;  /* SSB patch is dropped when we leave SSB */
+        radio_bfo = 0;
+    } else {  /* AM (MW / SW broadcast) */
+        rx.setAM(b->minFreq, b->maxFreq, freq, band_am_step(b->type));
+        radio_ssb_loaded = false;  /* SSB patch is dropped when we leave SSB */
+        radio_bfo = 0;
+    }
+    /* A mode change can reset the chip volume to its power-on default; restore it. */
+    rx.setVolume(radio_volume);
+
+    radio_band_idx = idx;
+    radio_freq = freq;
+    radio_mode = mode;
+}
+
+/*
+ * Select band `idx` from the plan and retune to that band's remembered frequency.
+ * Takes radio_mtx around the whole receiver access. Saves the current frequency
+ * back into the outgoing band's slot first, then clips the incoming band's saved
+ * frequency to its window and applies it. Returns the band name, or nullptr if idx
+ * is out of range (caller validates before calling, so this is defence-in-depth).
+ */
+static const char *radio_select_band(uint8_t idx) {
+    if (idx >= BAND_COUNT) return nullptr;
+
+    xSemaphoreTake(radio_mtx, portMAX_DELAY);
+    /* Remember where we were on the band we are leaving. */
+    band_freq[radio_band_idx] = radio_freq;
+    /* Restore the incoming band's last frequency, clipped to its edges. */
+    uint16_t f = band_freq[idx];
+    if (f < bands[idx].minFreq) f = bands[idx].minFreq;
+    if (f > bands[idx].maxFreq) f = bands[idx].maxFreq;
+    apply_band_locked(idx, f);
+    radio_mark_dirty();  /* real band change -> schedule a debounced persist */
+    xSemaphoreGive(radio_mtx);
+
+    return bands[idx].name;
+}
+
+/* --- Band accessors for the menu/display skill (plain aligned reads, no lock) --- */
+uint8_t radio_get_band_idx() { return radio_band_idx; }
+const char *radio_get_band_name() { return bands[radio_band_idx].name; }
+uint8_t radio_get_band_count() { return BAND_COUNT; }
+const char *radio_get_band_name_at(uint8_t i) {
+    return (i < BAND_COUNT) ? bands[i].name : "";
 }
 
 static void radio_register_routes(AsyncWebServer &server) {
@@ -521,6 +687,62 @@ static void radio_register_routes(AsyncWebServer &server) {
         doc["mode"] = mode_str;
         doc["freq"] = radio_freq;
         if (radio_is_ssb(mode)) doc["bfo"] = radio_bfo;
+        String response;
+        serializeJson(doc, response);
+        req->send(200, "application/json", response);
+    }, NULL, handle_body_collect);
+
+    /* POST /radio/band — jump to a preset from the band plan. Mirrors /radio/tune's
+     * auth + JSON handling, but the mode/edges/step all come from bands[idx]; the
+     * receiver work is done under radio_mtx inside radio_select_band(). */
+    server.on("/radio/band", HTTP_POST, [](AsyncWebServerRequest *req) {
+        if (!require_auth(req)) {
+            /* Body callback already ran; free the collected buffer before bailing. */
+            if (req->_tempObject) { free(req->_tempObject); req->_tempObject = nullptr; }
+            return;
+        }
+
+        if (!radio_ok) {
+            req->send(503, "application/json", "{\"error\":\"SI4732 not detected\"}");
+            return;
+        }
+
+        char *body = (char*)req->_tempObject;
+        if (!body) { req->send(400, "application/json", "{\"error\":\"no body\"}"); return; }
+
+        JsonDocument input;
+        if (deserializeJson(input, body) != DeserializationError::Ok) {
+            free(body); req->_tempObject = nullptr;
+            req->send(400, "application/json", "{\"error\":\"invalid JSON\"}");
+            return;
+        }
+
+        int idx = input["idx"] | -1;
+
+        free(body); req->_tempObject = nullptr;
+
+        if (idx < 0 || idx >= BAND_COUNT) {
+            char err[80];
+            snprintf(err, sizeof(err),
+                "{\"error\":\"band idx out of range (0..%d)\"}", BAND_COUNT - 1);
+            req->send(400, "application/json", err);
+            return;
+        }
+
+        const char *name = radio_select_band((uint8_t)idx);
+
+        event_add("radio: band %d (%s)", idx, name);
+        display_show_status();
+
+        char freq_display[24];
+        radio_format_freq(radio_freq, radio_mode, freq_display, sizeof(freq_display));
+
+        JsonDocument doc;
+        doc["ok"] = true;
+        doc["band"] = name;
+        doc["mode"] = radio_mode_str(radio_mode);
+        doc["freq"] = radio_freq;
+        doc["freq_display"] = freq_display;
         String response;
         serializeJson(doc, response);
         req->send(200, "application/json", response);
@@ -865,9 +1087,9 @@ static void radio_tick() {
      * concurrent status/tune. Clearing radio_dirty inside the lock closes the
      * window where a change during the write would be lost. */
     if (radio_dirty && millis() - radio_last_change_ms > RADIO_STORE_IDLE_MS) {
-        uint16_t f; uint8_t m, v; int b;
+        uint16_t f; uint8_t m, v, bnd; int b;
         xSemaphoreTake(radio_mtx, portMAX_DELAY);
-        f = radio_freq; m = radio_mode; v = radio_volume; b = radio_bfo;
+        f = radio_freq; m = radio_mode; v = radio_volume; b = radio_bfo; bnd = radio_band_idx;
         radio_dirty = false;
         xSemaphoreGive(radio_mtx);
         JsonDocument doc;
@@ -876,6 +1098,7 @@ static void radio_tick() {
         doc["freq"] = f;
         doc["volume"] = v;
         doc["bfo"] = b;
+        doc["band"] = bnd;
         String out;
         serializeJson(doc, out);
         write_spiffs_file(RADIO_STATE_FILE, out);  /* blocking flash write + encoder detach, outside the mutex */
@@ -892,12 +1115,18 @@ static const Skill radio_skill = {
 };
 
 /*
- * Restore the last-saved mode/freq/volume/bfo from SPIFFS over the FM defaults.
+ * Restore the last-saved band/freq/volume/bfo from SPIFFS over the FM defaults.
  * Called once from skill_radio_init() after the receiver is up and before the
  * skill is registered, so it runs single-tasked (server not yet started) — no
  * mutex needed. Anything missing, unparseable, schema-mismatched or out of range
- * is ignored, leaving the FM defaults in place. Reapplies state through the same
- * chip calls /radio/tune uses; never marks the state dirty (nothing changed).
+ * is ignored, leaving the FM defaults in place. Never marks the state dirty.
+ *
+ * v2 stores the selected band index rather than the raw mode, so the reapply runs
+ * through the same per-band path (apply_band_locked) as /radio/band: the saved
+ * frequency is validated against that band's own min/max — which is what lets an
+ * SW or SSB frequency survive a reboot (the old fixed-window check rejected them
+ * and fell back to FM). A v1 file has no "band" and is rejected by the version
+ * check above, resetting to the FM defaults.
  */
 static void radio_restore_state() {
     String raw = read_spiffs_file(RADIO_STATE_FILE);
@@ -907,47 +1136,33 @@ static void radio_restore_state() {
     if (deserializeJson(doc, raw) != DeserializationError::Ok) return;
     if ((int)(doc["v"] | 0) != RADIO_STATE_VERSION) return;  /* absent/mismatched schema */
 
-    int mode   = doc["mode"]   | -1;
+    int band   = doc["band"]   | -1;
     int freq   = doc["freq"]   | -1;
     int volume = doc["volume"] | -1;
     int bfo    = doc["bfo"]     | 0;
 
     /* Reject anything malformed — a single bad field falls back to the defaults. */
-    if (mode < RADIO_MODE_FM || mode > RADIO_MODE_AM) return;
+    if (band < 0 || band >= BAND_COUNT) return;
     if (volume < 0 || volume > 63) return;
-    if (mode == RADIO_MODE_FM) {
-        if (freq < RADIO_FM_MIN || freq > RADIO_FM_MAX) return;
-    } else if (mode == RADIO_MODE_AM) {
-        if (freq < RADIO_AM_MIN || freq > RADIO_AM_MAX) return;
-    } else {  /* LSB / USB */
-        if (freq < RADIO_SSB_MIN || freq > RADIO_SSB_MAX) return;
-        if (bfo < -RADIO_BFO_MAX || bfo > RADIO_BFO_MAX) return;
-    }
+    if (freq < 0) return;
 
-    /* Reapply via the same chip calls as /radio/tune. */
-    if (mode == RADIO_MODE_FM) {
-        rx.setFM(RADIO_FM_MIN, RADIO_FM_MAX, (uint16_t)freq, 10);
-        /* setFM resets de-emphasis/AGC to power-on defaults; reapply the EU
-         * 50 us + FM-AGC config so a restored FM boot matches /radio/tune. */
-        rx.setFMDeEmphasis(1);
-        rx.setAutomaticGainControl(0, 0);
-    } else if (mode == RADIO_MODE_AM) {
-        rx.setAM(RADIO_AM_MIN, RADIO_AM_MAX, (uint16_t)freq, 10);
-    } else {
-        if (!radio_ssb_loaded) {
-            rx.loadPatch(ssb_patch_content, sizeof(ssb_patch_content), 1);
-            radio_ssb_loaded = true;
-        }
-        rx.setSSB(RADIO_SSB_MIN, RADIO_SSB_MAX, (uint16_t)freq, 0, mode);
-        rx.setSSBAutomaticVolumeControl(1);
+    const RadioBand *b = &bands[band];
+    /* Clip the saved frequency to the band's window (per-band, not fixed limits). */
+    uint16_t f = (uint16_t)freq;
+    if (f < b->minFreq) f = b->minFreq;
+    if (f > b->maxFreq) f = b->maxFreq;
+
+    /* Volume must be set before apply_band_locked, which reapplies it to the chip. */
+    radio_volume  = (uint8_t)volume;
+    band_freq[band] = f;
+    apply_band_locked((uint8_t)band, f);
+
+    /* apply_band_locked zeroes the BFO on every band change; a valid saved offset
+     * on an SSB band is reapplied here so fine-tuning survives the reboot. */
+    if (radio_is_ssb(b->mode) && bfo >= -RADIO_BFO_MAX && bfo <= RADIO_BFO_MAX) {
+        radio_bfo = bfo;
         rx.setSSBBfo(-bfo);
     }
-    rx.setVolume((uint8_t)volume);
-
-    radio_mode   = (uint8_t)mode;
-    radio_freq   = (uint16_t)freq;
-    radio_volume = (uint8_t)volume;
-    radio_bfo    = bfo;
 }
 
 /*
@@ -998,9 +1213,14 @@ static void skill_radio_init() {
     pinMode(PIN_AMP_EN, OUTPUT);
     digitalWrite(PIN_AMP_EN, HIGH);
 
+    /* Seed each band's remembered frequency from its default before restore, so a
+     * band never visited this boot still tunes to a sane spot. radio_band_idx stays
+     * 0 (FM VHF); the boot FM tune above matches band 0's mode. */
+    for (uint8_t i = 0; i < BAND_COUNT; i++) band_freq[i] = bands[i].defFreq;
+
     radio_ok = true;
 
-    /* Overlay any saved mode/freq/volume/bfo on top of the FM defaults. Runs
+    /* Overlay any saved band/freq/volume/bfo on top of the FM defaults. Runs
      * single-tasked here (before server.begin), so no mutex is required. */
     radio_restore_state();
 
