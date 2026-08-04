@@ -360,6 +360,13 @@ static void radio_register_routes(AsyncWebServer &server) {
             }
             xSemaphoreTake(radio_mtx, portMAX_DELAY);
             rx.setFM(RADIO_FM_MIN, RADIO_FM_MAX, (uint16_t)freq, 10);
+            /* Match the reference firmware's post-setFM config so the chip
+             * reports FM RSSI/SNR. setFM alone leaves de-emphasis and AGC at
+             * power-on defaults; the SI4735 driver applies these as properties.
+             * De-emphasis 1 = 50 us (EU/JP/AU); AGC enabled with no attenuation
+             * (AGCDIS=0, AGCIDX=0) mirrors the ref's doAgc(0) at FM AGC index 0. */
+            rx.setFMDeEmphasis(1);
+            rx.setAutomaticGainControl(0, 0);
             xSemaphoreGive(radio_mtx);
             radio_ssb_loaded = false;  /* SSB patch is dropped when we leave SSB */
         } else if (strcmp(mode_str, "AM") == 0) {
@@ -763,6 +770,10 @@ static void skill_radio_init() {
 
     /* FM 64..108 MHz, start 100.0 MHz, 100 kHz step. */
     rx.setFM(RADIO_FM_MIN, RADIO_FM_MAX, 10000, 10);
+    /* Post-setFM config to match the reference firmware (see /radio/tune):
+     * de-emphasis 1 = 50 us (EU/JP/AU), AGC enabled with no attenuation. */
+    rx.setFMDeEmphasis(1);
+    rx.setAutomaticGainControl(0, 0);
     radio_freq = 10000;
     radio_mode = RADIO_MODE_FM;
 
