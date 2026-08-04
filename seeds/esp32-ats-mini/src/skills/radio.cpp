@@ -29,6 +29,17 @@
 #include "../Button.h"
 
 /*
+ * Display-theme accessors, defined in display.cpp — included AFTER radio.cpp in the
+ * same translation unit, so the persist path here needs the prototypes up front (same
+ * arrangement as display_show_status(), forward-declared in main.cpp). The theme is a
+ * global display setting persisted alongside the radio state (v7); radio.cpp only reads
+ * and restores the index, display.cpp owns the palette.
+ */
+void        display_set_theme(uint8_t idx);
+uint8_t     display_get_theme();
+uint8_t     display_theme_count();
+
+/*
  * Mode constants follow the ref ats-mini numbering so the SSB mode value doubles
  * as setSSB()'s usblsb argument (1=LSB, 2=USB) — no separate mapping needed.
  * FM stays 0 (SI4735 defaultFunction for setup()); AM moved 1 -> 3. Modes travel
@@ -93,8 +104,9 @@
  * the signal gate survives too. An older-version file is rejected by the version
  * check in radio_restore_state() and falls back to the FM defaults. v5 adds the
  * seven per-mode DSP scalars (AGC/AVC/SoftMute), all global (not per-band). v6 adds
- * the active band's two SSB calibration slots (usb_cal/lsb_cal), per-band like freq. */
-#define RADIO_STATE_VERSION 6
+ * the active band's two SSB calibration slots (usb_cal/lsb_cal), per-band like freq.
+ * v7 adds the global display theme index (owned by display.cpp; not per-band). */
+#define RADIO_STATE_VERSION 7
 #define RADIO_STORE_IDLE_MS 10000
 
 /*
@@ -2786,6 +2798,10 @@ static void radio_tick() {
         doc["ssb_sm"] = ssmv;
         doc["usb_cal"] = ucal;
         doc["lsb_cal"] = lcal;
+        /* v7: the global display theme index. Owned by display.cpp; read here through
+         * the accessor OUTSIDE radio_mtx (already released above) — it takes no radio
+         * lock and a byte read is atomic. */
+        doc["theme"] = display_get_theme();
         String out;
         serializeJson(doc, out);
         write_spiffs_file(RADIO_STATE_FILE, out);  /* blocking flash write + encoder detach, outside the mutex */
@@ -2833,6 +2849,15 @@ static void radio_restore_state() {
     int sstep  = doc["step"]   | -1;
     int sbw    = doc["bw"]     | -1;
     int ssq    = doc["squelch"] | -1;  /* v4: packed threshold + metric bit */
+
+    /* v7: the global display theme. Orthogonal to the radio state, so it is restored
+     * here up front — a malformed radio field below must not cost the saved theme. The
+     * index is validated against the live table; anything missing/out of range leaves
+     * the default theme 0. At boot display_mtx is not yet created (skill_display_init
+     * runs after us), so display_set_theme just stores the index and the boot paint in
+     * skill_display_init() picks it up. */
+    int th = doc["theme"] | -1;
+    if (th >= 0 && th < display_theme_count()) display_set_theme((uint8_t)th);
 
     /* Reject anything malformed — a single bad field falls back to the defaults. */
     if (band < 0 || band >= BAND_COUNT) return;
