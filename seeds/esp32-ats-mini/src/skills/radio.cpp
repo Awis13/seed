@@ -50,6 +50,10 @@
 #define RADIO_SSB_MAX 30000
 /* SSB fine-tuning (BFO) limit in Hz, applied symmetrically (-MAX..+MAX) */
 #define RADIO_BFO_MAX 14000
+/* SSB calibration trim (per-band/sideband BFO offset) limit in Hz and detent step.
+ * |bfo| <= 14000 and |cal| <= 2000 sum to <= 16000, which setSSBBfo(int) accepts. */
+#define RADIO_CAL_MAX  2000
+#define RADIO_CAL_STEP 10
 
 /*
  * Scan step ceiling. A blocking sweep re-tunes the receiver on every step; each
@@ -81,8 +85,9 @@
  * survive a reboot; v4 adds the packed squelch byte (threshold + metric select) so
  * the signal gate survives too. An older-version file is rejected by the version
  * check in radio_restore_state() and falls back to the FM defaults. v5 adds the
- * seven per-mode DSP scalars (AGC/AVC/SoftMute), all global (not per-band). */
-#define RADIO_STATE_VERSION 5
+ * seven per-mode DSP scalars (AGC/AVC/SoftMute), all global (not per-band). v6 adds
+ * the active band's two SSB calibration slots (usb_cal/lsb_cal), per-band like freq. */
+#define RADIO_STATE_VERSION 6
 #define RADIO_STORE_IDLE_MS 10000
 
 /*
@@ -289,6 +294,16 @@ static uint8_t  band_mode[BAND_COUNT];
  * radio_mtx (or single-tasked at boot), same as band_freq[]. Not persisted yet. */
 static uint8_t  band_step_idx[BAND_COUNT];
 static uint8_t  band_bw_idx[BAND_COUNT];
+/*
+ * Per-band, per-sideband SSB calibration: a frequency-trim offset (Hz) folded into
+ * the BFO so a given band/sideband can be nudged onto zero-beat. USB and LSB keep
+ * separate slots (the ref's usbCal/lsbCal) because the two sidebands mistune in
+ * opposite senses. Range +/-RADIO_CAL_MAX Hz, always a multiple of RADIO_CAL_STEP.
+ * Seeded to 0 in skill_radio_init() alongside band_freq[]; written only under
+ * radio_mtx (or single-tasked at boot). Applied by apply_cal_locked(). SSB-only —
+ * an FM/AM band never touches these. Persisted as of v6 (active band only). */
+static int16_t  band_usb_cal[BAND_COUNT];
+static int16_t  band_lsb_cal[BAND_COUNT];
 
 /*
  * Canonical mode of the active band's step/bandwidth tables. The stored
@@ -481,8 +496,12 @@ static int     menu_settings_idx = 0; /* cursor in the SETTINGS sublist */
  * on a non-FM band (mode is locked on VHF). ADJ_SQUELCH is a numeric 0..127 gate
  * threshold — clamped at the ends, not a table wrap like the others. ADJ_AGC/AVC/
  * SOFTMUTE are likewise numeric (cursor IS the value): AGC on every mode, AVC and
- * SoftMute on AM/SSB only (a no-op editor showing blanks on an FM band). */
-enum AdjustTarget { ADJ_STEP, ADJ_BW, ADJ_MODE, ADJ_SQUELCH, ADJ_AGC, ADJ_AVC, ADJ_SOFTMUTE };
+ * SoftMute on AM/SSB only (a no-op editor showing blanks on an FM band). ADJ_CAL is
+ * the SSB calibration trim: numeric +/-2000 Hz in 10 Hz detents, SSB-only (blank +
+ * no-op on FM/AM). Its cursor is a 0..400 INDEX (Hz = idx*10 - 2000), not the raw Hz,
+ * so the five-row window steps one detent per row (a raw-Hz cursor with a 10 Hz step
+ * would leave four of every five rows blank). */
+enum AdjustTarget { ADJ_STEP, ADJ_BW, ADJ_MODE, ADJ_SQUELCH, ADJ_AGC, ADJ_AVC, ADJ_SOFTMUTE, ADJ_CAL };
 static uint8_t adjust_target = ADJ_STEP;
 /* Cursor in the BAND picker (indexes bands[]). Re-seeded from radio_get_band_idx()
  * each time MENU_BAND is entered, so the list always opens on the active band. */
@@ -498,16 +517,16 @@ enum MainItem { MI_BAND = 0, MI_MODE, MI_STEP, MI_BW, MI_SQUELCH, MI_MUTE, MI_SE
 /*
  * SETTINGS-sublist dispatch keys. The order MUST match menu_settings_items[] below,
  * exactly like MainItem/menu_main_items[]: the click handler switches on the raw
- * cursor (menu_settings_idx), never the label text. AGC/AVC/SoftMute drop into a
- * numeric adjust editor; Brightness/Theme/About are not leaves yet; Back exits.
+ * cursor (menu_settings_idx), never the label text. AGC/AVC/SoftMute/Calibration drop
+ * into a numeric adjust editor; Brightness/Theme/About are not leaves yet; Back exits.
  */
-enum SettingsItem { SI_AGC = 0, SI_AVC, SI_SOFTMUTE, SI_BRIGHTNESS, SI_THEME, SI_ABOUT, SI_BACK };
+enum SettingsItem { SI_AGC = 0, SI_AVC, SI_SOFTMUTE, SI_CAL, SI_BRIGHTNESS, SI_THEME, SI_ABOUT, SI_BACK };
 
 static const char *const menu_main_items[] = {
     "Band", "Mode", "Step", "Bandwidth", "Squelch", "Mute", "Settings"
 };
 static const char *const menu_settings_items[] = {
-    "AGC", "AVC", "SoftMute", "Brightness", "Theme", "About", "Back"
+    "AGC", "AVC", "SoftMute", "Calibration", "Brightness", "Theme", "About", "Back"
 };
 #define MENU_MAIN_COUNT     ((int)(sizeof(menu_main_items) / sizeof(menu_main_items[0])))
 #define MENU_SETTINGS_COUNT ((int)(sizeof(menu_settings_items) / sizeof(menu_settings_items[0])))
@@ -526,7 +545,7 @@ static int menu_wrap(int idx, int delta, int count) {
 static const SkillEndpoint radio_endpoints[] = {
     {"POST", "/radio/tune",   "Tune: {mode:\"FM\"|\"AM\"|\"LSB\"|\"USB\", freq:<int>, bfo?:<int>}"},
     {"POST", "/radio/band",   "Jump to a band-plan preset: {idx:<int>}"},
-    {"POST", "/radio/config", "Set mode/step/bandwidth/squelch/mute/DSP: {mode?:\"AM\"|\"LSB\"|\"USB\", step_idx?:<int>, bw_idx?:<int>, squelch?:0-127, squelch_snr?:<bool>, mute?:<bool>, agc?:<int>, avc?:<even 12-90>, softmute?:0-32}"},
+    {"POST", "/radio/config", "Set mode/step/bandwidth/squelch/mute/DSP: {mode?:\"AM\"|\"LSB\"|\"USB\", step_idx?:<int>, bw_idx?:<int>, squelch?:0-127, squelch_snr?:<bool>, mute?:<bool>, agc?:<int>, avc?:<even 12-90>, softmute?:0-32, cal?:<-2000-2000 SSB>}"},
     {"POST", "/radio/volume", "Set volume: {volume:0-63}"},
     {"POST", "/radio/scan",   "Sweep current-mode band: {from,to,step,min_rssi?} -> RSSI/SNR per step"},
     {"GET",  "/radio/status", "Current freq/mode/RSSI/SNR (+bfo in SSB)"},
@@ -541,7 +560,7 @@ static const char *radio_describe() {
            "|--------|------|-------------|\n"
            "| POST | /radio/tune | Tune: `{\"mode\":\"FM|AM|LSB|USB\",\"freq\":<int>,\"bfo\":<int>}` |\n"
            "| POST | /radio/band | Jump to a band-plan preset: `{\"idx\":<int>}` |\n"
-           "| POST | /radio/config | Set mode/step/bandwidth + squelch/mute + DSP: `{\"mode\":\"AM|LSB|USB\",\"step_idx\":<int>,\"bw_idx\":<int>,\"squelch\":<0..127>,\"squelch_snr\":<bool>,\"mute\":<bool>,\"agc\":<int>,\"avc\":<even 12..90>,\"softmute\":<0..32>}` |\n"
+           "| POST | /radio/config | Set mode/step/bandwidth + squelch/mute + DSP: `{\"mode\":\"AM|LSB|USB\",\"step_idx\":<int>,\"bw_idx\":<int>,\"squelch\":<0..127>,\"squelch_snr\":<bool>,\"mute\":<bool>,\"agc\":<int>,\"avc\":<even 12..90>,\"softmute\":<0..32>,\"cal\":<-2000..2000>}` |\n"
            "| POST | /radio/volume | Set volume: `{\"volume\":<0..63>}` |\n"
            "| POST | /radio/scan | Blocking band sweep in the current mode: `{\"from\":<int>,\"to\":<int>,\"step\":<int>,\"min_rssi\":<int>}` |\n"
            "| GET | /radio/status | Current freq, mode, RSSI, SNR (+bfo in SSB) |\n\n"
@@ -568,6 +587,11 @@ static const char *radio_describe() {
            "  Range is per mode: FM 0..27, AM 0..37, SSB 0..1.\n"
            "- `avc` (AM/SSB only): AVC max gain, even values 12..90. Rejected in FM.\n"
            "- `softmute` (AM/SSB only): soft-mute max attenuation 0..32. Rejected in FM.\n\n"
+           "### SSB calibration (`cal`)\n\n"
+           "`POST /radio/config` `{\"cal\":<-2000..2000>}` sets a per-band, per-sideband\n"
+           "frequency trim (Hz) folded into the BFO, so each band/sideband can be nudged\n"
+           "onto zero-beat. SSB-only (rejected in FM/AM); kept separately for LSB and USB\n"
+           "and per band; reported by `/radio/status` for the active sideband.\n\n"
            "### Scan\n\n"
            "`POST /radio/scan` sweeps `from`..`to` (inclusive) with the given `step`,\n"
            "measuring RSSI/SNR at each point. It stays in the current mode and does\n"
@@ -679,6 +703,15 @@ int radio_get_menu_idx() {
                 return radio_is_ssb(m) ? ssb_avc : am_avc;
             if (adjust_target == ADJ_SOFTMUTE)
                 return radio_is_ssb(m) ? ssb_sm : am_sm;
+            if (adjust_target == ADJ_CAL) {
+                /* Cursor is a 0..400 INDEX into the +/-RADIO_CAL_MAX Hz / RADIO_CAL_STEP
+                 * grid (Hz = idx*step - max). SSB-only: on FM/AM item() blanks every
+                 * row, so 0 is a harmless placeholder cursor there. */
+                if (!radio_is_ssb(m)) return 0;
+                int16_t cal = (m == RADIO_MODE_USB) ? band_usb_cal[radio_band_idx]
+                                                    : band_lsb_cal[radio_band_idx];
+                return (cal + RADIO_CAL_MAX) / RADIO_CAL_STEP;
+            }
             /* ADJ_MODE: cursor is the band's mode position within modeCycle. */
             return mode_cycle_pos(band_mode[radio_band_idx]);
         }
@@ -697,6 +730,8 @@ int radio_get_menu_count() {
             if (adjust_target == ADJ_AGC) return agc_max_for_mode(band_table_mode()) + 1;
             if (adjust_target == ADJ_AVC) return 91;   /* 0..90 window; even-only in item()/scroll */
             if (adjust_target == ADJ_SOFTMUTE) return 33;  /* 0..32 */
+            /* +/-RADIO_CAL_MAX Hz in RADIO_CAL_STEP detents -> 0..400 index, 401 rows. */
+            if (adjust_target == ADJ_CAL) return 2 * RADIO_CAL_MAX / RADIO_CAL_STEP + 1;
             return MODE_CYCLE_COUNT;
         default:            return MENU_MAIN_COUNT;
     }
@@ -716,6 +751,7 @@ const char *radio_get_menu_title() {
             if (adjust_target == ADJ_AGC) return "AGC";
             if (adjust_target == ADJ_AVC) return "AVC";
             if (adjust_target == ADJ_SOFTMUTE) return "SoftMute";
+            if (adjust_target == ADJ_CAL) return "Cal Hz";
             return "Mode";
         default:            return "Menu";
     }
@@ -756,6 +792,16 @@ const char *radio_get_menu_item(int i) {
             static char buf[8];
             if (band_table_mode() == RADIO_MODE_FM || i < 0 || i > 32) return "";
             snprintf(buf, sizeof(buf), "%d", i);
+            return buf;
+        }
+        if (adjust_target == ADJ_CAL) {
+            /* `i` is the absolute 0..400 index candidate; map it back to signed Hz
+             * (idx*step - max) and show it with a sign. Blank past the index ends and
+             * on any non-SSB band (cal is SSB-only). */
+            static char buf[8];
+            int last = 2 * RADIO_CAL_MAX / RADIO_CAL_STEP;  /* 400 */
+            if (!radio_is_ssb(band_table_mode()) || i < 0 || i > last) return "";
+            snprintf(buf, sizeof(buf), "%+d", i * RADIO_CAL_STEP - RADIO_CAL_MAX);
             return buf;
         }
         /* Menu window items come from the band's own table mode, not radio_mode. */
@@ -911,6 +957,32 @@ static void apply_softmute_locked(uint8_t mode) {
 }
 
 /*
+ * The calibration slot for the CURRENTLY-RUNNING sideband on the active band: USB
+ * reads band_usb_cal[], every other mode reads band_lsb_cal[] (only meaningful in
+ * LSB — callers gate on radio_is_ssb(radio_mode)). Keyed off the live radio_mode
+ * because cal folds into the BFO of the demod actually on air. Plain aligned read;
+ * mutating callers hold radio_mtx.
+ */
+static int16_t *radio_current_cal() {
+    return (radio_mode == RADIO_MODE_USB) ? &band_usb_cal[radio_band_idx]
+                                          : &band_lsb_cal[radio_band_idx];
+}
+
+/*
+ * Fold the active band/sideband's calibration trim into the BFO and push it to the
+ * chip: setSSBBfo(-(radio_bfo + cal)). This is the ONE place setSSBBfo is called —
+ * every SSB set-up/tune/restore/edit routes through here so the sign convention and
+ * the cal term stay in a single spot. A no-op outside SSB (cal is meaningless in
+ * FM/AM). Reads the LIVE radio_mode/radio_band_idx/radio_bfo, so the caller must
+ * have those already updated to the intended target. Caller holds radio_mtx.
+ */
+static void apply_cal_locked() {
+    if (!radio_is_ssb(radio_mode)) return;
+    int16_t cal = *radio_current_cal();
+    rx.setSSBBfo(-(radio_bfo + cal));
+}
+
+/*
  * Drive the receiver onto band `idx` at frequency `freq` (already clipped to the
  * band's window, in that band's units). Shared by radio_select_band() and the
  * boot restore so the chip-config sequence lives in one place.
@@ -943,8 +1015,9 @@ static void apply_band_locked(uint8_t idx, uint16_t freq) {
         /* mode value doubles as usblsb (1=LSB, 2=USB); step 0 in SSB (BFO tunes). */
         rx.setSSB(b->minFreq, b->maxFreq, freq, 0, mode);
         rx.setSSBAutomaticVolumeControl(1);
+        /* Zero the BFO here; the calibration trim is folded in by apply_cal_locked()
+         * at the tail, once radio_mode/radio_band_idx below name the new target. */
         radio_bfo = 0;
-        rx.setSSBBfo(0);
     } else if (mode == RADIO_MODE_FM) {
         rx.setFM(b->minFreq, b->maxFreq, freq, stepsForMode(mode)[sidx].step);
         /* Match /radio/tune's post-setFM config: 50 us de-emphasis. The FM AGC is
@@ -983,6 +1056,11 @@ static void apply_band_locked(uint8_t idx, uint16_t freq) {
     radio_band_idx = idx;
     radio_freq = freq;
     radio_mode = mode;
+
+    /* SSB only: now that the three live-state words above name the new band/sideband,
+     * fold in that slot's calibration trim (BFO was zeroed to 0 in the SSB branch, so
+     * this applies -(0 + cal)). setSSB reset the BFO, so it must be re-pushed here. */
+    if (radio_is_ssb(mode)) apply_cal_locked();
 }
 
 /*
@@ -1156,8 +1234,10 @@ static void radio_register_routes(AsyncWebServer &server) {
             /* step=0 in SSB; mode value doubles as usblsb (1=LSB, 2=USB). */
             rx.setSSB(RADIO_SSB_MIN, RADIO_SSB_MAX, (uint16_t)freq, 0, mode);
             rx.setSSBAutomaticVolumeControl(1);
+            /* Stash the requested BFO; the actual setSSBBfo (with the band/sideband
+             * calibration folded in) runs in the common block below, once radio_mode
+             * names the new sideband so apply_cal_locked() picks the right cal slot. */
             radio_bfo = req_bfo;
-            rx.setSSBBfo(-radio_bfo);  /* sign follows the ref convention */
             xSemaphoreGive(radio_mtx);
         } else {
             req->send(400, "application/json", "{\"error\":\"mode must be FM, AM, LSB or USB\"}");
@@ -1169,6 +1249,9 @@ static void radio_register_routes(AsyncWebServer &server) {
         xSemaphoreTake(radio_mtx, portMAX_DELAY);
         radio_mode = mode;
         radio_freq = (uint16_t)freq;
+        /* SSB: apply the BFO now, with the current band's per-sideband cal folded in,
+         * now that radio_mode names the sideband apply_cal_locked() reads. */
+        if (radio_is_ssb(mode)) apply_cal_locked();
         radio_mark_dirty();  /* real tune -> schedule a debounced persist */
         xSemaphoreGive(radio_mtx);
 
@@ -1299,6 +1382,12 @@ static void radio_register_routes(AsyncWebServer &server) {
         int  avc_v   = input["avc"]      | -1;
         int  sm_v    = input["softmute"] | -1;
 
+        /* Optional SSB calibration trim: "cal" (Hz, -RADIO_CAL_MAX..RADIO_CAL_MAX,
+         * SSB-only). Range and SSB gating validated under the lock once the effective
+         * mode is known. */
+        bool has_cal = !input["cal"].isNull();
+        int  cal_v   = input["cal"] | 0;
+
         /* Parse the optional demod mode. Only AM/LSB/USB are settable here: FM is a
          * broadcast demod locked to the VHF band (a native-FM band is rejected under
          * the lock below), so it is never a valid config target. */
@@ -1314,9 +1403,9 @@ static void radio_register_routes(AsyncWebServer &server) {
         free(body); req->_tempObject = nullptr;
 
         if (!has_step && !has_bw && !has_mode && !has_squelch && !has_mute &&
-            !has_agc && !has_avc && !has_sm) {
+            !has_agc && !has_avc && !has_sm && !has_cal) {
             req->send(400, "application/json",
-                "{\"error\":\"provide step_idx, bw_idx, mode, squelch, mute, agc, avc and/or softmute\"}");
+                "{\"error\":\"provide step_idx, bw_idx, mode, squelch, mute, agc, avc, softmute and/or cal\"}");
             return;
         }
         if (mode_str_bad) {
@@ -1352,8 +1441,12 @@ static void radio_register_routes(AsyncWebServer &server) {
         bool avc_bad = has_avc && (avc_v < 12 || avc_v > 90 || (avc_v % 2));
         bool sm_fm   = has_sm  && mode == RADIO_MODE_FM;
         bool sm_bad  = has_sm  && (sm_v < 0 || sm_v > 32);
+        /* Cal is SSB-only (never FM/AM) and clamped to +/-RADIO_CAL_MAX. */
+        bool cal_notssb = has_cal && !radio_is_ssb(mode);
+        bool cal_bad    = has_cal && (cal_v < -RADIO_CAL_MAX || cal_v > RADIO_CAL_MAX);
         if (!mode_locked && !step_bad && !bw_bad && !squelch_bad &&
-            !agc_bad && !avc_fm && !avc_bad && !sm_fm && !sm_bad) {
+            !agc_bad && !avc_fm && !avc_bad && !sm_fm && !sm_bad &&
+            !cal_notssb && !cal_bad) {
             if (has_mode) {
                 /* Mode switch: reset step/bw cursors to the new mode's defaults (the
                  * old indices belong to a different table), zero the BFO, and reapply
@@ -1406,11 +1499,18 @@ static void radio_register_routes(AsyncWebServer &server) {
                 else                    am_sm  = (int8_t)sm_v;
                 apply_softmute_locked(mode);
             }
-            /* Step/bw/mode, the squelch gate (threshold + metric) and the per-mode DSP
-             * scalars are persisted (v4/v5); MAIN mute is ephemeral, so only a change to
-             * a persisted parameter schedules a flash write. */
+            /* SSB calibration: store into the effective sideband's slot and fold it into
+             * the BFO now. Gated to SSB above (cal_notssb), so `mode` is LSB/USB here. */
+            if (has_cal) {
+                if (mode == RADIO_MODE_USB) band_usb_cal[bnd] = (int16_t)cal_v;
+                else                        band_lsb_cal[bnd] = (int16_t)cal_v;
+                apply_cal_locked();
+            }
+            /* Step/bw/mode, the squelch gate (threshold + metric), the per-mode DSP
+             * scalars and the SSB cal are persisted (v4/v5/v6); MAIN mute is ephemeral,
+             * so only a change to a persisted parameter schedules a flash write. */
             if (has_step || has_bw || has_mode || has_squelch || has_sqmetric ||
-                has_agc || has_avc || has_sm) radio_mark_dirty();
+                has_agc || has_avc || has_sm || has_cal) radio_mark_dirty();
         }
         /* Snapshot the resulting labels under the lock, clamped defensively; the
          * .desc pointers are flash-resident constants, safe to use after release. */
@@ -1424,6 +1524,10 @@ static void radio_register_routes(AsyncWebServer &server) {
         int8_t avc_snap = radio_is_ssb(mode) ? ssb_avc : am_avc;
         int8_t sm_snap  = radio_is_ssb(mode) ? ssb_sm  : am_sm;
         bool mode_is_fm = (mode == RADIO_MODE_FM);
+        bool mode_is_ssb = radio_is_ssb(mode);
+        int16_t cal_snap = mode_is_ssb ? (mode == RADIO_MODE_USB ? band_usb_cal[bnd]
+                                                                 : band_lsb_cal[bnd])
+                                       : 0;
         xSemaphoreGive(radio_mtx);
 
         if (mode_locked) {
@@ -1472,6 +1576,16 @@ static void radio_register_routes(AsyncWebServer &server) {
                 "{\"error\":\"softmute out of range (0..32)\"}");
             return;
         }
+        if (cal_notssb) {
+            req->send(400, "application/json",
+                "{\"error\":\"cal only in SSB (LSB/USB)\"}");
+            return;
+        }
+        if (cal_bad) {
+            req->send(400, "application/json",
+                "{\"error\":\"cal out of range (-2000..2000)\"}");
+            return;
+        }
 
         event_add("radio: config mode=%s step=%s bw=%s", mode_desc, step_desc, bw_desc);
         display_show_status();
@@ -1490,6 +1604,8 @@ static void radio_register_routes(AsyncWebServer &server) {
             doc["avc"] = avc_snap;
             doc["softmute"] = sm_snap;
         }
+        /* Cal is SSB-only; report it only in LSB/USB. */
+        if (mode_is_ssb) doc["cal"] = cal_snap;
         String response;
         serializeJson(doc, response);
         req->send(200, "application/json", response);
@@ -1689,6 +1805,11 @@ static void radio_register_routes(AsyncWebServer &server) {
         int8_t agc_snap = lmode_fm ? fm_agc : (radio_is_ssb(lmode) ? ssb_agc : am_agc);
         int8_t avc_snap = radio_is_ssb(lmode) ? ssb_avc : am_avc;
         int8_t sm_snap  = radio_is_ssb(lmode) ? ssb_sm  : am_sm;
+        /* SSB calibration for the live sideband on the active band (SSB-only). */
+        int16_t cal_snap = radio_is_ssb(lmode)
+                               ? (lmode == RADIO_MODE_USB ? band_usb_cal[radio_band_idx]
+                                                          : band_lsb_cal[radio_band_idx])
+                               : 0;
         xSemaphoreGive(radio_mtx);
 
         char freq_display[24];
@@ -1699,6 +1820,7 @@ static void radio_register_routes(AsyncWebServer &server) {
         doc["freq"] = radio_freq;
         doc["freq_display"] = freq_display;
         if (radio_is_ssb(radio_mode)) doc["bfo"] = radio_bfo;
+        if (radio_is_ssb(radio_mode)) doc["cal"] = cal_snap;
         /* Step/bandwidth labels come from the BAND's live demod mode (band_mode[idx]),
          * not the live radio_mode — /radio/tune can leave radio_mode on a different
          * mode with a larger table, so reading these under radio_mode risks an OOB.
@@ -1846,6 +1968,10 @@ static void radio_tick() {
                         menu_level = MENU_ADJUST;
                         adjust_target = ADJ_SOFTMUTE;
                         break;
+                    case SI_CAL:
+                        menu_level = MENU_ADJUST;
+                        adjust_target = ADJ_CAL;
+                        break;
                     default:
                         /* SI_BRIGHTNESS/SI_THEME/SI_ABOUT placeholders (TODO: wire real
                          * editors) and SI_BACK all step back up to the MAIN list. */
@@ -1954,6 +2080,25 @@ static void radio_tick() {
                         if (v > 32) v = 32;
                         *slot = (int8_t)v;
                         if (radio_ok) apply_softmute_locked(m);
+                        radio_mark_dirty();
+                    }
+                    xSemaphoreGive(radio_mtx);
+                } else if (adjust_target == ADJ_CAL) {
+                    /* Numeric SSB calibration edit (SSB-only; no-op on FM/AM). One detent
+                     * = RADIO_CAL_STEP Hz, clamped to +/-RADIO_CAL_MAX, folded into the BFO
+                     * immediately via apply_cal_locked. Keyed off the band's live demod so
+                     * the right per-sideband slot is edited. Persisted (v6). */
+                    xSemaphoreTake(radio_mtx, portMAX_DELAY);
+                    uint8_t m = band_table_mode();
+                    if (radio_is_ssb(m)) {
+                        int16_t *slot = (m == RADIO_MODE_USB)
+                                            ? &band_usb_cal[radio_band_idx]
+                                            : &band_lsb_cal[radio_band_idx];
+                        int v = (int)*slot + (int)d * RADIO_CAL_STEP;
+                        if (v < -RADIO_CAL_MAX) v = -RADIO_CAL_MAX;
+                        if (v >  RADIO_CAL_MAX) v =  RADIO_CAL_MAX;
+                        *slot = (int16_t)v;
+                        if (radio_ok) apply_cal_locked();
                         radio_mark_dirty();
                     }
                     xSemaphoreGive(radio_mtx);
@@ -2068,6 +2213,7 @@ static void radio_tick() {
     if (radio_dirty && millis() - radio_last_change_ms > RADIO_STORE_IDLE_MS) {
         uint16_t f; uint8_t v, bnd, bmode, bstep, bbw, sq; int b;
         int8_t fagc, aagc, sagc, aavc, savc, asmv, ssmv;
+        int16_t ucal, lcal;
         xSemaphoreTake(radio_mtx, portMAX_DELAY);
         f = radio_freq; v = radio_volume; b = radio_bfo; bnd = radio_band_idx;
         /* v3: persist the active band's live demod mode and step/bw cursors so a mode
@@ -2080,6 +2226,8 @@ static void radio_tick() {
         /* v5: the seven per-mode DSP scalars (AGC/AVC/SoftMute), all global. */
         fagc = fm_agc; aagc = am_agc; sagc = ssb_agc;
         aavc = am_avc; savc = ssb_avc; asmv = am_sm; ssmv = ssb_sm;
+        /* v6: the active band's two SSB calibration slots (per-band, like freq/step). */
+        ucal = band_usb_cal[bnd]; lcal = band_lsb_cal[bnd];
         radio_dirty = false;
         xSemaphoreGive(radio_mtx);
         JsonDocument doc;
@@ -2099,6 +2247,8 @@ static void radio_tick() {
         doc["ssb_avc"] = savc;
         doc["am_sm"] = asmv;
         doc["ssb_sm"] = ssmv;
+        doc["usb_cal"] = ucal;
+        doc["lsb_cal"] = lcal;
         String out;
         serializeJson(doc, out);
         write_spiffs_file(RADIO_STATE_FILE, out);  /* blocking flash write + encoder detach, outside the mutex */
@@ -2194,6 +2344,23 @@ static void radio_restore_state() {
     j = doc["am_sm"]   | -1; if (j >= 0  && j <= 32)               am_sm   = (int8_t)j;
     j = doc["ssb_sm"]  | -1; if (j >= 0  && j <= 32)               ssb_sm  = (int8_t)j;
 
+    /* v6: the active band's two SSB calibration slots. Clamp to +/-RADIO_CAL_MAX; a
+     * missing key (older file, already rejected by the version check) leaves the 0
+     * seed. Set BEFORE apply_band_locked so its tail apply_cal_locked() folds the trim
+     * into the restored BFO. Only the saved band's slots are stored — the rest keep 0. */
+    if (!doc["usb_cal"].isNull()) {
+        int uc = doc["usb_cal"] | 0;
+        if (uc < -RADIO_CAL_MAX) uc = -RADIO_CAL_MAX;
+        if (uc >  RADIO_CAL_MAX) uc =  RADIO_CAL_MAX;
+        band_usb_cal[band] = (int16_t)uc;
+    }
+    if (!doc["lsb_cal"].isNull()) {
+        int lc = doc["lsb_cal"] | 0;
+        if (lc < -RADIO_CAL_MAX) lc = -RADIO_CAL_MAX;
+        if (lc >  RADIO_CAL_MAX) lc =  RADIO_CAL_MAX;
+        band_lsb_cal[band] = (int16_t)lc;
+    }
+
     /* Volume must be set before apply_band_locked, which reapplies it to the chip. */
     radio_volume  = (uint8_t)volume;
     band_freq[band] = f;
@@ -2205,7 +2372,9 @@ static void radio_restore_state() {
      * band into or out of SSB. */
     if (radio_is_ssb(rmode) && bfo >= -RADIO_BFO_MAX && bfo <= RADIO_BFO_MAX) {
         radio_bfo = bfo;
-        rx.setSSBBfo(-bfo);
+        /* Re-push with the restored band/sideband cal folded in (radio_mode/band_idx
+         * were set to the restored target by apply_band_locked above). */
+        apply_cal_locked();
     }
 }
 
@@ -2266,6 +2435,8 @@ static void skill_radio_init() {
         band_mode[i] = bands[i].mode;  /* live demod starts at the band's native mode */
         band_step_idx[i] = defaultStepIdx[bands[i].mode];
         band_bw_idx[i]   = defaultBwIdx[bands[i].mode];
+        band_usb_cal[i]  = 0;  /* SSB calibration trim starts at zero-beat */
+        band_lsb_cal[i]  = 0;
     }
 
     radio_ok = true;
