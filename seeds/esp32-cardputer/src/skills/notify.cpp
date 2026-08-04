@@ -405,8 +405,11 @@ static int notify_unread_count() {
 /* Whether anything critical is still unacknowledged — the one piece of state
    UI_STATUS, whose first row is the clock, reacts to.
  *
- * STILL NO CALLER after the screens landed; see notify_top_unread_level(). */
-__attribute__((unused))
+ * Called by ui_rule_tick() on the loop task, at most a dozen or so times a
+ * second while the status screen is up — the ceiling its 80ms gate allows, and
+ * the reason it gates before asking rather than after: this walk holds an
+ * interrupt-disabling spinlock, and an ungated call would take it on every pass
+ * of loop(). */
 static bool notify_crit_unread() {
     bool found = false;
     portENTER_CRITICAL(&notify_mux);

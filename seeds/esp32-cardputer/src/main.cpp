@@ -1785,9 +1785,12 @@ static uint16_t ui_level_color(uint8_t level) {
 // ui_rgb() above already packs 5/6/5 in the order M5GFX expects, so the two
 // halves of the palette agree and nothing converts anything.
 //
-// Called by ui_draw_card(), for the tint, the border, the accent bar and both
-// text colours — five blends a fade frame.
-static uint16_t ui_blend(uint8_t alpha, uint16_t fg, uint16_t bg) {
+// Called by ui_draw_card() for the tint, the border, the accent bar, both text
+// colours and the outlines of the cards stacked behind it, and by
+// ui_rule_tick() for the breathing rule. The count a fade frame costs used to
+// be written down here and was wrong by the two stack outlines; it is not a
+// number anything depends on, so it is no longer kept.
+static constexpr uint16_t ui_blend(uint8_t alpha, uint16_t fg, uint16_t bg) {
     uint32_t a = alpha;
     uint32_t ia = 255u - a;
     uint32_t r = ((((uint32_t)fg >> 11) & 0x1F) * a +
@@ -2810,7 +2813,10 @@ static int32_t ui_row_y(int row) {
 }
 
 // Everything the frame owns rather than a field: the two rules. Drawn on a full
-// repaint only, because nothing ever erases them.
+// repaint, because nothing else ever erases them — with one exception, and it
+// is directly below: ui_rule_tick() repaints the upper rule in place, on its
+// own faster gate, while an unacknowledged critical is outstanding. Those two
+// functions are the only writers of row 20 in this file.
 //
 // Two screens are exceptions and take the lower rule with them.
 //
@@ -2828,6 +2834,215 @@ static void ui_draw_frame(ui_screen_t screen) {
     if (screen != UI_MESSAGE && screen != UI_STATUS) {
         M5.Display.drawFastHLine(0, UI_RULE2_Y, M5.Display.width(), COL_RULE);
     }
+}
+
+// ---- The breathing rule ----
+//
+// While an unacknowledged critical is outstanding the hairline under the header
+// breathes: its colour ramps from the ordinary rule toward red and back, one
+// full cycle every two seconds, and returns to COL_RULE when the last critical
+// is acknowledged.
+//
+// BREATHING RATHER THAN BLINKING IS THE WHOLE POINT. A blink is a hard edge the
+// eye keeps re-detecting, which is right for an alarm demanding an action in the
+// next second and wrong for a device sitting on a shelf saying "there is
+// something here for you". The ramp reads as present rather than urgent, and it
+// never goes dark, so the rule never looks broken.
+//
+// THE ARRIVAL OF A CRITICAL IS NOT ONE OF THE MOMENTS THIS IS VISIBLE, which is
+// worth knowing before wondering why the panel looked idle. A POST raises the
+// card: ui_tick() consumes the arrival, ui_enter_card() calls ui_goto(), and the
+// screen is UI_MESSAGE within one tick of the message landing, at which point
+// the guard below stops drawing. So the breath gets at most a step or two on the
+// way past. The two ways to actually see it are a critical that was already
+// unread at boot — the flag is persisted, so the node comes up on the clock with
+// the rule already breathing — and walking back to status from the card without
+// acknowledging, which is ` three times: the card leaves to the message list,
+// the list to the menu, the menu to status, and only Enter ever acks. GET /ui
+// reports the state on either route; see ui_rule_breathing below.
+//
+// FULL WIDTH, x=0..239, because that is what ui_draw_frame() above draws. The
+// firmware this is ported from insets its rule by 8px at each end; ours does
+// not, and repainting an inset span here would leave an 8px stub of the original
+// colour at each end of a rule that is otherwise moving.
+//
+// The ramp runs from COL_RULE at alpha 0 toward a ceiling of 160/255 of COL_CRIT
+// over it. In 5/6/5 the rule is (7,15,7) and that ceiling is (21,17,7), so red
+// climbs fourteen of its thirty-two steps, green two, and blue does not move at
+// all — the ramp never darkens and never arrives at full red.
+//
+// THE PEAK ACTUALLY REACHED IS 20 OR 21 IN RED AND WHICH ONE IS NOT FIXED. The
+// phase is sampled rather than stepped through (see the ramp below), so where
+// the steps happen to fall against the cycle decides whether any of them lands
+// above alpha 156, which is where red rounds up from 20 to 21. Both occur, and
+// on real timings both occur within a session. Fifteen distinct reds exist
+// between the two ends and a given phase visits most but not all of them, so the
+// ramp does skip a level here and there rather than walking every one.
+//
+// Cost is one drawFastHLine of 240 pixels per step. At 16 bits a pixel on this
+// board's 40MHz panel bus that is under 0.1ms, so at most about 0.13% of the bus.
+// When nothing is outstanding no pixel is written at all — but the step gate is
+// time-based only, so the notification store is still walked once per step while
+// status is up, outstanding or not. That takes the queue from being read about
+// once a second by ui_tick() to about a dozen times a second, permanently, on
+// the screen this device idles on. It is a few microseconds under a spinlock
+// each time and it is the price of the gate being this simple. A forced repaint,
+// for scale, is a fillScreen and every field on top of it, ~13ms.
+#define UI_RULE_BREATHE_MS      80    // minimum interval between steps
+#define UI_RULE_BREATHE_CYCLE 2000    // a full ramp up and back down
+#define UI_RULE_BREATHE_MAX    160    // ceiling on the blend of COL_CRIT over COL_RULE
+
+// ui_blend() takes the alpha as a uint8_t and the ramp below computes it in
+// unsigned long, so the ceiling has to fit that cast. No realistic edit reaches
+// this, which is the point of asserting it rather than trusting it.
+static_assert(UI_RULE_BREATHE_MAX <= 255,
+              "the breathing rule's alpha ceiling does not fit ui_blend()'s uint8_t");
+
+// "NEVER DARKENS" IS THE ONE CLAIM ABOVE THAT A LATER EDIT CAN BREAK, so it is
+// asserted rather than written down. ui_blend() is a weighted sum per channel
+// between the two colours, so it is monotone in alpha exactly when COL_CRIT is
+// no darker than COL_RULE in every channel separately — a palette re-tune that
+// made red darker than the rule anywhere would turn the breath into a dip toward
+// black, which reads as the rule flickering out rather than as anything present.
+static_assert(((COL_CRIT >> 11) & 0x1F) >= ((COL_RULE >> 11) & 0x1F) &&
+              ((COL_CRIT >>  5) & 0x3F) >= ((COL_RULE >>  5) & 0x3F) &&
+              ( COL_CRIT        & 0x1F) >= ( COL_RULE        & 0x1F),
+              "COL_CRIT is darker than COL_RULE in some channel, so the "
+              "breathing rule would dip toward black instead of toward red");
+
+// And the ceiling colour itself, which the note above names. ui_blend() is
+// constexpr and ui_rgb() constant-initialises both colours, so this is the
+// actual returned value and not a restatement of the arithmetic.
+static_assert(ui_blend(UI_RULE_BREATHE_MAX, COL_CRIT, COL_RULE) ==
+                  (uint16_t)((21u << 11) | (17u << 5) | 7u),
+              "the breathing rule's ceiling colour is no longer (21,17,7)");
+
+// What the last step actually put on row 20, for GET /ui.
+//
+// RULE 3 OF THE UI SECTION, AND THIS FEATURE IS THE REASON IT IS A RULE. There
+// is no camera on this node, and the breathing rule is the one thing the panel
+// can show that has no other witness at all: the clock face reports its strings,
+// the card reports its body, and until these three exist the rule reports
+// nothing. It is derivable by cross-referencing GET /notify against GET /ui, but
+// that derivation is precisely the "second, parallel description that can drift"
+// the rule forbids — it would keep saying "breathing" for a critical that is
+// unread while the panel sits on the menu, which is not what the glass shows.
+//
+// So they are written from the draw path and nowhere else, the way the clock
+// caches are: whatever is here is what was last painted, or was last decided not
+// to paint. ui_rule_breathing IS the falling-edge latch as well as the report,
+// deliberately one variable and not two — the latch's question ("does row 20
+// currently carry a tint?") and the endpoint's are the same question, and two
+// variables holding one fact is how a report starts drifting from the thing it
+// reports. ui_rule_alpha and ui_rule_steps describe the animation and are
+// meaningless without it, so handle_ui() omits them when it is false rather than
+// serving the last value from a breath that has already ended.
+//
+// Written on the loop task and read from AsyncTCP, which preempts it, exactly as
+// for ui_clock_drawn and ui_card_body_id — hence the ordering at each write
+// below, and no new locking policy.
+static bool     ui_rule_breathing = false;
+static uint8_t  ui_rule_alpha = 0;
+static uint32_t ui_rule_steps = 0;
+
+static void ui_rule_tick() {
+    static unsigned long last_step = 0;
+
+    // THE STEP GATE COMES FIRST AND THE STORE IS ASKED SECOND, and that order is
+    // the point of the function's shape. notify_crit_unread() walks the queue
+    // under portENTER_CRITICAL(&notify_mux), a spinlock that disables interrupts
+    // on this core. loop() ends in delay(10), so an ungated call would take that
+    // lock on every pass — of the order of ninety times a second — against at
+    // most twelve or thirteen through the gate. The ratio is what matters here
+    // and it is about seven to one; both figures are ceilings, since a pass
+    // costs the delay plus whatever else loop() did.
+    //
+    // Unsigned subtraction, which is what this file uses everywhere the stamp is
+    // written only by the loop task, and it is correct across the millis()
+    // rollover. Deliberately NOT the signed cast the abandoned-OTA check uses:
+    // that one exists because AsyncTCP stamps ota_last_chunk_ms and can leave it
+    // newer than the reading it is subtracted from. Nothing but this function
+    // ever writes last_step.
+    if (millis() - last_step < UI_RULE_BREATHE_MS) return;
+    last_step = millis();
+
+    // ui_tick() tests ui_ready at its top; a tick called straight from loop()
+    // inherits none of that. When panel autodetect fails ui_begin() returns
+    // before setRotation(1) and before any frame is drawn, and an ungated line
+    // here would go to an uninitialised panel — which M5GFX would clip in
+    // silence, with no error and no return value to notice it by.
+    if (!ui_ready) return;
+    // Every other screen owns its own header and none of them wants this. The
+    // read needs no guarding and the screen cannot be mid-change here: ui_screen
+    // is written only by ui_goto(), only ever on the loop task, and every caller
+    // of it — ui_key_poll() and ui_tick()'s arrival handling — runs earlier in
+    // the same pass than this does. ui_goto() also raises ui_force, which
+    // bypasses the tick gate, so the repaint that follows a change has already
+    // landed by the time this line reads the result. Being last in the pass is
+    // what buys that.
+    if (ui_screen != UI_STATUS) return;
+
+    if (!notify_crit_unread()) {
+        // Put the plain rule back exactly once, on the falling edge.
+        //
+        // THE LATCH IS FOR DETERMINISM AND NOT BECAUSE IT IS LOAD-BEARING. Every
+        // true->false transition already coincides with a forced full repaint
+        // today: notify_ack_id() and notify_ack_all() both raise ui_force_net
+        // when something actually changed, the keyboard ack additionally leaves
+        // the card through ui_goto(), and eviction raises it on the POST path —
+        // while expiry cannot clear a critical at all, since notify_expire()
+        // skips unread ones by design. Without the latch the failure mode is
+        // therefore not a stuck red rule but a rule that is correct late, by up
+        // to one UI_TICK_MS. The clock's drawn-mode latch is here for the same
+        // reason and the argument is the same one: correctness should not rest
+        // on where ui_force happens to be raised today.
+        if (ui_rule_breathing) {
+            // Cleared BEFORE the draw, which is the opposite of how the clock
+            // stamps ui_clock_drawn and is right for the opposite reason: that
+            // flag promises a cache is filled and must not be believed early,
+            // this one promises row 20 carries a tint and must not be believed
+            // late. A reader arriving mid-function is told the plainer of the
+            // two states in both cases.
+            ui_rule_breathing = false;
+            M5.Display.drawFastHLine(0, UI_RULE1_Y, M5.Display.width(), COL_RULE);
+        }
+        return;
+    }
+
+    // PHASE FROM ABSOLUTE TIME, NOT FROM AN ACCUMULATED DELTA. The ramp is a
+    // function of the clock and of nothing this function remembers, so the first
+    // step never depends on a previous one — which matters, because the unread
+    // flag is persisted and restored at boot and a critical can therefore be
+    // outstanding on the very first loop() pass, with nobody having touched
+    // anything. It is also why a step the loop was too busy to take costs one
+    // frame of the breath instead of shifting the whole of it.
+    //
+    // The one consequence worth writing down: 2^32 mod 2000 is 1296, so at the
+    // millis() rollover every 49.7 days the phase jumps 1296ms and the ramp shows
+    // a single discontinuity. That is the price of the stateless form, it is
+    // gone by the next step, and it is not a bug.
+    //
+    // THE PHASE IS SAMPLED, NOT STEPPED THROUGH, and that is why the ceiling
+    // above is a ceiling rather than a value. The stamp is re-taken from
+    // millis() rather than advanced by the period, so a step costs a whole loop
+    // quantum and the real interval is the gate plus whatever the pass took —
+    // eighty-something milliseconds, not eighty. Successive cycles therefore
+    // sample the ramp at drifting offsets and no fixed set of alphas repeats.
+    unsigned long pos  = millis() % UI_RULE_BREATHE_CYCLE;
+    unsigned long half = UI_RULE_BREATHE_CYCLE / 2;
+    unsigned long up   = (pos < half) ? pos : (UI_RULE_BREATHE_CYCLE - pos);
+    uint8_t alpha = (uint8_t)(up * UI_RULE_BREATHE_MAX / half);
+    M5.Display.drawFastHLine(0, UI_RULE1_Y, M5.Display.width(),
+                             ui_blend(alpha, COL_CRIT, COL_RULE));
+
+    // AFTER the draw, and the flag last of the three, so that a reader on the
+    // other task never sees ui_rule_breathing true beside an alpha from the
+    // previous step. ui_rule_steps is what distinguishes a live ramp from a
+    // stuck one: alpha alone revisits its values twice a cycle, so two polls
+    // that agree prove nothing, whereas this only ever counts up.
+    ui_rule_alpha = alpha;
+    ui_rule_steps++;
+    ui_rule_breathing = true;
 }
 
 // ---- The message list ----
@@ -4307,6 +4522,29 @@ static void handle_ui(AsyncWebServerRequest *request) {
             ui_status_row(mode, r, row, sizeof(row), true);
             rows.add(row);
         }
+
+        // The hairline under the header, which on this screen is the one thing
+        // on the panel with no other witness. ONLY ON THIS SCREEN, because this
+        // is the only screen where anything drives it: elsewhere ui_rule_tick()
+        // returns at its screen guard and these would be whatever the last
+        // status visit left behind. An absent key says "nothing is driving the
+        // rule here", which is the truth, where a false would claim the tick had
+        // looked and found nothing outstanding.
+        //
+        // See ui_rule_breathing: written from the draw path, so this is what the
+        // rule IS rather than what an unread critical implies it ought to be.
+        JsonObject rule = doc["rule"].to<JsonObject>();
+        rule["breathing"] = ui_rule_breathing;
+        if (ui_rule_breathing) {
+            // The blend of the last step, 0..UI_RULE_BREATHE_MAX, and the count
+            // of steps drawn since boot. Both describe the animation and neither
+            // means anything without it, so both are omitted when it is not
+            // running rather than left to go stale. Poll twice: `steps` moving
+            // is the proof that the ramp is live and not stuck at one colour,
+            // which no single reading can establish.
+            rule["alpha"] = ui_rule_alpha;
+            rule["steps"] = ui_rule_steps;
+        }
     }
 
     // The menu goes out on every screen, not just while it is open: it is the
@@ -5312,11 +5550,25 @@ void loop() {
     // latency owes nothing to this placement.
     notify_poll();
 
-    // The keyboard and the screen, in that order and only from here. Every
-    // HTTP handler runs on the AsyncTCP task and must never draw; see the note
-    // at the top of the UI section for what a second writer does to M5GFX.
+    // The keyboard and the screen, in that order and only from here. TWO
+    // FUNCTIONS DRAW AND NOT ONE: ui_tick() paints the frame and every field,
+    // and ui_rule_tick() repaints a single line of that frame on a faster gate
+    // of its own. Both run on the loop task, so the one-writer rule the UI
+    // section opens with still holds — every HTTP handler runs on the AsyncTCP
+    // task and must never draw; see that note for what a second writer does to
+    // M5GFX.
     ui_key_poll();
     ui_tick();
+    // AFTER ui_tick() AND NEVER BEFORE IT. A forced pass on the same loop() pass
+    // runs fillScreen and would paint over a step taken above it, leaving the
+    // rule flat until the next step, which is 80ms away at the very soonest.
+    // Being last is also what lets it read ui_screen without a race; see there.
+    //
+    // Its own gate rather than a home inside ui_tick(): an 80ms breath from in
+    // there would mean dropping the global tick interval to 80ms, which runs
+    // strftime, getFreeHeap and the notification spinlock two and a half times
+    // more often on every screen, for one line on one of them.
+    ui_rule_tick();
 
     delay(10);
 }
