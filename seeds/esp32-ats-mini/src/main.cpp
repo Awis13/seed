@@ -1139,6 +1139,10 @@ button.sec{background:#21262d;border-color:var(--border)}
 <select id="bandsel" onchange="setBand(this.value)"></select>
 </div>
 <div class="panel">
+<label>Theme</label>
+<select id="themesel" onchange="setTheme(this.value)"></select>
+</div>
+<div class="panel">
 <label>Memory</label>
 <div id="memlist" class="mono" style="font-size:.85rem">--</div>
 <label>Save / clear slot</label>
@@ -1219,6 +1223,7 @@ lastMute=!!s.mute;
 if(s.rds_ps&&s.rds_ps.trim()){$('rds').style.display='block';$('rds').textContent=s.rds_ps}else{$('rds').style.display='none'}
 if(document.activeElement!==$('volsl')&&s.volume!=null){$('volsl').value=s.volume;$('vollab').textContent=s.volume}
 if(document.activeElement!==$('sqsl')&&s.squelch!=null){$('sqsl').value=s.squelch;$('sqlab').textContent=s.squelch}
+if(document.activeElement!==$('themesel')&&s.theme!=null)$('themesel').value=s.theme;
 renderDsp(s);}
 if(h){$('uptime').textContent=fmtUp(h.uptime_sec);$('ver').textContent=h.version||'--'}})
 .catch(function(e){if(e&&e.handled)return;live('off');banner('Device offline')});
@@ -1236,6 +1241,8 @@ if(document.activeElement!==$('softmute')&&s.softmute!=null)$('softmute').value=
 if(document.activeElement!==$('cal')&&s.cal!=null)$('cal').value=s.cal}}
 function setBand(v){post('/radio/band',{idx:parseInt(v,10)}).then(poll).catch(function(){})}
 function loadBands(){api('/radio/bands').then(function(r){if(r.status!==200)return;var b=r.body,sel=$('bandsel');sel.innerHTML='';(b.bands||[]).forEach(function(x){var o=document.createElement('option');o.value=x.idx;o.textContent=x.name;if(x.idx===b.current)o.selected=true;sel.appendChild(o)})}).catch(function(){})}
+function setTheme(v){post('/radio/config',{theme:parseInt(v,10)}).then(poll).catch(function(){})}
+function loadThemes(){api('/radio/themes').then(function(r){if(r.status!==200)return;var b=r.body,sel=$('themesel');sel.innerHTML='';(b.themes||[]).forEach(function(x){var o=document.createElement('option');o.value=x.idx;o.textContent=x.name;if(x.idx===b.current)o.selected=true;sel.appendChild(o)})}).catch(function(){})}
 function loadMemory(){api('/radio/memory').then(function(r){if(r.status!==200)return;var h='';(r.body.slots||[]).forEach(function(x){h+='<div class="row" style="align-items:center;margin-bottom:4px"><span style="flex:2">#'+x.slot+' '+x.band+' '+x.freq_display+' '+x.mode+'</span><button class="sec" style="flex:1" onclick="memRecall('+x.slot+')">Recall</button></div>'});$('memlist').innerHTML=h||'<span style="color:var(--muted)">no saved slots</span>'}).catch(function(){})}
 function memRecall(n){post('/radio/memory',{slot:n,action:'recall'}).then(function(){poll();loadMemory()}).catch(function(){})}
 function memAct(a){var n=parseInt($('memslot').value,10);if(!n){banner('Enter a slot 1-99');return}post('/radio/memory',{slot:n,action:a}).then(function(){loadMemory();if(a!=='clear')poll()}).catch(function(){})}
@@ -1243,7 +1250,7 @@ function setCfg(k,id){var v=$(id).value;if(v===''){banner('Enter a value');retur
 function setMetric(b){post('/radio/config',{squelch_snr:b}).then(poll).catch(function(){})}
 function setTz(){var v=$('tzin').value.trim();if(!v){banner('Enter a TZ string');return}api('/clock/tz',{method:'POST',headers:{'Content-Type':'text/plain'},body:v}).then(function(r){if(r.status>=400){banner((r.body&&r.body.error)||('Error '+r.status));return}banner('');$('tzin').value=''}).catch(function(e){if(e&&e.handled)return})}
 function loadCaps(){if(!token)return;api('/capabilities').then(function(r){if(r.status!==200)return;var c=r.body;$('batt').textContent=(c.battery_v!=null?c.battery_v+' V':'n/a');$('temp').textContent=(c.temp_c!=null?c.temp_c+' C':'--');$('wrssi').textContent=(c.wifi_rssi!=null?c.wifi_rssi+' dBm':'--');$('heap').textContent=(c.free_heap!=null?((c.free_heap/1024)|0)+' KB':'--');$('ip').textContent=c.wifi_ip||'--'}).catch(function(){})}
-function boot(){if(!token){showLogin();return}loadBands();loadMemory();loadCaps()}
+function boot(){if(!token){showLogin();return}loadBands();loadThemes();loadMemory();loadCaps()}
 if(token)showApp();else showLogin();
 poll();boot();setInterval(poll,1000);setInterval(loadCaps,5000);
 </script></body></html>)HTML";

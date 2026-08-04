@@ -38,6 +38,7 @@
 void        display_set_theme(uint8_t idx);
 uint8_t     display_get_theme();
 uint8_t     display_theme_count();
+const char *display_theme_name(uint8_t i);
 
 /*
  * Mode constants follow the ref ats-mini numbering so the SSB mode value doubles
@@ -596,7 +597,7 @@ static int     menu_settings_idx = 0; /* cursor in the SETTINGS sublist */
  * no-op on FM/AM). Its cursor is a 0..400 INDEX (Hz = idx*10 - 2000), not the raw Hz,
  * so the five-row window steps one detent per row (a raw-Hz cursor with a 10 Hz step
  * would leave four of every five rows blank). */
-enum AdjustTarget { ADJ_STEP, ADJ_BW, ADJ_MODE, ADJ_SQUELCH, ADJ_AGC, ADJ_AVC, ADJ_SOFTMUTE, ADJ_CAL };
+enum AdjustTarget { ADJ_STEP, ADJ_BW, ADJ_MODE, ADJ_SQUELCH, ADJ_AGC, ADJ_AVC, ADJ_SOFTMUTE, ADJ_CAL, ADJ_THEME };
 static uint8_t adjust_target = ADJ_STEP;
 /* Cursor in the BAND picker (indexes bands[]). Re-seeded from radio_get_band_idx()
  * each time MENU_BAND is entered, so the list always opens on the active band. */
@@ -650,7 +651,8 @@ static const SkillEndpoint radio_endpoints[] = {
     {"POST", "/radio/tune",   "Tune: {mode:\"FM\"|\"AM\"|\"LSB\"|\"USB\", freq:<int>, bfo?:<int>}"},
     {"POST", "/radio/band",   "Jump to a band-plan preset: {idx:<int>}"},
     {"GET",  "/radio/bands",  "List band-plan presets for UI: {bands:[{idx,name}],current}"},
-    {"POST", "/radio/config", "Set mode/step/bandwidth/squelch/mute/DSP: {mode?:\"AM\"|\"LSB\"|\"USB\", step_idx?:<int>, bw_idx?:<int>, squelch?:0-127, squelch_snr?:<bool>, mute?:<bool>, agc?:<int>, avc?:<even 12-90>, softmute?:0-32, cal?:<-2000-2000 SSB>}"},
+    {"GET",  "/radio/themes", "List colour themes for UI: {themes:[{idx,name}],current}"},
+    {"POST", "/radio/config", "Set mode/step/bandwidth/squelch/mute/DSP/theme: {mode?:\"AM\"|\"LSB\"|\"USB\", step_idx?:<int>, bw_idx?:<int>, squelch?:0-127, squelch_snr?:<bool>, mute?:<bool>, agc?:<int>, avc?:<even 12-90>, softmute?:0-32, cal?:<-2000-2000 SSB>, theme?:<int>}"},
     {"POST", "/radio/volume", "Set volume: {volume:0-63}"},
     {"POST", "/radio/scan",   "Sweep current-mode band: {from,to,step,min_rssi?} -> RSSI/SNR per step"},
     {"GET",  "/radio/status", "Current freq/mode/RSSI/SNR (+bfo in SSB, +RDS ps/rt/pi/pty in FM)"},
@@ -668,7 +670,8 @@ static const char *radio_describe() {
            "| POST | /radio/tune | Tune: `{\"mode\":\"FM|AM|LSB|USB\",\"freq\":<int>,\"bfo\":<int>}` |\n"
            "| POST | /radio/band | Jump to a band-plan preset: `{\"idx\":<int>}` |\n"
            "| GET | /radio/bands | List band-plan presets (name + index) for UI dropdowns |\n"
-           "| POST | /radio/config | Set mode/step/bandwidth + squelch/mute + DSP: `{\"mode\":\"AM|LSB|USB\",\"step_idx\":<int>,\"bw_idx\":<int>,\"squelch\":<0..127>,\"squelch_snr\":<bool>,\"mute\":<bool>,\"agc\":<int>,\"avc\":<even 12..90>,\"softmute\":<0..32>,\"cal\":<-2000..2000>}` |\n"
+           "| GET | /radio/themes | List colour themes (name + index) for the UI selector |\n"
+           "| POST | /radio/config | Set mode/step/bandwidth + squelch/mute + DSP + theme: `{\"mode\":\"AM|LSB|USB\",\"step_idx\":<int>,\"bw_idx\":<int>,\"squelch\":<0..127>,\"squelch_snr\":<bool>,\"mute\":<bool>,\"agc\":<int>,\"avc\":<even 12..90>,\"softmute\":<0..32>,\"cal\":<-2000..2000>,\"theme\":<int>}` |\n"
            "| POST | /radio/volume | Set volume: `{\"volume\":<0..63>}` |\n"
            "| POST | /radio/scan | Blocking band sweep in the current mode: `{\"from\":<int>,\"to\":<int>,\"step\":<int>,\"min_rssi\":<int>}` |\n"
            "| GET | /radio/status | Current freq, mode, RSSI, SNR (+bfo in SSB; +RDS `rds_ps`/`rds_rt`/`pi`/`pty` in FM) |\n"
@@ -836,6 +839,9 @@ int radio_get_menu_idx() {
                                                     : band_lsb_cal[radio_band_idx];
                 return (cal + RADIO_CAL_MAX) / RADIO_CAL_STEP;
             }
+            /* ADJ_THEME: cursor IS the global theme index (display owns it). */
+            if (adjust_target == ADJ_THEME)
+                return display_get_theme();
             /* ADJ_MODE: cursor is the band's mode position within modeCycle. */
             return mode_cycle_pos(band_mode[radio_band_idx]);
         }
@@ -857,6 +863,7 @@ int radio_get_menu_count() {
             if (adjust_target == ADJ_SOFTMUTE) return 33;  /* 0..32 */
             /* +/-RADIO_CAL_MAX Hz in RADIO_CAL_STEP detents -> 0..400 index, 401 rows. */
             if (adjust_target == ADJ_CAL) return 2 * RADIO_CAL_MAX / RADIO_CAL_STEP + 1;
+            if (adjust_target == ADJ_THEME) return display_theme_count();
             return MODE_CYCLE_COUNT;
         default:            return MENU_MAIN_COUNT;
     }
@@ -878,6 +885,7 @@ const char *radio_get_menu_title() {
             if (adjust_target == ADJ_AVC) return "AVC";
             if (adjust_target == ADJ_SOFTMUTE) return "SoftMute";
             if (adjust_target == ADJ_CAL) return "Cal Hz";
+            if (adjust_target == ADJ_THEME) return "Theme";
             return "Mode";
         default:            return "Menu";
     }
@@ -929,6 +937,12 @@ const char *radio_get_menu_item(int i) {
             if (!radio_is_ssb(band_table_mode()) || i < 0 || i > last) return "";
             snprintf(buf, sizeof(buf), "%+d", i * RADIO_CAL_STEP - RADIO_CAL_MAX);
             return buf;
+        }
+        if (adjust_target == ADJ_THEME) {
+            /* Theme names come from display.cpp; wrap the window index modulo the
+             * count like the band list so the caller can ask cursor-2..cursor+2. */
+            int n = display_theme_count();
+            return display_theme_name((uint8_t)(((i % n) + n) % n));
         }
         /* Menu window items come from the band's own table mode, not radio_mode. */
         uint8_t m = band_table_mode();
@@ -1677,6 +1691,26 @@ static void radio_register_routes(AsyncWebServer &server) {
         req->send(200, "application/json", response);
     });
 
+    /* GET /radio/themes — the colour-theme list for the UI selector: each name with
+     * its index, plus the current theme. The palette lives in display.cpp; this reads
+     * it through the public accessors, so no receiver access and no radio_ok gate. */
+    server.on("/radio/themes", HTTP_GET, [](AsyncWebServerRequest *req) {
+        if (!require_auth(req)) return;
+
+        JsonDocument doc;
+        JsonArray arr = doc["themes"].to<JsonArray>();
+        uint8_t n = display_theme_count();
+        for (uint8_t i = 0; i < n; i++) {
+            JsonObject o = arr.add<JsonObject>();
+            o["idx"] = i;
+            o["name"] = display_theme_name(i);
+        }
+        doc["current"] = display_get_theme();
+        String response;
+        serializeJson(doc, response);
+        req->send(200, "application/json", response);
+    });
+
     /* POST /radio/config — set the current band's demod mode and/or tuning step
      * and/or channel bandwidth. step_idx/bw_idx are indices into the (effective)
      * mode's step/bandwidth table, matching the desc strings reported by
@@ -1690,11 +1724,9 @@ static void radio_register_routes(AsyncWebServer &server) {
             return;
         }
 
-        if (!radio_ok) {
-            req->send(503, "application/json", "{\"error\":\"SI4732 not detected\"}");
-            return;
-        }
-
+        /* No radio_ok gate here: the "theme" field is a global DISPLAY property and
+         * must work even when the SI4732 was never detected. The receiver-affecting
+         * fields are gated on radio_ok further down, once we know one was requested. */
         char *body = (char*)req->_tempObject;
         if (!body) { req->send(400, "application/json", "{\"error\":\"no body\"}"); return; }
 
@@ -1738,6 +1770,12 @@ static void radio_register_routes(AsyncWebServer &server) {
         bool has_cal = !input["cal"].isNull();
         int  cal_v   = input["cal"] | 0;
 
+        /* Optional global colour theme: "theme" (0..count-1). A DISPLAY property, not a
+         * receiver setting — applied without radio_ok and without radio_mtx (the palette
+         * is guarded by display_mtx inside display_set_theme). */
+        bool has_theme = !input["theme"].isNull();
+        int  theme_v   = input["theme"] | -1;
+
         /* Parse the optional demod mode. Only AM/LSB/USB are settable here: FM is a
          * broadcast demod locked to the VHF band (a native-FM band is rejected under
          * the lock below), so it is never a valid config target. */
@@ -1753,14 +1791,49 @@ static void radio_register_routes(AsyncWebServer &server) {
         free(body); req->_tempObject = nullptr;
 
         if (!has_step && !has_bw && !has_mode && !has_squelch && !has_mute &&
-            !has_agc && !has_avc && !has_sm && !has_cal) {
+            !has_agc && !has_avc && !has_sm && !has_cal && !has_theme) {
             req->send(400, "application/json",
-                "{\"error\":\"provide step_idx, bw_idx, mode, squelch, mute, agc, avc, softmute and/or cal\"}");
+                "{\"error\":\"provide step_idx, bw_idx, mode, squelch, mute, agc, avc, softmute, cal and/or theme\"}");
             return;
         }
         if (mode_str_bad) {
             req->send(400, "application/json",
                 "{\"error\":\"mode must be AM, LSB or USB\"}");
+            return;
+        }
+
+        /* Apply the global theme BEFORE the radio_ok gate: it is a display property, so
+         * a theme change must take effect even when the receiver is absent. Validate the
+         * range first, then set it under display_mtx (inside display_set_theme) — never
+         * under radio_mtx, to avoid nesting the two locks. Persisted (v7). */
+        if (has_theme) {
+            if (theme_v < 0 || theme_v >= (int)display_theme_count()) {
+                char err[48];
+                snprintf(err, sizeof(err),
+                    "{\"error\":\"theme out of range (0..%d)\"}", display_theme_count() - 1);
+                req->send(400, "application/json", err);
+                return;
+            }
+            display_set_theme((uint8_t)theme_v);
+            radio_mark_dirty();
+        }
+
+        /* If the only field was the theme, respond now without touching the receiver —
+         * this path succeeds regardless of radio_ok. Any receiver-affecting field falls
+         * through to the radio_ok gate below. */
+        bool has_radio_field = has_step || has_bw || has_mode || has_squelch ||
+                               has_mute || has_agc || has_avc || has_sm || has_cal;
+        if (!has_radio_field) {
+            JsonDocument doc;
+            doc["ok"] = true;
+            doc["theme"] = display_get_theme();
+            String response;
+            serializeJson(doc, response);
+            req->send(200, "application/json", response);
+            return;
+        }
+        if (!radio_ok) {
+            req->send(503, "application/json", "{\"error\":\"SI4732 not detected\"}");
             return;
         }
 
@@ -1956,6 +2029,8 @@ static void radio_register_routes(AsyncWebServer &server) {
         }
         /* Cal is SSB-only; report it only in LSB/USB. */
         if (mode_is_ssb) doc["cal"] = cal_snap;
+        /* Theme is global; always report the current index. */
+        doc["theme"] = display_get_theme();
         String response;
         serializeJson(doc, response);
         req->send(200, "application/json", response);
@@ -2200,6 +2275,9 @@ static void radio_register_routes(AsyncWebServer &server) {
             doc["avc"] = avc_snap;
             doc["softmute"] = sm_snap;
         }
+        /* Global colour theme (a display property, not gated by receiver mode). */
+        doc["theme"] = display_get_theme();
+        doc["theme_name"] = display_theme_name(display_get_theme());
         /* RDS is an FM-broadcast feature; report the decoded fields only in FM. pi is
          * the numeric 16-bit Program Identification, pty the 5-bit Program Type. */
         if (lmode_fm) {
@@ -2482,9 +2560,15 @@ static void radio_tick() {
                         menu_level = MENU_ADJUST;
                         adjust_target = ADJ_CAL;
                         break;
+                    case SI_THEME:
+                        /* Descend into the theme list editor. The palette is a global
+                         * display property (not per-radio), edited live under display_mtx. */
+                        menu_level = MENU_ADJUST;
+                        adjust_target = ADJ_THEME;
+                        break;
                     default:
-                        /* SI_BRIGHTNESS/SI_THEME/SI_ABOUT placeholders (TODO: wire real
-                         * editors) and SI_BACK all step back up to the MAIN list. */
+                        /* SI_BRIGHTNESS/SI_ABOUT placeholders (TODO: wire real editors)
+                         * and SI_BACK all step back up to the MAIN list. */
                         menu_level = MENU_MAIN;
                         break;
                 }
@@ -2612,6 +2696,15 @@ static void radio_tick() {
                         radio_mark_dirty();
                     }
                     xSemaphoreGive(radio_mtx);
+                } else if (adjust_target == ADJ_THEME) {
+                    /* Global theme select. The palette lives in display.cpp and is
+                     * guarded by display_mtx, NOT radio_mtx — so this branch takes no
+                     * radio lock (nesting radio_mtx <-> display_mtx is forbidden).
+                     * display_set_theme forces a full repaint, so scrolling previews
+                     * each theme live. Persisted (v7); mark_dirty triggers the flush. */
+                    int v = menu_wrap(display_get_theme(), d, display_theme_count());
+                    display_set_theme((uint8_t)v);
+                    radio_mark_dirty();
                 } else {
                     /* The value editor scrolls the parameter itself, not a cursor:
                      * bump the active band's step/bandwidth row and apply it live so
