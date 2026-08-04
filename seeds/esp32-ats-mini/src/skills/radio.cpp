@@ -306,6 +306,29 @@ static int16_t  band_usb_cal[BAND_COUNT];
 static int16_t  band_lsb_cal[BAND_COUNT];
 
 /*
+ * Memory channels. A flat bank of MEMORY_COUNT preset slots, each a full snapshot of a
+ * tuned station: frequency (in the band's own units), the band index it belongs to, the
+ * live demod mode and the step/bandwidth cursors, plus the SSB sideband calibration trim
+ * (0 for FM/AM). freq == 0 marks an empty slot (as in the ref), so the zero-initialised
+ * .bss array starts entirely empty. Touched only from the HTTP handlers (save/recall/
+ * clear/list); the two that drive the receiver (save/recall) hold radio_mtx around the
+ * state/rx access. Persisted to a separate SPIFFS file (MEMORY_STATE_FILE), independent
+ * of radio.json — the radio-state schema/version is not affected.
+ */
+struct MemorySlot {
+    uint16_t freq;   /* tuned frequency in the band's units; 0 => empty slot */
+    uint8_t  band;   /* band index into bands[] (0..BAND_COUNT-1) */
+    uint8_t  mode;   /* RADIO_MODE_FM | _LSB | _USB | _AM */
+    uint8_t  step;   /* band_step_idx row for that band's mode */
+    uint8_t  bw;     /* band_bw_idx row for that band's mode */
+    int16_t  cal;    /* SSB sideband calibration trim (Hz); 0 in FM/AM */
+};
+#define MEMORY_COUNT 99
+#define MEMORY_STATE_FILE    "/memory.json"
+#define MEMORY_STATE_VERSION 1
+static MemorySlot memories[MEMORY_COUNT];  /* zero-init in .bss -> all slots empty */
+
+/*
  * Canonical mode of the active band's step/bandwidth tables. The stored
  * band_step_idx/band_bw_idx are row indices into THIS mode's table — the band's
  * own mode (bands[radio_band_idx].mode), NOT the live radio_mode. /radio/tune
@@ -549,6 +572,8 @@ static const SkillEndpoint radio_endpoints[] = {
     {"POST", "/radio/volume", "Set volume: {volume:0-63}"},
     {"POST", "/radio/scan",   "Sweep current-mode band: {from,to,step,min_rssi?} -> RSSI/SNR per step"},
     {"GET",  "/radio/status", "Current freq/mode/RSSI/SNR (+bfo in SSB)"},
+    {"GET",  "/radio/memory", "List occupied memory slots: {count, slots:[{slot,band,freq,mode,freq_display}]}"},
+    {"POST", "/radio/memory", "Save/recall/clear a memory slot: {slot:1-99, action:\"save\"|\"recall\"|\"clear\"}"},
     {NULL, NULL, NULL}
 };
 
@@ -563,7 +588,9 @@ static const char *radio_describe() {
            "| POST | /radio/config | Set mode/step/bandwidth + squelch/mute + DSP: `{\"mode\":\"AM|LSB|USB\",\"step_idx\":<int>,\"bw_idx\":<int>,\"squelch\":<0..127>,\"squelch_snr\":<bool>,\"mute\":<bool>,\"agc\":<int>,\"avc\":<even 12..90>,\"softmute\":<0..32>,\"cal\":<-2000..2000>}` |\n"
            "| POST | /radio/volume | Set volume: `{\"volume\":<0..63>}` |\n"
            "| POST | /radio/scan | Blocking band sweep in the current mode: `{\"from\":<int>,\"to\":<int>,\"step\":<int>,\"min_rssi\":<int>}` |\n"
-           "| GET | /radio/status | Current freq, mode, RSSI, SNR (+bfo in SSB) |\n\n"
+           "| GET | /radio/status | Current freq, mode, RSSI, SNR (+bfo in SSB) |\n"
+           "| GET | /radio/memory | List occupied memory slots |\n"
+           "| POST | /radio/memory | Save/recall/clear a memory slot |\n\n"
            "### Frequency units\n\n"
            "- FM: 10 kHz steps, so `10000` = 100.0 MHz (range 6400..10800)\n"
            "- AM: kHz, so `1000` = 1000 kHz (range 520..1710)\n"
@@ -603,6 +630,17 @@ static const char *radio_describe() {
            "- Step ceiling: `(to - from) / step + 1` must be <= 64 (a sweep runs under\n"
            "  the 3 s request ACK timeout); use a coarser step or paginate otherwise\n"
            "- Response: `{\"mode\",\"from\",\"to\",\"step\",\"count\",\"points\":[{\"freq\",\"rssi\",\"snr\"}]}`\n\n"
+           "### Memory channels\n\n"
+           "A bank of 99 preset slots, numbered `1`..`99`, each a full snapshot of a\n"
+           "tuned station (band, frequency, mode, step, bandwidth and SSB calibration).\n"
+           "The bank persists to flash (separate from the tuning state).\n\n"
+           "- `GET /radio/memory` lists the occupied slots only:\n"
+           "  `{\"count\":<int>,\"slots\":[{\"slot\":<1..99>,\"band\":<name>,\"freq\":<int>,\"mode\":<str>,\"freq_display\":<str>}]}`.\n"
+           "- `POST /radio/memory` `{\"slot\":<1..99>,\"action\":\"save|recall|clear\"}`:\n"
+           "  - `save` stores the current tuning into the slot (overwrites).\n"
+           "  - `recall` retunes the receiver to the slot; an empty slot is a 409.\n"
+           "  - `clear` empties the slot.\n"
+           "  An out-of-range `slot` or an unknown `action` is a 400.\n\n"
            "### Examples\n\n"
            "```\n"
            "curl -H 'Authorization: Bearer <token>' -X POST \\\n"
@@ -1127,6 +1165,159 @@ const char *radio_get_band_name() { return bands[radio_band_idx].name; }
 uint8_t radio_get_band_count() { return BAND_COUNT; }
 const char *radio_get_band_name_at(uint8_t i) {
     return (i < BAND_COUNT) ? bands[i].name : "";
+}
+
+/* --- Memory channels: snapshot / recall / clear + SPIFFS persistence --- */
+
+/*
+ * Snapshot the current tuning into memory slot i (0..MEMORY_COUNT-1). Under radio_mtx
+ * so the read of the live band/freq/step/bw/cal is coherent with a concurrent encoder
+ * tune. The stored mode is the band's live demod (band_mode[]), and the cal is the
+ * matching sideband slot for SSB (0 otherwise). Does not touch flash — the caller flushes
+ * the bank via memory_store_save() after the lock is released.
+ */
+static void radio_memory_save(uint8_t i) {
+    if (i >= MEMORY_COUNT) return;
+    xSemaphoreTake(radio_mtx, portMAX_DELAY);
+    uint8_t b = radio_band_idx;
+    uint8_t m = band_mode[b];
+    int16_t cal = 0;
+    if (radio_is_ssb(m))
+        cal = (m == RADIO_MODE_USB) ? band_usb_cal[b] : band_lsb_cal[b];
+    memories[i].freq = radio_freq;
+    memories[i].band = b;
+    memories[i].mode = m;
+    memories[i].step = band_step_idx[b];
+    memories[i].bw   = band_bw_idx[b];
+    memories[i].cal  = cal;
+    xSemaphoreGive(radio_mtx);
+}
+
+/*
+ * Recall memory slot i onto the receiver. Returns false when the slot is empty or holds
+ * a corrupt band/mode. Mirrors radio_select_band: saves the outgoing band's live freq
+ * first, seeds the target band's mode/step/bw/cal from the slot, clips the stored freq to
+ * the band's window and drives the chip through apply_band_locked (which handles the SSB
+ * patch load/unload and folds the cal into the BFO). Under radio_mtx; marks state dirty.
+ */
+static bool radio_recall_memory(uint8_t i) {
+    if (i >= MEMORY_COUNT) return false;
+    MemorySlot m = memories[i];
+    if (m.freq == 0) return false;                 /* empty slot */
+    if (m.band >= BAND_COUNT) return false;        /* corrupt band index */
+    if (m.mode != RADIO_MODE_FM && m.mode != RADIO_MODE_LSB &&
+        m.mode != RADIO_MODE_USB && m.mode != RADIO_MODE_AM) return false;
+
+    xSemaphoreTake(radio_mtx, portMAX_DELAY);
+    /* Remember where we were on the band we are leaving. */
+    band_freq[radio_band_idx] = radio_freq;
+    /* Seed the target band's live state from the slot before apply_band_locked reads it. */
+    band_mode[m.band]     = m.mode;
+    band_step_idx[m.band] = clamp_idx(m.step, stepCount(m.mode));
+    band_bw_idx[m.band]   = clamp_idx(m.bw, bwCount(m.mode));
+    if (radio_is_ssb(m.mode)) {
+        if (m.mode == RADIO_MODE_USB) band_usb_cal[m.band] = m.cal;
+        else                          band_lsb_cal[m.band] = m.cal;
+    }
+    /* Clip the stored frequency to the target band's window. */
+    uint16_t f = m.freq;
+    if (f < bands[m.band].minFreq) f = bands[m.band].minFreq;
+    if (f > bands[m.band].maxFreq) f = bands[m.band].maxFreq;
+    apply_band_locked(m.band, f);
+    radio_mark_dirty();
+    xSemaphoreGive(radio_mtx);
+    return true;
+}
+
+/*
+ * Clear memory slot i (mark it empty). freq == 0 is the empty sentinel; the radio_mtx
+ * hold is only for consistency with the other memories[] writers (a single aligned store
+ * would be atomic anyway). The flash flush is the caller's job (memory_store_save()).
+ */
+static void radio_memory_clear(uint8_t i) {
+    if (i >= MEMORY_COUNT) return;
+    xSemaphoreTake(radio_mtx, portMAX_DELAY);
+    memories[i].freq = 0;
+    xSemaphoreGive(radio_mtx);
+}
+
+/*
+ * Serialise the occupied slots to MEMORY_STATE_FILE. Compact schema: only non-empty
+ * slots, keyed by slot index "0".."98", each a [freq,band,mode,step,bw,cal] array. The
+ * bank is snapshotted into the JSON under a short radio_mtx hold so a concurrent save/
+ * clear can't tear a slot; the blocking flash write (write_spiffs_file, which detaches the
+ * encoder itself) then runs OUTSIDE the lock. Called after every save/clear.
+ */
+static void memory_store_save() {
+    JsonDocument doc;
+    doc["v"] = MEMORY_STATE_VERSION;
+    JsonObject slots = doc["slots"].to<JsonObject>();
+    char key[4];
+    xSemaphoreTake(radio_mtx, portMAX_DELAY);
+    for (uint8_t i = 0; i < MEMORY_COUNT; i++) {
+        if (memories[i].freq == 0) continue;
+        snprintf(key, sizeof(key), "%u", (unsigned)i);
+        JsonArray a = slots[key].to<JsonArray>();
+        a.add(memories[i].freq);
+        a.add(memories[i].band);
+        a.add(memories[i].mode);
+        a.add(memories[i].step);
+        a.add(memories[i].bw);
+        a.add(memories[i].cal);
+    }
+    xSemaphoreGive(radio_mtx);
+    String out;
+    serializeJson(doc, out);
+    write_spiffs_file(MEMORY_STATE_FILE, out);  /* blocking flash write + encoder detach */
+}
+
+/*
+ * Load the memory bank from MEMORY_STATE_FILE over the empty default. Runs once at boot
+ * from skill_radio_init(), single-tasked (server not up yet), so no lock. A missing/
+ * unparseable file or a version mismatch leaves every slot empty. Each slot is validated:
+ * a bad band, mode or a zero/oversized freq drops that slot to empty, the freq is clipped
+ * to the band's window and the cal is zeroed on a non-SSB mode.
+ */
+static void memory_store_load() {
+    String raw = read_spiffs_file(MEMORY_STATE_FILE);
+    if (raw.length() == 0) return;  /* no saved bank -> keep all slots empty */
+
+    JsonDocument doc;
+    if (deserializeJson(doc, raw) != DeserializationError::Ok) return;
+    if ((int)(doc["v"] | 0) != MEMORY_STATE_VERSION) return;
+
+    JsonObjectConst slots = doc["slots"].as<JsonObjectConst>();
+    if (slots.isNull()) return;
+
+    for (JsonPairConst kv : slots) {
+        int idx = atoi(kv.key().c_str());
+        if (idx < 0 || idx >= MEMORY_COUNT) continue;
+        JsonArrayConst a = kv.value().as<JsonArrayConst>();
+        if (a.isNull() || a.size() < 6) continue;
+        long freq = a[0] | 0L;
+        int  band = a[1] | -1;
+        int  mode = a[2] | -1;
+        int  step = a[3] | 0;
+        int  bw   = a[4] | 0;
+        int  cal  = a[5] | 0;
+        /* Validate; a bad slot stays empty rather than poisoning the bank. */
+        if (freq <= 0 || freq > 0xFFFF) continue;
+        if (band < 0 || band >= BAND_COUNT) continue;
+        if (mode != RADIO_MODE_FM && mode != RADIO_MODE_LSB &&
+            mode != RADIO_MODE_USB && mode != RADIO_MODE_AM) continue;
+        /* Clip the stored freq to the band's window. */
+        uint16_t f = (uint16_t)freq;
+        if (f < bands[band].minFreq) f = bands[band].minFreq;
+        if (f > bands[band].maxFreq) f = bands[band].maxFreq;
+        if (cal < -RADIO_CAL_MAX) cal = -RADIO_CAL_MAX;
+        if (cal >  RADIO_CAL_MAX) cal =  RADIO_CAL_MAX;
+        memories[idx].freq = f;
+        memories[idx].band = (uint8_t)band;
+        memories[idx].mode = (uint8_t)mode;
+        memories[idx].step = clamp_idx((uint8_t)step, stepCount((uint8_t)mode));
+        memories[idx].bw   = clamp_idx((uint8_t)bw, bwCount((uint8_t)mode));
+        memories[idx].cal  = radio_is_ssb((uint8_t)mode) ? (int16_t)cal : 0;
+    }
 }
 
 static void radio_register_routes(AsyncWebServer &server) {
@@ -1847,6 +2038,125 @@ static void radio_register_routes(AsyncWebServer &server) {
         serializeJson(doc, response);
         req->send(200, "application/json", response);
     });
+
+    /* GET /radio/memory — list the occupied memory slots, compact (only non-empty).
+     * Slot numbers are exposed 1..MEMORY_COUNT (the internal index + 1). Reads the bank
+     * under radio_mtx; no receiver access, so no radio_ok gate. */
+    server.on("/radio/memory", HTTP_GET, [](AsyncWebServerRequest *req) {
+        if (!require_auth(req)) return;
+
+        JsonDocument doc;
+        JsonArray arr = doc["slots"].to<JsonArray>();
+        int count = 0;
+        xSemaphoreTake(radio_mtx, portMAX_DELAY);
+        for (uint8_t i = 0; i < MEMORY_COUNT; i++) {
+            if (memories[i].freq == 0) continue;
+            MemorySlot m = memories[i];
+            JsonObject o = arr.add<JsonObject>();
+            o["slot"] = i + 1;  /* 1..MEMORY_COUNT in the API */
+            o["band"] = (m.band < BAND_COUNT) ? bands[m.band].name : "?";
+            o["freq"] = m.freq;
+            o["mode"] = radio_mode_str(m.mode);
+            char fd[24];
+            radio_format_freq(m.freq, m.mode, fd, sizeof(fd));
+            o["freq_display"] = fd;
+            count++;
+        }
+        xSemaphoreGive(radio_mtx);
+        doc["count"] = count;
+        String response;
+        serializeJson(doc, response);
+        req->send(200, "application/json", response);
+    });
+
+    /* POST /radio/memory — save/recall/clear a memory slot: {slot:1..MEMORY_COUNT,
+     * action:"save"|"recall"|"clear"}. save/clear rewrite the SPIFFS bank (outside
+     * radio_mtx); recall drives the receiver through radio_recall_memory. */
+    server.on("/radio/memory", HTTP_POST, [](AsyncWebServerRequest *req) {
+        if (!require_auth(req)) {
+            /* Body callback already ran; free the collected buffer before bailing. */
+            if (req->_tempObject) { free(req->_tempObject); req->_tempObject = nullptr; }
+            return;
+        }
+
+        if (!radio_ok) {
+            req->send(503, "application/json", "{\"error\":\"SI4732 not detected\"}");
+            return;
+        }
+
+        char *body = (char*)req->_tempObject;
+        if (!body) { req->send(400, "application/json", "{\"error\":\"no body\"}"); return; }
+
+        JsonDocument input;
+        if (deserializeJson(input, body) != DeserializationError::Ok) {
+            free(body); req->_tempObject = nullptr;
+            req->send(400, "application/json", "{\"error\":\"invalid JSON\"}");
+            return;
+        }
+
+        int slot = input["slot"] | -1;
+        const char *action = input["action"] | (const char*)nullptr;
+
+        free(body); req->_tempObject = nullptr;
+
+        if (slot < 1 || slot > MEMORY_COUNT) {
+            req->send(400, "application/json",
+                "{\"error\":\"slot out of range (1..99)\"}");
+            return;
+        }
+        if (!action) {
+            req->send(400, "application/json",
+                "{\"error\":\"action required (save|recall|clear)\"}");
+            return;
+        }
+        uint8_t idx = (uint8_t)(slot - 1);
+
+        if (strcmp(action, "save") == 0) {
+            radio_memory_save(idx);
+            memory_store_save();  /* flush the bank to flash (outside radio_mtx) */
+            event_add("radio: memory %d saved", slot);
+            JsonDocument doc;
+            doc["ok"] = true;
+            doc["slot"] = slot;
+            doc["action"] = "save";
+            String response;
+            serializeJson(doc, response);
+            req->send(200, "application/json", response);
+        } else if (strcmp(action, "recall") == 0) {
+            if (!radio_recall_memory(idx)) {
+                req->send(409, "application/json", "{\"error\":\"slot empty\"}");
+                return;
+            }
+            event_add("radio: memory %d recalled", slot);
+            display_show_status();
+            char fd[24];
+            radio_format_freq(radio_freq, radio_mode, fd, sizeof(fd));
+            JsonDocument doc;
+            doc["ok"] = true;
+            doc["slot"] = slot;
+            doc["band"] = bands[radio_band_idx].name;
+            doc["mode"] = radio_mode_str(radio_mode);
+            doc["freq"] = radio_freq;
+            doc["freq_display"] = fd;
+            String response;
+            serializeJson(doc, response);
+            req->send(200, "application/json", response);
+        } else if (strcmp(action, "clear") == 0) {
+            radio_memory_clear(idx);
+            memory_store_save();  /* flush the bank to flash (outside radio_mtx) */
+            event_add("radio: memory %d cleared", slot);
+            JsonDocument doc;
+            doc["ok"] = true;
+            doc["slot"] = slot;
+            doc["action"] = "clear";
+            String response;
+            serializeJson(doc, response);
+            req->send(200, "application/json", response);
+        } else {
+            req->send(400, "application/json",
+                "{\"error\":\"action must be save, recall or clear\"}");
+        }
+    }, NULL, handle_body_collect);
 }
 
 /*
@@ -2444,6 +2754,11 @@ static void skill_radio_init() {
     /* Overlay any saved band/freq/volume/bfo on top of the FM defaults. Runs
      * single-tasked here (before server.begin), so no mutex is required. */
     radio_restore_state();
+
+    /* Overlay the saved memory bank on top of the empty default. Also single-tasked
+     * here (before server.begin), so memory_store_load takes no lock. Independent of
+     * radio_restore_state — a corrupt/missing memory file leaves the slots empty. */
+    memory_store_load();
 
     Serial.println("[radio] SI4732 up: FM 100.0 MHz");
     skill_register(&radio_skill);
