@@ -822,8 +822,9 @@ static bool write_spiffs_file(const char *path, const String &content) {
 //
 // SPIFFS.rename() will not clobber an existing name, hence the remove.
 //
-// Used by the notification store, which is not part of this commit yet.
-__attribute__((unused))
+// The notification store is the caller, and notify_load() holds up the other
+// half: it reads NOTIFY_FILE, and falls back to NOTIFY_FILE_TMP when that comes
+// back empty. Any future caller owes the same fallback.
 static bool write_spiffs_file_atomic(const char *path, const char *tmp_path,
                                      const String &content) {
     if (!write_spiffs_file(tmp_path, content)) return false;
@@ -2562,10 +2563,28 @@ static void handle_capabilities(AsyncWebServerRequest *request) {
     };
     for (int i = 0; eps[i]; i++) ep.add(eps[i]);
 
-    // Skill endpoints
+    // Skill endpoints, each path at most once.
+    //
+    // A skill's endpoint table has one row per METHOD, because that is what
+    // /skill renders as its API table and GET /notify and POST /notify are two
+    // different things to document. This array is a list of PATHS — the spec
+    // above says "all HTTP paths the node handles" — and a path repeated here
+    // is not extra detail, it is a false statement about the surface: a client
+    // counting entries to size a probe list finds one endpoint that does not
+    // exist. So the dedup belongs here, at the point where rows become paths,
+    // and NOT in the skill tables, which are right as they stand.
+    //
+    // Linear scan over a list this length is cheaper than anything cleverer,
+    // and /capabilities is not a hot path.
     for (int i = 0; i < g_skill_count; i++) {
         const SkillEndpoint *se = g_skills[i]->endpoints;
-        for (int j = 0; se[j].path; j++) ep.add(se[j].path);
+        for (int j = 0; se[j].path; j++) {
+            bool seen = false;
+            for (JsonVariant v : ep) {
+                if (strcmp(v.as<const char*>(), se[j].path) == 0) { seen = true; break; }
+            }
+            if (!seen) ep.add(se[j].path);
+        }
     }
 
     String response;
@@ -3341,10 +3360,14 @@ static void handle_wifi_post(AsyncWebServerRequest *request) {
 // against exactly the list POST /gpio/write refuses.
 #include "skills/gpio.cpp"
 #include "skills/serial.cpp"
+#include "skills/notify.cpp"
 
 static void skills_init() {
     skill_gpio_init();
     skill_serial_init();
+    // Reads the stored queue off SPIFFS, so it has to run after SPIFFS.begin()
+    // in setup() — which it does, skills_init() being called well below it.
+    skill_notify_init();
 }
 
 // ===== Routes =====
@@ -3575,6 +3598,14 @@ void loop() {
     // Retire the provisioning AP once it has done its job, or once the window
     // a keyboard-raised session opened has run out. Non-blocking.
     ap_poll();
+
+    // Expiry and the coalesced SPIFFS write. Above ui_tick() on purpose: an
+    // expiry handled on this pass raises ui_force, and the ui_tick() below then
+    // acts on it in the same pass instead of leaving the screen stale for the
+    // delay(10). Arrivals raise the flag too, but from the AsyncTCP task and at
+    // any point in the pass — notify_poll() handles none of them — so their
+    // latency owes nothing to this placement.
+    notify_poll();
 
     // The keyboard and the screen, in that order and only from here. Every
     // HTTP handler runs on the AsyncTCP task and must never draw; see the note
