@@ -626,6 +626,20 @@ static String auth_token = "";
 // by both formatters: the clock face's AP line and the NETWORK screen's.
 // "Seed-" + four hex + NUL fits in ten; sized with headroom.
 static char ap_ssid[16] = "";
+// HOW LONG THAT IS, AS A NUMBER, because the clock face puts the SSID, the
+// session state and the password on ONE row and has to bound the total. The
+// buffer is no use for that — it is headroom, and three buffers' headroom on
+// one row overflows it.
+//
+// THE TWO PIECES AND NOT THE ANSWER, so that the length and the format that
+// builds it cannot drift apart. wifi_setup() formats with these same two
+// constants rather than with a matching pair of literals; widen the suffix
+// there and this number follows, instead of staying nine while the row prints
+// the first nine characters of a longer SSID — silently, and identically on the
+// panel and in GET /ui, which is the failure that has no witness.
+#define AP_SSID_PREFIX "Seed-"
+#define AP_SSID_HEX     4     // get_mac_suffix() returns exactly this many
+#define AP_SSID_CHARS  ((int)(sizeof(AP_SSID_PREFIX) - 1) + AP_SSID_HEX)
 static String mdns_name = "";
 static unsigned long boot_time = 0;
 
@@ -645,8 +659,14 @@ static bool ap_active = false;
 // exact cross-task String reassignment that was a use-after-free for the WiFi
 // credentials. GET /ui never reaches the read (it passes redact=true and
 // returns a placeholder first), but the panel does, and defence here costs a
-// dozen bytes. The generated password is twelve chars; sized with headroom.
+// dozen bytes. The generated password is AP_PASSWORD_CHARS long; sized with
+// headroom.
 static char ap_password[16] = "";
+// The generated length, shared with ap_generate_password() rather than written
+// twice, for the reason AP_SSID_CHARS above exists: the clock face's AP row
+// bounds three variable parts against one buffer, and a password that grew by a
+// character somewhere else in the file would push that row over without a word.
+#define AP_PASSWORD_CHARS  12
 static bool ap_temporary = false;
 static unsigned long ap_expires_at = 0;
 // Set when a keyboard-raised AP failed to come up, so the menu entry can say so
@@ -1011,12 +1031,12 @@ static bool wifi_save_config(const String &ssid, const String &pass) {
 static bool ap_seen_sta_down = false;
 
 // One session's password. No lookalike glyphs — this gets typed off a serial
-// console or, once the panel is driven, off a 240px screen; 12 chars out of a
-// 32-symbol alphabet is 60 bits.
+// console or, once the panel is driven, off a 240px screen; AP_PASSWORD_CHARS
+// out of a 32-symbol alphabet is 60 bits at twelve.
 static String ap_generate_password() {
     static const char charset[] = "abcdefghijkmnpqrstuvwxyz23456789";
     const uint32_t n = sizeof(charset) - 1;
-    char buf[13];
+    char buf[AP_PASSWORD_CHARS + 1];
     for (size_t i = 0; i < sizeof(buf) - 1; i++) {
         buf[i] = charset[esp_random() % n];
     }
@@ -1118,16 +1138,25 @@ static void wifi_setup() {
     // the WiFi stack (see get_mac_suffix), so this is free to sit ahead of the
     // radio and is already settled by the time anything advertises it.
     String suffix = get_mac_suffix();
-    // %.4s, not %s. get_mac_suffix() returns exactly four hex characters, so
-    // "Seed-" + suffix is nine and fits with room to spare — but the compiler
-    // cannot see inside the String and warned that up to 14 bytes could go into
-    // an 11-byte tail (-Wformat-truncation). The precision makes the invariant
-    // the source already relies on visible to the compiler instead of implied,
-    // and clamps the write if get_mac_suffix() ever returns something longer.
-    // Not silenced on the grounds that it looked like a false positive: the
-    // GNSS block in serial.cpp shipped truncated on a live node while the same
-    // warning was being reported and read as noise.
-    snprintf(ap_ssid, sizeof(ap_ssid), "Seed-%.4s", suffix.c_str());
+    // A PRECISION, not a bare %s. get_mac_suffix() returns exactly
+    // AP_SSID_HEX hex characters, so the SSID is AP_SSID_CHARS long and fits
+    // with room to spare — but the compiler cannot see inside the String and
+    // warned that up to 14 bytes could go into an 11-byte tail
+    // (-Wformat-truncation). The precision makes the invariant the source
+    // already relies on visible to the compiler instead of implied, and clamps
+    // the write if get_mac_suffix() ever returns something longer. Not silenced
+    // on the grounds that it looked like a false positive: the GNSS block in
+    // serial.cpp shipped truncated on a live node while the same warning was
+    // being reported and read as noise.
+    //
+    // BUILT FROM THE SAME TWO CONSTANTS AP_SSID_CHARS IS, and not from a
+    // matching pair of literals. The clock face puts this SSID on a shared row
+    // and clamps it there to AP_SSID_CHARS; a format widened here to a longer
+    // suffix would not truncate — ap_ssid has headroom — it would print short
+    // on the panel AND in GET /ui, identically, so nothing would look wrong and
+    // the one person standing at a stranded node could not find the network.
+    snprintf(ap_ssid, sizeof(ap_ssid), AP_SSID_PREFIX "%.*s", AP_SSID_HEX,
+             suffix.c_str());
     mdns_name = "seed-" + suffix;
     mdns_name.toLowerCase();
 
@@ -1309,14 +1338,29 @@ static_assert(UI_HDR_Y + 8 + UI_BADGE_R < UI_RULE1_Y,
 // text_width() sums those advances, so a string's width is the sum of its
 // glyphs' entries and there is no letter spacing to add.
 //
+// FONT0 IS THE EXCEPTION AND IT COMES FROM SOMEWHERE ELSE: lgfx/Fonts/
+// glcdfont.h for the bitmaps, and the GLCDfont constructed in lgfx_fonts.cpp
+// for the metrics. It is the one font here whose x_advance does NOT come from a
+// table through updateFontMetric() — that override takes its metrics pointer
+// unnamed and only range-checks the code point, so the advance stays whatever
+// getDefaultMetric() put there, which is the font's own `width`. That is not a
+// footnote: it is the entire basis of the fixed-pitch bound the bottom rows'
+// erase band is derived from.
+//
 // THESE ARE A SNAPSHOT OF ONE M5GFX RELEASE, hand-transcribed, and every
 // assertion below is expressed in terms of the copies rather than the tables.
 // fontHeight() is not constexpr and the width tables are not reachable from a
 // constant expression, so nothing here can check itself: a library bump that
 // retabulated a font would relay this screen silently, with a clean build and
-// every assert still passing. The version is pinned in platformio.ini; whoever
-// moves that pin re-checks these eight numbers against lgfx/Fonts/ in the same
-// commit.
+// every assert still passing.
+//
+// AND M5GFX IS NOT PINNED. platformio.ini asks for `^0.2.26`, which is a caret
+// RANGE and not a pin: any 0.2.x above that resolves, so the library can move
+// under these numbers on a machine that fetches dependencies afresh, with no
+// edit to this repository to notice. This comment used to say the version was
+// pinned and that whoever moved the pin would re-check the metrics — there is
+// no such moment. Whoever narrows that range, or finds it has drifted,
+// re-checks the metrics below against lgfx/Fonts/ in the same commit.
 //
 // FONT7 IS THE SEVEN-SEGMENT FACE, and its table is why the clock row carries
 // no padding at all: a digit and '-' both advance 32 and ':' advances 12, so
@@ -1333,6 +1377,15 @@ static_assert(UI_HDR_Y + 8 + UI_BADGE_R < UI_RULE1_Y,
 #define UI_F4_H         26   // chr_hgt_f32
 #define UI_F2_H         16   // chr_hgt_f16
 #define UI_F0_H          8   // the 6x8 GLCD font the footer legend uses
+// FONT0 HAS NO WIDTH TABLE AT ALL, which is the one metric here that is a
+// property of the font's TYPE rather than a transcribed number. It is a
+// GLCDfont, whose updateFontMetric() only range-checks the code point and never
+// touches the metrics, so every glyph keeps the default x_advance — the font's
+// own `width` field, 6. A Font0 string is therefore exactly 6px a character
+// whatever characters it holds. Font2 and Font4 are BMP/RLE fonts and do carry
+// per-glyph tables, which is why their widths below are sums and this one is a
+// multiplication.
+#define UI_F0_W          6   // GLCDfont width field; fixed pitch, no table
 #define UI_F7_DIGIT_W   32   // widtbl_f7s, and the same entry for '-'
 #define UI_F7_COLON_W   12   // widtbl_f7s
 #define UI_F4_DIGIT_W   14   // widtbl_f32; '-' there is 8, which is what the pad covers
@@ -1369,16 +1422,122 @@ static_assert(UI_HDR_Y + 8 + UI_BADGE_R < UI_RULE1_Y,
 #define UI_DATE_W      236
 #define UI_CROW0_Y      99
 #define UI_CROW1_Y     117
-// The two bottom rows run the full width from UI_LABEL_X. The widest string
-// either can hold is the AP line "Seed-ffff  10m left" at 131px in Font2 —
-// ap_ssid is "Seed-" plus four hex, so nine characters, and the session states
-// are fixed text. Row 0's other branch is ui_net_summary()'s STA case, a dotted
-// quad at 111px at the very most; row 1's are "pw " plus a twelve-character
-// password at 117 and "up " plus the longest uptime millis() can reach at 103.
-// (133 is the HEADER's bound for that field, which formats an "AP " prefix this
-// row never sees; it is not this field's number.)
-#define UI_CROW_MAX_W  131
-#define UI_CROW_W      232
+// THE TWO BOTTOM ROWS ARE THREE MUTUALLY EXCLUSIVE MODES, AND THE MODE PICKS
+// THE FONT FOR BOTH ROWS AT ONCE. ui_status_row_mode() is the only place that
+// decides which mode is up, and each of its two callers asks it once per pass
+// and passes the answer down — ui_draw_clock() to both the font and the
+// formatter, GET /ui to both rows.
+//
+//   AP up      row 0   SSID, session state and password      Font0
+//              row 1   the auth token                        Font0
+//   connected  row 0   signal strength                       Font2
+//              row 1   the mDNS name and port                Font2
+//   offline    row 0   says so                               Font2
+//              row 1   the keys this screen answers to       Font2
+//
+// AP FIRST, BEFORE THE ASSOCIATED TEST, and the order is the whole point. A
+// setup AP raised from the menu on a node that is already on WiFi puts the
+// radio in WIFI_AP_STA and leaves both up until the session expires, so the two
+// states are simultaneously true — and the panel is the only place the AP
+// password exists at all. Testing the link first would show signal strength to
+// somebody standing in front of a node whose password they have no other way to
+// read. (ui_net_summary(), which feeds the HEADER, tests the link first and so
+// can show the STA address above rows showing AP credentials. That is a
+// pre-existing disagreement between the two and not one this introduces.)
+//
+// FONT0 ON THE AP ROWS IS A CONSTRAINT, NOT A PREFERENCE. The token is 32 hex
+// characters; Font2 gives a hex digit 8px, 'a'..'e' 7px and 'f' 6px, so the bare
+// token is 242px for the one this node happens to carry and 256px if it were
+// all digits. The panel is 240 wide and these rows start at x=4, so Font2
+// cannot put the token on the glass at all, with or without a word in front of
+// it. Font0 has no width table (see UI_F0_W), so "token " plus 32 characters is
+// a CONSTANT 228px whatever the token says — that is what makes the row safe
+// rather than lucky, and it leaves six pixels against this band. The AP's other
+// row carries an SSID, a session state and a twelve-character password on one
+// line, which is 260px in Font2 and 216 in Font0. The connected and offline
+// rows are short — 155px at their widest — and stay in the 16px face.
+#define UI_CROW_BYTES   40
+// The keys this screen answers to. The commit that made this screen a clock
+// face took the footer legend off it for the room, and said the hint would come
+// back into a bottom row when there was nothing else to say; the offline mode
+// is that case, and this is the hint. ENT and ` both open the menu
+// and `;`/`.` do nothing here, so naming ENT alone is the honest short form.
+// Deliberately NOT the sibling firmware's "hold KEY 3s for setup AP": there is
+// no such gesture in this firmware, where the AP is raised from the menu.
+#define UI_CROW_KEYS   "ENT menu  , / dim/bright"
+// token_load() makes a token of sixteen random bytes as hex. The precision at
+// the format site is what makes this 32 a property of the ROW rather than a
+// note about today: a token restored from SPIFFS is whatever that file holds.
+#define UI_CROW_TOKEN_LEN  32
+#define UI_CROW_TOKEN_PFX  "token "
+// What GET /ui puts where the panel puts the AP password. Deliberately no
+// longer than a real password, so the endpoint's copy of the row and the
+// panel's are the same shape and neither truncates where the other does not.
+#define UI_CROW_PW_HIDDEN  "(panel only)"
+// AP row 0 is "<ssid>  <session state>  pw <password>". It is the one row in
+// this file where three variable parts share a line, so its length is a
+// computed budget asserted against UI_CROW_BYTES rather than an eyeballed one,
+// and the two variable lengths are clamped by precisions at the format site.
+//
+// THE FIXED PARTS ARE MACROS THE FORMAT STRINGS ARE ASSEMBLED FROM, not
+// separators counted by eye against literals seven hundred lines away. Every
+// term below is either sizeof() over the exact text that gets printed or a
+// named length that its own producer also uses.
+#define UI_STRLEN(s)        ((int)(sizeof(s) - 1))
+#define UI_CROW_AP_SEP      "  "
+#define UI_CROW_AP_PWPFX    "pw "
+#define UI_CROW_AP_LEFT     "m left"    // after the minute count
+#define UI_CROW_AP_PERM     "stays up"
+#define UI_CROW_AP0_TEMP_FMT \
+    "%.*s" UI_CROW_AP_SEP "%lu" UI_CROW_AP_LEFT UI_CROW_AP_SEP \
+    UI_CROW_AP_PWPFX "%.*s"
+#define UI_CROW_AP0_PERM_FMT \
+    "%.*s" UI_CROW_AP_SEP UI_CROW_AP_PERM UI_CROW_AP_SEP \
+    UI_CROW_AP_PWPFX "%.*s"
+// Two digits for the minute count: AP_SESSION_MS is asserted below to keep
+// ap_minutes_left() inside them. The permanent wording is asserted to be no
+// longer than the countdown it shares the budget with.
+#define UI_CROW_AP_STATE_CHARS  (2 + UI_STRLEN(UI_CROW_AP_LEFT))
+#define UI_CROW_AP0_CHARS  (AP_SSID_CHARS + 2 * UI_STRLEN(UI_CROW_AP_SEP) + \
+                            UI_CROW_AP_STATE_CHARS + \
+                            UI_STRLEN(UI_CROW_AP_PWPFX) + AP_PASSWORD_CHARS)
+// THE ERASE BAND IS SIZED FROM THE BUFFER AND NOT FROM TODAY'S STRINGS, which
+// is what makes the Font0 rows provable instead of re-derived by hand every
+// time somebody edits a format string forty lines away. Font0 is fixed pitch,
+// so the widest thing a UI_CROW_BYTES buffer can EVER put on the glass in it is
+// (UI_CROW_BYTES - 1) glyphs, and that bound holds for any string anyone writes
+// into it later. The Font2 rows get no such gift — Font2's widest advance is
+// 10px, so 39 glyphs there could be 390px — and are still summed by hand below.
+#define UI_CROW_W      234
+#define UI_CROW_MAX_W_F0  (UI_F0_W * (UI_CROW_BYTES - 1))
+// The widest string the Font2 modes can hold, summed over widtbl_f16:
+//
+//   "signal -128 dBm"       100px  — WiFi.RSSI() is an int8_t, so four
+//                                    characters is the whole numeric range
+//   "seed-0000.local:8080"  135px  — mdns_name is "seed-" plus four LOWERCASE
+//                                    hex, and the widest hex glyphs there are
+//                                    the digits at 8px, not the letters
+//   UI_CROW_KEYS            155px  <- the widest, and the one below is asserted
+//   "offline"                42px
+#define UI_CROW_MAX_W_F2  155
+// There is deliberately no single UI_CROW_MAX_W any more. It named one number
+// when one font drew both rows; with two fonts a single figure would hide which
+// of them it came from, and the two are established in completely different
+// ways — one from the buffer, one by hand from a width table.
+//
+// The band a mode change has to clear by hand: both rows, at the height of the
+// TALLER of the two fonts. See ui_draw_clock() for why a font change cannot be
+// left to ui_draw_field()'s padding.
+#define UI_CROW_BAND_H (UI_CROW1_Y + UI_F2_H - UI_CROW0_Y)
+
+// Which of the three the bottom rows are in. The value is remembered across
+// draws — see ui_clock_rows_drawn — so the enum is here with the geometry it
+// decides rather than beside the formatter that reads it.
+enum ui_crow_mode_t {
+    UI_CROW_AP = 0,   // the provisioning AP is up, with or without a link
+    UI_CROW_LINK,     // associated, no AP
+    UI_CROW_OFF       // neither
+};
 // What the face reads before the first NTP sync. Named rather than written out
 // at each site because GET /ui decides whether the clock is synced by comparing
 // what the panel actually drew against this string, instead of asking the C
@@ -1400,34 +1559,94 @@ static_assert(UI_SEC_Y >= UI_CLOCK_Y,
               "the seconds sit above the top of the clock's cell");
 static_assert(UI_DATE_Y + UI_F4_H <= UI_CROW0_Y,
               "the date's cell reaches into the row below it");
+// THE ROW CELLS ARE SPELT AT THE TALLER FONT ON PURPOSE. The bottom rows are
+// Font2 in two of their three modes and Font0 in the third, so UI_F2_H here is
+// the binding case and the Font0 mode has eight rows of slack under it. These
+// two would still pass at UI_F0_H and would then be asserting nothing about the
+// mode that actually fills the band.
 static_assert(UI_CROW0_Y + UI_F2_H <= UI_CROW1_Y,
-              "the two bottom rows overlap");
+              "the two bottom rows overlap in the taller of their two fonts");
 static_assert(UI_CROW1_Y + UI_F2_H <= UI_PANEL_H,
-              "the lower row leaves the bottom of the panel");
+              "the lower row leaves the bottom of the panel in the taller of its two fonts");
+static_assert(UI_F2_H >= UI_F0_H,
+              "Font0 is now the taller row font, so every cell asserted at UI_F2_H "
+              "and the mode-change clear derived from it are all understated");
 static_assert(UI_PANEL_W / 2 - UI_DATE_W / 2 >= 0 &&
               UI_PANEL_W / 2 + UI_DATE_W / 2 <= UI_PANEL_W,
               "the date's centred erase band leaves the panel");
 static_assert(UI_LABEL_X + UI_CROW_W <= UI_PANEL_W,
               "a bottom row's erase band leaves the right edge of the panel");
-// THE TWO THAT A CONTENT CHANGE BREAKS, rather than two more restatements of
-// the geometry. An erase band narrower than the widest string its field can
-// hold leaves the previous value's tail on the glass, and M5GFX reports neither
-// a clip nor an overrun for it — the same silent failure the header's spans are
+// THE ONES THAT A CONTENT CHANGE BREAKS, rather than more restatements of the
+// geometry. An erase band narrower than the widest string its field can hold
+// leaves the previous value's tail on the glass, and M5GFX reports neither a
+// clip nor an overrun for it — the same silent failure the header's spans are
 // asserted against. These are the only numbers on this screen that a format
 // string or a message text can invalidate from somewhere else in the file.
 static_assert(UI_DATE_W >= UI_DATE_MAX_W,
               "the date's erase band is narrower than the widest date its format can render");
-static_assert(UI_CROW_W >= UI_CROW_MAX_W,
-              "a bottom row's erase band is narrower than the widest string it can hold");
+// Font0: derived from the buffer, so nothing anybody writes into a bottom row
+// can outrun the band. Binding at equality today by construction, and the drift
+// it catches is a buffer grown without the band.
+static_assert(UI_CROW_W >= UI_CROW_MAX_W_F0,
+              "a Font0 bottom row can outrun its erase band: the row buffer holds "
+              "more fixed-pitch glyphs than UI_CROW_W has room for");
+// Font2: NOT the same quality of guard, and worth saying so plainly rather than
+// letting the pair below look like the one above. The band carries 79px of
+// slack over the sum, so this assert will not fire for any realistic edit; the
+// length tie under it is what actually stands between the legend and a silent
+// overrun, and it catches only a change of LENGTH. A 24-character rewrite could
+// reach 240px — Font2's widest advance is 10 — and nothing here would say so.
+// Two of the four strings the sum is taken over are runtime-composed and tied
+// to nothing at all; they are bounded by their formats' numeric ranges, which
+// is an argument and not a check. Making this as strong as the Font0 bound
+// needs the width table transcribed into a constexpr array here, which is a
+// second copy of the thing this whole block already warns about drifting.
+static_assert(UI_CROW_W >= UI_CROW_MAX_W_F2,
+              "a Font2 bottom row's erase band is narrower than the widest string it can hold");
+static_assert(UI_STRLEN(UI_CROW_KEYS) == 24,
+              "the key legend changed length; re-sum UI_CROW_MAX_W_F2 over "
+              "widtbl_f16 before changing this number to match");
+// The token row is the one string on this screen that a single byte of prefix
+// pushes past its buffer, and it would be cut identically on the panel and in
+// GET /ui — so nothing would look wrong and the token would simply be short.
+static_assert((int)sizeof(UI_CROW_TOKEN_PFX) + UI_CROW_TOKEN_LEN <= UI_CROW_BYTES,
+              "the token row does not fit its buffer and would be truncated silently");
+// GET /ui's copy of the AP row has to be the same shape as the panel's, and the
+// redaction goes through the SAME %.*s the password does — so a placeholder
+// longer than a password would not widen the row, it would be cut down to
+// twelve characters and read as something else entirely.
+static_assert((int)sizeof(UI_CROW_PW_HIDDEN) - 1 <= AP_PASSWORD_CHARS,
+              "the redaction is longer than the password it stands in for and would "
+              "be truncated by the row's own precision");
+static_assert(AP_SSID_CHARS < (int)sizeof(ap_ssid) &&
+              AP_PASSWORD_CHARS < (int)sizeof(ap_password),
+              "an AP row length budget is longer than the buffer it describes");
+static_assert(UI_CROW_AP0_CHARS < UI_CROW_BYTES,
+              "the AP's SSID, session state and password no longer fit one row buffer");
+// The session state's budget is the countdown's length, so the permanent
+// wording has to fit inside it, and the minute count has to stay at two digits.
+static_assert(UI_STRLEN(UI_CROW_AP_PERM) <= UI_CROW_AP_STATE_CHARS,
+              "the permanent AP's wording is longer than the countdown whose budget "
+              "UI_CROW_AP0_CHARS gives the session state");
+static_assert(AP_SESSION_MS <= 99UL * 60UL * 1000UL,
+              "a session over 99 minutes gives ap_minutes_left() a third digit and "
+              "overruns the two UI_CROW_AP_STATE_CHARS budgets for it");
 // WHY THE LOWER CHROME GOES, asserted rather than only asserted in prose, so
 // that a stack moved back up cannot leave two suppressions in place with
 // nothing left to justify them. The rule would fall in the two-pixel gap
 // between the bottom rows and read as a divider that separates nothing; the
 // footer legend's 8px band overlaps the lower row outright.
+//
+// THE SECOND ONE IS SPELT AT UI_F0_H AND NOT AT UI_F2_H, which is the opposite
+// choice from the cell asserts above and for the opposite reason. Font2 is on
+// the RIGHT of that comparison, where a taller font makes the claim EASIER: at
+// UI_F2_H it reads 121 < 133 and would go on passing while the Font0 mode's
+// lower row ended at 125 and left the footer band clear. At UI_F0_H it reads
+// 121 < 125 — four pixels of margin instead of twelve, and true in both fonts.
 static_assert(UI_CROW0_Y + UI_F2_H <= UI_RULE2_Y && UI_RULE2_Y < UI_CROW1_Y,
               "the lower rule no longer falls between the clock face's bottom rows");
-static_assert(UI_CROW1_Y < UI_FOOT_Y + UI_F0_H && UI_FOOT_Y < UI_CROW1_Y + UI_F2_H,
-              "the footer legend no longer overlaps the clock face's lower row");
+static_assert(UI_CROW1_Y < UI_FOOT_Y + UI_F0_H && UI_FOOT_Y < UI_CROW1_Y + UI_F0_H,
+              "the footer legend no longer overlaps the clock face's lower row in its shorter font");
 
 // ---- Notification geometry ----
 //
@@ -1680,15 +1899,33 @@ static const UiMenuItem ui_menu[] = {
 // — see wifi_ssid above — precisely so the claim can be true.
 //
 // ui_status_row() also reads ap_ssid and ap_password, which were the last two
-// Strings on the /ui path; both are now fixed buffers too. Their write patterns
-// differ and the difference is why they were not the same risk. ap_password is
-// rolled by ap_start() and cleared by ap_stop(), both on the loop task, so a
-// raise or drop concurrent with a report on AsyncTCP was a genuine reassignment
-// race — narrowed only by /ui redacting it before the read. ap_ssid, despite
-// what this ledger once said, is NOT written in ap_start()/ap_stop() at all: it
-// is set once in wifi_setup() (before the web server exists) and never touched
-// again, so it never actually raced. Both are fixed buffers now regardless, so
-// the whole /ui path is String-free by construction rather than by argument.
+// Strings on the /ui path THAT A WRITER REASSIGNS. Their write patterns differ
+// and the difference is why they were not the same risk. ap_password is rolled
+// by ap_start() and cleared by ap_stop(), both on the loop task, so a raise or
+// drop concurrent with a report on AsyncTCP was a genuine reassignment race —
+// narrowed only by /ui redacting it before the read. ap_ssid, despite what this
+// ledger once said, is NOT written in ap_start()/ap_stop() at all: it is set
+// once in wifi_setup() (before the web server exists) and never touched again,
+// so it never actually raced. Both are fixed buffers now regardless.
+//
+// THIS LEDGER USED TO END "SO THE WHOLE /ui PATH IS STRING-FREE BY
+// CONSTRUCTION". It is not, and it was not when that was written. Three Strings
+// are read on this path today and all three are safe for the SAME reason, which
+// is not "no String" but "no reassignment after server.begin()":
+//
+//   mdns_name    set once in wifi_setup(); read by UI_NETWORK row 3 and now by
+//                the clock face's connected row.
+//   auth_token   set once in token_load(), which setup() runs before
+//                server.begin(); read by the clock face's AP row.
+//   WiFi.SSID()  returns a String BY VALUE — a fresh object per call, so there
+//                is nothing for another task to free under it. It is a heap
+//                allocation on every tick of UI_NETWORK, which is why our own
+//                copy is preferred, not a race.
+//
+// So the property to keep is narrower than the old sentence and worth stating
+// exactly: nothing read from AsyncTCP may be a String that a writer reassigns
+// after the web server starts. A String written once before that, or returned
+// by value, is fine; a fixed buffer is required only where a writer exists.
 static bool ui_ready = false;          // panel initialised and drawable
 // What M5GFX's panel autodetection actually answered, as opposed to what
 // M5.getBoard() reports after cfg.fallback_board has papered over a failure.
@@ -1784,9 +2021,15 @@ static char ui_card_body[2][NOTIFY_BODY_LEN + 4];
 // from the one next to it: ui_draw_field() compares with strncmp over cache_n-1,
 // so a cache shorter than its own content silently compares a prefix and stops
 // repainting on a change past the cut. The date is 15 characters either way
-// ("Wed 28 May 2026" and the pre-sync notice both); 24 is headroom. The bottom
-// rows hold an SSID and a session state, a dotted quad, an uptime or a
-// password, none of which reach 40.
+// ("Wed 28 May 2026" and the pre-sync notice both); 24 is headroom.
+//
+// THE BOTTOM ROWS' SIZE IS NO LONGER HEADROOM AND IS NOT SPELT HERE. It is
+// UI_CROW_BYTES, up with the geometry, because the erase band is derived from
+// it: Font0 is fixed pitch, so the buffer's length is what bounds the widest
+// thing the AP rows can ever put on the glass. The tightest content is the
+// token row at 39 of those 40 bytes, which is one byte of slack — a longer
+// prefix than "token " truncates the token, and truncates it identically on the
+// panel and in GET /ui, so nothing would look wrong. That is asserted.
 //
 // SEPARATE FROM ui_cache_value[] AND NOT SHARING IT. That array is written by
 // ui_begin()'s splash and by three other screens, and the fields here are a
@@ -1794,7 +2037,12 @@ static char ui_card_body[2][NOTIFY_BODY_LEN + 4];
 static char ui_clock_time[8];
 static char ui_clock_sec[4];
 static char ui_clock_date[24];
-static char ui_clock_row[2][40];
+static char ui_clock_row[2][UI_CROW_BYTES];
+// WHICH MODE THOSE TWO ROWS WERE LAST DRAWN IN, remembered the way the header's
+// badge remembers its drawn state and for the same class of reason: the thing
+// that changes is not the string, so the per-field cache cannot see it. Here it
+// is the FONT. -1 is a value no mode has, so the first draw always clears.
+static int ui_clock_rows_drawn = -1;
 // WHETHER A DRAW HAS EVER FILLED THEM, on the same principle as ui_card_body_id
 // and for a sharper reason. Only ui_draw_clock() writes those caches, and
 // ui_tick() returns before reaching it whenever !ui_ready — so on a node whose
@@ -1825,27 +2073,29 @@ static uint32_t ui_card_body_id = 0;
 
 // ---- Field values ----
 
-static void ui_uptime(char *out, size_t n) {
-    unsigned long s = (millis() - boot_time) / 1000;
-    unsigned long d = s / 86400;
-    s %= 86400;
-    if (d > 0) {
-        snprintf(out, n, "%lud %02lu:%02lu:%02lu", d, s / 3600, (s / 60) % 60, s % 60);
-    } else {
-        snprintf(out, n, "%02lu:%02lu:%02lu", s / 3600, (s / 60) % 60, s % 60);
-    }
-}
+// THE PANEL NO LONGER SHOWS AN UPTIME ANYWHERE. ui_uptime() lived here and had
+// exactly one caller, the clock face's lower row in its non-AP case; the three
+// modes below give that row to the mDNS name and the key legend instead, which
+// leaves the function with no caller at all and -Wunused-function would say so.
+// It is removed rather than kept for a future caller. The number itself has not
+// gone anywhere — GET /health and GET /firmware/version both report
+// uptime_sec, and they compute it from millis() and boot_time directly rather
+// than through this formatter, so nothing on the network path changes.
 
 // One line summarising where the node can be reached, for the header.
 //
 // The octets are formatted by hand rather than through IPAddress::toString().
 // That method builds and returns a String — a heap allocation, a copy and a
-// free every time — and this function runs on every UI tick, twice per tick on
-// the STATUS screen, which is the header plus the clock face's first row (the
-// second call goes away only while the provisioning AP is up). At 5Hz that was
-// roughly ten allocate/free pairs a second for the life of the boot, on a board
-// with no PSRAM and a single 300-odd KB heap that also has to find a contiguous
-// 6KB block whenever GET /skill is called. Nothing here needs the heap at all.
+// free every time — and it runs on every UI tick on every screen, because the
+// header is on every screen. It used to run TWICE per tick on STATUS, once for
+// the header and once for the clock face's first row; the three row modes below
+// took the second call away. That does not make it dead code, and the saving is
+// one call in five per second and not a reason for anything: two callers remain
+// and both matter — the header, and UI_NETWORK's `ip` row while that screen is
+// up. At 5Hz this was roughly ten allocate/free pairs a second for the life of
+// the boot, on a board with no PSRAM and a single 300-odd KB heap that also has
+// to find a contiguous 6KB block whenever GET /skill is called. Nothing here
+// needs the heap at all.
 static void ui_net_summary(char *out, size_t n) {
     if (WiFi.status() == WL_CONNECTED) {
         uint32_t ip = (uint32_t)WiFi.localIP();
@@ -1904,6 +2154,33 @@ static void ui_menu_state(int i, char *out, size_t n) {
     }
 }
 
+// Which of the three shapes the clock face's bottom rows are in. THE ONE PLACE
+// THAT DECIDES, AND ASKED ONCE PER PASS — the answer is then passed to the
+// formatter rather than recomputed by it. That is why ui_status_row() takes a
+// mode instead of calling this itself: this function reads WiFi.status(), a
+// live radio state, so three calls in one draw are three chances to get three
+// answers, and a row drawn in one mode's font holding another mode's text is a
+// failure with no error, no clip and no report behind it.
+//
+// Today's arrangement would survive the sloppier version for a narrow reason —
+// ap_active is written only from the loop task, so the AP edge cannot land
+// mid-draw, and the one pair that CAN flip under us shares a font. Neither of
+// those is a property of this design, only of its current three modes: a fourth
+// mode with a font of its own would break it silently. One read per pass costs
+// nothing and does not depend on either.
+//
+// AP IS TESTED FIRST AND THE LINK SECOND. Both can be true: a setup AP raised
+// from the menu on an associated node puts the radio in WIFI_AP_STA and leaves
+// both up until the session expires. Signal strength is available from a dozen
+// places; the AP password is available from this screen and nowhere else in the
+// universe, so it wins the tie. See the geometry block for the note on the
+// header disagreeing with these rows while that is true.
+static ui_crow_mode_t ui_status_row_mode() {
+    if (ap_active) return UI_CROW_AP;
+    if (WiFi.status() == WL_CONNECTED) return UI_CROW_LINK;
+    return UI_CROW_OFF;
+}
+
 // The clock face's two bottom rows, as one string each: how this node is
 // reached right now. The panel draws them and GET /ui reports them, from here
 // and from nowhere else, for the same reason ui_field() exists — one formatter
@@ -1915,36 +2192,86 @@ static void ui_menu_state(int i, char *out, size_t n) {
 // gets the password, /ui passes true and gets a placeholder. Anything secret
 // that lands on these rows later must go through the same argument.
 //
-// While the AP is up both rows become its credentials, which is the same
-// deliberate swap the five-row screen this replaced already made: these two
-// rows are worth less than the only copy of a password that exists. Which kind
-// of session it is goes beside the SSID, because the two behave differently and
-// the difference matters to somebody standing here — a keyboard-raised AP
-// closes on a timer, the boot AP stays up until the node is provisioned.
+// THE TOKEN IS NOT REDACTED AND THAT IS NOT AN OVERSIGHT. GET /ui will not
+// answer without it, so a caller reading it back out of this row already had
+// it; there is nothing to leak. The password is the opposite case, which is
+// why the two are treated differently on rows that sit one above the other.
+// If a later row ever carries both at once, the redaction has to survive the
+// merge — it is the row, not the field, that /ui serialises.
 //
-// Safe from either task. Everything read here is a scalar or one of the two
-// fixed char buffers that exist precisely so that a String reassignment on the
-// loop task cannot free an array an AsyncTCP reader is walking.
-static void ui_status_row(int row, char *out, size_t n, bool redact) {
+// While the AP is up BOTH rows are given to it, which is the same deliberate
+// swap the five-row screen this replaced already made: everything else these
+// rows could say is worth less than the only copy of a password that exists,
+// and the token beside it is what turns a joined phone into a working client
+// without a second trip to a terminal. Which kind of session it is goes beside
+// the SSID, because the two behave differently and the difference matters to
+// somebody standing here — a keyboard-raised AP closes on a timer, the boot AP
+// stays up until the node is provisioned.
+//
+// Safe from either task. Everything read here is a scalar, one of the two fixed
+// char buffers that exist precisely so that a String reassignment on the loop
+// task cannot free an array an AsyncTCP reader is walking, or one of the two
+// write-once Strings the /ui ledger up in the UI state block accounts for.
+//
+// `mode` IS A PARAMETER AND NOT A CALL, for the reason ui_draw_field()'s
+// `force` is one: a pass has to see one answer throughout. Both callers take it
+// once — the panel so the font it installs matches the text it draws, the
+// endpoint so its two rows describe the same instant.
+static void ui_status_row(ui_crow_mode_t mode, int row, char *out, size_t n,
+                          bool redact) {
     out[0] = '\0';
-    if (row == 0) {
-        if (!ap_active) {
-            ui_net_summary(out, n);
-        } else if (ap_temporary) {
-            snprintf(out, n, "%s  %lum left", ap_ssid, ap_minutes_left());
-        } else {
-            snprintf(out, n, "%s  stays up", ap_ssid);
+    switch (mode) {
+    case UI_CROW_AP:
+        // ap_minutes_left() RETURNS 0 FOR A SESSION THAT DOES NOT EXPIRE, and
+        // the boot AP — raised because the stored credentials did not work, and
+        // the only way into the node when that happens — is exactly that
+        // session. Formatting it through the countdown branch would read
+        // "Seed-f1f8  0m left" to the one user who has no other way in. The
+        // guard is ap_temporary and not a zero test, because zero is also what
+        // the last few seconds of a real session round to.
+        //
+        // THE TWO PRECISIONS ARE THE BOUND, not decoration. ap_ssid and
+        // ap_password are both sixteen-byte buffers with headroom, and this is
+        // the one row in the file where three variable parts share a line — the
+        // compiler said so, with -Wformat-truncation, before they were added.
+        // They clamp to the lengths UI_CROW_AP0_CHARS was derived from, which
+        // is the same trick wifi_setup() plays with %.4s and for the same
+        // reason: make the invariant visible instead of implied.
+        if (row == 0) {
+            if (ap_temporary) {
+                snprintf(out, n, UI_CROW_AP0_TEMP_FMT,
+                         AP_SSID_CHARS, ap_ssid, ap_minutes_left(),
+                         AP_PASSWORD_CHARS,
+                         redact ? UI_CROW_PW_HIDDEN : ap_password);
+            } else {
+                snprintf(out, n, UI_CROW_AP0_PERM_FMT,
+                         AP_SSID_CHARS, ap_ssid, AP_PASSWORD_CHARS,
+                         redact ? UI_CROW_PW_HIDDEN : ap_password);
+            }
+        } else if (row == 1) {
+            // THE PRECISION IS THE INVARIANT. UI_CROW_TOKEN_LEN is what the
+            // erase band and the buffer assert are derived from, and
+            // token_load() reads its token back out of SPIFFS — so clamp the
+            // row to the length that was asserted rather than assume the file.
+            snprintf(out, n, UI_CROW_TOKEN_PFX "%.*s", UI_CROW_TOKEN_LEN,
+                     auth_token.c_str());
         }
-    } else if (row == 1) {
-        if (!ap_active) {
-            char up[24];
-            ui_uptime(up, sizeof(up));
-            snprintf(out, n, "up %s", up);
-        } else if (redact) {
-            snprintf(out, n, "(on the panel only)");
-        } else {
-            snprintf(out, n, "pw %s", ap_password);
-        }
+        break;
+    case UI_CROW_LINK:
+        // WiFi.RSSI() RETURNS 0 WHEN NOT ASSOCIATED — not a sentinel, not a
+        // very negative number, just zero, which reads as an unusually strong
+        // signal. This branch is only reached with the link up, which is what
+        // makes the reading mean anything; the mode test above is the gate.
+        if (row == 0)      snprintf(out, n, "signal %d dBm", (int)WiFi.RSSI());
+        else if (row == 1) snprintf(out, n, "%s.local:%d", mdns_name.c_str(),
+                                    HTTP_PORT);
+        break;
+    case UI_CROW_OFF:
+        // Nothing to say about how the node is reached, so the row that would
+        // have said it carries the keys instead. See UI_CROW_KEYS.
+        if (row == 0)      snprintf(out, n, "offline");
+        else if (row == 1) snprintf(out, n, "%s", UI_CROW_KEYS);
+        break;
     }
 }
 
@@ -2169,9 +2496,12 @@ static_assert(UI_MENU_COUNT <= 99,
 static void ui_footer(ui_screen_t screen, char *out, size_t n) {
     switch (screen) {
     case UI_STATUS:
-        // No legend on the clock face. Its lower row occupies the footer band,
-        // so the keys it does answer to — ENT for the menu, `,` and `/` for
-        // brightness — are undocumented on the glass for now.
+        // No legend on the clock face. Its lower row occupies the footer band —
+        // and now carries the legend itself, as UI_CROW_KEYS, but only in the
+        // offline mode, where that row has nothing better to say. On a node
+        // that is on the network or offering a setup AP the keys are still
+        // undocumented on the glass, because the row is spent on the address
+        // and the credentials.
         out[0] = '\0';
         break;
     case UI_MENU:
@@ -2427,15 +2757,30 @@ static void ui_wrap2(const char *src, char *l1, size_t n1, char *l2, size_t n2,
 // Repaint one text field, and only if its content changed.
 //
 // The opaque background plus a fixed padding width is what erases the previous
-// value, so nothing here ever needs fillScreen and nothing ever flickers. The
-// cache keys on the text alone, so a field whose colours change but whose
-// string does not will not repaint on its own — MOVING A FIELD ONTO OR OFF A
-// COLOURED GROUND IS THE CALLER'S PROBLEM TO SOLVE, and there are two answers
-// to it in this file. A screen transition sets ui_force and every field
-// repaints. The menu selection bar does not: it slides one row on every arrow
-// key with no transition and no ui_force, and pays for that with the explicit
-// `moved` test below, which fills the new ground and blanks the two affected
-// rows' caches by hand so the fields draw themselves back over it.
+// value, so nothing here ever needs fillScreen and nothing ever flickers.
+//
+// THE ERASE IS `padding` WIDE AND ONE CELL OF THE FONT BEING DRAWN TALL, and
+// the second half of that is a real bound, not a detail. M5GFX fills the
+// remainder of the pad at the height it gets from the font's metrics, so a
+// field redrawn in a SHORTER font than it last used repaints only the top of
+// its old band and leaves the rest of the previous glyphs on the glass. The
+// cache cannot catch it, because the font is not part of the key. (It also
+// fills only when `padding` is STRICTLY greater than the string's width: a
+// string exactly as wide as its pad erases nothing at all.)
+//
+// The cache keys on the text alone, so a field whose colours change, or whose
+// FONT changes, but whose string does not, will not repaint on its own —
+// MOVING A FIELD ONTO OR OFF A COLOURED GROUND, OR INTO A DIFFERENT FACE, IS
+// THE CALLER'S PROBLEM TO SOLVE, and there are three answers to it in this
+// file. A screen transition sets ui_force and every field repaints. The menu
+// selection bar does not: it slides one row on every arrow key with no
+// transition and no ui_force, and pays for that with the explicit `moved` test
+// below, which fills the new ground and blanks the two affected rows' caches by
+// hand so the fields draw themselves back over it. The clock face's bottom rows
+// change FONT with their mode, and pay for it the same way: ui_draw_clock()
+// remembers the mode it drew, clears the band and blanks those caches when it
+// moves. All three do the caller's half by hand; none of them is something this
+// function can do for them.
 //
 // `force` is a PARAMETER AND NOT A READ OF ui_force, and that is the whole
 // reason ui_tick() can clear the flag before it draws instead of after. One
@@ -2731,6 +3076,12 @@ static void ui_draw_card(bool force) {
 // the two rows ui_status_row() formats. Geometry and every width are up with
 // the UI_CLOCK_* constants; nothing is measured here.
 //
+// THE BOTTOM TWO ROWS HAVE THREE MODES AND THE MODE PICKS THEIR FONT. This
+// function asks ui_status_row_mode() ONCE and hands the answer to both the font
+// it installs and the formatter that fills the rows, so the text and the face
+// it is drawn in cannot come from two different reads of a live radio. What
+// that costs and why it needs remembering is at the fillRect below.
+//
 // NOTHING ON THIS SCREEN CAN PRINT 1970. clock_local_time() returns false for
 // anything at or below TIME_VALID_EPOCH, which is the whole pre-NTP epoch, and
 // the placeholders below are what a caller sees until the first sync lands. The
@@ -2741,7 +3092,7 @@ static void ui_draw_card(bool force) {
 // opaque background of whichever one is being drawn covers every pixel the
 // other one left. There is nothing outside the glyphs for a pad to erase.
 static void ui_draw_clock(bool force) {
-    char hhmm[8], ss[4], date[24], row[40];
+    char hhmm[8], ss[4], date[24], row[UI_CROW_BYTES];
     struct tm now;
     if (clock_local_time(now)) {
         strftime(hhmm, sizeof(hhmm), "%H:%M", &now);
@@ -2766,13 +3117,55 @@ static void ui_draw_clock(bool force) {
                   M5.Display.width() / 2, UI_DATE_Y, &fonts::Font4, COL_DIM,
                   UI_TC, UI_DATE_W, COL_BG);
 
+    // ONE FONT FOR BOTH ROWS, CHOSEN ONCE FROM THE MODE. Not one choice per
+    // row: the two rows are one block and a mode that splits them across two
+    // faces would put an 8px row above a 16px one with the gap between them
+    // still sized for two 16px cells.
+    //
+    // The casts are not decoration: fonts::Font0 is a GLCDfont and fonts::Font2
+    // a BMPfont (an RLEfont is Font4, Font6, Font7 and Font8 — not this one),
+    // two unrelated concrete types, so the conditional has no common pointer
+    // type without them. ui_draw_field() takes the base IFont anyway.
+    ui_crow_mode_t mode = ui_status_row_mode();
+    const lgfx::IFont *row_font =
+        (mode == UI_CROW_AP) ? (const lgfx::IFont *)&fonts::Font0
+                             : (const lgfx::IFont *)&fonts::Font2;
+
+    // THE FONT CHANGES WITH THE MODE AND ui_draw_field() CANNOT SEE THAT.
+    // It caches on the TEXT alone and its padding erases only the CURRENT
+    // font's cell height — eight rows under Font0 where Font2 painted sixteen —
+    // so the AP mode drawing over a Font2 row repaints the top half and leaves
+    // the bottom half of the old glyphs on the glass. No clip, no error, no
+    // difference in what GET /ui reports; the only witness is the panel, and
+    // this project has no camera.
+    //
+    // ap_start() and ap_stop() both raise ui_force, so today the two edges into
+    // and out of the AP mode happen to repaint in full — but that is an
+    // incidental property of two call sites, and the connected/offline edge
+    // raises nothing whatsoever. Remembering what was drawn is what makes the
+    // screen correct wherever ui_force is or is not raised.
+    //
+    // The band is both rows at UI_F2_H, which covers the Font0 rows too, and it
+    // is exactly the span the fields themselves can paint: UI_CROW_W is asserted
+    // to be at least as wide as anything either font can put here.
+    if (mode != ui_clock_rows_drawn) {
+        M5.Display.fillRect(UI_LABEL_X, UI_CROW0_Y, UI_CROW_W, UI_CROW_BAND_H,
+                            COL_BG);
+        // Blanked, not left alone: the fillRect took the text off the glass and
+        // a cache still holding it would compare equal and decline to draw it
+        // back. No mode's rows are ever empty, so "" can never match one.
+        ui_clock_row[0][0] = '\0';
+        ui_clock_row[1][0] = '\0';
+        ui_clock_rows_drawn = mode;
+    }
+
     for (int r = 0; r < 2; r++) {
         // false: the panel is the password's only channel, so this is the one
         // caller that asks for it unredacted.
-        ui_status_row(r, row, sizeof(row), false);
+        ui_status_row(mode, r, row, sizeof(row), false);
         ui_draw_field(force, ui_clock_row[r], sizeof(ui_clock_row[r]), row,
                       UI_LABEL_X, r == 0 ? UI_CROW0_Y : UI_CROW1_Y,
-                      &fonts::Font2, COL_TEXT, UI_TL, UI_CROW_W, COL_BG);
+                      row_font, COL_TEXT, UI_TL, UI_CROW_W, COL_BG);
     }
     // AFTER every field, never before, exactly as ui_card_body_id is stamped.
     // The flag is the promise that the caches hold a drawn screen, and GET /ui
@@ -3802,6 +4195,12 @@ static void handle_events(AsyncWebServerRequest *request) {
 // which is why there is no lock and nothing to tear. It passes redact=true to
 // ui_status_row(), so the provisioning AP's password — which lives only in RAM
 // and on the panel — does not travel the network.
+//
+// The clock face's other AP row is the auth token, and that one goes out AS IT
+// IS. require_auth() above is why: this handler answers nothing without the
+// token, so a caller reading it back off a reported row is being shown what
+// they already presented. Redacting it would hide the row's shape from the only
+// window anyone has onto this screen and protect nothing.
 static void handle_ui(AsyncWebServerRequest *request) {
     if (!require_auth(request)) return;
 
@@ -3893,11 +4292,19 @@ static void handle_ui(AsyncWebServerRequest *request) {
         JsonArray rows = clock["rows"].to<JsonArray>();
         // Sized from the draw cache and not from `value` above, so that a row
         // long enough to be cut is cut at the same place here as it is on the
-        // glass. Nothing reaches that today — the longest of these is about
-        // twenty-five characters — and the point is that it cannot start to.
+        // glass. That is no longer a hypothetical margin: the AP mode's lower
+        // row is "token " and thirty-two hex characters, 38 of the buffer's 39
+        // usable bytes, and its upper row is 36 with room for 39. A `value`-
+        // sized buffer here would cut both at a different byte from the panel
+        // and the report would quietly stop describing the screen.
         char row[sizeof(ui_clock_row[0])];
+        // ONE READ OF THE MODE FOR BOTH ROWS, for the reason the card object
+        // below takes one read of ui_msg_id: the mode is derived from live
+        // radio state, and two reads could put row 0 from one shape beside
+        // row 1 from another — a pair that never existed on the glass.
+        ui_crow_mode_t mode = ui_status_row_mode();
         for (int r = 0; r < 2; r++) {
-            ui_status_row(r, row, sizeof(row), true);
+            ui_status_row(mode, r, row, sizeof(row), true);
             rows.add(row);
         }
     }
@@ -4481,7 +4888,9 @@ static void handle_skill(AsyncWebServerRequest *request) {
     s += "Status is a clock face, not a table: a large HH:MM, the seconds beside\n";
     s += "it, the date under both, and two rows for how the node is reached. It\n";
     s += "has no key legend along the bottom — the stack needs the room — but ENT\n";
-    s += "still opens the menu and `,` / `/` still change the brightness. `clock`\n";
+    s += "still opens the menu and `,` / `/` still change the brightness — and\n";
+    s += "the lower row says exactly that while the node is offline and has\n";
+    s += "nothing better to report. `clock`\n";
     s += "reports `time`, `seconds` and `date` as the panel drew them, plus\n";
     s += "`synced` — false until the first NTP sync, when the face reads `--:--`\n";
     s += "and the date row says so. Those four are ABSENT until a draw has\n";
@@ -4489,8 +4898,16 @@ static void handle_skill(AsyncWebServerRequest *request) {
     s += "boot on a node whose panel did not come up. Absent means the screen is\n";
     s += "not known, not that it is blank; GET /clock answers the time itself.\n";
     s += "`rows` is always present and is recomputed per request rather than\n";
-    s += "read back from the panel, because while the setup AP is up those two\n";
-    s += "rows are its SSID and password and the password is redacted there.\n\n";
+    s += "read back from the panel, because one of its three shapes carries the\n";
+    s += "setup AP's password and that has to be redacted here. The shapes are\n";
+    s += "mutually exclusive. AP up: the SSID, how long the session has left and\n";
+    s += "the password — REDACTED, it exists on the panel and nowhere else —\n";
+    s += "then the auth token, which is NOT redacted, because this endpoint\n";
+    s += "already required it and there is nothing left to leak. On the network:\n";
+    s += "signal strength, then the mDNS name and port. Offline: says so, then\n";
+    s += "the key hint. The AP shape is tested FIRST and both it and the link\n";
+    s += "can be true at once, so a node with a live AP reports credentials and\n";
+    s += "not signal strength.\n\n";
     s += "The card reports its subject by id, plus `body1` and `body2` — THE TWO\n";
     s += "LINES THE PANEL ACTUALLY WRAPPED, not the raw body. A body is 96\n";
     s += "characters and the report buffers are 48, so the raw string would be cut\n";
