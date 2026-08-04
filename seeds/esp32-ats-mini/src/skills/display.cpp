@@ -212,6 +212,90 @@ const char *display_theme_name(uint8_t i) {
     return t.name;  /* points at a flash string literal — valid after t goes out of scope */
 }
 
+/*
+ * --- Backlight brightness ---
+ *
+ * The panel backlight (PIN_LCD_BL) is on a ledc PWM channel set up in
+ * skill_display_init(). This is the current duty (10..255); 0 is deliberately
+ * out of range so this control can never black the screen out with no on-screen
+ * way back (a full-off dim/sleep is a later, separate feature). Written only
+ * through display_set_brightness (under display_mtx once it exists); read as a
+ * lone atomic byte by display_get_brightness on the radio persist path.
+ */
+static uint8_t brightness = 255;
+
+/* True once ledcAttach has run in skill_display_init(): before that the channel
+ * does not exist, so display_set_brightness only stores the value (the boot paint
+ * applies it). Lets radio_restore_state() set a saved brightness before the panel
+ * is up, mirroring how display_set_theme is safe to call pre-init. */
+static bool bl_ready = false;
+
+/*
+ * Set the backlight duty. Clamped to a 10..255 floor so the panel stays visible.
+ * Takes display_mtx when it exists (the value is shared with the persist read),
+ * and writes the ledc channel only once it is attached — at boot (called from
+ * radio_restore_state before skill_display_init) it just stores the level and the
+ * boot paint pushes it to the hardware.
+ */
+void display_set_brightness(uint8_t v) {
+    if (v < 10) v = 10;
+    bool locked = (display_mtx != nullptr);
+    if (locked) xSemaphoreTake(display_mtx, portMAX_DELAY);
+    brightness = v;
+    if (bl_ready) ledcWrite(PIN_LCD_BL, v);
+    if (locked) xSemaphoreGive(display_mtx);
+}
+
+/* Current backlight duty. A lone byte written under display_mtx — the read is
+ * atomic, so no lock is taken (and none may be, off the radio persist path). */
+uint8_t display_get_brightness() { return brightness; }
+
+/*
+ * --- Battery gauge ---
+ *
+ * The boot probe (main.cpp) reads VBAT once; this samples it live so the on-screen
+ * icon tracks discharge. GPIO4 is on ADC1, safe to read with WiFi up (WiFi drives
+ * ADC2). Averaged over 8 reads to smooth divider noise and throttled to ~2 s so it
+ * costs nothing per 10 Hz frame. Four charge states with hysteresis (thresholds and
+ * HYST follow the reference Battery.cpp) keep the bar from flickering at a boundary;
+ * above 4.3 V reads as charging (USB feeding the divider past a full cell). Below
+ * ~2.5 V the divider is unpopulated / no cell, so the icon is hidden.
+ *
+ * bat_soc / bat_charging / bat_present are single-byte atomics: written here on
+ * loopTask (no lock), read in the draw path (under display_mtx). A one-frame stale
+ * read is harmless for a coarse gauge. bat_v is used only inside the sampler.
+ */
+static float   bat_v = 0.0f;
+static uint8_t bat_soc = 0;          /* 0..3 filled segments */
+static bool    bat_charging = false;
+static bool    bat_present = false;
+
+static void battery_sample() {
+    static uint32_t last_ms = 0;
+    uint32_t now = millis();
+    if (last_ms != 0 && (now - last_ms) < 2000) return;
+    last_ms = now;
+
+    uint32_t acc = 0;
+    for (int i = 0; i < 8; i++) acc += (uint32_t)analogRead(PIN_VBAT_ADC);
+    float v = (acc / 8.0f) * VBAT_FACTOR / 1000.0f;
+
+    if (v < 2.5f) { bat_present = false; return; }
+    bat_present = true;
+    bat_v = v;
+    bat_charging = (v > 4.3f);
+
+    /* Segment boundaries (V) and hysteresis from the reference gauge. Climb a level
+     * only above boundary+HYST, drop only below boundary-HYST — so a cell sitting on
+     * a threshold does not toggle the bar every sample. */
+    static const float bnd[3] = {3.68f, 3.78f, 3.88f};
+    const float hyst = 0.02f;
+    uint8_t s = bat_soc;
+    while (s < 3 && v > bnd[s] + hyst)     s++;
+    while (s > 0 && v < bnd[s - 1] - hyst) s--;
+    bat_soc = s;
+}
+
 /* --- Endpoints --- */
 static const SkillEndpoint display_endpoints[] = {
     {"POST", "/display", "Show custom text: {text, line?}"},
@@ -320,6 +404,35 @@ static void draw_radio_screen(const char *band, const char *mode, uint16_t freq,
     gfx->setTextDatum(TR_DATUM);
     gfx->drawString(hhmm, 318, 4, 2);
     gfx->setTextDatum(MC_DATUM);
+
+    /* Battery gauge, tucked under the wall clock in the top-right so it clears both
+     * the clock row (y 4..20) and the big frequency below. Small outline plus up to
+     * three fill segments by charge state. An empty cell (soc 0, not charging) draws
+     * the outline and a stub in the fixed low-warn red (0xF800) so a flat battery is
+     * unmistakable under any theme — the sole non-theme colour, deliberate. Charging
+     * (>4.3 V) fills all three segments and overlays a bolt. Hidden when no cell is
+     * detected (bat_present false). Reads the sampler's atomics; snapshot up front. */
+    if (bat_present) {
+        uint8_t soc = bat_soc;
+        bool charging = bat_charging;
+        const int bx = 289, by = 24, bw = 26, bh = 12;
+        bool low = (soc == 0 && !charging);
+        uint16_t border = low ? 0xF800 : t.muted;
+        uint16_t fill   = low ? 0xF800 : t.accent;
+        gfx->drawRoundRect(bx, by, bw, bh, 2, border);
+        gfx->fillRect(bx + bw, by + 3, 2, bh - 6, border);   /* positive-terminal nub */
+        int segs = charging ? 3 : (int)soc;
+        int sw = (bw - 4) / 3;                                /* per-segment width */
+        for (int s = 0; s < segs; s++) {
+            gfx->fillRect(bx + 2 + s * sw, by + 2, sw - 1, bh - 4, fill);
+        }
+        if (charging) {
+            /* Small lightning bolt over the fill (band colour), marking charge. */
+            int mx = bx + bw / 2;
+            gfx->fillTriangle(mx + 2, by + 2, mx - 3, by + bh / 2 + 1, mx, by + bh / 2, t.band);
+            gfx->fillTriangle(mx, by + bh / 2, mx + 3, by + bh / 2 - 1, mx - 2, by + bh - 2, t.band);
+        }
+    }
 
     /* Big frequency: MHz for FM (freq is 10 kHz units), kHz otherwise. FONT7 is
      * the 7-segment face — digits and '.' only, all a frequency needs. */
@@ -459,6 +572,10 @@ void display_show_status() {
  * Non-static: forward-declared in main.cpp, called from radio.cpp's tick.
  */
 void display_tick_render() {
+    /* Refresh the battery gauge (throttled to ~2 s inside). Done before any lock —
+     * the sampler only touches its own atomics and the ADC. */
+    battery_sample();
+
     /* Snapshot the radio state up front (accessors lock radio_mtx internally and
      * release it) before touching display_mtx, so the two locks never nest. */
     const char *mode = radio_get_mode_str();
@@ -789,9 +906,13 @@ static void skill_display_init() {
      * repaint path ever sees a null mutex. The boot paint runs single-tasked. */
     display_mtx = xSemaphoreCreateMutex();
 
-    /* Backlight full-on via ledc (16 kHz, 8-bit). Kept off TFT_eSPI on purpose. */
+    /* Backlight via ledc (16 kHz, 8-bit). Kept off TFT_eSPI on purpose. Push the
+     * current `brightness` (default 255, or a level restored pre-init from persist)
+     * now that the channel exists; bl_ready lets display_set_brightness reach the
+     * hardware from here on. */
     ledcAttach(PIN_LCD_BL, 16000, 8);
-    ledcWrite(PIN_LCD_BL, 255);
+    bl_ready = true;
+    ledcWrite(PIN_LCD_BL, brightness);
 
     tft.begin();
     tft.setRotation(3);
