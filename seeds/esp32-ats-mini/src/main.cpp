@@ -23,6 +23,8 @@
 //   GET  /config.md         — node description
 //   POST /config.md         — update description
 //   GET  /events            — event log (?since=unix_ts)
+//   GET  /clock             — local time, timezone, NTP sync state
+//   POST /clock/tz          — set the POSIX TZ string (raw text/plain body)
 //   GET  /firmware/version  — version, partition, uptime
 //   POST /firmware/upload   — upload OTA binary (streaming)
 //   POST /firmware/apply    — reboot into new firmware
@@ -33,6 +35,8 @@
 //   POST /wifi/config       — save WiFi credentials
 
 #include <Arduino.h>
+#include <stdlib.h>
+#include <time.h>
 #include <WiFi.h>
 #include <ESPmDNS.h>
 #include <SPIFFS.h>
@@ -48,6 +52,11 @@
 #define TOKEN_FILE          "/auth_token.txt"
 #define WIFI_CONFIG_FILE    "/wifi.json"
 #define CONFIG_MD_FILE      "/config.md"
+#define TZ_FILE             "/tz.txt"
+// No location is baked into the seed: UTC until an agent posts a POSIX TZ.
+#define TZ_DEFAULT          "UTC0"
+// Anything older than this is the pre-NTP epoch, not a real wall clock.
+#define TIME_VALID_EPOCH    1700000000
 
 // ===== ATS Mini v4 pin map =====
 #define PIN_PWR_EN      15  // power hold — HIGH before anything else, LOW = off
@@ -345,6 +354,44 @@ static bool write_spiffs_file(const char *path, const String &content) {
     return true;
 }
 
+// ===== Timezone =====
+//
+// The seed knows no city. It stores a raw POSIX TZ string in SPIFFS and hands
+// it to the C library; whoever provisions the node decides what "local" means.
+
+static String tz_string = TZ_DEFAULT;
+
+static void tz_apply() {
+    setenv("TZ", tz_string.c_str(), 1);
+    tzset();
+}
+
+static void tz_load() {
+    String stored = read_spiffs_file(TZ_FILE);
+    stored.trim();
+    if (stored.length() > 0) tz_string = stored;
+    tz_apply();
+}
+
+// POSIX TZ strings are printable ASCII without spaces, e.g. "UTC0" or
+// "CET-1CEST,M3.5.0,M10.5.0/3". Reject anything else rather than feed the
+// C library a string that silently degrades to UTC.
+static bool tz_valid(const String &tz) {
+    if (tz.length() == 0 || tz.length() > 63) return false;
+    for (unsigned int i = 0; i < tz.length(); i++) {
+        char c = tz.charAt(i);
+        if (c < 0x21 || c > 0x7E) return false;
+    }
+    return true;
+}
+
+// Local wall clock, or false before the first NTP sync (time() still near 0).
+static bool clock_local_time(struct tm &out) {
+    time_t now = time(NULL);
+    if (now <= TIME_VALID_EPOCH) return false;
+    return localtime_r(&now, &out) != NULL;
+}
+
 // ===== Auth =====
 
 static void token_load() {
@@ -489,6 +536,12 @@ static void wifi_setup() {
     // node running on WiFi never offers a way in.
     WiFi.mode(WIFI_STA);
 
+    // Start SNTP with the stored TZ before associating: the daemon is
+    // non-blocking and keeps retrying on its own, so the clock also syncs after
+    // a later reconnect (loop() re-begins WiFi) instead of only on a successful
+    // boot-time connect.
+    configTzTime(tz_string.c_str(), "pool.ntp.org", "time.nist.gov");
+
     wifi_load_config();
     if (wifi_ssid.length() > 0) {
         WiFi.begin(wifi_ssid.c_str(), wifi_pass.c_str());
@@ -496,9 +549,6 @@ static void wifi_setup() {
         while (WiFi.status() != WL_CONNECTED && attempts < 20) {
             delay(500);
             attempts++;
-        }
-        if (WiFi.status() == WL_CONNECTED) {
-            configTime(0, 0, "pool.ntp.org", "time.nist.gov");
         }
     }
 
@@ -600,6 +650,7 @@ static void handle_capabilities(AsyncWebServerRequest *request) {
     JsonArray ep = doc["endpoints"].to<JsonArray>();
     const char *eps[] = {
         "/health", "/capabilities", "/config.md", "/events",
+        "/clock", "/clock/tz",
         "/firmware/version", "/firmware/upload", "/firmware/apply",
         "/firmware/confirm", "/firmware/rollback",
         "/skill", NULL
@@ -672,6 +723,71 @@ static void handle_events(AsyncWebServerRequest *request) {
             e["msg"] = events_buf[idx].message;
         }
     }
+    String response;
+    serializeJson(doc, response);
+    request->send(200, "application/json", response);
+}
+
+// --- Clock ---
+
+static void handle_clock_get(AsyncWebServerRequest *request) {
+    if (!require_auth(request)) return;
+
+    struct tm now;
+    bool synced = clock_local_time(now);
+
+    JsonDocument doc;
+    doc["tz"] = tz_string;
+    doc["synced"] = synced;
+    doc["epoch"] = (unsigned long)time(NULL);
+    if (synced) {
+        char buf[40];
+        strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &now);
+        doc["local_time"] = buf;
+        strftime(buf, sizeof(buf), "%Z", &now);
+        doc["tz_abbrev"] = buf;
+    }
+    String response;
+    serializeJson(doc, response);
+    request->send(200, "application/json", response);
+}
+
+// Body is a raw POSIX TZ string (text/plain), NOT JSON — collected by
+// handle_body_collect into request->_tempObject.
+static void handle_clock_tz(AsyncWebServerRequest *request) {
+    char *body = (char*)request->_tempObject;
+    if (!check_auth(request)) {
+        if (body) { free(body); request->_tempObject = nullptr; }
+        request->send(401, "application/json",
+            "{\"error\":\"Authorization: Bearer <token> required\"}");
+        return;
+    }
+    if (!body) {
+        request->send(400, "application/json",
+            "{\"error\":\"body must be a POSIX TZ string\"}");
+        return;
+    }
+    String tz(body);
+    free(body);
+    request->_tempObject = nullptr;
+
+    tz.trim();
+    if (!tz_valid(tz)) {
+        request->send(400, "application/json",
+            "{\"error\":\"invalid TZ (POSIX string, 1..63 printable chars)\"}");
+        return;
+    }
+    if (!write_spiffs_file(TZ_FILE, tz)) {
+        request->send(500, "application/json", "{\"error\":\"write failed\"}");
+        return;
+    }
+    tz_string = tz;
+    tz_apply();
+    event_add("timezone set to %s", tz_string.c_str());
+
+    JsonDocument doc;
+    doc["ok"] = true;
+    doc["tz"] = tz_string;
     String response;
     serializeJson(doc, response);
     request->send(200, "application/json", response);
@@ -874,6 +990,8 @@ static void handle_skill(AsyncWebServerRequest *request) {
     s += "| GET | /config.md | Node config |\n";
     s += "| POST | /config.md | Update config |\n";
     s += "| GET | /events | Event log |\n";
+    s += "| GET | /clock | Local time, timezone, NTP sync state |\n";
+    s += "| POST | /clock/tz | Set POSIX TZ, raw body e.g. `CET-1CEST,M3.5.0,M10.5.0/3` |\n";
     s += "| GET | /firmware/version | Version |\n";
     s += "| POST | /firmware/upload | Upload .bin |\n";
     s += "| POST | /firmware/apply | Apply + reboot |\n";
@@ -979,6 +1097,8 @@ static void setup_routes() {
     server.on("/config.md", HTTP_GET, handle_config_get);
     server.on("/config.md", HTTP_POST, handle_config_post, NULL, handle_body_collect);
     server.on("/events", HTTP_GET, handle_events);
+    server.on("/clock", HTTP_GET, handle_clock_get);
+    server.on("/clock/tz", HTTP_POST, handle_clock_tz, NULL, handle_body_collect);
     server.on("/firmware/version", HTTP_GET, handle_firmware_version);
     server.on("/firmware/upload", HTTP_POST, handle_firmware_upload, NULL, handle_firmware_upload_body);
     server.on("/firmware/apply", HTTP_POST, handle_firmware_apply);
@@ -1010,6 +1130,7 @@ void setup() {
     }
 
     hw_probe();       // I2C scan + battery ADC
+    tz_load();        // before wifi_setup(): configTzTime() needs the TZ string
     wifi_setup();     // RF up first; also raises the setup AP if STA fails
     token_load();     // after wifi_setup(): needs RF up for a real hardware RNG
     skills_init();    // display can now show the token / AP password on screen
