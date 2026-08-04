@@ -72,6 +72,12 @@ static volatile bool eibi_loading = false;
 static volatile int eibi_state = 0;   /* 0 idle, 1 loading, 2 ok, 3 error */
 static char eibi_err[64] = {0};
 
+/* Slot count of the currently loaded schedule, cached in RAM so the device menu
+ * label (SI_EIBI) can reflect "loaded / N slots" WITHOUT a SPIFFS read — the menu is
+ * drawn under display_mtx, where flash access is disallowed. Primed once at boot
+ * (skill_eibi_init) and updated by the worker on a successful load. 0 == not loaded. */
+static volatile int eibi_count = 0;
+
 /* --- Schedule state --- */
 
 static bool eibi_available() {
@@ -221,6 +227,21 @@ static bool eibi_utc_now(int &h, int &m) {
 static void eibi_format_until(const EibiSlot *s, char *out, size_t len) {
     if (s->sh < 0 || s->eh < 0) { snprintf(out, len, "24:00"); return; }
     snprintf(out, len, "%02d:%02d", s->eh, s->em);
+}
+
+/* Resolve the station on `freq` at the given UTC time into a caller-provided buffer,
+ * hiding EibiSlot from callers that are compiled BEFORE this file in the unity build
+ * (radio.cpp's tick — it #includes ahead of eibi.cpp, so it cannot see the struct).
+ * Returns false when the schedule is missing or nothing is on air right now. The file
+ * read is serialised on eibi_mtx inside eibi_lookup; call it from the loopTask tick
+ * only (SPIFFS read), never from an ISR. */
+static bool eibi_now_name(uint16_t freq, int utc_h, int utc_m, char *out, size_t len) {
+    if (!out || !len) return false;
+    EibiSlot slot;
+    if (!eibi_lookup(freq, utc_h, utc_m, slot)) { out[0] = '\0'; return false; }
+    strncpy(out, slot.name, len - 1);
+    out[len - 1] = '\0';
+    return true;
 }
 
 /* --- Download + parse + commit --- */
@@ -466,6 +487,7 @@ static void eibi_load_task(void *arg) {
     if (ok) {
         event_add("eibi: loaded %d slots, %u bytes", slots, (unsigned)bytes);
         eibi_err[0] = '\0';
+        eibi_count = slots;   /* cache for the menu label (avoids a flash read there) */
         eibi_state = 2;
     } else {
         event_add("eibi: load failed (%s)", err);
@@ -478,25 +500,34 @@ static void eibi_load_task(void *arg) {
     vTaskDelete(NULL);
 }
 
-/* POST /radio/eibi/load — kick off the download on the worker task and return
- * immediately. The download must NOT run here: this handler executes on the
- * async_tcp task, which is watchdog-subscribed, and a multi-second blocking GET
- * trips the WDT and reboots the node. Poll /radio/eibi/status for the result. */
-static void eibi_handle_load(AsyncWebServerRequest *req) {
-    if (!require_auth(req)) return;
+/* Kick the schedule download onto the worker task and return at once. Shared by the
+ * HTTP handler and the device-menu "EIBI Load" action so the task-spawn logic lives
+ * in one place. Returns false if WiFi is down, a load is already in flight, or the
+ * task could not be created (eibi_err/eibi_state are set on the create failure).
+ * Sets eibi_loading/eibi_state and logs the same event either way. Never blocks: the
+ * multi-second GET runs on the spawned task (deliberately NOT watchdog-subscribed),
+ * so this is safe both on the async_tcp handler and on the loopTask menu dispatch. */
+static bool eibi_start_load() {
+    if (WiFi.status() != WL_CONNECTED) return false;
 
-    if (WiFi.status() != WL_CONNECTED) {
-        req->send(503, "application/json", "{\"error\":\"no WiFi\"}");
-        return;
+    /* Atomic check-then-set of eibi_loading across tasks. C2 added a SECOND caller
+     * (the SI_EIBI menu action on the loopTask) alongside eibi_handle_load on the
+     * async_tcp task, so the flag is now genuinely contended: without this guard both
+     * could read false and BOTH spawn a worker, clobbering the same /eibi.tmp write
+     * and racing the non-reentrant encoder pause/resume. eibi_mtx is released BEFORE
+     * xTaskCreate — the worker takes eibi_mtx itself around the file swap, so holding
+     * it here would nest. Guarded state is only the flag/coarse-status trio. */
+    bool already;
+    if (eibi_mtx) xSemaphoreTake(eibi_mtx, portMAX_DELAY);
+    already = eibi_loading;
+    if (!already) {
+        eibi_loading = true;
+        eibi_state = 1;
+        eibi_err[0] = '\0';
     }
-    if (eibi_loading) {
-        req->send(409, "application/json", "{\"error\":\"already loading\"}");
-        return;
-    }
+    if (eibi_mtx) xSemaphoreGive(eibi_mtx);
+    if (already) return false;
 
-    eibi_loading = true;
-    eibi_state = 1;
-    eibi_err[0] = '\0';
     event_add("eibi: schedule download started");
 
     /* Generous stack: HTTPClient + TLS-capable buffers need well past the default.
@@ -507,7 +538,50 @@ static void eibi_handle_load(AsyncWebServerRequest *req) {
         eibi_state = 3;
         strncpy(eibi_err, "task create failed", sizeof(eibi_err) - 1);
         eibi_err[sizeof(eibi_err) - 1] = '\0';
-        req->send(500, "application/json", "{\"error\":\"task create failed\"}");
+        return false;
+    }
+    return true;
+}
+
+/* Render the Settings "EIBI" menu row (SI_EIBI) reflecting load state, into a caller
+ * buffer. Reads only RAM (eibi_state, eibi_count) — NO flash — so it is safe to call
+ * from the menu draw under display_mtx. Loading -> "EIBI ...", error -> "EIBI err",
+ * loaded -> "EIBI <N>" (slot count), otherwise the plain "EIBI Load" call to action. */
+static void eibi_menu_label(char *buf, size_t len) {
+    if (eibi_state == 1)      snprintf(buf, len, "EIBI ...");
+    else if (eibi_state == 3) snprintf(buf, len, "EIBI err");
+    else if (eibi_count > 0)  snprintf(buf, len, "EIBI %d", eibi_count);
+    else                      snprintf(buf, len, "EIBI Load");
+}
+
+/* POST /radio/eibi/load — kick off the download on the worker task and return
+ * immediately. The download must NOT run here: this handler executes on the
+ * async_tcp task, which is watchdog-subscribed, and a multi-second blocking GET
+ * trips the WDT and reboots the node. Poll /radio/eibi/status for the result. */
+static void eibi_handle_load(AsyncWebServerRequest *req) {
+    if (!require_auth(req)) return;
+
+    /* Distinguish the two pre-flight failures for the right HTTP status before
+     * delegating the actual spawn to eibi_start_load (which re-checks both). */
+    if (WiFi.status() != WL_CONNECTED) {
+        req->send(503, "application/json", "{\"error\":\"no WiFi\"}");
+        return;
+    }
+    if (eibi_loading) {
+        req->send(409, "application/json", "{\"error\":\"already loading\"}");
+        return;
+    }
+    if (!eibi_start_load()) {
+        /* The preflight above ruled out the common cases, but eibi_start_load re-checks
+         * eibi_loading atomically and can still return false if it LOST the cross-task
+         * race (another task claimed the load between our preflight and its guarded
+         * set) -> report 409. A genuine task-create failure leaves eibi_loading false
+         * with eibi_err set -> 500, preserving the original status codes. */
+        if (eibi_loading) {
+            req->send(409, "application/json", "{\"error\":\"already loading\"}");
+        } else {
+            req->send(500, "application/json", "{\"error\":\"task create failed\"}");
+        }
         return;
     }
 
@@ -535,5 +609,9 @@ static const Skill eibi_skill = {
 
 static void skill_eibi_init() {
     if (!eibi_mtx) eibi_mtx = xSemaphoreCreateMutex();
+    /* Prime the cached slot count from a schedule already on flash from a previous
+     * session, so the menu label shows "loaded / N" before any load runs this boot.
+     * Single-tasked here (setup), so this SPIFFS read is safe. */
+    if (eibi_available()) eibi_count = eibi_slot_count();
     skill_register(&eibi_skill);
 }
