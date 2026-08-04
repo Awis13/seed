@@ -31,6 +31,10 @@
 //     configured endpoint. That upload is the seed's first OUTBOUND request,
 //     and it runs on the firmware's first dedicated task — pinned to core 0,
 //     because the IDF's HTTP client blocks and loop() cannot afford to.
+//   - One progress bar with several suppliers (skills/progress.cpp): the IR
+//     blast publishes into it, POST /progress pushes into it from outside, and
+//     an arbiter picks which job the clock face and the LED ring show. A job
+//     started on the device outranks one pushed over the network.
 //
 // Endpoints:
 //   GET  /health            — alive check (no auth)
@@ -64,7 +68,7 @@
 #include <TFT_eSPI.h>
 
 // ===== Configuration =====
-#define SEED_VERSION        "0.8.1"
+#define SEED_VERSION        "0.9.0"
 #define HTTP_PORT           8080
 #define TOKEN_FILE          "/auth_token.txt"
 #define WIFI_CONFIG_FILE    "/wifi.json"
@@ -77,6 +81,14 @@
 // How long an OTA upload may go without a body chunk before loop() tears it
 // down. See the watchdog in loop() for why this number.
 #define OTA_STALL_TIMEOUT_MS 30000
+
+// What a running IR blast calls itself on the progress bar, and how long that
+// job outlives its last update. The label is a key as well as a caption, so it
+// is a constant rather than a literal typed twice: publishing under one string
+// and clearing under another leaves the bar up forever. ASCII, like every
+// label — the panel's fonts have no other glyphs.
+#define IR_PROGRESS_LABEL   "IR blast"
+#define IR_PROGRESS_TTL_S   5
 
 // ===== T-Embed CC1101 pin map =====
 #define PIN_PWR_EN      15  // power hold — HIGH before anything else, LOW = off
@@ -573,9 +585,21 @@ static bool clock_local_time(struct tm &out) {
 #define BADGE_TEXT_X 103
 #define BADGE_PAD    20
 
-// Defined in skills/ir.cpp, which is included further down: one line of blast
-// progress for the bottom row. The skill never touches TFT_eSPI itself.
-static bool ir_status_line(char *out, size_t n);
+// Progress bar under the bottom row: a 4px full-width rule at the very bottom
+// edge of the 170px panel, which is the one place a bar this wide fits without
+// renegotiating a layout three connectivity modes already share. It sits
+// directly under the note row that carries its label, so the two read as one
+// thing. Amber over the hairline colour — no new colours on this face.
+#define BAR_X        8
+#define BAR_Y      166
+#define BAR_H        4
+#define BAR_W      304
+
+// Defined in skills/progress.cpp, which is included further down: the winning
+// job as one line for the note row, and the percentage the bar is drawn from.
+// The skill never touches TFT_eSPI — it only formats a string, which is the
+// arrangement ir.cpp's own status line had before the arc grew an arbiter.
+static bool progress_status_line(char *out, size_t n, int *pct);
 
 // Defined in skills/notify.cpp, same arrangement: the notification store never
 // touches TFT_eSPI, it only answers questions the clock face asks of it.
@@ -603,6 +627,12 @@ static char fld_note[48]  = "";
 // Unread count the badge currently shows, or -1 for "nothing drawn yet". 10
 // stands for "9+", so that going from 12 unread to 11 costs no SPI.
 static int clock_badge_drawn = -1;
+// Filled width of the progress bar as it currently stands on the panel, or -1
+// for "the band is bare ground" — which is both the no-job state and the state
+// a fillScreen leaves behind, so the two need no telling apart. Like the badge
+// and unlike every text field, the bar is pixels rather than a string, so it
+// carries its own change test instead of going through draw_field.
+static int clock_bar_drawn = -1;
 
 // Repaint a field only when its content changed. An opaque text background plus
 // a fixed padding width erases the previous value, so per-second updates never
@@ -625,6 +655,39 @@ static void draw_field(char *cache, size_t cache_size, const char *text,
     tft.setTextPadding(padding);
     tft.drawString(text, x, y, font);
     tft.setTextPadding(0);
+}
+
+// The bar itself. `pct` below zero means no job is showing, and the whole band
+// goes back to the ground rather than being left on its last width.
+//
+// Only the pixels that changed are touched: the fill grows or the trough takes
+// back what it lost, the same way ui.h draws the recording level meter. A job
+// stepping one percent at a time would otherwise repaint 304x4 once a second
+// for a pixel and a half of difference.
+static void clock_bar_draw(int pct) {
+    if (pct < 0) {
+        if (clock_bar_drawn < 0) return;
+        tft.fillRect(BAR_X, BAR_Y, BAR_W, BAR_H, COL_BG);
+        clock_bar_drawn = -1;
+        return;
+    }
+    if (pct > 100) pct = 100;
+    int w = (BAR_W * pct) / 100;
+
+    // Nothing is on the band yet: lay the trough down whole before filling any
+    // of it, or the unfilled part of the bar is whatever was there before.
+    if (clock_bar_drawn < 0) {
+        tft.fillRect(BAR_X, BAR_Y, BAR_W, BAR_H, COL_RULE);
+        clock_bar_drawn = 0;
+    }
+    if (w == clock_bar_drawn) return;
+
+    if (w > clock_bar_drawn) {
+        tft.fillRect(BAR_X + clock_bar_drawn, BAR_Y, w - clock_bar_drawn, BAR_H, COL_ACCENT);
+    } else {
+        tft.fillRect(BAR_X + w, BAR_Y, clock_bar_drawn - w, BAR_H, COL_RULE);
+    }
+    clock_bar_drawn = w;
 }
 
 static void display_init() {
@@ -735,15 +798,21 @@ static void display_tick() {
         row1r[0] = '\0';
         snprintf(row2, sizeof(row2), "hold KEY 3s for setup AP");
     }
-    // An IR blast borrows the note row, but only when it is otherwise empty:
-    // the token and the setup gesture have nowhere else to be displayed.
-    if (row2[0] == '\0') ir_status_line(row2, sizeof(row2));
+    // A running job borrows the note row for its label and the band under it
+    // for its bar, but only when the row is otherwise empty: the token and the
+    // setup gesture have nowhere else to be displayed. Whose job it is has
+    // already been decided by then — this reads the winner, it does not choose
+    // between suppliers.
+    int bar_pct = -1;
+    if (row2[0] == '\0') progress_status_line(row2, sizeof(row2), &bar_pct);
+
     draw_field(fld_left, sizeof(fld_left), row1l, 8, ROW1_Y, 2,
                COL_DIM, TL_DATUM, 150);
     draw_field(fld_right, sizeof(fld_right), row1r, tft.width() - 8, ROW1_Y, 2,
                ap_active ? COL_ACCENT : COL_DIM, TR_DATUM, 150);
     draw_field(fld_note, sizeof(fld_note), row2, tft.width() / 2, ROW2_Y, 2,
                COL_DIM, TC_DATUM, 304);
+    clock_bar_draw(bar_pct);
 
     display_force = false;
 }
@@ -764,6 +833,7 @@ static void display_status() {
     tft.drawFastHLine(8, 20, tft.width() - 16, COL_RULE);
     display_force = true;  // the wipe took every field with it
     clock_badge_drawn = -1;
+    clock_bar_drawn = -1;  // ...and the bar, whose band is bare ground again
     display_tick();
 }
 
@@ -1610,6 +1680,12 @@ static void handle_wifi_post(AsyncWebServerRequest *request) {
 #include "skills/serial.cpp"
 #include "skills/ir.cpp"
 #include "skills/notify.cpp"
+/* After notify.cpp, for the three JSON response helpers its endpoints already
+   own — the same borrowing voice.cpp does, rather than a fourth copy of
+   serializeJson into a String. It depends on no skill of its own: suppliers
+   publish into it and it publishes into nothing, which is the direction that
+   lets a third supplier be added without touching this list. */
+#include "skills/progress.cpp"
 /* After notify.cpp, which it reads for the unread level it breathes, and before
    ui.h, which hands it every encoder detent. */
 #include "skills/ring.cpp"
@@ -1633,6 +1709,10 @@ static void skills_init() {
     skill_serial_init();
     skill_ir_init();
     skill_notify_init();
+    /* Nothing to bring up: no hardware, no stored state, and a store that is
+       already zeroed. It is here rather than first only to match the include
+       order above. */
+    skill_progress_init();
     /* Last, and after skill_ir_init() in particular: the two share the four RMT
        TX memory blocks this chip has, IR takes two of them, and whichever runs
        first gets what it asks for. */
@@ -1821,15 +1901,25 @@ void loop() {
     // the RMT peripheral. Advances as far as it can each pass and never blocks.
     ir_poll();
 
-    // A blast lights the ring as a progress arc without ir.cpp knowing a ring
-    // exists: loop() reads the same snapshot the on-device progress screen
-    // reads and hands over the percentage. A blast is the only job long enough
-    // to be worth showing today, which is why this clears the arc rather than
-    // arbitrating — a second source would have to be merged in here.
+    // A blast is a supplier of progress, not the owner of it. loop() reads the
+    // same snapshot the on-device blast screen reads and publishes it under a
+    // label, exactly as anything over HTTP would; ir.cpp still knows nothing
+    // about a ring, a bar or an arbiter.
+    //
+    // Republished on every pass rather than only on a change: a walk of four
+    // slots and a sixteen-byte copy under a spinlock, on a pass that is already
+    // reading the IR state anyway. What it buys is that the TTL keeps rolling
+    // forward, so a loop that stops running takes the bar down with it instead
+    // of leaving it frozen. Five seconds is short for that same reason — this
+    // line is the publisher, so "no update in five seconds" means something has
+    // gone badly wrong, not that a step is taking a while.
     {
         IrProgress p = ir_progress();
-        if (p.running && p.total > 0) ring_progress_set(p.sent * 100 / p.total);
-        else ring_progress_clear();
+        if (p.running && p.total > 0)
+            progress_publish_device(IR_PROGRESS_LABEL, p.sent * 100 / p.total,
+                                    IR_PROGRESS_TTL_S);
+        else
+            progress_clear(IR_PROGRESS_LABEL);
     }
 
     // Expires notifications whose ttl has run out and mirrors the newest few to
@@ -1853,6 +1943,24 @@ void loop() {
     // fires an auto-upload. After mic_poll(), so the take it reacts to has
     // already published its length.
     voice_poll();
+
+    // Retires expired jobs and picks the one job the panel and the ring will
+    // show. Deliberately below every supplier and above every consumer, so a
+    // percentage published on this pass reaches the screen on this pass rather
+    // than on the next one — and any later supplier belongs above this line for
+    // the same reason. It samples millis() once and hands that one reading to
+    // both the expiry and the selection: two readings would let a job expire
+    // between them and be chosen out of a store it had just been dropped from.
+    progress_poll();
+
+    // The arc, now fed by the arbiter rather than by whichever supplier wrote
+    // to it last. Same snapshot the clock face's bar reads, so the two cannot
+    // disagree about which job is running.
+    {
+        int pct = 0;
+        if (progress_current(&pct)) ring_progress_set(pct);
+        else ring_progress_clear();
+    }
 
     // Encoder and buttons, every pass: input latency is what makes the knob
     // feel attached to the screen. This owns the panel whenever the UI is on a

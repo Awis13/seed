@@ -70,7 +70,8 @@
  * /skill so an agent can drive it. The UI has no endpoints and nothing remote
  * can call it, so registering it would advertise routes that do not exist.
  * It also has to drive TFT_eSPI, and main.cpp owns that — skills deliberately
- * only format strings (see ir_status_line). So it is an include, not a skill.
+ * only format strings (see progress_status_line). So it is an include, not a
+ * skill.
  *
  * Relationship to the API
  * -----------------------
