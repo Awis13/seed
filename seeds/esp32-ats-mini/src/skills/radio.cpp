@@ -521,7 +521,7 @@ uint32_t radio_idle_ms() { return millis() - last_input_ms; }
 static SemaphoreHandle_t radio_mtx = nullptr;
 
 /*
- * Rotary encoder on PIN_ENC_A/PIN_ENC_B (Ben Buxton's decoder). The constructor
+ * Rotary encoder on PIN_ENC_A/PIN_ENC_B (own MIT quadrature decoder, see Rotary.h). The constructor
  * takes (pin1, pin2) = (B, A): passing them in this order makes a clockwise turn
  * read as DIR_CW, matching "clockwise tunes up". An interrupt on both pins feeds
  * process(); each detent nudges enc_delta, drained by radio_tick().
