@@ -126,7 +126,18 @@
 // only I2C owner; see the ownership note above hw_probe().
 #define PIN_I2C_SDA      8
 #define PIN_I2C_SCL      9
-#define PIN_KB_INT      11  // TCA8418 interrupt, active low; claimed by M5Cardputer
+// TCA8418 interrupt, active low. It is an OUTPUT of the keyboard controller and
+// an input as far as this board is concerned: the driver calls the chip's
+// enableInterrupts() unconditionally, so the TCA8418 asserts this line on every
+// key event. That makes the pin externally driven, which is why the gpio skill
+// refuses it — two chips pushing one net is not a thing to expose over HTTP.
+//
+// The ESP32 side, however, does NOT listen. M5Cardputer's Keyboard_Class::begin()
+// constructs TCA8418KeyboardReader with its interrupt_pin argument defaulted, and
+// the default is -1; the reader's begin() only calls pinMode()/attachInterruptArg()
+// when that value is >= 0. So nothing here configures GPIO11 or attaches an ISR to
+// it, and no earlier claim that M5Cardputer "claims" this pin was correct.
+#define PIN_KB_INT      11
 
 // ES8311 audio codec, I2S side. Nothing here drives I2S: M5Unified only
 // *configures* its Speaker and Mic at begin() and touches no pin until one of
@@ -148,6 +159,16 @@
 
 #define PIN_IR_TX       44
 #define PIN_VBAT_ADC    10  // battery divider; the ratio is unverified, so unread
+
+// RGB LED data line. M5Unified's board table maps board_M5CardputerADV to this
+// pin, and _setup_led() runs on every begin(), so the assignment is documented
+// rather than guessed. It only CONFIGURES the LED — it builds an RMT bus object
+// holding this pin number and drives nothing. The RMT peripheral is started by
+// M5.Led.begin(), which this firmware never calls, and cfg.led_brightness
+// defaults to 0, so the pin is idle at runtime. Idle, not free: the supply
+// behind it is gated by GPIO38 and anything that lights the LED takes the pin
+// back, which is why it is not on the safe list below.
+#define PIN_RGB_LED     21
 
 // UART broken out on the EXT 2.54-14P expansion header. Nothing on the
 // mainboard sits on these two lines; whatever answers here is whatever cap is
@@ -222,8 +243,14 @@
 //          which stores the numbers and starts nothing — so the pins stay idle
 //          and stay safe. They stop being safe the moment anything calls
 //          Ex_I2C.begin().
-//   7      Assigned to nothing on the mainboard. It is also not brought out to
-//          any connector, so it is safe to drive and does nothing visible.
+//   7      Wired to an internal FPC connector and to nothing else. M5GFX's own
+//          board table names it "Internal FPC" for the ADVANCE, in the same
+//          column where it writes "NC" for a pin that goes nowhere on a
+//          sibling board — so the distinction is the library's, not an
+//          inference. M5Stack's product notes describe an unpopulated FPC
+//          footprint near the 3.5mm jack. On a stock unit nothing is attached
+//          to it, which is what makes it safe to drive; it stops being safe the
+//          moment something is plugged into that connector.
 //
 // Excluded, by group:
 //   3,4,5,6,13,14,15,39,40  the EXT 2.54-14P expansion header. Its SPI fan-out
@@ -245,12 +272,16 @@
 //                           and the recovery path with it.
 //   0,45,47,48              strapping pins and module-internal lines.
 //   26-32                   SPI flash. 22-25 do not exist on the ESP32-S3.
-//   16,17,18,21             UNCLASSIFIED — excluded because we do not know, not
+//   21                      RGB LED data line — see PIN_RGB_LED above. A known
+//                           assignment from M5Unified's board table, not an
+//                           unknown one, and excluded because the LED owns the
+//                           pin even though nothing here starts the RMT.
+//   16,17,18                UNCLASSIFIED — excluded because we do not know, not
 //                           because we know. M5Stack's published Cardputer-Adv
-//                           pinmap lists no assignment for these four, yet the
+//                           pinmap lists no assignment for these three, yet the
 //                           board carries a microphone and an NS4150B amplifier
 //                           whose pins appear nowhere in that document. The odds
-//                           that four undocumented pins and two undocumented
+//                           that three undocumented pins and two undocumented
 //                           peripherals are unrelated are poor, so guessing is
 //                           worse than excluding. This is a gap to close with a
 //                           schematic or a meter, not a settled fact: whoever
@@ -260,8 +291,7 @@ static const int gpio_safe_pins[] = {1, 2, 7};
 static const int gpio_safe_pins_count =
     sizeof(gpio_safe_pins) / sizeof(gpio_safe_pins[0]);
 
-// Used by skills/gpio.cpp, which is not part of this commit yet.
-__attribute__((unused))
+// Used by /capabilities and by skills/gpio.cpp, which reports it as `safe`.
 static bool gpio_is_safe(int pin) {
     for (int i = 0; i < gpio_safe_pins_count; i++) {
         if (gpio_safe_pins[i] == pin) return true;
@@ -300,8 +330,9 @@ static void event_add(const char *fmt, ...) {
 
 // ===== Skill/plugin interface =====
 //
-// No skills ship in this commit. The scaffold is here so that dropping a
-// skills/ directory in later needs no change to anything above it.
+// Two skills ship: gpio and serial, both at the bottom of this file. Everything
+// a skill needs — the PIN_* map, gpio_is_safe(), require_auth(), event_add(),
+// handle_body_collect() — is declared above the #includes that pull them in.
 
 struct SkillEndpoint {
     const char *method;       // "GET", "POST"
@@ -321,8 +352,7 @@ struct Skill {
 static const Skill *g_skills[MAX_SKILLS];
 static int g_skill_count = 0;
 
-// Called by each skill's own init(), none of which exist yet.
-__attribute__((unused))
+// Called by each skill's own init(), from skills_init() below.
 static int skill_register(const Skill *skill) {
     if (g_skill_count >= MAX_SKILLS) return -1;
     g_skills[g_skill_count++] = skill;
@@ -1471,9 +1501,20 @@ static void ui_handle_key(char key) {
     }
 }
 
-// Read the keyboard. Cheap to call every loop: the TCA8418 raises an interrupt
-// and the reader only touches I2C when its ISR flag is set, so an idle keyboard
-// costs a flag test.
+// Read the keyboard. Cheap to call every loop: the reader only touches I2C when
+// its ISR flag is set, so an idle keyboard costs a flag test.
+//
+// KNOWN DEFECT, recorded here rather than fixed, because fixing it is a change
+// to the keyboard and not to anything this commit adds. That flag is never set.
+// M5Cardputer's Keyboard_Class::begin() builds its TCA8418 reader with the
+// interrupt pin defaulted to -1 (see PIN_KB_INT above), so the reader attaches
+// no ISR; its update() returns early on !_isr_flag forever, the key list it
+// feeds is never written, and keysState() therefore stays empty. The chip does
+// assert its INT line — the driver enables that — but nothing on this side is
+// watching it, so no key press reaches ui_handle_key() and the on-device menu
+// cannot be driven. The fix is to install the reader explicitly with the pin,
+// and it needs somebody at the device to verify, since a key has to be pressed.
+// /ui reporting an empty last_key on a node that has been used is the symptom.
 static void ui_key_poll() {
     // No reader was installed at all if the board did not identify — see
     // ui_begin() for why that is on purpose.
@@ -2513,11 +2554,20 @@ static void handle_wifi_post(AsyncWebServerRequest *request) {
 
 // ===== Skills =====
 //
-// Nothing to include yet. Skills arrive as `#include "skills/<name>.cpp"` here
-// and one init() call below; build_src_filter already excludes src/skills/ from
-// the build so they compile into this translation unit rather than separately.
+// Skills are #included, not compiled separately: build_src_filter in
+// platformio.ini excludes src/skills/ from the build so that each one lands in
+// THIS translation unit. That is what lets a skill use the file-scope helpers
+// above without a header to keep in step with them.
+//
+// Order is load-bearing between these two. serial.cpp calls gpio_pin_exists()
+// and gpio_refuse_reason() from gpio.cpp, so that it validates UART pins
+// against exactly the list POST /gpio/write refuses.
+#include "skills/gpio.cpp"
+#include "skills/serial.cpp"
 
 static void skills_init() {
+    skill_gpio_init();
+    skill_serial_init();
 }
 
 // ===== Routes =====
