@@ -618,12 +618,13 @@ static void hw_probe() {
 static AsyncWebServer server(HTTP_PORT);
 static String auth_token = "";
 // FIXED BUFFER, not String, for the same reason wifi_ssid below is one: it is
-// read by ui_field() on the AsyncTCP task (GET /ui) and a String reassignment
-// frees the buffer a concurrent reader is walking. Written once in wifi_setup()
-// before the web server starts and never again, so today no writer races it —
-// but the panel's cross-task reader makes that a property to keep by
-// construction, not one to rely on staying true. "Seed-" + four hex + NUL fits
-// in ten; sized with headroom.
+// read on the AsyncTCP task (GET /ui, through ui_status_row() and ui_field())
+// and a String reassignment frees the buffer a concurrent reader is walking.
+// Written once in wifi_setup() before the web server starts and never again,
+// so today no writer races it — but the panel's cross-task reader makes that a
+// property to keep by construction, not one to rely on staying true. It is read
+// by both formatters: the clock face's AP line and the NETWORK screen's.
+// "Seed-" + four hex + NUL fits in ten; sized with headroom.
 static char ap_ssid[16] = "";
 static String mdns_name = "";
 static unsigned long boot_time = 0;
@@ -640,8 +641,8 @@ static unsigned long boot_time = 0;
 #define AP_SESSION_MS (10UL * 60UL * 1000UL)
 static bool ap_active = false;
 // FIXED BUFFER, not String. Written on the loop task (ap_start rolls it,
-// ap_stop clears it) and read on the AsyncTCP task by ui_field() — the exact
-// cross-task String reassignment that was a use-after-free for the WiFi
+// ap_stop clears it) and read on the AsyncTCP task by ui_status_row() — the
+// exact cross-task String reassignment that was a use-after-free for the WiFi
 // credentials. GET /ui never reaches the read (it passes redact=true and
 // returns a placeholder first), but the panel does, and defence here costs a
 // dozen bytes. The generated password is twelve chars; sized with headroom.
@@ -1195,9 +1196,13 @@ static void wifi_setup() {
 //    that changes nothing costs no SPI at all. See ui_draw_field().
 //
 // 3. WHAT IS ON THE SCREEN IS ANSWERABLE OVER HTTP. There is no camera on this
-//    node. GET /ui and the panel derive every value from the same ui_field()
-//    calls, so the endpoint reports the screen's real content rather than a
-//    second, parallel description of it that can drift.
+//    node. GET /ui and the panel derive every value from the same formatters —
+//    ui_field() for the label/value screens, ui_status_row() for the clock
+//    face's two rows — or, where a value only exists once it has been laid out,
+//    from the draw caches themselves. Either way the endpoint reports the
+//    screen's real content rather than a second, parallel description of it
+//    that can drift. A screen that grows a shape of its own grows a `content`
+//    kind and an object to match; it does not get described twice.
 
 // Layout, in pixels, for the 240x135 panel in landscape.
 //
@@ -1206,6 +1211,10 @@ static void wifi_setup() {
 //   26..114  five rows, 18px apart
 //   116      rule
 //   121..129 footer: the key legend for the current screen
+//
+// STATUS does not use the five rows, the lower rule or the footer; it is a
+// clock face and owns everything below the header. See the clock geometry
+// further down.
 #define UI_ROWS         5
 #define UI_HDR_Y        2
 #define UI_RULE1_Y     20
@@ -1245,6 +1254,7 @@ static void wifi_setup() {
 // the landscape geometry setRotation(1) produces on this board, which is what
 // the layout note above already assumes throughout.
 #define UI_PANEL_W     240
+#define UI_PANEL_H     135
 #define UI_HDR_TITLE_W  67
 #define UI_BADGE_CX     75
 #define UI_BADGE_R       3
@@ -1279,6 +1289,145 @@ static_assert(UI_PANEL_W - UI_LABEL_X - UI_HDR_NET_W >= 0,
 // it. UI_HDR_Y + 8 is the centre line of Font2's 16px cell.
 static_assert(UI_HDR_Y + 8 + UI_BADGE_R < UI_RULE1_Y,
               "the badge dot crosses the rule under the header");
+
+// ---- The clock face ----
+//
+// STATUS is the screen this node sits on, so it is a clock and not a table: a
+// large HH:MM with the seconds beside it, the date under that, and two rows at
+// the bottom for how the node is reached. That stack needs 106 rows and only 95
+// are free between the two rules, so this one screen drops the lower rule and
+// the footer legend and takes 21..134 instead. ui_draw_frame() and ui_tick()
+// are where the two are suppressed.
+//
+// EVERY WIDTH BELOW IS A SUM OVER THE M5GFX FONT TABLES, and deliberately not a
+// runtime measurement. textWidth() and textLength() run the display's shared
+// UTF-8 decoder against the one M5.Display object and may only be called from
+// the loop task; GET /ui runs on AsyncTCP and measures nothing, and keeping the
+// figures constant is what lets it stay that way. They come from
+// lgfx/Fonts/Font7srle.h (Font7), Font32rle.h (Font4) and Font16.h (Font2).
+// RLEfont and BMPfont set x_advance to exactly the width-table entry and
+// text_width() sums those advances, so a string's width is the sum of its
+// glyphs' entries and there is no letter spacing to add.
+//
+// THESE ARE A SNAPSHOT OF ONE M5GFX RELEASE, hand-transcribed, and every
+// assertion below is expressed in terms of the copies rather than the tables.
+// fontHeight() is not constexpr and the width tables are not reachable from a
+// constant expression, so nothing here can check itself: a library bump that
+// retabulated a font would relay this screen silently, with a clean build and
+// every assert still passing. The version is pinned in platformio.ini; whoever
+// moves that pin re-checks these eight numbers against lgfx/Fonts/ in the same
+// commit.
+//
+// FONT7 IS THE SEVEN-SEGMENT FACE, and its table is why the clock row carries
+// no padding at all: a digit and '-' both advance 32 and ':' advances 12, so
+// "00:00" and "--:--" are the same 140px. Every string that row can ever hold
+// covers exactly the same pixels, and the per-glyph opaque background erases
+// all of them — there is nothing left for a padding number to fill, and any
+// number written here would be a figure that never does anything.
+//
+// Font7 also has REAL GLYPHS ONLY FOR THE DIGITS, ':', '.' AND '-'. Its own
+// header says the rest print as a space, and they do it while still advancing
+// 12px, so a word placed on that row renders as a run of invisible cells. That
+// is why the pre-sync notice lives in the date row and never in the clock's.
+#define UI_F7_H         48   // chr_hgt_f7s
+#define UI_F4_H         26   // chr_hgt_f32
+#define UI_F2_H         16   // chr_hgt_f16
+#define UI_F0_H          8   // the 6x8 GLCD font the footer legend uses
+#define UI_F7_DIGIT_W   32   // widtbl_f7s, and the same entry for '-'
+#define UI_F7_COLON_W   12   // widtbl_f7s
+#define UI_F4_DIGIT_W   14   // widtbl_f32; '-' there is 8, which is what the pad covers
+#define UI_CLOCK_Y      22
+#define UI_CLOCK_W     (4 * UI_F7_DIGIT_W + UI_F7_COLON_W)
+#define UI_SEC_W       (2 * UI_F4_DIGIT_W)
+#define UI_CLOCK_GAP    12
+// Neither x is written down, because the clock and the seconds are centred as
+// one block: changing the gap or either width has to move both, and a literal
+// would move only one of them.
+#define UI_CLOCK_X     ((UI_PANEL_W - (UI_CLOCK_W + UI_CLOCK_GAP + UI_SEC_W)) / 2)
+#define UI_SEC_X       (UI_CLOCK_X + UI_CLOCK_W + UI_CLOCK_GAP)
+// BOTTOMS FLUSH, NOT BASELINES. fontHeight() returns the em box and this uses
+// it as one, so the bottom of the seconds' 26px cell lands on the bottom of the
+// clock's 48px cell. The SECONDS' digits then sit about six pixels above the
+// clock's, because Font4 leaves 7 rows of descender under its baseline (19 of
+// 26) where Font7 leaves 1 (47 of 48). Aligning the two baselines instead would
+// be UI_CLOCK_Y + 47 - 19 = 50, and a 26px cell starting there ends at 75 —
+// five rows inside the date band below. The mismatch is the deliberate choice;
+// the collision is what it avoids.
+#define UI_SEC_Y       (UI_CLOCK_Y + UI_F7_H - UI_F4_H)
+#define UI_DATE_Y       71
+// THE FORMAT AND ITS WIDEST RENDERING ARE ONE FACT AND LIVE TOGETHER. The pad
+// below has to cover the widest string this row can ever hold, and that number
+// is a property of the format string, not of the field — change one and the
+// other is wrong. "%a %d %b %Y" tops out at "Wed 28 May 2026": Wed is the
+// widest weekday at 52px in Font4, May the widest month at 48, the day and year
+// are 14px digits. The pre-sync notice is 170. Widening the format — "%A %d %B
+// %Y" would put "Wednesday 05 August 2026" on this row — means re-deriving
+// UI_DATE_MAX_W from the tables above, and the assertion below is what stops
+// the field silently overrunning its erase band in the meantime.
+#define UI_DATE_FMT    "%a %d %b %Y"
+#define UI_DATE_MAX_W  199
+#define UI_DATE_W      236
+#define UI_CROW0_Y      99
+#define UI_CROW1_Y     117
+// The two bottom rows run the full width from UI_LABEL_X. The widest string
+// either can hold is the AP line "Seed-ffff  10m left" at 131px in Font2 —
+// ap_ssid is "Seed-" plus four hex, so nine characters, and the session states
+// are fixed text. Row 0's other branch is ui_net_summary()'s STA case, a dotted
+// quad at 111px at the very most; row 1's are "pw " plus a twelve-character
+// password at 117 and "up " plus the longest uptime millis() can reach at 103.
+// (133 is the HEADER's bound for that field, which formats an "AP " prefix this
+// row never sees; it is not this field's number.)
+#define UI_CROW_MAX_W  131
+#define UI_CROW_W      232
+// What the face reads before the first NTP sync. Named rather than written out
+// at each site because GET /ui decides whether the clock is synced by comparing
+// what the panel actually drew against this string, instead of asking the C
+// library a second time from a different task and possibly getting a different
+// answer than the glass has on it.
+#define UI_CLOCK_UNSYNCED  "--:--"
+#define UI_SEC_UNSYNCED    "--"
+#define UI_NTP_NOTICE      "waiting for NTP"
+
+static_assert(UI_CLOCK_X >= 0,
+              "the clock block is wider than the panel");
+static_assert(UI_CLOCK_Y > UI_RULE1_Y,
+              "the clock's cell crosses the rule under the header");
+static_assert(UI_SEC_X + UI_SEC_W <= UI_PANEL_W,
+              "the seconds' erase band leaves the right edge of the panel");
+static_assert(UI_CLOCK_Y + UI_F7_H <= UI_DATE_Y,
+              "the clock's cell reaches into the date row");
+static_assert(UI_SEC_Y >= UI_CLOCK_Y,
+              "the seconds sit above the top of the clock's cell");
+static_assert(UI_DATE_Y + UI_F4_H <= UI_CROW0_Y,
+              "the date's cell reaches into the row below it");
+static_assert(UI_CROW0_Y + UI_F2_H <= UI_CROW1_Y,
+              "the two bottom rows overlap");
+static_assert(UI_CROW1_Y + UI_F2_H <= UI_PANEL_H,
+              "the lower row leaves the bottom of the panel");
+static_assert(UI_PANEL_W / 2 - UI_DATE_W / 2 >= 0 &&
+              UI_PANEL_W / 2 + UI_DATE_W / 2 <= UI_PANEL_W,
+              "the date's centred erase band leaves the panel");
+static_assert(UI_LABEL_X + UI_CROW_W <= UI_PANEL_W,
+              "a bottom row's erase band leaves the right edge of the panel");
+// THE TWO THAT A CONTENT CHANGE BREAKS, rather than two more restatements of
+// the geometry. An erase band narrower than the widest string its field can
+// hold leaves the previous value's tail on the glass, and M5GFX reports neither
+// a clip nor an overrun for it — the same silent failure the header's spans are
+// asserted against. These are the only numbers on this screen that a format
+// string or a message text can invalidate from somewhere else in the file.
+static_assert(UI_DATE_W >= UI_DATE_MAX_W,
+              "the date's erase band is narrower than the widest date its format can render");
+static_assert(UI_CROW_W >= UI_CROW_MAX_W,
+              "a bottom row's erase band is narrower than the widest string it can hold");
+// WHY THE LOWER CHROME GOES, asserted rather than only asserted in prose, so
+// that a stack moved back up cannot leave two suppressions in place with
+// nothing left to justify them. The rule would fall in the two-pixel gap
+// between the bottom rows and read as a divider that separates nothing; the
+// footer legend's 8px band overlaps the lower row outright.
+static_assert(UI_CROW0_Y + UI_F2_H <= UI_RULE2_Y && UI_RULE2_Y < UI_CROW1_Y,
+              "the lower rule no longer falls between the clock face's bottom rows");
+static_assert(UI_CROW1_Y < UI_FOOT_Y + UI_F0_H && UI_FOOT_Y < UI_CROW1_Y + UI_F2_H,
+              "the footer legend no longer overlaps the clock face's lower row");
 
 // ---- Notification geometry ----
 //
@@ -1530,7 +1679,7 @@ static const UiMenuItem ui_menu[] = {
 // provisioning POST rewrites from the AsyncTCP task. Those are now fixed buffers
 // — see wifi_ssid above — precisely so the claim can be true.
 //
-// ui_field() also reads ap_ssid and ap_password, which were the last two
+// ui_status_row() also reads ap_ssid and ap_password, which were the last two
 // Strings on the /ui path; both are now fixed buffers too. Their write patterns
 // differ and the difference is why they were not the same risk. ap_password is
 // rolled by ap_start() and cleared by ap_stop(), both on the loop task, so a
@@ -1631,6 +1780,37 @@ static char ui_cache_note[16];
 // glass actually has on it. See handle_ui() for why the endpoint reads this
 // cache instead of wrapping the body itself.
 static char ui_card_body[2][NOTIFY_BODY_LEN + 4];
+// The clock face's five fields. Each is sized from the string it stores and not
+// from the one next to it: ui_draw_field() compares with strncmp over cache_n-1,
+// so a cache shorter than its own content silently compares a prefix and stops
+// repainting on a change past the cut. The date is 15 characters either way
+// ("Wed 28 May 2026" and the pre-sync notice both); 24 is headroom. The bottom
+// rows hold an SSID and a session state, a dotted quad, an uptime or a
+// password, none of which reach 40.
+//
+// SEPARATE FROM ui_cache_value[] AND NOT SHARING IT. That array is written by
+// ui_begin()'s splash and by three other screens, and the fields here are a
+// different shape in a different font at different coordinates.
+static char ui_clock_time[8];
+static char ui_clock_sec[4];
+static char ui_clock_date[24];
+static char ui_clock_row[2][40];
+// WHETHER A DRAW HAS EVER FILLED THEM, on the same principle as ui_card_body_id
+// and for a sharper reason. Only ui_draw_clock() writes those caches, and
+// ui_tick() returns before reaching it whenever !ui_ready — so on a node whose
+// panel autodetect failed they stay empty for the whole boot, and on every
+// normal boot they are empty from the moment the web server starts until the
+// first tick. An ungated read reports "" for all three, and, worse, computes
+// synced=true from an empty string that is not the pre-sync placeholder: /ui
+// would assert the clock had synced while /clock said it had not, on a node
+// whose screen shows nothing at all. Absence is what handle_ui() reports
+// instead, because an absent key reads as "not known yet" and an empty one
+// reads as "the panel is showing a blank clock".
+//
+// One-way: set once by the first draw and never cleared. A screen change does
+// not invalidate it — the caches still hold what that screen last had on it,
+// which is what they are for.
+static bool ui_clock_drawn = false;
 // WHICH MESSAGE THOSE TWO LINES BELONG TO, and the report is worthless without
 // it. The cache is only ever refilled by a draw, and a draw happens on the tick
 // after the card opens — so between ui_enter_card() and the first
@@ -1661,7 +1841,8 @@ static void ui_uptime(char *out, size_t n) {
 // The octets are formatted by hand rather than through IPAddress::toString().
 // That method builds and returns a String — a heap allocation, a copy and a
 // free every time — and this function runs on every UI tick, twice per tick on
-// the STATUS screen, which is the header plus the "net" row. At 5Hz that was
+// the STATUS screen, which is the header plus the clock face's first row (the
+// second call goes away only while the provisioning AP is up). At 5Hz that was
 // roughly ten allocate/free pairs a second for the life of the boot, on a board
 // with no PSRAM and a single 300-odd KB heap that also has to find a contiguous
 // 6KB block whenever GET /skill is called. Nothing here needs the heap at all.
@@ -1723,91 +1904,69 @@ static void ui_menu_state(int i, char *out, size_t n) {
     }
 }
 
-// The single source of truth for what a screen shows. The panel calls this to
-// draw a row; GET /ui calls it to report one. Both get their own buffers, so
-// there is no shared string for the two tasks to race over, and the two can
-// never describe the screen differently.
+// The clock face's two bottom rows, as one string each: how this node is
+// reached right now. The panel draws them and GET /ui reports them, from here
+// and from nowhere else, for the same reason ui_field() exists — one formatter
+// means the endpoint cannot describe the screen differently from the screen.
 //
-// `redact` is the whole reason this takes an argument at all. The provisioning
-// AP's password is on the STATUS screen while the AP is up, because the screen
-// is its only channel — setup() no longer prints it and it is never persisted.
-// It must not leave the device. /ui passes redact=true and gets a placeholder;
-// the panel passes false. Anything secret added here must go the same way.
+// THIS IS WHERE THE PROVISIONING AP'S PASSWORD LIVES, and it is the only place
+// it exists at all: rolled on every raise, never persisted, never sent
+// anywhere. `redact` is what keeps it that way — the panel passes false and
+// gets the password, /ui passes true and gets a placeholder. Anything secret
+// that lands on these rows later must go through the same argument.
+//
+// While the AP is up both rows become its credentials, which is the same
+// deliberate swap the five-row screen this replaced already made: these two
+// rows are worth less than the only copy of a password that exists. Which kind
+// of session it is goes beside the SSID, because the two behave differently and
+// the difference matters to somebody standing here — a keyboard-raised AP
+// closes on a timer, the boot AP stays up until the node is provisioned.
+//
+// Safe from either task. Everything read here is a scalar or one of the two
+// fixed char buffers that exist precisely so that a String reassignment on the
+// loop task cannot free an array an AsyncTCP reader is walking.
+static void ui_status_row(int row, char *out, size_t n, bool redact) {
+    out[0] = '\0';
+    if (row == 0) {
+        if (!ap_active) {
+            ui_net_summary(out, n);
+        } else if (ap_temporary) {
+            snprintf(out, n, "%s  %lum left", ap_ssid, ap_minutes_left());
+        } else {
+            snprintf(out, n, "%s  stays up", ap_ssid);
+        }
+    } else if (row == 1) {
+        if (!ap_active) {
+            char up[24];
+            ui_uptime(up, sizeof(up));
+            snprintf(out, n, "up %s", up);
+        } else if (redact) {
+            snprintf(out, n, "(on the panel only)");
+        } else {
+            snprintf(out, n, "pw %s", ap_password);
+        }
+    }
+}
+
+// The single source of truth for what a label/value screen shows. The panel
+// calls this to draw a row; GET /ui calls it to report one. Both get their own
+// buffers, so there is no shared string for the two tasks to race over, and the
+// two can never describe the screen differently.
+//
+// STATUS IS NO LONGER ONE OF THEM. It is a clock face with two full-width rows
+// under it, so it reports through its own object exactly as the menu, the list
+// and the card do, and ui_status_row() above is its formatter — including the
+// redaction that used to live here.
 //
 // Returns false when the screen has no row at that index (the menu has no
 // fields at all — it has entries, which GET /ui reports separately).
 static bool ui_field(ui_screen_t screen, int idx, char *label, size_t label_n,
-                     char *value, size_t value_n, bool redact) {
+                     char *value, size_t value_n) {
     label[0] = '\0';
     value[0] = '\0';
     if (idx < 0 || idx >= UI_ROWS) return false;
 
     switch (screen) {
-    case UI_STATUS: {
-        // While the AP is up the bottom two rows become the credentials
-        // somebody standing in front of the node needs to type into a phone.
-        // That is a deliberate swap, not an extra screen: those two rows are
-        // worth less than the only copy of a password that exists.
-        switch (idx) {
-        case 0: {
-            snprintf(label, label_n, "time");
-            struct tm now;
-            if (clock_local_time(now)) {
-                strftime(value, value_n, "%Y-%m-%d %H:%M:%S", &now);
-            } else {
-                snprintf(value, value_n, "waiting for NTP");
-            }
-            return true;
-        }
-        case 1:
-            snprintf(label, label_n, "net");
-            ui_net_summary(value, value_n);
-            return true;
-        case 2:
-            snprintf(label, label_n, "up");
-            ui_uptime(value, value_n);
-            return true;
-        case 3:
-            if (ap_active) {
-                snprintf(label, label_n, "ap");
-                // Which kind of session this is, next to the SSID, because the
-                // two behave differently and the difference matters to somebody
-                // standing here: a keyboard-raised AP closes on a timer, the
-                // boot AP stays up until the node is actually provisioned.
-                if (ap_temporary) {
-                    snprintf(value, value_n, "%s  %lum left", ap_ssid,
-                             ap_minutes_left());
-                } else {
-                    snprintf(value, value_n, "%s  stays up", ap_ssid);
-                }
-            } else {
-                snprintf(label, label_n, "heap");
-                snprintf(value, value_n, "%lu KB free",
-                         (unsigned long)(ESP.getFreeHeap() / 1024));
-            }
-            return true;
-        case 4:
-            if (ap_active) {
-                snprintf(label, label_n, "pw");
-                if (redact) {
-                    snprintf(value, value_n, "(on the panel only)");
-                } else {
-                    // Nothing but the password on this row. The session's
-                    // remaining time moved up to the "ap" row above, where it
-                    // does not compete for width with the one string on this
-                    // screen that has to be transcribed without a typo.
-                    snprintf(value, value_n, "%s", ap_password);
-                }
-            } else {
-                snprintf(label, label_n, "seed");
-                snprintf(value, value_n, "v%s", SEED_VERSION);
-            }
-            return true;
-        default:
-            return false;
-        }
-    }
-
     case UI_NETWORK:
         switch (idx) {
         case 0:
@@ -1954,11 +2113,13 @@ static bool ui_field(ui_screen_t screen, int idx, char *label, size_t label_n,
             return false;
         }
 
-    // Three screens have no label/value rows at all. The menu has entries, the
-    // list has messages and the card has one message, and GET /ui reports each
-    // of them through its own object rather than through fields[]. An empty
-    // fields[] on those three is therefore not a screen failing to describe
-    // itself; doc["content"] names where its content actually is.
+    // Four screens have no label/value rows at all. Status has a clock face,
+    // the menu has entries, the list has messages and the card has one message,
+    // and GET /ui reports each of them through its own object rather than
+    // through fields[]. An empty fields[] on those four is therefore not a
+    // screen failing to describe itself; doc["content"] names where its content
+    // actually is.
+    case UI_STATUS:
     case UI_MENU:
     case UI_MESSAGES:
     case UI_MESSAGE:
@@ -1999,10 +2160,19 @@ static_assert(UI_MENU_COUNT <= 99,
 // is documented, because it is the only place it can be. Enter acknowledges and
 // backtick does not, and a user who cannot be told that will assume looking at
 // a message is what marks it read.
+//
+// AN EMPTY LEGEND MEANS NO FOOTER AT ALL, not an empty footer. ui_tick() skips
+// the field entirely when this comes back empty, and it has to: the field's
+// padding is what erases the band, so drawing an empty string there would wipe
+// whatever the screen has put in those rows. The clock face is exactly that
+// case — it owns the panel down to the last row and has no legend.
 static void ui_footer(ui_screen_t screen, char *out, size_t n) {
     switch (screen) {
     case UI_STATUS:
-        snprintf(out, n, "ENT menu   , / dim/bright");
+        // No legend on the clock face. Its lower row occupies the footer band,
+        // so the keys it does answer to — ENT for the menu, `,` and `/` for
+        // brightness — are undocumented on the glass for now.
+        out[0] = '\0';
         break;
     case UI_MENU:
         snprintf(out, n, "; . move  ENT select  ` back  %d/%d",
@@ -2297,15 +2467,20 @@ static int32_t ui_row_y(int row) {
 // Everything the frame owns rather than a field: the two rules. Drawn on a full
 // repaint only, because nothing ever erases them.
 //
-// The card is the exception and takes the lower rule with it. That rule sits at
-// y=116, inside the rows the card's fade envelope repaints (21..120), so on the
-// card screen it would survive only as an 8px stub either side of the card. A
-// rule with a hole in it reads as a drawing bug; the footer below is perfectly
-// legible without one.
+// Two screens are exceptions and take the lower rule with them.
+//
+// The card: that rule sits at y=116, inside the rows the card's fade envelope
+// repaints (21..120), so on the card screen it would survive only as an 8px
+// stub either side of the card. A rule with a hole in it reads as a drawing
+// bug; the footer below is perfectly legible without one.
+//
+// The clock face: the rule lands in the two-pixel gap between its bottom two
+// rows, where it separates two halves of one thing. See the clock geometry and
+// the assertions over it.
 static void ui_draw_frame(ui_screen_t screen) {
     M5.Display.fillScreen(COL_BG);
     M5.Display.drawFastHLine(0, UI_RULE1_Y, M5.Display.width(), COL_RULE);
-    if (screen != UI_MESSAGE) {
+    if (screen != UI_MESSAGE && screen != UI_STATUS) {
         M5.Display.drawFastHLine(0, UI_RULE2_Y, M5.Display.width(), COL_RULE);
     }
 }
@@ -2548,6 +2723,62 @@ static void ui_draw_card(bool force) {
     ui_card_body_id = v.id;
 
     if (fading) ui_card_fade++;
+}
+
+// ---- The clock face ----
+//
+// The whole of STATUS: HH:MM, the seconds beside it, the date under both, and
+// the two rows ui_status_row() formats. Geometry and every width are up with
+// the UI_CLOCK_* constants; nothing is measured here.
+//
+// NOTHING ON THIS SCREEN CAN PRINT 1970. clock_local_time() returns false for
+// anything at or below TIME_VALID_EPOCH, which is the whole pre-NTP epoch, and
+// the placeholders below are what a caller sees until the first sync lands. The
+// notice goes in the date row because Font7 draws letters as blank cells.
+//
+// The clock field is drawn with NO PADDING, which is correct and not an
+// omission: "00:00" and "--:--" are both 140px in Font7, so the per-glyph
+// opaque background of whichever one is being drawn covers every pixel the
+// other one left. There is nothing outside the glyphs for a pad to erase.
+static void ui_draw_clock(bool force) {
+    char hhmm[8], ss[4], date[24], row[40];
+    struct tm now;
+    if (clock_local_time(now)) {
+        strftime(hhmm, sizeof(hhmm), "%H:%M", &now);
+        strftime(ss, sizeof(ss), "%S", &now);
+        strftime(date, sizeof(date), UI_DATE_FMT, &now);
+    } else {
+        snprintf(hhmm, sizeof(hhmm), "%s", UI_CLOCK_UNSYNCED);
+        snprintf(ss, sizeof(ss), "%s", UI_SEC_UNSYNCED);
+        snprintf(date, sizeof(date), "%s", UI_NTP_NOTICE);
+    }
+
+    ui_draw_field(force, ui_clock_time, sizeof(ui_clock_time), hhmm,
+                  UI_CLOCK_X, UI_CLOCK_Y, &fonts::Font7, COL_TEXT, UI_TL,
+                  0, COL_BG);
+    // The one field here that does need its pad: "00" is 28px and "--" only 16,
+    // so the wide-to-narrow step leaves 12px of the previous value behind
+    // without a side-fill to take them.
+    ui_draw_field(force, ui_clock_sec, sizeof(ui_clock_sec), ss,
+                  UI_SEC_X, UI_SEC_Y, &fonts::Font4, COL_DIM, UI_TL,
+                  UI_SEC_W, COL_BG);
+    ui_draw_field(force, ui_clock_date, sizeof(ui_clock_date), date,
+                  M5.Display.width() / 2, UI_DATE_Y, &fonts::Font4, COL_DIM,
+                  UI_TC, UI_DATE_W, COL_BG);
+
+    for (int r = 0; r < 2; r++) {
+        // false: the panel is the password's only channel, so this is the one
+        // caller that asks for it unredacted.
+        ui_status_row(r, row, sizeof(row), false);
+        ui_draw_field(force, ui_clock_row[r], sizeof(ui_clock_row[r]), row,
+                      UI_LABEL_X, r == 0 ? UI_CROW0_Y : UI_CROW1_Y,
+                      &fonts::Font2, COL_TEXT, UI_TL, UI_CROW_W, COL_BG);
+    }
+    // AFTER every field, never before, exactly as ui_card_body_id is stamped.
+    // The flag is the promise that the caches hold a drawn screen, and GET /ui
+    // runs on the AsyncTCP task and preempts this one — a flag raised first
+    // would be true for a reader arriving mid-function.
+    ui_clock_drawn = true;
 }
 
 // Leave the current screen for another one. The frame is repainted from
@@ -3078,12 +3309,13 @@ static void ui_tick() {
         ui_draw_msglist(force);
     } else if (ui_screen == UI_MESSAGE) {
         ui_draw_card(force);
+    } else if (ui_screen == UI_STATUS) {
+        ui_draw_clock(force);
     } else {
         char label[16], value[48];
         for (int row = 0; row < UI_ROWS; row++) {
             int32_t y = ui_row_y(row);
-            ui_field(ui_screen, row, label, sizeof(label), value, sizeof(value),
-                     false);
+            ui_field(ui_screen, row, label, sizeof(label), value, sizeof(value));
             ui_draw_field(force, ui_cache_label[row],
                           sizeof(ui_cache_label[row]), label,
                           UI_LABEL_X, y, &fonts::Font2, COL_DIM,
@@ -3095,10 +3327,19 @@ static void ui_tick() {
         }
     }
 
+    // An empty legend is drawn as nothing at all rather than as an empty field,
+    // because the field's padding is the erase and the clock face has its lower
+    // row in that band. Leaving ui_cache_foot holding the previous screen's
+    // legend is safe: every screen change goes through ui_goto(), which raises
+    // ui_force, and a forced pass fillScreen()s the panel and repaints this
+    // field with force=true — so a stale cache can never survive a transition
+    // into a screen that does draw a legend.
     ui_footer(ui_screen, buf, sizeof(buf));
-    ui_draw_field(force, ui_cache_foot, sizeof(ui_cache_foot), buf, UI_LABEL_X,
-                  UI_FOOT_Y, &fonts::Font0, COL_DIM, UI_TL,
-                  236, COL_BG);
+    if (buf[0] != '\0') {
+        ui_draw_field(force, ui_cache_foot, sizeof(ui_cache_foot), buf,
+                      UI_LABEL_X, UI_FOOT_Y, &fonts::Font0, COL_DIM, UI_TL,
+                      236, COL_BG);
+    }
 }
 
 // Bring up M5Unified, the panel and the keyboard. Must run before hw_probe(),
@@ -3555,11 +3796,12 @@ static void handle_events(AsyncWebServerRequest *request) {
 // — none of that is observable here, and this endpoint agreeing with
 // expectations is not a substitute for somebody looking at the glass.
 //
-// This handler runs on the AsyncTCP task and therefore draws NOTHING; see the
-// note at the top of the UI section. It reads word-sized scalars and calls
-// ui_field() into its own buffers, which is why there is no lock and nothing to
-// tear. It passes redact=true, so the provisioning AP's password — which lives
-// only in RAM and on the panel — does not travel the network.
+// This handler runs on the AsyncTCP task and therefore draws NOTHING, and
+// measures nothing either; see the note at the top of the UI section. It reads
+// word-sized scalars and calls the screens' formatters into its own buffers,
+// which is why there is no lock and nothing to tear. It passes redact=true to
+// ui_status_row(), so the provisioning AP's password — which lives only in RAM
+// and on the panel — does not travel the network.
 static void handle_ui(AsyncWebServerRequest *request) {
     if (!require_auth(request)) return;
 
@@ -3578,13 +3820,14 @@ static void handle_ui(AsyncWebServerRequest *request) {
     doc["brightness"] = ui_brightness;
     doc["backlight"] = ui_brightness > 0;
 
-    // WHICH KEY BELOW CARRIES THIS SCREEN'S CONTENT. Four screens fill
-    // fields[]; the menu, the message list and the card have no label/value
-    // rows at all and report through "menu", "messages" and "card" instead. An
-    // empty fields[] is a true statement about those three, but only if
-    // something says where to look instead — otherwise a caller reasonably
-    // reads it as a screen that failed to describe itself.
+    // WHICH KEY BELOW CARRIES THIS SCREEN'S CONTENT. Three screens fill
+    // fields[]; status, the menu, the message list and the card have no
+    // label/value rows at all and report through "clock", "menu", "messages"
+    // and "card" instead. An empty fields[] is a true statement about those
+    // four, but only if something says where to look instead — otherwise a
+    // caller reasonably reads it as a screen that failed to describe itself.
     switch (ui_screen) {
+    case UI_STATUS:   doc["content"] = "clock";    break;
     case UI_MENU:     doc["content"] = "menu";     break;
     case UI_MESSAGES: doc["content"] = "messages"; break;
     case UI_MESSAGE:  doc["content"] = "card";     break;
@@ -3594,13 +3837,69 @@ static void handle_ui(AsyncWebServerRequest *request) {
     JsonArray fields = doc["fields"].to<JsonArray>();
     char label[16], value[48];
     for (int row = 0; row < UI_ROWS; row++) {
-        if (!ui_field(ui_screen, row, label, sizeof(label), value, sizeof(value),
-                      true)) {
+        if (!ui_field(ui_screen, row, label, sizeof(label), value,
+                      sizeof(value))) {
             break;
         }
         JsonObject f = fields.add<JsonObject>();
         f["label"] = label;
         f["value"] = value;
+    }
+
+    // The clock face, only while it is up, for the same reason the card object
+    // is: the caches below are what one screen last drew, and reporting them
+    // from another screen would describe a panel nobody is looking at.
+    //
+    // THE TOP THREE COME FROM THE DRAW CACHES, exactly as the card's body lines
+    // do. Re-deriving them here would call localtime_r() and strftime() from a
+    // second task and land on a different second than the panel is showing —
+    // "what is on the glass" is the whole contract of this endpoint, and a
+    // clock is the one field where a plausible-looking second answer is
+    // indistinguishable from the right one.
+    //
+    // ONLY ONCE A DRAW HAS FILLED THEM. See ui_clock_drawn: the caches are
+    // empty until the first tick paints this screen, and never filled at all on
+    // a node whose panel did not come up. Omitted rather than emptied, on the
+    // card's principle — an absent key reads as "not known yet" where an empty
+    // string reads as a blank clock — and because `synced` computed from an
+    // unwritten cache does not merely read wrong, it reads TRUE: "" is not the
+    // pre-sync placeholder, so an ungated report would claim a synced clock on
+    // a node with a dead panel and an unsynced clock. GET /clock is the
+    // endpoint that answers the time itself; this one answers the screen.
+    //
+    // THE TWO ROWS DO NOT COME FROM THE CACHE, AND CANNOT. It holds the AP
+    // password verbatim, because the panel is that password's only channel;
+    // emitting it would put the password on the network. They go back through
+    // the formatter with redact=true instead — the same route the five-row
+    // screen used, and the same one the panel takes with redact=false.
+    //
+    // That is a deliberate exception to the cache policy above and it has a
+    // price: these two are recomputed here, so on a minute boundary a
+    // time-boxed AP's countdown can come back one minute ahead of the glass,
+    // and they are reported even before the first draw, when the glass has
+    // nothing on it. Both are the cost of the password never leaving RAM, and
+    // both are visible to a caller through the absence of the fields above.
+    if (ui_screen == UI_STATUS) {
+        JsonObject clock = doc["clock"].to<JsonObject>();
+        if (ui_clock_drawn) {
+            clock["time"] = ui_clock_time;
+            clock["seconds"] = ui_clock_sec;
+            clock["date"] = ui_clock_date;
+            // Derived from what was drawn rather than from a second call into
+            // the C library, so it cannot disagree with the three strings
+            // beside it.
+            clock["synced"] = strcmp(ui_clock_time, UI_CLOCK_UNSYNCED) != 0;
+        }
+        JsonArray rows = clock["rows"].to<JsonArray>();
+        // Sized from the draw cache and not from `value` above, so that a row
+        // long enough to be cut is cut at the same place here as it is on the
+        // glass. Nothing reaches that today — the longest of these is about
+        // twenty-five characters — and the point is that it cannot start to.
+        char row[sizeof(ui_clock_row[0])];
+        for (int r = 0; r < 2; r++) {
+            ui_status_row(r, row, sizeof(row), true);
+            rows.add(row);
+        }
     }
 
     // The menu goes out on every screen, not just while it is open: it is the
@@ -4174,10 +4473,24 @@ static void handle_skill(AsyncWebServerRequest *request) {
     s += "screen, the backlight level, whether the panel came up, whether M5\n";
     s += "identified the board, and the last key the firmware saw. Its `content`\n";
     s += "field names where that screen's content is reported, because not every\n";
-    s += "screen has rows: four fill `fields[]`, the menu fills `menu` (entries,\n";
-    s += "selection and window offset, since it scrolls), the message list fills\n";
-    s += "`messages` (count, unread, selection and window), and the card fills\n";
-    s += "`card`. An empty `fields[]` on those three is correct, not a failure.\n\n";
+    s += "screen has rows: three fill `fields[]`, status fills `clock`, the menu\n";
+    s += "fills `menu` (entries, selection and window offset, since it scrolls),\n";
+    s += "the message list fills `messages` (count, unread, selection and window),\n";
+    s += "and the card fills `card`. An empty `fields[]` on those four is correct,\n";
+    s += "not a failure.\n\n";
+    s += "Status is a clock face, not a table: a large HH:MM, the seconds beside\n";
+    s += "it, the date under both, and two rows for how the node is reached. It\n";
+    s += "has no key legend along the bottom — the stack needs the room — but ENT\n";
+    s += "still opens the menu and `,` / `/` still change the brightness. `clock`\n";
+    s += "reports `time`, `seconds` and `date` as the panel drew them, plus\n";
+    s += "`synced` — false until the first NTP sync, when the face reads `--:--`\n";
+    s += "and the date row says so. Those four are ABSENT until a draw has\n";
+    s += "actually filled them: for the first tick after boot, and for the whole\n";
+    s += "boot on a node whose panel did not come up. Absent means the screen is\n";
+    s += "not known, not that it is blank; GET /clock answers the time itself.\n";
+    s += "`rows` is always present and is recomputed per request rather than\n";
+    s += "read back from the panel, because while the setup AP is up those two\n";
+    s += "rows are its SSID and password and the password is redacted there.\n\n";
     s += "The card reports its subject by id, plus `body1` and `body2` — THE TWO\n";
     s += "LINES THE PANEL ACTUALLY WRAPPED, not the raw body. A body is 96\n";
     s += "characters and the report buffers are 48, so the raw string would be cut\n";
