@@ -637,6 +637,7 @@ static int menu_wrap(int idx, int delta, int count) {
 static const SkillEndpoint radio_endpoints[] = {
     {"POST", "/radio/tune",   "Tune: {mode:\"FM\"|\"AM\"|\"LSB\"|\"USB\", freq:<int>, bfo?:<int>}"},
     {"POST", "/radio/band",   "Jump to a band-plan preset: {idx:<int>}"},
+    {"GET",  "/radio/bands",  "List band-plan presets for UI: {bands:[{idx,name}],current}"},
     {"POST", "/radio/config", "Set mode/step/bandwidth/squelch/mute/DSP: {mode?:\"AM\"|\"LSB\"|\"USB\", step_idx?:<int>, bw_idx?:<int>, squelch?:0-127, squelch_snr?:<bool>, mute?:<bool>, agc?:<int>, avc?:<even 12-90>, softmute?:0-32, cal?:<-2000-2000 SSB>}"},
     {"POST", "/radio/volume", "Set volume: {volume:0-63}"},
     {"POST", "/radio/scan",   "Sweep current-mode band: {from,to,step,min_rssi?} -> RSSI/SNR per step"},
@@ -654,6 +655,7 @@ static const char *radio_describe() {
            "|--------|------|-------------|\n"
            "| POST | /radio/tune | Tune: `{\"mode\":\"FM|AM|LSB|USB\",\"freq\":<int>,\"bfo\":<int>}` |\n"
            "| POST | /radio/band | Jump to a band-plan preset: `{\"idx\":<int>}` |\n"
+           "| GET | /radio/bands | List band-plan presets (name + index) for UI dropdowns |\n"
            "| POST | /radio/config | Set mode/step/bandwidth + squelch/mute + DSP: `{\"mode\":\"AM|LSB|USB\",\"step_idx\":<int>,\"bw_idx\":<int>,\"squelch\":<0..127>,\"squelch_snr\":<bool>,\"mute\":<bool>,\"agc\":<int>,\"avc\":<even 12..90>,\"softmute\":<0..32>,\"cal\":<-2000..2000>}` |\n"
            "| POST | /radio/volume | Set volume: `{\"volume\":<0..63>}` |\n"
            "| POST | /radio/scan | Blocking band sweep in the current mode: `{\"from\":<int>,\"to\":<int>,\"step\":<int>,\"min_rssi\":<int>}` |\n"
@@ -672,7 +674,9 @@ static const char *radio_describe() {
            "  (FM VHF, MW, the SW broadcast segments and the amateur SSB bands). It\n"
            "  sets the mode, band edges and tuning step for you and restores the last\n"
            "  frequency used on that band. `idx` runs `0`..(band count - 1); an\n"
-           "  out-of-range index is a 400. Response: `{\"ok\",\"band\",\"mode\",\"freq\",\"freq_display\"}`.\n\n"
+           "  out-of-range index is a 400. Response: `{\"ok\",\"band\",\"mode\",\"freq\",\"freq_display\"}`.\n"
+           "- `GET /radio/bands` returns the preset list for building a UI selector:\n"
+           "  `{\"bands\":[{\"idx\":<int>,\"name\":<str>}],\"current\":<idx>}`.\n\n"
            "### Volume\n\n"
            "- `POST /radio/volume` `{\"volume\":<0..63>}` sets the receiver volume\n"
            "  (same value reported by `/radio/status` and driven by the encoder).\n\n"
@@ -1640,6 +1644,26 @@ static void radio_register_routes(AsyncWebServer &server) {
         serializeJson(doc, response);
         req->send(200, "application/json", response);
     }, NULL, handle_body_collect);
+
+    /* GET /radio/bands — the band-plan preset list for UI dropdowns: each name with
+     * its index, plus the currently selected band. Uses the public band accessors;
+     * no receiver access, so no radio_ok gate. */
+    server.on("/radio/bands", HTTP_GET, [](AsyncWebServerRequest *req) {
+        if (!require_auth(req)) return;
+
+        JsonDocument doc;
+        JsonArray arr = doc["bands"].to<JsonArray>();
+        uint8_t n = radio_get_band_count();
+        for (uint8_t i = 0; i < n; i++) {
+            JsonObject o = arr.add<JsonObject>();
+            o["idx"] = i;
+            o["name"] = radio_get_band_name_at(i);
+        }
+        doc["current"] = radio_get_band_idx();
+        String response;
+        serializeJson(doc, response);
+        req->send(200, "application/json", response);
+    });
 
     /* POST /radio/config — set the current band's demod mode and/or tuning step
      * and/or channel bandwidth. step_idx/bw_idx are indices into the (effective)
