@@ -40,6 +40,13 @@ uint8_t     display_get_theme();
 uint8_t     display_theme_count();
 const char *display_theme_name(uint8_t i);
 
+/* Backlight brightness accessors, also defined in display.cpp. The backlight duty
+ * is a global display setting persisted alongside the radio state (v8); radio.cpp
+ * only reads and restores the level, display.cpp owns the ledc channel. Guarded by
+ * display_mtx inside display_set_brightness — never touch radio_mtx for it. */
+void        display_set_brightness(uint8_t v);
+uint8_t     display_get_brightness();
+
 /*
  * Mode constants follow the ref ats-mini numbering so the SSB mode value doubles
  * as setSSB()'s usblsb argument (1=LSB, 2=USB) — no separate mapping needed.
@@ -106,8 +113,11 @@ const char *display_theme_name(uint8_t i);
  * check in radio_restore_state() and falls back to the FM defaults. v5 adds the
  * seven per-mode DSP scalars (AGC/AVC/SoftMute), all global (not per-band). v6 adds
  * the active band's two SSB calibration slots (usb_cal/lsb_cal), per-band like freq.
- * v7 adds the global display theme index (owned by display.cpp; not per-band). */
-#define RADIO_STATE_VERSION 7
+ * v7 adds the global display theme index (owned by display.cpp; not per-band).
+ * v8 adds the global backlight brightness (also display.cpp); layout/sleep keys are
+ * to follow in the same v8 — new keys are read tolerantly (doc["key"] | default) so a
+ * later addition needs no version bump, only a v7-or-older file resets to defaults. */
+#define RADIO_STATE_VERSION 8
 #define RADIO_STORE_IDLE_MS 10000
 
 /*
@@ -597,7 +607,7 @@ static int     menu_settings_idx = 0; /* cursor in the SETTINGS sublist */
  * no-op on FM/AM). Its cursor is a 0..400 INDEX (Hz = idx*10 - 2000), not the raw Hz,
  * so the five-row window steps one detent per row (a raw-Hz cursor with a 10 Hz step
  * would leave four of every five rows blank). */
-enum AdjustTarget { ADJ_STEP, ADJ_BW, ADJ_MODE, ADJ_SQUELCH, ADJ_AGC, ADJ_AVC, ADJ_SOFTMUTE, ADJ_CAL, ADJ_THEME };
+enum AdjustTarget { ADJ_STEP, ADJ_BW, ADJ_MODE, ADJ_SQUELCH, ADJ_AGC, ADJ_AVC, ADJ_SOFTMUTE, ADJ_CAL, ADJ_THEME, ADJ_BRIGHTNESS };
 static uint8_t adjust_target = ADJ_STEP;
 /* Cursor in the BAND picker (indexes bands[]). Re-seeded from radio_get_band_idx()
  * each time MENU_BAND is entered, so the list always opens on the active band. */
@@ -622,8 +632,8 @@ enum MainItem { MI_BAND = 0, MI_MEMORY, MI_MODE, MI_STEP, MI_BW, MI_SQUELCH, MI_
 /*
  * SETTINGS-sublist dispatch keys. The order MUST match menu_settings_items[] below,
  * exactly like MainItem/menu_main_items[]: the click handler switches on the raw
- * cursor (menu_settings_idx), never the label text. AGC/AVC/SoftMute/Calibration drop
- * into a numeric adjust editor; Brightness/Theme/About are not leaves yet; Back exits.
+ * cursor (menu_settings_idx), never the label text. AGC/AVC/SoftMute/Calibration and
+ * Brightness/Theme drop into their adjust editors; About is not a leaf yet; Back exits.
  */
 enum SettingsItem { SI_AGC = 0, SI_AVC, SI_SOFTMUTE, SI_CAL, SI_BRIGHTNESS, SI_THEME, SI_ABOUT, SI_BACK };
 
@@ -842,6 +852,9 @@ int radio_get_menu_idx() {
             /* ADJ_THEME: cursor IS the global theme index (display owns it). */
             if (adjust_target == ADJ_THEME)
                 return display_get_theme();
+            /* ADJ_BRIGHTNESS: cursor IS the backlight duty 10..255 (display owns it). */
+            if (adjust_target == ADJ_BRIGHTNESS)
+                return display_get_brightness();
             /* ADJ_MODE: cursor is the band's mode position within modeCycle. */
             return mode_cycle_pos(band_mode[radio_band_idx]);
         }
@@ -864,6 +877,8 @@ int radio_get_menu_count() {
             /* +/-RADIO_CAL_MAX Hz in RADIO_CAL_STEP detents -> 0..400 index, 401 rows. */
             if (adjust_target == ADJ_CAL) return 2 * RADIO_CAL_MAX / RADIO_CAL_STEP + 1;
             if (adjust_target == ADJ_THEME) return display_theme_count();
+            /* Brightness spans 0..255 nominal; item() blanks below the 10 floor. */
+            if (adjust_target == ADJ_BRIGHTNESS) return 256;
             return MODE_CYCLE_COUNT;
         default:            return MENU_MAIN_COUNT;
     }
@@ -886,6 +901,7 @@ const char *radio_get_menu_title() {
             if (adjust_target == ADJ_SOFTMUTE) return "SoftMute";
             if (adjust_target == ADJ_CAL) return "Cal Hz";
             if (adjust_target == ADJ_THEME) return "Theme";
+            if (adjust_target == ADJ_BRIGHTNESS) return "Brightness";
             return "Mode";
         default:            return "Menu";
     }
@@ -943,6 +959,14 @@ const char *radio_get_menu_item(int i) {
              * count like the band list so the caller can ask cursor-2..cursor+2. */
             int n = display_theme_count();
             return display_theme_name((uint8_t)(((i % n) + n) % n));
+        }
+        if (adjust_target == ADJ_BRIGHTNESS) {
+            /* Absolute duty candidate; render it directly, blanking rows below the
+             * 10 floor or past 255 (same window style as ADJ_SQUELCH). */
+            static char buf[8];
+            if (i < 10 || i > 255) return "";
+            snprintf(buf, sizeof(buf), "%d", i);
+            return buf;
         }
         /* Menu window items come from the band's own table mode, not radio_mode. */
         uint8_t m = band_table_mode();
@@ -2566,9 +2590,16 @@ static void radio_tick() {
                         menu_level = MENU_ADJUST;
                         adjust_target = ADJ_THEME;
                         break;
+                    case SI_BRIGHTNESS:
+                        /* Descend into the numeric backlight editor. Brightness is a
+                         * global display property (not per-radio), edited live under
+                         * display_mtx inside display_set_brightness. */
+                        menu_level = MENU_ADJUST;
+                        adjust_target = ADJ_BRIGHTNESS;
+                        break;
                     default:
-                        /* SI_BRIGHTNESS/SI_ABOUT placeholders (TODO: wire real editors)
-                         * and SI_BACK all step back up to the MAIN list. */
+                        /* SI_ABOUT placeholder (TODO: wire a real leaf) and SI_BACK
+                         * both step back up to the MAIN list. */
                         menu_level = MENU_MAIN;
                         break;
                 }
@@ -2704,6 +2735,19 @@ static void radio_tick() {
                      * each theme live. Persisted (v7); mark_dirty triggers the flush. */
                     int v = menu_wrap(display_get_theme(), d, display_theme_count());
                     display_set_theme((uint8_t)v);
+                    radio_mark_dirty();
+                } else if (adjust_target == ADJ_BRIGHTNESS) {
+                    /* Backlight brightness. Owned by display.cpp and guarded by
+                     * display_mtx inside display_set_brightness — NOT radio_mtx, so
+                     * this branch takes no radio lock (nesting radio_mtx <-> display_mtx
+                     * is forbidden, same as the theme branch above). Step 5 per detent,
+                     * clamped to the 10..255 floor so this control never blacks the
+                     * panel out. Live: the backlight tracks the knob. Persisted (v8);
+                     * mark_dirty triggers the flush. */
+                    int v = (int)display_get_brightness() + d * 5;
+                    if (v < 10)  v = 10;
+                    if (v > 255) v = 255;
+                    display_set_brightness((uint8_t)v);
                     radio_mark_dirty();
                 } else {
                     /* The value editor scrolls the parameter itself, not a cursor:
@@ -2895,6 +2939,10 @@ static void radio_tick() {
          * the accessor OUTSIDE radio_mtx (already released above) — it takes no radio
          * lock and a byte read is atomic. */
         doc["theme"] = display_get_theme();
+        /* v8: the global backlight brightness. Owned by display.cpp; read here through
+         * the accessor OUTSIDE radio_mtx (already released above) — it takes no radio
+         * lock and a byte read is atomic. */
+        doc["brt"] = display_get_brightness();
         String out;
         serializeJson(doc, out);
         write_spiffs_file(RADIO_STATE_FILE, out);  /* blocking flash write + encoder detach, outside the mutex */
@@ -2951,6 +2999,15 @@ static void radio_restore_state() {
      * skill_display_init() picks it up. */
     int th = doc["theme"] | -1;
     if (th >= 0 && th < display_theme_count()) display_set_theme((uint8_t)th);
+
+    /* v8: the global backlight brightness, restored up front alongside the theme for
+     * the same reason (a malformed radio field below must not cost it). Validated to
+     * the 10..255 range display_set_brightness enforces; anything missing/out of range
+     * leaves the default 255. Like the theme, this runs before skill_display_init (the
+     * ledc channel is not up yet), so display_set_brightness just stores the level and
+     * the boot paint applies it. Read tolerantly so future v8 keys need no bump. */
+    int brt = doc["brt"] | -1;
+    if (brt >= 10 && brt <= 255) display_set_brightness((uint8_t)brt);
 
     /* Reject anything malformed — a single bad field falls back to the defaults. */
     if (band < 0 || band >= BAND_COUNT) return;
