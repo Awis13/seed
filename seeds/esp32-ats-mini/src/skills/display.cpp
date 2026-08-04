@@ -24,6 +24,7 @@
  */
 
 #include <TFT_eSPI.h>
+#include "esp_heap_caps.h"   // heap_caps_malloc/free, MALLOC_CAP_SPIRAM (BMP capture)
 
 /* Accessors defined in radio.cpp (included just before this file). */
 uint16_t radio_get_freq();
@@ -110,6 +111,7 @@ static uint8_t display_mode = DISPLAY_STATUS;
 /* --- Endpoints --- */
 static const SkillEndpoint display_endpoints[] = {
     {"POST", "/display", "Show custom text: {text, line?}"},
+    {"GET", "/display/capture", "Grab the live screen as a 320x170 24-bit BMP"},
     {NULL, NULL, NULL}
 };
 
@@ -119,12 +121,17 @@ static const char *display_describe() {
            "### Endpoints\n\n"
            "| Method | Path | Description |\n"
            "|--------|------|-------------|\n"
-           "| POST | /display | Show custom text: `{\"text\":\"...\",\"line\":<int>}` |\n\n"
+           "| POST | /display | Show custom text: `{\"text\":\"...\",\"line\":<int>}` |\n"
+           "| GET | /display/capture | Grab the live screen as a 320x170 24-bit BMP |\n\n"
            "### Behaviour\n\n"
            "- The status screen (frequency, mode, RSSI) is painted at boot and "
            "repainted on every `/radio/tune`. RSSI is a snapshot, not a live feed.\n"
            "- `POST /display` takes over the screen with custom text until the "
            "next tune repaints the status screen.\n"
+           "- `GET /display/capture` returns exactly what the panel shows now as an "
+           "uncompressed 24-bit BMP (`image/bmp`, 320x170). The frame is snapshotted "
+           "under the display lock and streamed from PSRAM, so it never blocks the "
+           "on-device UI. 503 if the back-buffer is not ready.\n"
            "- `line` (optional, default 0) shifts the text vertically: each unit "
            "is one row down from centre, negative moves up. Clamped to -2..2 so "
            "the text stays on the visible panel.\n"
@@ -134,6 +141,9 @@ static const char *display_describe() {
            "```\n"
            "curl -H 'Authorization: Bearer <token>' -X POST \\\n"
            "  -d '{\"text\":\"HELLO\",\"line\":0}' http://<host>:8080/display\n"
+           "\n"
+           "curl -H 'Authorization: Bearer <token>' \\\n"
+           "  http://<host>:8080/display/capture -o screen.bmp\n"
            "```\n";
 }
 
@@ -466,6 +476,50 @@ void display_show_ap(const char *ssid, const char *pass, const char *token) {
     display_flush();
 }
 
+/*
+ * --- GET /display/capture: the live screen as a 24-bit BMP ---
+ *
+ * The panel is otherwise invisible over HTTP; this hands an agent the exact
+ * pixels on screen so themes / S-meter / layouts can be eyeballed. The frame is
+ * copied once (under display_mtx) into a private PSRAM buffer, then streamed
+ * lock-free from that copy, so a capture never stalls or tears the on-device UI.
+ */
+#define CAP_W 320
+#define CAP_H 170
+#define CAP_ROW_BYTES (CAP_W * 3)              /* 960, already a multiple of 4 */
+#define CAP_SNAP_BYTES (CAP_W * CAP_H * 2)     /* 108800: raw RGB565 framebuffer */
+#define CAP_HDR 54                             /* BITMAPFILEHEADER + BITMAPINFOHEADER */
+#define CAP_DATA (CAP_ROW_BYTES * CAP_H)       /* 163200 pixel bytes */
+#define CAP_TOTAL (CAP_HDR + CAP_DATA)         /* 163254 total file bytes */
+
+/* Little-endian stores — BMP is little-endian regardless of host endianness. */
+static void cap_put_u16(uint8_t *p, uint16_t v) { p[0] = v; p[1] = v >> 8; }
+static void cap_put_u32(uint8_t *p, uint32_t v) {
+    p[0] = v; p[1] = v >> 8; p[2] = v >> 16; p[3] = v >> 24;
+}
+
+/*
+ * Fill the 54-byte BMP header for a 320x170, 24-bit, uncompressed frame. Height
+ * is left positive, so the pixel array is bottom-up (BMP default) — the filler
+ * below emits image rows in reverse to match, no negative-height needed.
+ */
+static void display_bmp_header(uint8_t *h) {
+    memset(h, 0, CAP_HDR);
+    h[0] = 'B'; h[1] = 'M';
+    cap_put_u32(h + 2, CAP_TOTAL);   /* file size */
+    cap_put_u32(h + 10, CAP_HDR);    /* pixel data offset */
+    cap_put_u32(h + 14, 40);         /* BITMAPINFOHEADER size */
+    cap_put_u32(h + 18, CAP_W);      /* width */
+    cap_put_u32(h + 22, CAP_H);      /* height (positive -> bottom-up) */
+    cap_put_u16(h + 26, 1);          /* planes */
+    cap_put_u16(h + 28, 24);         /* bits per pixel */
+    cap_put_u32(h + 30, 0);          /* BI_RGB, no compression */
+    cap_put_u32(h + 34, CAP_DATA);   /* image size */
+    cap_put_u32(h + 38, 2835);       /* x pixels/metre (~72 dpi) */
+    cap_put_u32(h + 42, 2835);       /* y pixels/metre */
+    /* colours-used / important both zero from the memset. */
+}
+
 static void display_register_routes(AsyncWebServer &server) {
 
     /* POST /display — take over the screen with custom text. */
@@ -523,6 +577,84 @@ static void display_register_routes(AsyncWebServer &server) {
         event_add("display: custom text");
         req->send(200, "application/json", "{\"ok\":true}");
     }, NULL, handle_body_collect);
+
+    /* GET /display/capture — the live screen as an uncompressed 24-bit BMP. */
+    server.on("/display/capture", HTTP_GET, [](AsyncWebServerRequest *req) {
+        if (!require_auth(req)) return;
+
+        /* No back-buffer means nothing coherent to hand out (direct-to-panel
+         * fallback has no readable framebuffer). */
+        if (!spr_ready) {
+            req->send(503, "application/json", "{\"error\":\"display not ready\"}");
+            return;
+        }
+
+        /* One PSRAM allocation holds the BMP header followed by a private copy of
+         * the RGB565 framebuffer. Kept out of internal DRAM on purpose: at ~22%
+         * heap use a 163 KB DRAM stage would overflow, and PSRAM has 8 MB to
+         * spare. Freed on disconnect (below) so no request leaks 108 KB. */
+        uint8_t *buf =
+            (uint8_t *)heap_caps_malloc(CAP_HDR + CAP_SNAP_BYTES, MALLOC_CAP_SPIRAM);
+        if (!buf) {
+            req->send(503, "application/json", "{\"error\":\"capture alloc failed\"}");
+            return;
+        }
+        display_bmp_header(buf);
+
+        /* Snapshot the sprite under display_mtx for the memcpy ONLY — the HTTP
+         * stream below runs off this private copy with no lock held, so a capture
+         * can't block a repaint (or vice versa). spr.getPointer() is the 16bpp
+         * framebuffer (uint16_t*); CAP_SNAP_BYTES is its exact size. */
+        xSemaphoreTake(display_mtx, portMAX_DELAY);
+        memcpy(buf + CAP_HDR, spr.getPointer(), CAP_SNAP_BYTES);
+        xSemaphoreGive(display_mtx);
+
+        /* Free the PSRAM copy once the response is fully sent / the client drops.
+         * This is the sole owner of buf after this point — no double free. */
+        req->onDisconnect([buf]() { heap_caps_free(buf); });
+
+        /* Fixed-length filler: Content-Length is known (CAP_TOTAL), so bytes are
+         * generated on demand straight from buf — no chunked framing and no large
+         * DRAM staging buffer. `index` is the byte offset already sent.
+         *
+         * Pixel rows are emitted bottom-up to match the positive-height header.
+         * TFT_eSprite stores each 16bpp pixel byte-swapped (drawPixel swaps into
+         * panel byte order; readPixel swaps back), so __builtin_bswap16 recovers
+         * standard RGB565 before the 565->888 expand. BMP wants BGR byte order. */
+        AsyncWebServerResponse *resp = req->beginResponse(
+            "image/bmp", CAP_TOTAL,
+            [buf](uint8_t *out, size_t maxLen, size_t index) -> size_t {
+                if (index >= CAP_TOTAL) return 0;
+                const uint16_t *px = (const uint16_t *)(buf + CAP_HDR);
+                size_t produced = 0;
+                size_t pos = index;
+                while (produced < maxLen && pos < CAP_TOTAL) {
+                    if (pos < CAP_HDR) {          /* header bytes verbatim */
+                        out[produced++] = buf[pos++];
+                        continue;
+                    }
+                    size_t off = pos - CAP_HDR;   /* byte into pixel data */
+                    size_t row = off / CAP_ROW_BYTES;   /* BMP row (bottom-up) */
+                    size_t rem = off % CAP_ROW_BYTES;
+                    size_t x = rem / 3;           /* pixel column */
+                    size_t comp = rem % 3;        /* 0=B, 1=G, 2=R */
+                    size_t y = (CAP_H - 1) - row; /* image row (source is top-down) */
+                    uint16_t v = __builtin_bswap16(px[y * CAP_W + x]);
+                    uint8_t r5 = (v >> 11) & 0x1F;
+                    uint8_t g6 = (v >> 5) & 0x3F;
+                    uint8_t b5 = v & 0x1F;
+                    if (comp == 0)      out[produced++] = (uint8_t)((b5 * 255) / 31);
+                    else if (comp == 1) out[produced++] = (uint8_t)((g6 * 255) / 63);
+                    else                out[produced++] = (uint8_t)((r5 * 255) / 31);
+                    pos++;
+                }
+                return produced;
+            });
+        resp->addHeader("Content-Disposition", "inline; filename=\"display.bmp\"");
+        req->send(resp);
+
+        event_add("display: capture");
+    });
 }
 
 static const Skill display_skill = {
