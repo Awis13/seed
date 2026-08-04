@@ -58,6 +58,18 @@
  */
 #define RADIO_SCAN_MAX_STEPS 64
 
+/*
+ * Radio-state persistence. The last-tuned mode/freq/volume/bfo are stashed in a
+ * tiny JSON file on SPIFFS so a reboot lands back where the user left off. Writes
+ * are debounced: a real change marks the state dirty and, once the knob has been
+ * idle for RADIO_STORE_IDLE_MS, radio_tick() flushes one snapshot to flash. This
+ * coalesces a fast encoder sweep (dozens of freq changes) into a single write and
+ * keeps the blocking flash write off the settle-critical tuning path.
+ */
+#define RADIO_STATE_FILE    "/radio.json"
+#define RADIO_STATE_VERSION 1
+#define RADIO_STORE_IDLE_MS 10000
+
 /* --- Receiver + state (file-local) --- */
 static SI4735 rx;
 static uint16_t radio_freq;              /* current frequency (FM: 10 kHz units, AM/SSB: kHz) */
@@ -66,6 +78,20 @@ static uint8_t  radio_volume = 40;       /* 0..63 */
 static bool     radio_ok = false;        /* true once the SI4732 answered on I2C */
 static bool     radio_ssb_loaded = false;/* true while the SSB patch is live in chip RAM */
 static int      radio_bfo = 0;           /* current BFO offset in Hz (SSB only) */
+
+/*
+ * Persistence bookkeeping. radio_dirty is set on a genuine state change (a tune,
+ * a volume change, an encoder step); radio_last_change_ms timestamps it so the
+ * flush in radio_tick() can wait out the idle window before touching flash.
+ * Restore on boot must NOT set these — it is reapplying already-saved state.
+ */
+static bool     radio_dirty = false;
+static uint32_t radio_last_change_ms = 0;
+
+static void radio_mark_dirty() {
+    radio_dirty = true;
+    radio_last_change_ms = millis();
+}
 
 /*
  * Every I2C access to `rx` now runs from two contexts: the async HTTP task
@@ -235,6 +261,7 @@ static const char *radio_describe() {
            "curl -H 'Authorization: Bearer <token>' -X POST \\\n"
            "  -d '{\"from\":8700,\"to\":9000,\"step\":20,\"min_rssi\":20}' http://<host>:8080/radio/scan\n"
            "```\n\n"
+           "The current mode/freq/volume/bfo persist across a reboot (saved to flash).\n\n"
            "Band presets, live background scan and RDS are not driven yet.\n";
 }
 
@@ -419,6 +446,7 @@ static void radio_register_routes(AsyncWebServer &server) {
         xSemaphoreTake(radio_mtx, portMAX_DELAY);
         radio_mode = mode;
         radio_freq = (uint16_t)freq;
+        radio_mark_dirty();  /* real tune -> schedule a debounced persist */
         xSemaphoreGive(radio_mtx);
 
         event_add("radio: tuned %s %d", mode_str, freq);
@@ -476,6 +504,7 @@ static void radio_register_routes(AsyncWebServer &server) {
         xSemaphoreTake(radio_mtx, portMAX_DELAY);
         radio_volume = (uint8_t)v;
         rx.setVolume(radio_volume);
+        radio_mark_dirty();  /* real volume change -> schedule a debounced persist */
         xSemaphoreGive(radio_mtx);
 
         event_add("radio: volume %d", v);
@@ -701,6 +730,7 @@ static void radio_tick() {
                     else        rx.frequencyDown();
                 }
                 radio_freq = rx.getFrequency();
+                radio_mark_dirty();  /* encoder retune -> schedule a debounced persist */
             }
         } else {
             /* Volume follows the raw count for precise +/-1 steps. */
@@ -708,6 +738,7 @@ static void radio_tick() {
                 int v = constrain((int)radio_volume + d, 0, 63);
                 radio_volume = (uint8_t)v;
                 rx.setVolume(radio_volume);
+                radio_mark_dirty();  /* encoder volume change -> schedule a debounced persist */
             }
         }
         xSemaphoreGive(radio_mtx);
@@ -725,6 +756,30 @@ static void radio_tick() {
         last_draw = millis();
         display_tick_render();
     }
+
+    /* 5) Debounced persist: once the state has been dirty and idle long enough,
+     * snapshot it under the mutex and flush one JSON blob to SPIFFS. The snapshot
+     * is consistent (freq/mode/volume/bfo are also written by the HTTP task and
+     * the encoder branch above), but the write itself — a blocking flash op that
+     * detaches the encoder — runs OUTSIDE the mutex so it never stalls a
+     * concurrent status/tune. Clearing radio_dirty inside the lock closes the
+     * window where a change during the write would be lost. */
+    if (radio_dirty && millis() - radio_last_change_ms > RADIO_STORE_IDLE_MS) {
+        uint16_t f; uint8_t m, v; int b;
+        xSemaphoreTake(radio_mtx, portMAX_DELAY);
+        f = radio_freq; m = radio_mode; v = radio_volume; b = radio_bfo;
+        radio_dirty = false;
+        xSemaphoreGive(radio_mtx);
+        JsonDocument doc;
+        doc["v"] = RADIO_STATE_VERSION;
+        doc["mode"] = m;
+        doc["freq"] = f;
+        doc["volume"] = v;
+        doc["bfo"] = b;
+        String out;
+        serializeJson(doc, out);
+        write_spiffs_file(RADIO_STATE_FILE, out);  /* blocking flash write + encoder detach, outside the mutex */
+    }
 }
 
 static const Skill radio_skill = {
@@ -735,6 +790,65 @@ static const Skill radio_skill = {
     .register_routes = radio_register_routes,
     .tick = radio_tick
 };
+
+/*
+ * Restore the last-saved mode/freq/volume/bfo from SPIFFS over the FM defaults.
+ * Called once from skill_radio_init() after the receiver is up and before the
+ * skill is registered, so it runs single-tasked (server not yet started) — no
+ * mutex needed. Anything missing, unparseable, schema-mismatched or out of range
+ * is ignored, leaving the FM defaults in place. Reapplies state through the same
+ * chip calls /radio/tune uses; never marks the state dirty (nothing changed).
+ */
+static void radio_restore_state() {
+    String raw = read_spiffs_file(RADIO_STATE_FILE);
+    if (raw.length() == 0) return;  /* no saved state -> keep FM defaults */
+
+    JsonDocument doc;
+    if (deserializeJson(doc, raw) != DeserializationError::Ok) return;
+    if ((int)(doc["v"] | 0) != RADIO_STATE_VERSION) return;  /* absent/mismatched schema */
+
+    int mode   = doc["mode"]   | -1;
+    int freq   = doc["freq"]   | -1;
+    int volume = doc["volume"] | -1;
+    int bfo    = doc["bfo"]     | 0;
+
+    /* Reject anything malformed — a single bad field falls back to the defaults. */
+    if (mode < RADIO_MODE_FM || mode > RADIO_MODE_AM) return;
+    if (volume < 0 || volume > 63) return;
+    if (mode == RADIO_MODE_FM) {
+        if (freq < RADIO_FM_MIN || freq > RADIO_FM_MAX) return;
+    } else if (mode == RADIO_MODE_AM) {
+        if (freq < RADIO_AM_MIN || freq > RADIO_AM_MAX) return;
+    } else {  /* LSB / USB */
+        if (freq < RADIO_SSB_MIN || freq > RADIO_SSB_MAX) return;
+        if (bfo < -RADIO_BFO_MAX || bfo > RADIO_BFO_MAX) return;
+    }
+
+    /* Reapply via the same chip calls as /radio/tune. */
+    if (mode == RADIO_MODE_FM) {
+        rx.setFM(RADIO_FM_MIN, RADIO_FM_MAX, (uint16_t)freq, 10);
+        /* setFM resets de-emphasis/AGC to power-on defaults; reapply the EU
+         * 50 us + FM-AGC config so a restored FM boot matches /radio/tune. */
+        rx.setFMDeEmphasis(1);
+        rx.setAutomaticGainControl(0, 0);
+    } else if (mode == RADIO_MODE_AM) {
+        rx.setAM(RADIO_AM_MIN, RADIO_AM_MAX, (uint16_t)freq, 10);
+    } else {
+        if (!radio_ssb_loaded) {
+            rx.loadPatch(ssb_patch_content, sizeof(ssb_patch_content), 1);
+            radio_ssb_loaded = true;
+        }
+        rx.setSSB(RADIO_SSB_MIN, RADIO_SSB_MAX, (uint16_t)freq, 0, mode);
+        rx.setSSBAutomaticVolumeControl(1);
+        rx.setSSBBfo(-bfo);
+    }
+    rx.setVolume((uint8_t)volume);
+
+    radio_mode   = (uint8_t)mode;
+    radio_freq   = (uint16_t)freq;
+    radio_volume = (uint8_t)volume;
+    radio_bfo    = bfo;
+}
 
 /*
  * Bring the SI4732 up. Blocking, runs once at boot after hw_probe() (Wire is
@@ -785,6 +899,11 @@ static void skill_radio_init() {
     digitalWrite(PIN_AMP_EN, HIGH);
 
     radio_ok = true;
+
+    /* Overlay any saved mode/freq/volume/bfo on top of the FM defaults. Runs
+     * single-tasked here (before server.begin), so no mutex is required. */
+    radio_restore_state();
+
     Serial.println("[radio] SI4732 up: FM 100.0 MHz");
     skill_register(&radio_skill);
 }
