@@ -60,6 +60,14 @@
 #define RADIO_SCAN_MAX_STEPS 64
 
 /*
+ * Squelch poll cadence. The signal-gate re-reads RSSI/SNR (an I2C round-trip taken
+ * under radio_mtx) on this interval from radio_tick(), NOT every loop — a per-tick
+ * read would spam the bus and fight the mutex. 250 ms is fast enough to gate speech
+ * pauses without audible chatter.
+ */
+#define RADIO_SQUELCH_POLL_MS 250
+
+/*
  * Radio-state persistence. The last-tuned mode/freq/volume/bfo are stashed in a
  * tiny JSON file on SPIFFS so a reboot lands back where the user left off. Writes
  * are debounced: a real change marks the state dirty and, once the knob has been
@@ -219,6 +227,20 @@ static uint8_t  radio_volume = 40;       /* 0..63 */
 static bool     radio_ok = false;        /* true once the SI4732 answered on I2C */
 static bool     radio_ssb_loaded = false;/* true while the SSB patch is live in chip RAM */
 static int      radio_bfo = 0;           /* current BFO offset in Hz (SSB only) */
+
+/*
+ * Layered audio mute + squelch state. See radio_set_mute() for the OR layering.
+ * radio_squelch packs the signal gate: the low 7 bits (&0x7f) are the threshold
+ * 0..127 (0 = squelch off), the top bit (0x80) selects the metric (1 = SNR, else
+ * RSSI). All are written only under radio_mtx (mute_squelch also from the loop-task
+ * squelch poll), same discipline as the receiver state above. Not persisted in this
+ * cut: a reboot lands with mute off and squelch disabled.
+ */
+enum MuteLayer { MUTE_MAIN, MUTE_SQUELCH, MUTE_TEMP };
+static bool     mute_main = false;       /* user/HTTP mute toggle (MUTE_MAIN layer) */
+static bool     mute_squelch = false;    /* signal-gate mute (MUTE_SQUELCH layer) */
+static bool     audio_muted = false;     /* current physical DSP soft-mute state */
+static uint8_t  radio_squelch = 0;       /* packed: [7]=metric(1=SNR), [6:0]=threshold */
 
 /*
  * Band-plan cursor and the per-band "where was I" store. radio_band_idx indexes
@@ -469,7 +491,7 @@ static int menu_wrap(int idx, int delta, int count) {
 static const SkillEndpoint radio_endpoints[] = {
     {"POST", "/radio/tune",   "Tune: {mode:\"FM\"|\"AM\"|\"LSB\"|\"USB\", freq:<int>, bfo?:<int>}"},
     {"POST", "/radio/band",   "Jump to a band-plan preset: {idx:<int>}"},
-    {"POST", "/radio/config", "Set current band's mode/step/bandwidth: {mode?:\"AM\"|\"LSB\"|\"USB\", step_idx?:<int>, bw_idx?:<int>}"},
+    {"POST", "/radio/config", "Set mode/step/bandwidth/squelch/mute: {mode?:\"AM\"|\"LSB\"|\"USB\", step_idx?:<int>, bw_idx?:<int>, squelch?:0-127, squelch_snr?:<bool>, mute?:<bool>}"},
     {"POST", "/radio/volume", "Set volume: {volume:0-63}"},
     {"POST", "/radio/scan",   "Sweep current-mode band: {from,to,step,min_rssi?} -> RSSI/SNR per step"},
     {"GET",  "/radio/status", "Current freq/mode/RSSI/SNR (+bfo in SSB)"},
@@ -484,7 +506,7 @@ static const char *radio_describe() {
            "|--------|------|-------------|\n"
            "| POST | /radio/tune | Tune: `{\"mode\":\"FM|AM|LSB|USB\",\"freq\":<int>,\"bfo\":<int>}` |\n"
            "| POST | /radio/band | Jump to a band-plan preset: `{\"idx\":<int>}` |\n"
-           "| POST | /radio/config | Set current band's mode/step/bandwidth: `{\"mode\":\"AM|LSB|USB\",\"step_idx\":<int>,\"bw_idx\":<int>}` |\n"
+           "| POST | /radio/config | Set mode/step/bandwidth + squelch/mute: `{\"mode\":\"AM|LSB|USB\",\"step_idx\":<int>,\"bw_idx\":<int>,\"squelch\":<0..127>,\"squelch_snr\":<bool>,\"mute\":<bool>}` |\n"
            "| POST | /radio/volume | Set volume: `{\"volume\":<0..63>}` |\n"
            "| POST | /radio/scan | Blocking band sweep in the current mode: `{\"from\":<int>,\"to\":<int>,\"step\":<int>,\"min_rssi\":<int>}` |\n"
            "| GET | /radio/status | Current freq, mode, RSSI, SNR (+bfo in SSB) |\n\n"
@@ -680,6 +702,43 @@ void radio_get_signal(uint8_t *rssi, uint8_t *snr) {
 }
 
 /*
+ * Layered audio mute. Three request layers — MAIN (the user/HTTP mute toggle),
+ * SQUELCH (the signal gate) and TEMP (a one-shot transient mute) — are OR-ed: the
+ * audio is muted whenever ANY layer wants it, a pared-down take on the reference
+ * firmware's mute bitmask. Only the DSP soft-mute (rx.setAudioMute) is driven —
+ * deliberately never PIN_AMP_EN (the class-D amp) nor PIN_AUDIO_MUTE (already owned
+ * by the SI4735 driver via setAudioMuteMcuPin). No delay() lives on this path.
+ *
+ * Caller MUST hold radio_mtx (same contract as apply_*_locked): this touches the
+ * receiver and the shared layer flags. MAIN/SQUELCH update their sticky flag; TEMP
+ * is a one-shot request with no stored flag. The chip is toggled ONLY on a real
+ * edge (audio_muted != want) so the 250 ms squelch poll cannot spam I2C. The
+ * library signature is setAudioMute(bool off): off=true mutes, off=false unmutes,
+ * so `want` maps straight through.
+ */
+static void radio_set_mute(uint8_t layer, bool on) {
+    if (layer == MUTE_MAIN)         mute_main = on;
+    else if (layer == MUTE_SQUELCH) mute_squelch = on;
+    bool temp = (layer == MUTE_TEMP) ? on : false;
+    bool want = mute_main || mute_squelch || temp;
+    if (audio_muted != want) {
+        rx.setAudioMute(want);  /* off=true -> mute */
+        audio_muted = want;
+    }
+}
+
+/*
+ * Query a mute layer: MAIN/SQUELCH report their sticky flag, anything else (incl.
+ * the overall query) reports the physical soft-mute state. Plain aligned-bool reads;
+ * callers that need coherence with a concurrent write hold radio_mtx anyway.
+ */
+static bool radio_is_muted(uint8_t layer) {
+    if (layer == MUTE_MAIN)    return mute_main;
+    if (layer == MUTE_SQUELCH) return mute_squelch;
+    return audio_muted;
+}
+
+/*
  * Apply a step-table row to the chip's currentStep, on which frequencyUp/Down act.
  * SSB is intentionally skipped in this cut: SSB fine-tuning is done through the BFO
  * (out of scope here), and setSSB() was called with step 0 so encoder tuning stays
@@ -757,8 +816,12 @@ static void apply_band_locked(uint8_t idx, uint16_t freq) {
         radio_ssb_loaded = false;  /* SSB patch is dropped when we leave SSB */
         radio_bfo = 0;
     }
-    /* A mode change can reset the chip volume to its power-on default; restore it. */
-    rx.setVolume(radio_volume);
+    /* A mode change can reset the chip volume to its power-on default AND clear the
+     * DSP soft-mute. Re-push the volume only while MAIN mute is off (a setVolume while
+     * muted would unmute), and always reassert the physical mute — setFM/setAM/setSSB
+     * drop the soft-mute, so it must be reapplied to keep the layers honoured. */
+    if (!mute_main) rx.setVolume(radio_volume);
+    rx.setAudioMute(audio_muted);
 
     /* Apply the band's channel bandwidth (and, for non-SSB, its tuning step) on top
      * of the mode set-call. setFM/setAM already loaded the step above; this keeps
@@ -1064,6 +1127,16 @@ static void radio_register_routes(AsyncWebServer &server) {
         int bw_idx   = input["bw_idx"]   | -1;
         const char *mode_str = input["mode"] | (const char*)nullptr;
 
+        /* Optional squelch gate and MAIN mute toggle. "squelch" is the 0..127
+         * threshold (0 = off); "squelch_snr" optionally flips the metric (default
+         * keeps the current one); "mute" drives the MUTE_MAIN layer. */
+        bool has_squelch  = !input["squelch"].isNull();
+        bool has_sqmetric = !input["squelch_snr"].isNull();
+        bool has_mute     = !input["mute"].isNull();
+        int  squelch      = input["squelch"]     | -1;
+        bool sq_snr       = input["squelch_snr"] | false;
+        bool mute_on      = input["mute"]        | false;
+
         /* Parse the optional demod mode. Only AM/LSB/USB are settable here: FM is a
          * broadcast demod locked to the VHF band (a native-FM band is rejected under
          * the lock below), so it is never a valid config target. */
@@ -1078,9 +1151,9 @@ static void radio_register_routes(AsyncWebServer &server) {
 
         free(body); req->_tempObject = nullptr;
 
-        if (!has_step && !has_bw && !has_mode) {
+        if (!has_step && !has_bw && !has_mode && !has_squelch && !has_mute) {
             req->send(400, "application/json",
-                "{\"error\":\"provide step_idx, bw_idx and/or mode\"}");
+                "{\"error\":\"provide step_idx, bw_idx, mode, squelch and/or mute\"}");
             return;
         }
         if (mode_str_bad) {
@@ -1107,7 +1180,8 @@ static void radio_register_routes(AsyncWebServer &server) {
         uint8_t bw_max   = bwCount(mode);
         bool step_bad = has_step && (step_idx < 0 || step_idx >= step_max);
         bool bw_bad   = has_bw   && (bw_idx   < 0 || bw_idx   >= bw_max);
-        if (!mode_locked && !step_bad && !bw_bad) {
+        bool squelch_bad = has_squelch && (squelch < 0 || squelch > 127);
+        if (!mode_locked && !step_bad && !bw_bad && !squelch_bad) {
             if (has_mode) {
                 /* Mode switch: reset step/bw cursors to the new mode's defaults (the
                  * old indices belong to a different table), zero the BFO, and reapply
@@ -1127,13 +1201,33 @@ static void radio_register_routes(AsyncWebServer &server) {
                 band_bw_idx[bnd] = (uint8_t)bw_idx;
                 apply_bandwidth_locked(mode, band_bw_idx[bnd]);
             }
-            radio_mark_dirty();
+            if (has_squelch) {
+                /* Keep the current metric bit unless squelch_snr was sent. */
+                uint8_t metric_bit = has_sqmetric ? (sq_snr ? 0x80 : 0x00)
+                                                  : (uint8_t)(radio_squelch & 0x80);
+                radio_squelch = (uint8_t)((squelch & 0x7f) | metric_bit);
+                /* Threshold cleared -> drop any active squelch mute now, not at the
+                 * next poll, so the audio is not left gated. */
+                if ((radio_squelch & 0x7f) == 0 && mute_squelch)
+                    radio_set_mute(MUTE_SQUELCH, false);
+            }
+            if (has_mute) {
+                radio_set_mute(MUTE_MAIN, mute_on);
+                /* Leaving MAIN mute re-pushes the held volume (writes were skipped
+                 * while muted); still a no-op audio-wise if squelch keeps it muted. */
+                if (!mute_main) rx.setVolume(radio_volume);
+            }
+            /* Step/bw/mode are persisted (v3); squelch/mute are not, so only a change
+             * to the persisted parameters schedules a flash write. */
+            if (has_step || has_bw || has_mode) radio_mark_dirty();
         }
         /* Snapshot the resulting labels under the lock, clamped defensively; the
          * .desc pointers are flash-resident constants, safe to use after release. */
         const char *step_desc = stepsForMode(mode)[clamp_idx(band_step_idx[bnd], step_max)].desc;
         const char *bw_desc   = bwForMode(mode)[clamp_idx(band_bw_idx[bnd], bw_max)].desc;
         const char *mode_desc = radio_mode_str(mode);
+        uint8_t sq_snap = radio_squelch;
+        bool mute_snap = mute_main;
         xSemaphoreGive(radio_mtx);
 
         if (mode_locked) {
@@ -1155,6 +1249,11 @@ static void radio_register_routes(AsyncWebServer &server) {
             req->send(400, "application/json", err);
             return;
         }
+        if (squelch_bad) {
+            req->send(400, "application/json",
+                "{\"error\":\"squelch out of range (0..127)\"}");
+            return;
+        }
 
         event_add("radio: config mode=%s step=%s bw=%s", mode_desc, step_desc, bw_desc);
         display_show_status();
@@ -1164,6 +1263,9 @@ static void radio_register_routes(AsyncWebServer &server) {
         doc["mode"] = mode_desc;
         doc["step"] = step_desc;
         doc["bw"] = bw_desc;
+        doc["squelch"] = sq_snap & 0x7f;
+        doc["squelch_metric"] = (sq_snap & 0x80) ? "snr" : "rssi";
+        doc["mute"] = mute_snap;
         String response;
         serializeJson(doc, response);
         req->send(200, "application/json", response);
@@ -1207,7 +1309,9 @@ static void radio_register_routes(AsyncWebServer &server) {
          * write and the setVolume() can't interleave with an encoder step. */
         xSemaphoreTake(radio_mtx, portMAX_DELAY);
         radio_volume = (uint8_t)v;
-        rx.setVolume(radio_volume);
+        /* Store the level always, but push it to the chip only when MAIN mute is off
+         * — a setVolume while muted would unmute. It is re-pushed on unmute. */
+        if (!mute_main) rx.setVolume(radio_volume);
         radio_mark_dirty();  /* real volume change -> schedule a debounced persist */
         xSemaphoreGive(radio_mtx);
 
@@ -1347,6 +1451,8 @@ static void radio_register_routes(AsyncWebServer &server) {
         rx.getCurrentReceivedSignalQuality();
         uint8_t rssi = rx.getCurrentRSSI();
         uint8_t snr = rx.getCurrentSNR();
+        bool mute_snap = radio_is_muted(MUTE_MAIN);
+        uint8_t sq_snap = radio_squelch;
         xSemaphoreGive(radio_mtx);
 
         char freq_display[24];
@@ -1368,6 +1474,9 @@ static void radio_register_routes(AsyncWebServer &server) {
         doc["rssi"] = rssi;
         doc["snr"] = snr;
         doc["volume"] = radio_volume;
+        doc["mute"] = mute_snap;
+        doc["squelch"] = sq_snap & 0x7f;
+        doc["squelch_metric"] = (sq_snap & 0x80) ? "snr" : "rssi";
         String response;
         serializeJson(doc, response);
         req->send(200, "application/json", response);
@@ -1557,7 +1666,9 @@ static void radio_tick() {
             if (d != 0) {
                 int v = constrain((int)radio_volume + d, 0, 63);
                 radio_volume = (uint8_t)v;
-                rx.setVolume(radio_volume);
+                /* Store always; push to the chip only when MAIN mute is off (a
+                 * setVolume while muted would unmute — see radio_set_mute). */
+                if (!mute_main) rx.setVolume(radio_volume);
                 radio_mark_dirty();  /* encoder volume change -> schedule a debounced persist */
             }
         }
@@ -1570,6 +1681,31 @@ static void radio_tick() {
         millis() - last_input_ms > RADIO_COMMAND_TIMEOUT_MS) {
         ui_mode = UI_VFO;
         menu_level = MENU_MAIN;  /* covers MENU_BAND too: next entry opens at the top */
+    }
+
+    /* 3b) Squelch: throttled signal-gate poll (every RADIO_SQUELCH_POLL_MS, not
+     * every tick — a RSSI/SNR read is an I2C round-trip under radio_mtx). radio_squelch
+     * packs a 0..127 threshold in its low 7 bits (0 = disabled) and a metric select in
+     * the top bit (1 = SNR, else RSSI). When the chosen metric drops below the
+     * threshold the SQUELCH layer mutes; at/above it unmutes. No hysteresis (matches
+     * the reference). The measurement and the set_mute share ONE radio_mtx hold and no
+     * delay(); the physical toggle happens only on an edge inside radio_set_mute. */
+    static uint32_t last_squelch_ms = 0;
+    if (radio_ok && millis() - last_squelch_ms > RADIO_SQUELCH_POLL_MS) {
+        last_squelch_ms = millis();
+        xSemaphoreTake(radio_mtx, portMAX_DELAY);
+        uint8_t thr = radio_squelch & 0x7f;
+        if (thr) {
+            rx.getCurrentReceivedSignalQuality();
+            uint8_t rssi = rx.getCurrentRSSI();
+            uint8_t snr = rx.getCurrentSNR();
+            uint8_t val = (radio_squelch & 0x80) ? snr : rssi;
+            if (val >= thr && mute_squelch)       radio_set_mute(MUTE_SQUELCH, false);
+            else if (val < thr && !mute_squelch)  radio_set_mute(MUTE_SQUELCH, true);
+        } else if (mute_squelch) {
+            radio_set_mute(MUTE_SQUELCH, false);  /* threshold cleared -> unmute */
+        }
+        xSemaphoreGive(radio_mtx);
     }
 
     /* 4) Throttled repaint (~10 Hz). display_tick_render() itself leaves a custom
