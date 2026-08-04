@@ -505,7 +505,7 @@ static uint8_t ui_mode = UI_VFO;
  * Mode/Step/Bandwidth stay placeholders that bounce back to the VFO until later
  * tickets wire real parameter editing onto them.
  */
-enum MenuLevel { MENU_MAIN, MENU_SETTINGS, MENU_BAND, MENU_ADJUST };
+enum MenuLevel { MENU_MAIN, MENU_SETTINGS, MENU_BAND, MENU_ADJUST, MENU_MEMORY };
 static uint8_t menu_level = MENU_MAIN;
 static int     menu_idx = 0;      /* cursor in the MAIN list */
 static int     menu_settings_idx = 0; /* cursor in the SETTINGS sublist */
@@ -531,11 +531,20 @@ static uint8_t adjust_target = ADJ_STEP;
 static uint8_t menu_band_idx = 0;
 
 /*
+ * MENU_MEMORY is a scrolling list over the 99 memory slots (memories[]). Like the
+ * BAND picker it is a cursor list, not a value editor: the encoder moves memory_idx
+ * (0..MEMORY_COUNT-1) with no live preview (the receiver is untouched per detent —
+ * recall only fires on click), and a click acts on the highlighted slot. An empty
+ * slot (freq == 0) is SAVED to (snapshot of the current tuning); an occupied slot is
+ * RECALLED onto the receiver. Re-seeded to 0 on entry so the list opens at slot 1. */
+static int memory_idx = 0;
+
+/*
  * MAIN-list dispatch keys. The order MUST match menu_main_items[] below so the
  * click handler can switch on the raw cursor (menu_idx) instead of strcmp-ing the
  * label — the label is display text, the index is the contract.
  */
-enum MainItem { MI_BAND = 0, MI_MODE, MI_STEP, MI_BW, MI_SQUELCH, MI_MUTE, MI_SETTINGS };
+enum MainItem { MI_BAND = 0, MI_MEMORY, MI_MODE, MI_STEP, MI_BW, MI_SQUELCH, MI_MUTE, MI_SETTINGS };
 
 /*
  * SETTINGS-sublist dispatch keys. The order MUST match menu_settings_items[] below,
@@ -546,7 +555,7 @@ enum MainItem { MI_BAND = 0, MI_MODE, MI_STEP, MI_BW, MI_SQUELCH, MI_MUTE, MI_SE
 enum SettingsItem { SI_AGC = 0, SI_AVC, SI_SOFTMUTE, SI_CAL, SI_BRIGHTNESS, SI_THEME, SI_ABOUT, SI_BACK };
 
 static const char *const menu_main_items[] = {
-    "Band", "Mode", "Step", "Bandwidth", "Squelch", "Mute", "Settings"
+    "Band", "Memory", "Mode", "Step", "Bandwidth", "Squelch", "Mute", "Settings"
 };
 static const char *const menu_settings_items[] = {
     "AGC", "AVC", "SoftMute", "Calibration", "Brightness", "Theme", "About", "Back"
@@ -721,6 +730,7 @@ int radio_get_menu_idx() {
     switch (menu_level) {
         case MENU_SETTINGS: return menu_settings_idx;
         case MENU_BAND:     return menu_band_idx;
+        case MENU_MEMORY:   return memory_idx;
         case MENU_ADJUST: {
             /* Index the band's own table mode, and clamp so a cursor read never
              * exceeds the current table (belt-and-suspenders). */
@@ -761,6 +771,7 @@ int radio_get_menu_count() {
     switch (menu_level) {
         case MENU_SETTINGS: return MENU_SETTINGS_COUNT;
         case MENU_BAND:     return BAND_COUNT;
+        case MENU_MEMORY:   return MEMORY_COUNT;
         case MENU_ADJUST:
             if (adjust_target == ADJ_STEP) return stepCount(band_table_mode());
             if (adjust_target == ADJ_BW)   return bwCount(band_table_mode());
@@ -782,6 +793,7 @@ const char *radio_get_menu_title() {
     switch (menu_level) {
         case MENU_SETTINGS: return "Settings";
         case MENU_BAND:     return "Band";
+        case MENU_MEMORY:   return "Memory";
         case MENU_ADJUST:
             if (adjust_target == ADJ_STEP) return "Step";
             if (adjust_target == ADJ_BW)   return "Bandwidth";
@@ -858,6 +870,26 @@ const char *radio_get_menu_item(int i) {
     if (menu_level == MENU_SETTINGS) {
         int n = MENU_SETTINGS_COUNT;
         return menu_settings_items[((i % n) + n) % n];
+    }
+    if (menu_level == MENU_MEMORY) {
+        /* Slot row: "NN <freq>" for an occupied slot (freq reuses radio_format_freq,
+         * which folds the SSB sideband into the string), "NN ---" for an empty one.
+         * Slots are shown 1-based (index + 1) to match the HTTP API's 1..99 numbering.
+         * `i` is the absolute window candidate; wrap it modulo the bank like the other
+         * lists. One static buffer is safe: draw_menu_screen consumes each returned
+         * string before asking for the next row. */
+        int n = MEMORY_COUNT;
+        int slot = ((i % n) + n) % n;
+        static char buf[32];
+        const MemorySlot &ms = memories[slot];
+        if (ms.freq == 0) {
+            snprintf(buf, sizeof(buf), "%2d ---", slot + 1);
+        } else {
+            char fd[24];
+            radio_format_freq(ms.freq, ms.mode, fd, sizeof(fd));
+            snprintf(buf, sizeof(buf), "%2d %s", slot + 1, fd);
+        }
+        return buf;
     }
     int n = MENU_MAIN_COUNT;
     return menu_main_items[((i % n) + n) % n];
@@ -2206,6 +2238,11 @@ static void radio_tick() {
                         menu_level = MENU_BAND;
                         menu_band_idx = radio_get_band_idx();
                         break;
+                    case MI_MEMORY:
+                        /* Open the 99-slot memory list; cursor opens at slot 1. */
+                        menu_level = MENU_MEMORY;
+                        memory_idx = 0;
+                        break;
                     case MI_STEP:
                         /* Drop into the step value-editor for the active band. */
                         menu_level = MENU_ADJUST;
@@ -2260,6 +2297,27 @@ static void radio_tick() {
                 radio_select_band(menu_band_idx);
                 ui_mode = UI_VFO;
                 menu_level = MENU_MAIN;  /* next menu entry opens at the top level */
+            } else if (menu_level == MENU_MEMORY) {
+                /* Act on the highlighted slot. An empty slot is SAVED (snapshot of the
+                 * current tuning) and we stay in the list so the now-occupied slot is
+                 * visible; an occupied slot is RECALLED onto the receiver and we drop to
+                 * the VFO on that station. The memory helpers own radio_mtx themselves
+                 * (save/recall take it for the snapshot/reapply); memory_store_save()
+                 * flushes the bank to flash OUTSIDE the lock (it detaches the encoder for
+                 * the blocking SPIFFS write), so it is called here with no lock held.
+                 * TODO: device-side clear is deferred — long-press is already claimed by
+                 * menu-open, so clearing a slot stays HTTP-only (POST /radio/memory). */
+                if (memories[memory_idx].freq == 0) {
+                    radio_memory_save(memory_idx);
+                    memory_store_save();
+                    memory_idx = menu_wrap(memory_idx, 1, MEMORY_COUNT);  /* advance -> instant repaint + ready for next save */
+                } else {
+                    if (radio_recall_memory(memory_idx)) {
+                        ui_mode = UI_VFO;
+                        menu_level = MENU_MAIN;
+                    }
+                    /* else: corrupt slot, stay in the list */
+                }
             } else {
                 /* SETTINGS: dispatch on the sublist cursor (SettingsItem order matches
                  * menu_settings_items[]). AGC/AVC/SoftMute descend into their numeric
@@ -2439,6 +2497,10 @@ static void radio_tick() {
                 menu_settings_idx = menu_wrap(menu_settings_idx, d, MENU_SETTINGS_COUNT);
             else if (menu_level == MENU_BAND)
                 menu_band_idx = (uint8_t)menu_wrap(menu_band_idx, d, BAND_COUNT);
+            else if (menu_level == MENU_MEMORY)
+                /* Move the slot cursor only — no live preview (the receiver is
+                 * reprogrammed on click, not per detent). Pure UI state, no lock. */
+                memory_idx = menu_wrap(memory_idx, d, MEMORY_COUNT);
             else
                 menu_idx = menu_wrap(menu_idx, d, MENU_MAIN_COUNT);
         }
