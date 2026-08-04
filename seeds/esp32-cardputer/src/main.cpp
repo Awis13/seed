@@ -1201,7 +1201,7 @@ static void wifi_setup() {
 
 // Layout, in pixels, for the 240x135 panel in landscape.
 //
-//   0..18    header: screen title left, network summary right
+//   0..18    header: screen title left, unread badge, network summary right
 //   20       rule
 //   26..114  five rows, 18px apart
 //   116      rule
@@ -1214,6 +1214,43 @@ static void wifi_setup() {
 #define UI_ROW_H       18
 #define UI_RULE2_Y    116
 #define UI_FOOT_Y     121
+// The header row, left to right, on the 240px-wide panel. Four spans that never
+// overlap, so no one of them can erase another's pixels:
+//
+//   4..70    screen title, left at x=4, padding 67
+//   72..78   badge dot, r=3 about cx=75
+//   81..100  badge count, left at x=81, padding 20
+//   102..235 network summary, right at x=236, padding 134
+//
+// Padding is what erases the previous value here, and M5GFX only fills the
+// REMAINDER of the band — and only when `padding > string width`, STRICTLY
+// greater. A string as wide as its padding erases nothing at all and the
+// previous value's tail stays on the glass, with no error and no clipping to
+// show for it. So every width below clears the widest string its field can
+// ever hold: 66px for "HARDWARE" and "MESSAGES", and 14px for "9+".
+//
+// The network field is sized to the widest string its FORMAT can hold, which
+// is not the same thing. ui_net_summary() prints at most "AP " and a dotted
+// quad, so the structural bound is "AP 255.255.255.255" at 133px. What this
+// build can actually reach is narrower — ap_start() pins the AP to AP_IP_A..D
+// and refuses to raise it at all if the pin fails, so the AP branch tops out
+// at "AP 172.31.157.1" (109px) and the STA branch at 111px. The 124 this field
+// used before was therefore already sufficient, and no erase was ever missed.
+// 134 buys the field the freedom to keep working if AP_IP_A..D is ever moved
+// to wider octets, which is a one-line edit four hundred lines from here with
+// nothing to connect it to this number.
+//
+// UI_PANEL_W exists so the seams below can be asserted at compile time; the
+// draw calls themselves still take the width from M5.Display at runtime. It is
+// the landscape geometry setRotation(1) produces on this board, which is what
+// the layout note above already assumes throughout.
+#define UI_PANEL_W     240
+#define UI_HDR_TITLE_W  67
+#define UI_BADGE_CX     75
+#define UI_BADGE_R       3
+#define UI_BADGE_X      81
+#define UI_BADGE_W      20
+#define UI_HDR_NET_W   134
 // Two columns on a data row: a dim label, then the value.
 #define UI_LABEL_X      4
 #define UI_LABEL_W     50
@@ -1221,6 +1258,27 @@ static void wifi_setup() {
 #define UI_VALUE_W    182
 #define UI_MENU_X       8
 #define UI_MENU_R_X   232
+
+// The header's spans are asserted and not merely written down, on the precedent
+// of the footer legend's counters further down this file. Every seam up there
+// is one or two pixels wide and one #define away from a silent overlap: M5GFX
+// reports neither a collision nor a clip, so the first evidence of one would be
+// a smear on the glass that no build and no endpoint can show. ui_begin()'s
+// splash held the title's old width for exactly this reason — the invariant had
+// already drifted at one call site before it was ever written down.
+static_assert(UI_LABEL_X + UI_HDR_TITLE_W <= UI_BADGE_CX - UI_BADGE_R,
+              "the header title's erase band reaches into the badge dot");
+static_assert(UI_BADGE_CX + UI_BADGE_R < UI_BADGE_X,
+              "the badge dot reaches into the badge count's erase band");
+static_assert(UI_BADGE_X + UI_BADGE_W <= UI_PANEL_W - UI_LABEL_X - UI_HDR_NET_W,
+              "the badge count's erase band reaches into the network summary");
+static_assert(UI_PANEL_W - UI_LABEL_X - UI_HDR_NET_W >= 0,
+              "the network summary's erase band starts off the left of the panel");
+// The dot is the one header element drawn as geometry rather than as a font
+// cell, so it is the one that can leave the row without a glyph metric stopping
+// it. UI_HDR_Y + 8 is the centre line of Font2's 16px cell.
+static_assert(UI_HDR_Y + 8 + UI_BADGE_R < UI_RULE1_Y,
+              "the badge dot crosses the rule under the header");
 
 // ---- Notification geometry ----
 //
@@ -1427,12 +1485,14 @@ struct UiMenuItem {
 // MESSAGES WENT IN AT THE TOP, NOT ON THE END, and that is a change to a menu
 // that already existed rather than an addition beside it: every entry below
 // moved down one, and the cursor a fresh boot starts on is now Messages where
-// it used to be Network. Deliberate, and worth the disruption for one reason —
-// this is the only row on the device that carries an unread count. There is no
-// badge on the status screen, no buzzer and no LED, so the queue gets noticed
-// here or not at all, and a row that has to be scrolled past five others to be
-// seen is not a notification. Everything below it is configuration a user goes
-// looking for; this is the row that has something to say without being asked.
+// it used to be Network. Deliberate, and still right now that the header
+// carries a badge — but for a different reason than the one it went in for.
+// The badge is what gets a message noticed; this row is where the reader is
+// sent once it has, and it is the only entry here whose state changes without
+// the user having touched anything. Everything below it is configuration, which
+// a user goes looking for and can find by looking. Landing a fresh boot's
+// cursor on the one row that may have something new on it costs the rest
+// nothing.
 //
 // Nothing keys off the old numbering. The indices are used in exactly three
 // places and all three take them from this table: ui_activate() by lookup,
@@ -1535,6 +1595,11 @@ static volatile unsigned long ui_last_key_ms = 0;
 // changes nothing costs no SPI.
 static char ui_cache_hdr[16];
 static char ui_cache_net[24];
+// The unread badge is a dot and a count that always move together, so one
+// remembered value covers both. It is not a string cache: the dot has no string
+// to key on. Quantised the same way the drawn value is, so everything above
+// nine compares equal. -1 is a state nothing can quantise to.
+static int ui_badge_drawn = -1;
 // Sized to hold a whole value rather than a prefix of one: the change test is a
 // strncmp against the cache, so a cache shorter than the strings it stores
 // would silently stop repainting fields that differ only past its end.
@@ -1637,11 +1702,11 @@ static void ui_menu_state(int i, char *out, size_t n) {
             snprintf(out, n, "%u", (unsigned)ui_brightness);
             break;
         case UI_ACT_SCREEN:
-            // The Messages row carries the queue's state, and it is the only
-            // place on this firmware that an unread count is visible without
-            // navigating to it. There is no badge on the status screen and no
-            // buzzer and no LED on this node, so the menu is where a message
-            // gets noticed.
+            // The Messages row carries the queue's state in full: how many are
+            // unread AND how many are held. The header's badge is the thing
+            // that gets a message noticed — it is on every screen and this row
+            // is not — but it is quantised at "9+" and says nothing about the
+            // read ones, so this is still where the queue is actually read.
             //
             // Both calls take the store's spinlock and are safe from any task,
             // which matters because GET /ui calls this from AsyncTCP.
@@ -1906,11 +1971,13 @@ static bool ui_field(ui_screen_t screen, int idx, char *label, size_t label_n,
 // the node gets. Kept in sync with ui_handle_key() by being right next to it.
 //
 // THE SCROLL COUNTER LIVES HERE AND NOT IN THE HEADER. The source firmware puts
-// its `n/m` in the header bar, which on this panel is already full: the title
-// field runs 0..114 and the network summary 112..236, and those two overlap by
-// 2px as it is. The footer has the room, but not much of it — Font0 is fixed
-// at 6px a glyph, so the 236px field holds 39 characters, and the longest
-// legend below is the card's at exactly 39 with a two-digit counter on it:
+// its `n/m` in the header bar, which on this panel has nowhere to put it: the
+// four spans up there — title, badge dot, badge count, network summary — are
+// asserted not to touch, and what they leave between them is one pixel in two
+// places and two in a third. The footer has the room, but not much of it —
+// Font0 is fixed at 6px a glyph, so the 236px field holds 39 characters, and
+// the longest legend below is the card's at exactly 39 with a two-digit
+// counter on it:
 // "; . next  ENT ack  ` keep unread  20/20" measures 234px into 236. Two
 // pixels of slack, so a legend that grows by one character does not fit.
 //
@@ -2915,12 +2982,55 @@ static void ui_tick() {
     ui_draw_field(force, ui_cache_hdr, sizeof(ui_cache_hdr),
                   ui_screen_title[ui_screen],
                   UI_LABEL_X, UI_HDR_Y, &fonts::Font2, COL_ACCENT,
-                  UI_TL, 110, COL_BG);
+                  UI_TL, UI_HDR_TITLE_W, COL_BG);
     char buf[48];
     ui_net_summary(buf, sizeof(buf));
     ui_draw_field(force, ui_cache_net, sizeof(ui_cache_net), buf,
                   M5.Display.width() - UI_LABEL_X, UI_HDR_Y, &fonts::Font2,
-                  COL_DIM, UI_TR, 124, COL_BG);
+                  COL_DIM, UI_TR, UI_HDR_NET_W, COL_BG);
+
+    // The unread badge, in the gap the two header fields leave between them.
+    // The header is on every screen, so this is the one place that says a
+    // message arrived without having to navigate to Messages for it.
+    //
+    // Not a ui_draw_field, and it cannot be one: that caches on the text, and
+    // the dot has no text. A single explicit test drives both halves, which is
+    // correct because they never disagree — the dot is lit exactly when the
+    // count is non-empty.
+    //
+    // The quantise is what makes this cheap. Everything above nine draws the
+    // same "9+", so collapsing it to one value before the comparison means a
+    // queue churning between ten and twenty unread costs no SPI at all.
+    //
+    // notify_unread_count() takes the store's spinlock, which disables
+    // interrupts on this core for the length of the walk, so the dot and the
+    // count are driven from ONE call and not one each. That is this call site
+    // only — a MENU tick still reaches the store again through ui_menu_state().
+    int unread = notify_unread_count();
+    int badge = unread > 9 ? 10 : unread;
+    // `force` and not ui_force: a forced pass has already run fillScreen, so
+    // the dot is gone from the glass whatever ui_badge_drawn still says.
+    if (force || badge != ui_badge_drawn) {
+        ui_badge_drawn = badge;
+        // Cleared by painting the same circle in the background colour, so the
+        // dot gives back exactly the pixels it took and no more. The +8 is half
+        // of Font2's 16px cell, which puts the dot on the centre line of the
+        // two strings either side of it.
+        M5.Display.fillCircle(UI_BADGE_CX, UI_HDR_Y + 8, UI_BADGE_R,
+                              badge ? COL_ACCENT : COL_BG);
+        if (badge == 0)      buf[0] = '\0';
+        else if (badge > 9)  snprintf(buf, sizeof(buf), "9+");
+        else                 snprintf(buf, sizeof(buf), "%d", badge);
+        // Drawn straight rather than through the field cache: the test above
+        // has already decided, and a second gate keyed on the text alone would
+        // be a second answer to a question the dot's half cannot ask.
+        M5.Display.setFont(&fonts::Font2);
+        M5.Display.setTextDatum(UI_TL);
+        M5.Display.setTextColor(COL_ACCENT, COL_BG);
+        M5.Display.setTextPadding(UI_BADGE_W);
+        M5.Display.drawString(buf, UI_BADGE_X, UI_HDR_Y);
+        M5.Display.setTextPadding(0);
+    }
 
     if (ui_screen == UI_MENU) {
         ui_menu_first = ui_window(ui_menu_index, ui_menu_first, UI_MENU_COUNT,
@@ -3097,7 +3207,7 @@ static void ui_begin() {
     ui_draw_frame(ui_screen);
     ui_draw_field(true, ui_cache_hdr, sizeof(ui_cache_hdr), "SEED", UI_LABEL_X,
                   UI_HDR_Y, &fonts::Font2, COL_ACCENT, UI_TL,
-                  110, COL_BG);
+                  UI_HDR_TITLE_W, COL_BG);
     ui_draw_field(true, ui_cache_value[0], sizeof(ui_cache_value[0]),
                   "starting...",
                   UI_VALUE_X, ui_row_y(0), &fonts::Font2, COL_TEXT,

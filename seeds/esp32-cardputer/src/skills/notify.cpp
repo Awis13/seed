@@ -419,15 +419,16 @@ static bool notify_crit_unread() {
 }
 
 /* The most severe level still unacknowledged, or false if nothing is. The
-   status bar's badge takes its colour from this, which is a different question
-   from notify_crit_unread()'s: that one asks whether UI_STATUS should stop
-   looking idle, this one asks which of three colours to draw. One pass under
-   the lock answers it, rather than a call per level.
+   question a severity-coloured badge would ask, and a different one from
+   notify_crit_unread()'s: that one asks whether UI_STATUS should stop looking
+   idle, this one asks which of three colours to draw. One pass under the lock
+   answers it, rather than a call per level.
  *
- * STILL NO CALLER. The status-screen badge these two were kept for is not part
- * of this commit either: the screens that landed are the list and the card, and
- * discoverability is carried by the menu's Messages row, which shows the unread
- * count from any screen. Left marked rather than given an invented caller. */
+ * STILL NO CALLER, and the header's badge is not one. That badge draws in the
+ * accent colour whatever is sitting in the queue: colouring it by severity
+ * changes what the screen means rather than where things are on it, and belongs
+ * to a commit that can be judged on that alone. Left marked rather than given
+ * an invented caller. */
 __attribute__((unused))
 static bool notify_top_unread_level(uint8_t &out) {
     bool found = false;
