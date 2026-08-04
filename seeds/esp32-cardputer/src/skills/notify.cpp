@@ -295,8 +295,8 @@ static unsigned long notify_age_of(const Notification &e, time_t now,
 /* Age in the four characters the panel's age column is cut for. Presentation
    with no TFT in it, so it lives here next to the clock arithmetic.
  *
- * No caller until the notification list, which is not part of this commit. */
-__attribute__((unused))
+ * Called by both screens: the list draws it in every row and the card draws it
+ * beside the source. */
 static void notify_age_str(unsigned long age_s, char *out, size_t n) {
     if (age_s < 60)          snprintf(out, n, "now");
     else if (age_s < 3600)   snprintf(out, n, "%lum", age_s / 60);
@@ -394,7 +394,7 @@ static int notify_unread_count() {
 /* Whether anything critical is still unacknowledged — the one piece of state
    UI_STATUS, whose first row is the clock, reacts to.
  *
- * No caller until the status screen, which is not part of this commit. */
+ * STILL NO CALLER after the screens landed; see notify_top_unread_level(). */
 __attribute__((unused))
 static bool notify_crit_unread() {
     bool found = false;
@@ -413,7 +413,10 @@ static bool notify_crit_unread() {
    looking idle, this one asks which of three colours to draw. One pass under
    the lock answers it, rather than a call per level.
  *
- * No caller until the status screen, which is not part of this commit. */
+ * STILL NO CALLER. The status-screen badge these two were kept for is not part
+ * of this commit either: the screens that landed are the list and the card, and
+ * discoverability is carried by the menu's Messages row, which shows the unread
+ * count from any screen. Left marked rather than given an invented caller. */
 __attribute__((unused))
 static bool notify_top_unread_level(uint8_t &out) {
     bool found = false;
@@ -479,12 +482,12 @@ static bool notify_view(int index, NotifyView &out) {
  * what makes "an arrival cannot change which message you are reading" true of
  * the drawing and not only of the navigation.
  *
- * No caller until the notification card, which is not part of this commit.
- * KEEP IT: this signature IS the fix. Resolving the id and then asking for the
- * count separately is the two-acquisition version this replaced, and it reads
- * as the obvious simplification of an apparently unused function.
+ * KEEP IT: this signature IS the fix, and it now has the caller that needs it.
+ * Resolving the id and then asking for the count separately is the
+ * two-acquisition version this replaced, and it still reads as the obvious
+ * simplification. ui_draw_card() draws the entry, its position and the total in
+ * one frame; all three come from here and cannot disagree.
  */
-__attribute__((unused))
 static bool notify_view_by_id(uint32_t id, NotifyView &out, int *index_out,
                               int *count_out) {
     time_t now = time(NULL);
@@ -508,8 +511,10 @@ static bool notify_view_by_id(uint32_t id, NotifyView &out, int *index_out,
 /* Position of an id in the list, or -1. The screen holds an id rather than an
    index precisely because the list can shift under it.
  *
- * No caller until the notification list, which is not part of this commit. */
-__attribute__((unused))
+ * Three callers, none of which draws from the result: ui_tick() tests it for
+ * existence, ui_move() steps from it, and ui_leave_card() puts the list cursor
+ * back on the message that was being read. Everything the card actually renders
+ * comes from notify_view_by_id() instead. */
 static int notify_index_of(uint32_t id) {
     int found = -1;
     portENTER_CRITICAL(&notify_mux);
@@ -580,10 +585,9 @@ static int notify_expire() {
 
 /* One-shot handoff of an arrival to loop(), which owns every screen change.
  *
- * No caller until the notification screens, which are not part of this commit.
- * POST /notify already raises the flag, so the arrival is being staged now and
- * merely goes unread until something consumes it. */
-__attribute__((unused))
+ * Consumed at the top of ui_tick(), which raises the card for it only from the
+ * status screen — but consumes the flag either way, so an arrival during
+ * navigation cannot surface as a card several screens later. */
 static bool notify_take_arrival(uint32_t *id) {
     if (!notify_arrived) return false;
     notify_arrived = false;
@@ -775,9 +779,13 @@ static const SkillEndpoint notify_endpoints[] = {
 static const char *notify_describe() {
     return "## Skill: notify\n\n"
            "A pager. Anything that can run curl can queue a message on the\n"
-           "device. The screens that show it and the keys that acknowledge it\n"
-           "are not in this build yet, so for now the queue is read with\n"
-           "GET /notify and cleared with POST /notify/ack.\n\n"
+           "device, where it lands on the panel: the Messages entry in the menu\n"
+           "carries the unread count, opens the queue as a scrolling list, and\n"
+           "Enter on a row opens that message as a card. A message arriving\n"
+           "while the node is sitting on its status screen raises its own card.\n"
+           "On the card Enter acknowledges and the back key does not, so a\n"
+           "message can be read now and dealt with later. The queue is also\n"
+           "readable with GET /notify and clearable with POST /notify/ack.\n\n"
            "### Endpoints\n\n"
            "| Method | Path | Description |\n"
            "|--------|------|-------------|\n"
