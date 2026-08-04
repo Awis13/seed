@@ -198,13 +198,46 @@ void radio_encoder_resume() {
 /*
  * The handheld input router's mode: what the encoder currently adjusts. A click
  * on the push button (tracked in radio_tick) toggles between tuning frequency
- * and setting volume — the whole handheld UX for this cut. Long-press is wired
- * up as a reserved hook for the menu that grows in a later step. UI_VFO/UI_VOLUME
- * keep the old 0/1 values so the display's active-target highlight (which reads
- * radio_get_tune_target()) needs no change.
+ * and setting volume — the base handheld UX. A long-press opens the modal menu
+ * (UI_MENU). UI_VFO/UI_VOLUME keep the old 0/1 values so the display's
+ * active-target highlight (which reads radio_get_tune_target()) needs no change;
+ * UI_MENU is appended last so those two are untouched.
  */
-enum UiMode { UI_VFO, UI_VOLUME };
+enum UiMode { UI_VFO, UI_VOLUME, UI_MENU };
 static uint8_t ui_mode = UI_VFO;
+
+/*
+ * Modal menu state. Long-press drops the router into UI_MENU; the encoder then
+ * scrolls a small on-screen list, a click selects, and inactivity/back returns to
+ * UI_VFO. Two nested levels for now — a top MAIN list and a SETTINGS sublist —
+ * each remembering its own cursor so a round-trip through Settings lands back on
+ * the same MAIN row. Items are placeholders in this cut: only "Settings" (open
+ * the sublist) and "Back" (return) do anything; the rest bounce straight back to
+ * the VFO until later tickets wire real parameter editing onto them.
+ */
+enum MenuLevel { MENU_MAIN, MENU_SETTINGS };
+static uint8_t menu_level = MENU_MAIN;
+static int     menu_idx = 0;      /* cursor in the MAIN list */
+static int     menu_settings_idx = 0; /* cursor in the SETTINGS sublist */
+
+static const char *const menu_main_items[] = {
+    "Band", "Mode", "Step", "Bandwidth", "Settings"
+};
+static const char *const menu_settings_items[] = {
+    "Brightness", "Theme", "About", "Back"
+};
+#define MENU_MAIN_COUNT     ((int)(sizeof(menu_main_items) / sizeof(menu_main_items[0])))
+#define MENU_SETTINGS_COUNT ((int)(sizeof(menu_settings_items) / sizeof(menu_settings_items[0])))
+
+/*
+ * Circular menu-cursor step. Adds delta (which may be several detents or negative)
+ * and wraps modulo count so scrolling loops top-to-bottom instead of clamping. The
+ * double-mod keeps the result non-negative for a downward wrap past zero.
+ */
+static int menu_wrap(int idx, int delta, int count) {
+    if (count <= 0) return 0;
+    return (((idx + delta) % count) + count) % count;
+}
 
 /* --- Endpoints --- */
 static const SkillEndpoint radio_endpoints[] = {
@@ -304,6 +337,34 @@ uint8_t radio_get_volume() { return radio_volume; }
 /* Kept named radio_get_tune_target() (returning the UI_VFO/UI_VOLUME value) so
  * display.cpp's active-target highlight needs no change. */
 uint8_t radio_get_tune_target() { return ui_mode; }
+
+/* Menu accessors for the display skill. All plain aligned-word reads off the same
+ * loop-task thread that mutates them (radio_tick), so no lock is needed. */
+uint8_t radio_get_ui_mode() { return ui_mode; }
+uint8_t radio_get_menu_level() { return menu_level; }
+
+/* Cursor and length of whichever level is active. */
+int radio_get_menu_idx() {
+    return (menu_level == MENU_SETTINGS) ? menu_settings_idx : menu_idx;
+}
+int radio_get_menu_count() {
+    return (menu_level == MENU_SETTINGS) ? MENU_SETTINGS_COUNT : MENU_MAIN_COUNT;
+}
+
+/* Title of the active level, and its item text at an arbitrary index. The index
+ * is wrapped modulo the count so the caller can ask for idx-2..idx+2 (the visible
+ * window) without bounds-checking each row itself. */
+const char *radio_get_menu_title() {
+    return (menu_level == MENU_SETTINGS) ? "Settings" : "Menu";
+}
+const char *radio_get_menu_item(int i) {
+    if (menu_level == MENU_SETTINGS) {
+        int n = MENU_SETTINGS_COUNT;
+        return menu_settings_items[((i % n) + n) % n];
+    }
+    int n = MENU_MAIN_COUNT;
+    return menu_main_items[((i % n) + n) % n];
+}
 
 uint8_t radio_get_rssi() {
     if (!radio_ok) return 0;
@@ -693,15 +754,42 @@ static void radio_tick() {
     static ButtonTracker key_btn;
     ButtonTracker::State key = key_btn.update(digitalRead(PIN_ENC_KEY) == LOW);
     if (key.wasClicked || key.wasShortPressed) {
-        /* Any press under 2s toggles the encoder's target: frequency <-> volume.
-         * Treating wasShortPressed (0.5-2s) like a click removes the dead zone
-         * where a slightly-held tap did nothing. Long-press (>=2s) stays reserved
-         * for the menu below. */
-        ui_mode = (ui_mode == UI_VFO) ? UI_VOLUME : UI_VFO;
+        if (ui_mode == UI_MENU) {
+            /* In the menu a click selects the highlighted row. */
+            if (menu_level == MENU_MAIN) {
+                if (strcmp(menu_main_items[menu_idx], "Settings") == 0) {
+                    /* Descend into the Settings sublist (keeps its own cursor). */
+                    menu_level = MENU_SETTINGS;
+                } else {
+                    /* Band/Mode/Step/Bandwidth are placeholders for now — real
+                     * parameter editing lands in later tickets. Bounce to the VFO. */
+                    ui_mode = UI_VFO;
+                }
+            } else {
+                /* SETTINGS: "Back" and every other placeholder return to MAIN. */
+                menu_level = MENU_MAIN;
+            }
+        } else {
+            /* Any press under 2s toggles the encoder's target: frequency <->
+             * volume. Treating wasShortPressed (0.5-2s) like a click removes the
+             * dead zone where a slightly-held tap did nothing. */
+            ui_mode = (ui_mode == UI_VFO) ? UI_VOLUME : UI_VFO;
+        }
         last_input_ms = millis();
     }
+    /* Long-press (>=2s) opens the modal menu. isLongPressed is a level, held true
+     * for the whole press, so an edge-guard fires the entry exactly once and rearms
+     * only after the button is released. */
+    static bool long_handled = false;
     if (key.isLongPressed) {
-        /* Reserved for the menu (grows in a later step) — deliberately a no-op. */
+        if (!long_handled) {
+            long_handled = true;
+            ui_mode = UI_MENU;
+            menu_level = MENU_MAIN;  /* always open at the top level */
+            last_input_ms = millis();
+        }
+    } else {
+        long_handled = false;
     }
 
     /* 2) Snapshot both encoder counters in one critical section so no ISR step
@@ -717,7 +805,17 @@ static void radio_tick() {
 
     if ((d != 0 || da != 0) || key.wasClicked) last_input_ms = millis();
 
-    if (radio_ok && (d != 0 || da != 0)) {
+    if (ui_mode == UI_MENU) {
+        /* Menu scroll uses the raw +/-1 count for a precise one-row-per-detent
+         * step. Pure UI state — it never touches the receiver, so it takes neither
+         * radio_ok nor radio_mtx. */
+        if (d != 0) {
+            if (menu_level == MENU_SETTINGS)
+                menu_settings_idx = menu_wrap(menu_settings_idx, d, MENU_SETTINGS_COUNT);
+            else
+                menu_idx = menu_wrap(menu_idx, d, MENU_MAIN_COUNT);
+        }
+    } else if (radio_ok && (d != 0 || da != 0)) {
         xSemaphoreTake(radio_mtx, portMAX_DELAY);
         if (ui_mode == UI_VFO) {
             /* Frequency follows the accelerated count so a fast sweep strides in
@@ -744,8 +842,10 @@ static void radio_tick() {
         xSemaphoreGive(radio_mtx);
     }
 
-    /* 3) Command timeout: auto-return from volume to frequency after inactivity. */
-    if (ui_mode == UI_VOLUME && millis() - last_input_ms > RADIO_COMMAND_TIMEOUT_MS) {
+    /* 3) Command timeout: auto-return to the VFO from volume OR the menu after
+     * inactivity, so the knob is always tuning again when next touched. */
+    if ((ui_mode == UI_VOLUME || ui_mode == UI_MENU) &&
+        millis() - last_input_ms > RADIO_COMMAND_TIMEOUT_MS) {
         ui_mode = UI_VFO;
     }
 
