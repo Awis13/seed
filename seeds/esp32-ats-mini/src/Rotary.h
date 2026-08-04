@@ -17,12 +17,18 @@
  *
  * A mechanical rotary encoder outputs a two-bit Gray code on two pins. One
  * physical detent walks the pins through a full 00->10->11->01->00 cycle (or the
- * reverse for the opposite direction). process() reads the pins, tracks the net
- * quadrature position, and reports one DIR_CW / DIR_CCW event per completed
- * detent. In HALF_STEP mode it reports at both the rest and half positions, i.e.
- * twice per detent. Invalid or bouncing transitions cancel out and never
- * miscount (inherent debounce). This is an independent implementation built on
- * the public-domain 4x4 quadrature transition table.
+ * reverse for the opposite direction). process() runs an ORDERED state machine
+ * that is anchored to the detent rest state (00): it advances one sub-state per
+ * valid Gray edge and reports exactly ONE DIR_CW / DIR_CCW event when a complete
+ * cycle returns to rest. Because the machine re-anchors at every physical detent,
+ * a missed or coalesced edge (common when an ISR reads the net pin state) simply
+ * fails to complete that detent and resets to rest -- it can NEVER leave a
+ * residual that eats a later detent or shifts the emit phase. Illegal edges
+ * (both bits change at once, or no change) reset to the anchor too, which
+ * debounces contact chatter for free. In HALF_STEP mode it reports at both the
+ * rest (00) and half (11) positions, i.e. twice per detent. This is an
+ * independent implementation: the state names, encoding and transition tables
+ * below are derived directly from the quadrature Gray-code sequence.
  */
 #include "Arduino.h"
 
@@ -50,8 +56,10 @@ class Rotary
     // Process pin(s)
     unsigned char process();
   private:
-    unsigned char prev;   // last two-bit pin reading (pin2<<1 | pin1)
-    signed char accum;    // net quadrature steps toward the next detent
+    // Current machine state. The low nibble is the sub-state id; the emit bits
+    // (DIR_CW / DIR_CCW) are ORed into the table entry that completes a detent
+    // and are masked off before the next lookup.
+    unsigned char state;
     unsigned char pin1;
     unsigned char pin2;
 };
