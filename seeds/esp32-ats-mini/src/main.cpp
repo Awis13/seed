@@ -31,6 +31,7 @@
 //   POST /firmware/confirm  — confirm (cancel rollback)
 //   POST /firmware/rollback — revert to previous
 //   GET  /skill             — AI agent skill file
+//   POST /auth/token/rotate — regenerate the node token (hardware RNG)
 //   GET  /                  — WiFi config page
 //   POST /wifi/config       — save WiFi credentials
 
@@ -503,6 +504,63 @@ static bool require_auth(AsyncWebServerRequest *request) {
     return false;
 }
 
+// POST /auth/token/rotate — regenerate the node token with the hardware RNG.
+// The original token was minted by old firmware before RF was up (weak
+// esp_random entropy); rotating on current firmware yields a strong token
+// without a physical USB reflash. A current-token holder can already POST
+// arbitrary firmware, so gating this on require_auth() grants no new privilege.
+// Order matters to avoid lockout: persist to flash, read it back, and only
+// then swap the RAM copy. If flash write or readback fails, the old token
+// stays valid in both RAM and flash.
+static void handle_token_rotate(AsyncWebServerRequest *request) {
+    if (!require_auth(request)) return;
+
+    // Same generation loop as token_load(): 16 bytes -> 32 hex chars.
+    char buf[33];
+    for (int i = 0; i < 16; i++) {
+        snprintf(buf + i * 2, 3, "%02x", (uint8_t)esp_random());
+    }
+    buf[32] = '\0';
+    String new_token(buf);
+
+    // a. Persist first. Failure -> RAM untouched, old token still works.
+    if (!write_spiffs_file(TOKEN_FILE, new_token)) {
+        request->send(500, "application/json",
+            "{\"error\":\"flash write failed\"}");
+        return;
+    }
+
+    // b. Read back and verify. On mismatch, restore the old (still-valid RAM)
+    //    token to flash so flash and RAM agree, and leave RAM untouched.
+    String readback = read_spiffs_file(TOKEN_FILE);
+    readback.trim();
+    if (readback != new_token) {
+        // Restore the old token to flash. If that restore ALSO fails, flash now
+        // holds neither the confirmed-old nor the confirmed-new token; RAM still
+        // authenticates the current session, but the next reboot would reseed
+        // from the corrupted file and lock the operator out — so make that case
+        // explicit and demand a physical reflash before any reboot.
+        bool restored = write_spiffs_file(TOKEN_FILE, auth_token);
+        request->send(500, "application/json",
+            restored ? "{\"error\":\"token readback mismatch, old token kept\"}"
+                     : "{\"error\":\"token readback mismatch AND flash restore failed - reflash required before reboot\"}");
+        return;
+    }
+
+    // c. Flash is good — swap the RAM copy. The new token authenticates the
+    //    next request; the old one stops working immediately. Inherent
+    //    two-generals gap: if the device reboots between this confirmed
+    //    readback and the response completing, flash and post-reboot RAM both
+    //    hold the new token but the operator never received it (unavoidable for
+    //    any persist-then-notify design; not a regression).
+    auth_token = new_token;
+
+    // The caller authenticated with the OLD token; this response is the only
+    // channel that surfaces the NEW token on an STA node.
+    request->send(200, "application/json",
+        "{\"ok\":true,\"token\":\"" + new_token + "\"}");
+}
+
 // ===== WiFi =====
 
 static void wifi_load_config() {
@@ -722,7 +780,7 @@ static void handle_capabilities(AsyncWebServerRequest *request) {
         "/clock", "/clock/tz",
         "/firmware/version", "/firmware/upload", "/firmware/apply",
         "/firmware/confirm", "/firmware/rollback",
-        "/skill", "/ui", NULL
+        "/skill", "/auth/token/rotate", "/ui", NULL
     };
     for (int i = 0; eps[i]; i++) ep.add(eps[i]);
 
@@ -1161,6 +1219,7 @@ static void handle_skill(AsyncWebServerRequest *request) {
     s += "| POST | /firmware/confirm | Confirm |\n";
     s += "| POST | /firmware/rollback | Rollback |\n";
     s += "| GET | /skill | This file |\n";
+    s += "| POST | /auth/token/rotate | Regenerate node token (hardware RNG) |\n";
 
     // Skill endpoints
     for (int i = 0; i < g_skill_count; i++) {
@@ -1470,6 +1529,7 @@ static void setup_routes() {
     server.on("/firmware/confirm", HTTP_POST, handle_firmware_confirm);
     server.on("/firmware/rollback", HTTP_POST, handle_firmware_rollback);
     server.on("/skill", HTTP_GET, handle_skill);
+    server.on("/auth/token/rotate", HTTP_POST, handle_token_rotate);
     server.on("/ui", HTTP_GET, handle_ui);
     server.on("/", HTTP_GET, handle_wifi_page);
     server.on("/wifi/config", HTTP_POST, handle_wifi_post);
