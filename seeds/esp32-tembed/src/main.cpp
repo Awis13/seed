@@ -68,7 +68,7 @@
 #include <TFT_eSPI.h>
 
 // ===== Configuration =====
-#define SEED_VERSION        "0.15.0"
+#define SEED_VERSION        "0.16.0"
 #define HTTP_PORT           8080
 #define TOKEN_FILE          "/auth_token.txt"
 #define WIFI_CONFIG_FILE    "/wifi.json"
@@ -338,6 +338,20 @@ static void probe_cc1101() {
 static void battery_probe();
 static void battery_refresh();
 
+// The charger shares that I2C bus and is a separate skill for one reason:
+// charger_probe() WRITES. It sets four registers on the BQ25896 — the
+// termination current above all, which on the power-on value cuts charging
+// at 77% of this cell — and skills/battery.cpp is an extended argument for
+// writing nothing, which it must be allowed to go on being. The values, the
+// order they go out in and the guard that bounds them are at the head of
+// skills/charger.cpp.
+//
+// Declared here, like the gauge's, because the probe has to run from hw_probe()
+// rather than from skills_init(): the charger should be off its power-on
+// defaults from the first second the device is powered.
+static void charger_probe();
+static void charger_refresh();
+
 static void hw_probe() {
     memset(&hw, 0, sizeof(hw));
 
@@ -356,6 +370,7 @@ static void hw_probe() {
 
     probe_cc1101();
     battery_probe();
+    charger_probe();
 
     // Board detection heuristic
     bool fuel_gauge = false;
@@ -1696,6 +1711,11 @@ static void handle_wifi_post(AsyncWebServerRequest *request) {
    than this, from hw_probe(), through the two forward declarations above it —
    the panel needs a charge level before any skill exists. */
 #include "skills/battery.cpp"
+/* After battery.cpp, and the order is documentation rather than a dependency:
+   the two share an I2C bus and nothing else, and neither calls into the other.
+   Reading them in this order is reading the power hardware in the order the
+   boot probe touches it. */
+#include "skills/charger.cpp"
 /* After notify.cpp, for the three JSON response helpers its endpoints already
    own — the same borrowing voice.cpp does, rather than a fourth copy of
    serializeJson into a String. It depends on no skill of its own: suppliers
@@ -1728,6 +1748,9 @@ static void skills_init() {
     /* Only a registration: the gauge was read at boot by hw_probe() and the
        cache behind GET /battery was filled there. */
     skill_battery_init();
+    /* Likewise, and the write it did is already done: hw_probe() configured
+       the charger and verified it by reading it back. */
+    skill_charger_init();
     /* Nothing to bring up: no hardware, no stored state, and a store that is
        already zeroed. It is here rather than first only to match the include
        order above. */
@@ -2022,14 +2045,27 @@ void loop() {
     // line, so it does not need the tick above and must not wait for it.
     if (ui_screen == UI_CLOCK) clock_rule_tick();
 
-    // Keep the fuel gauge reading current — battery_probe() only ran at boot.
-    // Nothing else touches the I2C bus once hw_probe() has finished, and this
-    // is the only place the diagnostic registers behind GET /battery are
-    // read: see the cadence argument at the head of skills/battery.cpp.
+    // Keep the fuel gauge and the charger current — the probes only ran at
+    // boot. Nothing else touches the I2C bus once hw_probe() has finished, and
+    // this is the only place the registers behind GET /battery and GET /charger
+    // are read: see the cadence argument at the head of skills/battery.cpp and
+    // the I2C rule at the head of skills/charger.cpp. Neither endpoint may ever
+    // reach the bus itself — it would run the transaction on the AsyncTCP task,
+    // interleaved with this one.
+    //
+    // charger_refresh() READS, COMPARES, and writes only when the comparison
+    // fails. The four writes happen once at boot in charger_probe(); after that
+    // the same registers are re-read every pass and checked against the table,
+    // and the table is re-issued only if the part has stopped holding it. That
+    // conditional rewrite is what stands in for the charger's own watchdog,
+    // which is disabled rather than fed — and this is NOT a watchdog kick: 60 s
+    // is longer than its 40 s default, so feeding it from here would let it
+    // expire and revert the configuration on roughly every cycle.
     static unsigned long last_battery = 0;
     if (millis() - last_battery > 60000) {
         last_battery = millis();
         battery_refresh();
+        charger_refresh();
     }
 
     // 10ms is the idle cadence, and it is the whole pass's granularity. A blast
