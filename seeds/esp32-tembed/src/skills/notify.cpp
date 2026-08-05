@@ -45,9 +45,10 @@
  *     unread is lying to the ring and to the badge.
  *
  * The labels themselves live in a table parallel to the slots rather than in
- * Notification, which keeps the per-entry struct at the 208 bytes it already
- * costs and puts the whole price of the feature — NOTIFY_MAX * NOTIFY_OPT_MAX
- * * NOTIFY_OPT_LEN, about 1.3 KB — in one place that can be read off.
+ * Notification, which leaves the per-entry struct at whatever its own fields
+ * cost — 392 bytes, see the static_assert under them — and puts the whole price
+ * of the feature — NOTIFY_MAX * NOTIFY_OPT_MAX * NOTIFY_OPT_LEN, about 1.3 KB —
+ * in one place that can be read off.
  *
  * Store shape
  * -----------
@@ -124,8 +125,12 @@
 #define NOTIFY_MAX          20
 #define NOTIFY_PERSIST       6
 #define NOTIFY_SOURCE_LEN   17   /* 16 chars, e.g. "home-rig", "k1c" */
-#define NOTIFY_TITLE_LEN    41   /* 40 chars */
-#define NOTIFY_BODY_LEN     97   /* 96 chars, two ellipsised lines on screen */
+#define NOTIFY_TITLE_LEN    65   /* 64 chars */
+/* 256 chars. The card still draws exactly two lines and ui_wrap2() ends the
+   second with an ellipsis, so what is stored is again wider than what is shown
+   — the whole of it is served by GET /notify, which is where a body this long
+   is read. */
+#define NOTIFY_BODY_LEN    257
 #define NOTIFY_KEY_LEN      25   /* 24 chars of client-supplied dedup key */
 /* The range an id may take is 1..NOTIFY_ID_MAX, and both ends are excluded for
    the same reason. 0 marks a free slot. 0xFFFFFFFF is the id whose successor is
@@ -206,9 +211,16 @@ struct NotifyView {
 /* The queue is twenty of these and nothing else, so its size is worth pinning
    rather than trusting: `chosen` and `opt_count` were added into two bytes of
    tail padding the struct was already paying for, and this is what says so.
-   Outside the sliced region deliberately — the host's `unsigned long` and
-   `time_t` are wider than the device's and the number would not hold there. */
-static_assert(sizeof(Notification) == 208,
+   Outside the sliced region because it is a statement about this device's RAM
+   and not about whatever machine the host suite is compiled on. The number does
+   in fact hold on an ordinary 64-bit host, by coincidence: the four bytes of
+   padding the device spends after its 32-bit `created_ms` are exactly what that
+   host spends on a wider one, and both reach `created_epoch` at offset 16. But
+   a host with a 32-bit `unsigned long` AND a 32-bit `time_t` lays the same
+   fields out as 384, and a suite that refuses to compile there would be saying
+   nothing about this device. tools/test_notify_options.sh checks the size at
+   run time instead, where a mismatch can report the number it got. */
+static_assert(sizeof(Notification) == 392,
               "Notification changed size: the queue costs NOTIFY_MAX times this");
 
 /* The store itself is sliced onto the host too, because the restore loop under
@@ -301,13 +313,32 @@ static bool notify_level_parse(const char *s, uint8_t &out) {
 
 /* --- Text ---
  *
- * Copy into a bounded field, cutting on a character rather than on a byte.
+ * Copy into a bounded field, cutting on a character rather than on a byte, and
+ * put every control byte back as a space.
  *
  * snprintf() alone cuts at whatever byte the limit lands on, and a byte in the
  * middle of a UTF-8 sequence is half a character: the field then ends in a
  * fragment that GET /notify hands to its caller verbatim and that a strict
  * JSON reader is entitled to reject. The screen is indifferent — it measures
  * in pixels and ellipsises — so this is about the wire and the snapshot file.
+ *
+ * A control byte is the same kind of problem arriving by a different door. The
+ * serialiser escapes the seven sequences JSON names — quote, backslash, and the
+ * five whitespace ones — and writes every other byte under 0x20 out raw, which
+ * is not JSON any reader has to accept. So the document this device serves, and
+ * the snapshot file it writes, are malformed for as long as one is stored. It
+ * is replaced rather than refused because this is a pager: a message that
+ * arrives mangled is still a message, and one that is refused is silence.
+ *
+ * The filter is wider than that argument, and the difference is on purpose
+ * rather than by mistake. RFC 8259 requires escaping only U+0000 to U+001F, so
+ * 0x7F is legal raw in a JSON string and is not part of the malformed set at
+ * all: it is blanked because it has no glyph on this panel and because
+ * notify_option_check() below already refuses it in a label, and one rule for
+ * every string this skill stores is worth more than the byte. The five the
+ * serialiser does escape correctly — tab, newline and the rest — are flattened
+ * for a third reason again: two body lines on a 300px card show a pasted
+ * command's shape as gaps, not as lines. Neither is part of the JSON fix.
  *
  * Input that was not valid UTF-8 to begin with is not repaired, only left no
  * worse than it arrived.
@@ -316,8 +347,9 @@ static bool notify_level_parse(const char *s, uint8_t &out) {
  * tools/test_notify_options.sh; the marker rules from the types region apply.
  */
 /* host-test:begin text — sliced out by tools/test_notify_options.sh */
-static void notify_copy_text(char *dst, size_t size, const char *src) {
-    snprintf(dst, size, "%s", src);
+/* The cut, on its own so that it keeps its early returns and the filter under
+   it still runs on every path through the copy. */
+static void notify_cut_utf8(char *dst, const char *src) {
     size_t len = strlen(dst);
     if (len == 0 || strlen(src) <= len) return;  /* nothing was cut */
 
@@ -334,6 +366,30 @@ static void notify_copy_text(char *dst, size_t size, const char *src) {
                 : (lead & 0xF8) == 0xF0 ? 4
                 : 1;
     if (start + need > len) dst[start] = '\0';
+}
+
+static void notify_copy_text(char *dst, size_t size, const char *src) {
+    snprintf(dst, size, "%s", src);
+    notify_cut_utf8(dst, src);
+
+    /* After the cut, and it stays after the cut, but the two cannot actually
+       interact: every byte this touches is below 0x20 or is 0x7F, and a UTF-8
+       lead byte is 0xC0 or above while a continuation byte is 0x80 or above, so
+       nothing here is a byte the cut looks at. The order is for the reader.
+       One byte in, one byte out — a run of them becomes a run of spaces rather
+       than collapsing — so every offset the cut just settled stays where it is.
+       A space rather than a visible marker, which is what voice.cpp already
+       chose for free-form text from a remote party; the labels in
+       notify_option_check() are refused instead, because a label is a short
+       thing a person retypes and a message is not.
+       Bytes at 0x80 and above are left exactly as they are. They are the tail
+       of a UTF-8 character that the cut above has already made sure is whole,
+       the serialiser passes them through correctly, and stripping them would
+       damage text the API is otherwise contracted to hand back unchanged. */
+    for (char *p = dst; *p; p++) {
+        unsigned char c = (unsigned char)*p;
+        if (c < 0x20 || c == 0x7F) *p = ' ';
+    }
 }
 
 /*
@@ -1276,10 +1332,17 @@ static const char *notify_describe() {
            "the earlier message instead of queueing a second one, so a job that\n"
            "reports progress leaves one entry rather than fifty.\n\n"
            "Lengths are capped and longer values are truncated, not rejected:\n"
-           "title 40, body 96, source 16, id 24, and each option label 15 —\n"
+           "title 64, body 256, source 16, id 24, and each option label 15 —\n"
            "bytes, which is characters for ASCII and fewer for anything else.\n"
            "The cut lands on a character boundary, so a multi-byte one is\n"
            "dropped whole rather than left half-written in the JSON.\n\n"
+           "Control bytes come back as spaces. Anything below 0x20, and 0x7F,\n"
+           "is replaced by a single space on the way in — including newlines\n"
+           "and tabs — so a body built by pasting command output reads as one\n"
+           "run-on line here rather than as the shape it had. Nothing is\n"
+           "dropped and no byte moves: a message is never refused over one.\n"
+           "`id` goes through the same rule, so two keys differing only in a\n"
+           "control byte are one key here and replace each other's message.\n\n"
            "### Asking a question\n\n"
            "`options` is up to four short labels. The knob picks one and the\n"
            "index is stored on the device — nothing is sent anywhere, so ask,\n"

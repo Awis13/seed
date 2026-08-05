@@ -419,8 +419,18 @@ static int ui_first_drawn = -1;
    of them is on screen at a time, and entering any screen wipes the panel and
    raises display_force, which makes draw_field ignore whatever the previous
    screen left in here. Wide enough for an ellipsised font 4 title, which is
-   the longest string any of them draws. */
-static char ui_row[UI_ROW_COUNT][48];
+   the longest string any of them draws — so it is keyed to the title field and
+   not to a number, because draw_field compares only the first cache_size - 1
+   bytes: a line narrower than what it is asked to hold makes two different
+   titles agreeing on that prefix compare equal, and the card then keeps the
+   previous message's title on screen. */
+#define UI_ROW_LEN   (NOTIFY_TITLE_LEN + 4)
+static char ui_row[UI_ROW_COUNT][UI_ROW_LEN];
+/* Says the same thing to a reader who pins this back to a number: the four
+   bytes are the ellipsis and its terminator, and a line short of that is a
+   cache that cannot hold what the widest column draws through it. */
+static_assert(sizeof(ui_row[0]) >= NOTIFY_TITLE_LEN + 4,
+              "a row cache line is narrower than an ellipsised title");
 
 /* The message list needs its own cache: three cells per row, and it is the one
    screen whose rows are not a single string. Each cell is wide enough for the
@@ -430,12 +440,14 @@ static char ui_row[UI_ROW_COUNT][48];
 #define MSG_CELL_LEN (NOTIFY_TITLE_LEN + 4)
 static char ui_msg_cell[MSG_ROWS][3][MSG_CELL_LEN];
 
-/* The card's two body lines get their own, wider cache. A body is 96
+/* The card's two body lines get their own, wider cache. A body is 256
    characters and the panel is 276px, which at the narrowest glyphs font 2 has
    (3px, the punctuation) is more characters than fit in a row cache line. The
    pixel budget is the bound that matters; the buffer must not be a second,
    quieter one that cuts a line the display could have shown. */
 static char ui_card_body[2][NOTIFY_BODY_LEN + 4];
+static_assert(sizeof(ui_card_body[0]) >= NOTIFY_BODY_LEN + 4,
+              "a body cache line is narrower than the body it holds");
 
 static void ui_draw_row(int i, const char *text, int32_t y, uint8_t font,
                         uint16_t color) {
@@ -1005,12 +1017,43 @@ static void ui_draw_card() {
     draw_field(ui_row[1], sizeof(ui_row[1]), age, rx, y + 7, 2,
                c_sec, TR_DATUM, MSG_AGE_W, tint);
 
-    char title[48];
+    /* Keyed to the field, like the row cache it is drawn through: at the
+       narrowest glyphs font 4 has, about fifty-five characters cross this
+       column, so a fixed buffer sized for the old title would cut the card's
+       title before the pixels did. The card geometry note above counts the
+       same 276px the other way — 11 characters at the widest glyph and around
+       18 of ordinary mixed case — because that is what a reader gets; a buffer
+       has to survive the narrowest.
+       Two asserts, because the two directions fail differently and both fail
+       quietly. Wider than the cache is the aliasing one: draw_field compares
+       only the first cache_size - 1 bytes, so a string wider than the cache it
+       is drawn through makes two different titles compare equal and leaves the
+       previous message's title on the card. Narrower than the field is the
+       hardcoded 48 this buffer stopped being — a second, quieter cut ahead of
+       the pixels — so it is pinned from below as well.
+       Both are about the buffer declared on the next line and not about
+       UI_ROW_LEN, which the assert beside ui_row[] already pins. They read as a
+       restatement of it only for as long as this buffer is declared from the
+       same macro: write `char title[64]` here and the lower of the two is the
+       one that fails, and nothing else in the file would. */
+    char title[UI_ROW_LEN];
+    static_assert(sizeof(title) <= sizeof(ui_row[0]),
+                  "the card title is wider than the cache it is compared in");
+    static_assert(sizeof(title) >= NOTIFY_TITLE_LEN + 4,
+                  "the card title is narrower than an ellipsised title");
     ui_ellipsis(title, sizeof(title), v.title, 4, text_w);
     draw_field(ui_row[2], sizeof(ui_row[2]), title, tx, y + 28, 4,
                c_pri, TL_DATUM, (uint16_t)text_w, tint);
 
+    /* Both directions again, and for the same two reasons: ui_wrap2 puts a
+       body that fits the line on b1 whole, so a line short of the field cuts
+       the body before the pixels do. */
     char b1[NOTIFY_BODY_LEN + 4], b2[NOTIFY_BODY_LEN + 4];
+    static_assert(sizeof(b1) <= sizeof(ui_card_body[0]),
+                  "a body line is wider than the cache it is compared in");
+    static_assert(sizeof(b1) >= NOTIFY_BODY_LEN + 4 &&
+                  sizeof(b2) >= NOTIFY_BODY_LEN + 4,
+                  "a body line is narrower than the body it has to hold");
     ui_wrap2(v.body, b1, sizeof(b1), b2, sizeof(b2), 2, text_w);
     draw_field(ui_card_body[0], sizeof(ui_card_body[0]), b1, tx, y + 60, 2,
                c_sec, TL_DATUM, (uint16_t)text_w, tint);
