@@ -10,12 +10,20 @@
 # wider than the band it is drawn in does not fail a build and does not throw —
 # it draws off the edge of a 320px panel, or worse, sits inside a padding that
 # no longer covers it and leaves the previous row's tail behind as ghosting. A
-# selection that clamps instead of wrapping just feels stiff. A row that
-# brackets a chip nobody has chosen invites a click that answers a question the
-# user was only dismissing, and a stored index past the labels that are there
-# hands notify_choose_id() an answer nobody gave. None of that is
+# row that brackets a chip nobody has chosen invites a click that answers a
+# question the user was only dismissing, and a stored index past the labels that
+# are there hands notify_choose_id() an answer nobody gave. None of that is
 # visible from the outside, and the only witness is somebody standing in front
 # of the device with the knob in their hand.
+#
+# What is NOT here any more, and where it went: the knob no longer feeds these
+# functions. The card scrolls, so one turn of it is a position in the body first
+# and a chip only past the end of the body, and that whole decision lives in
+# ui_card_step() — pinned by tools/test_card.sh, including the two properties
+# this file used to claim about a detent. Checks were left here describing
+# detents that reached ui_chip_step() directly; they would have gone on passing
+# while describing nothing the firmware does, which is worse than no coverage at
+# all, so they were re-pointed rather than kept green.
 #
 # The measuring is real. TFT_eSPI's textWidth() for fonts 2..8 is the plain sum
 # of that font's width table, and the stub below reads the table for font 2 out
@@ -32,13 +40,11 @@
 # a call site that ignored one would not be caught here — which is exactly why
 # each of them is called in one place and does the deciding there, rather than
 # being repeated as a condition somebody can quietly write differently.
-# No coverage is claimed for any of that. Nor for two guards that no input
-# reaches: the `steps %= n` in ui_chip_step(), which keeps the addition after it
-# in range for any int and cannot be made to fail from outside the function, and
-# the `if (budget < 1) budget = 1;` in ui_chip_row(), which is unreachable at
-# MSG_HINT_W 300 — four chips, the narrowest share this row can be cut into,
-# still leave 61px each — and would only stop a division result of zero or less
-# from reaching ui_ellipsis() if the band were ever made tiny.
+# No coverage is claimed for any of that. Nor for one guard that no input
+# reaches: the `if (budget < 1) budget = 1;` in ui_chip_row(), unreachable at a
+# 300px row — four chips, the narrowest share this row can be cut into, still
+# leave 61px each — which would only stop a division result of zero or less from
+# reaching ui_ellipsis() if the band were ever made tiny.
 #
 # The code is sliced straight out of src/ui.h between its `host-test:begin fit`,
 # `host-test:begin chips` and `host-test:end` markers, and the option types come
@@ -63,12 +69,6 @@ if [ ! -f "$font" ]; then
     echo "run 'pio run -e tembed' once to fetch TFT_eSPI, or set TFT_ESPI_DIR"
     exit 1
 fi
-
-# The width of the band the row is drawn into, read from ui.h rather than
-# repeated here: it is the budget the fitting divides up, and a copy that
-# drifted would move the boundary in the test only.
-row_px=$(grep -E '^#define[[:space:]]+MSG_HINT_W' "$ui" | awk '{print $3}')
-[ -n "$row_px" ] || { echo "cannot read MSG_HINT_W from $ui"; exit 1; }
 
 slice() {
     awk -v tag="$2" '
@@ -114,8 +114,6 @@ fi
 #include <time.h>
 #include <limits.h>
 
-#define MSG_HINT_W ${row_px}
-
 /* Font 2's width table, read out of TFT_eSPI's Fonts/Font16.c by the script
    that generated this file. Index 0 is char 32. */
 static const unsigned char widtbl_f16[96] = {
@@ -141,6 +139,11 @@ static TftStub tft;
 
 STUB
     slice "$notify" types
+    # The band the row is drawn into comes out of the card's own geometry now
+    # rather than being read off a literal: MSG_HINT_W is the card's width, so
+    # the budget the fitting divides up is compiled here exactly as the firmware
+    # compiles it, and a card that changed width would move this test with it.
+    slice "$ui" cardgeom
     slice "$ui" fit
     slice "$ui" chips
     cat <<'MAIN'
@@ -310,30 +313,17 @@ int main(void) {
               "a click on a message that asks nothing never answers");
         check(!ui_chip_answers(-1, 0), "with or without a selection");
 
-        /* And the two properties the pair leans on: -1 has to DRAW as no
-           selection, or the panel is lying about what the click would do, and
-           the first detent has to land ON the first chip, or a selection made
-           by hand cannot reach it. */
+        /* The property the pair leans on that IS this file's: -1 has to DRAW
+           as no selection, or the panel is lying about what the click would do.
+           What a detent does about it is ui_card_step()'s, and is checked in
+           tools/test_card.sh — including that the knob cannot reach a chip
+           until the body has been read to the end, which is the same invariant
+           these two functions hold at entry and at click. */
         n = four(op);
         check(brackets(row_of(op, n, -1, -1), '[') == 0,
               "nothing selected draws no bracket anywhere on the row");
         check_str(row_of(op, n, -1, -1), " YES  NO  LATER  DETAILS ",
                   "which is the whole row, unbracketed");
-        check(ui_chip_step(-1, 1, 4) == 0,
-              "one detent forward from nothing selected lands on the first chip");
-        check(ui_chip_step(-1, -1, 4) == 0,
-              "and one back lands there too: the first detent chooses to answer, "
-              "it does not move");
-        check(ui_chip_step(-1, 2, 4) == 1,
-              "two forward is the first chip and then one step off it");
-        check(ui_chip_step(-1, -2, 4) == 3,
-              "and two back is the first chip and then one step the other way");
-        check(ui_chip_step(-1, 1, 1) == 0,
-              "a row of one chip is where the first detent lands whichever way it turns");
-        check(ui_chip_step(-1, -1, 1) == 0, "including backwards");
-        check(ui_chip_step(-1, 0, 4) == 0,
-              "and no detent at all reports the first chip, which is why the click "
-              "path checks the selection itself rather than what this returns");
     }
 
     printf("the answered chip is starred, and it survives coming back to it\n");
@@ -488,42 +478,35 @@ int main(void) {
                   "a count past NOTIFY_OPT_MAX draws exactly the labels there are");
     }
 
-    printf("stepping wraps at both ends, the way a knob with no stops must\n");
+    printf("the click clamps a selection the message no longer has\n");
     {
-        check(ui_chip_step(0, 1, 4) == 1, "one detent forward from the first");
-        check(ui_chip_step(3, 1, 4) == 0, "and off the end lands on the first");
-        check(ui_chip_step(0, -1, 4) == 3, "one detent back from the first lands on the last");
-        check(ui_chip_step(3, -1, 4) == 2, "and one back from the last is the one before it");
-        check(ui_chip_step(0, 2, 3) == 2, "two detents at once");
-        check(ui_chip_step(0, 4, 3) == 1, "and four of them on a row of three wrap once");
-        check(ui_chip_step(0, -4, 3) == 2, "the same backwards");
-        check(ui_chip_step(0, 0, 4) == 0, "no detents is no movement");
-    }
-
-    printf("stepping clamps a selection the message no longer has\n");
-    {
-        /* This is the clamp the click depends on: ui_chip_step(sel, 0, count)
-           is what the card runs the stored selection through before handing it
-           to notify_choose_id() as the answer. An index above the labels there
-           are is one that did not come from a detent on this row — a `chosen`
-           read back out of a snapshot is the way in — and it is clamped rather
-           than trusted, here and again in notify_choose_id(). */
-        check(ui_chip_step(3, 0, 2) == 1, "a selection past the end comes back to the last chip");
-        check(ui_chip_step(9, 0, 4) == 3, "however far past it is");
-        check(ui_chip_step(3, 1, 2) == 0, "a stale selection still steps from where it was clamped");
-        check(ui_chip_step(0, 1, 0) == 0, "a message with no options steps nowhere");
-        check(ui_chip_step(5, 3, 0) == 0, "and reports the first chip rather than an index");
+        /* This is the clamp the click depends on: ui_chip_clamp() is what the
+           card runs the stored selection through before handing it to
+           notify_choose_id() as the answer. An index above the labels there are
+           is one that did not come from a turn of the knob on this row — a
+           `chosen` read back out of a snapshot is the way in — and it is
+           clamped rather than trusted, here and again in notify_choose_id(). */
+        check(ui_chip_clamp(0, 4) == 0, "a selection on the first chip is the first chip");
+        check(ui_chip_clamp(3, 4) == 3, "and one on the last is the last");
+        check(ui_chip_clamp(3, 2) == 1, "a selection past the end comes back to the last chip");
+        check(ui_chip_clamp(9, 4) == 3, "however far past it is");
+        /* On a message with no options both of these are zero, and zero is not
+           a chip there — there is no chip to be. It is the only value the
+           function can return when there is nothing to index, and what stops it
+           being handed over as an answer is ui_chip_answers(), not this. So
+           both names call it the same thing. */
+        check(ui_chip_clamp(0, 0) == 0, "a message with no options clamps to zero");
+        check(ui_chip_clamp(5, 0) == 0, "and so does a selection past the end of one");
         /* Never out of range on the way out, which is the only thing
            notify_choose_id() is being trusted with. */
         {
             int in_range = 1;
             for (uint8_t c = 1; c <= NOTIFY_OPT_MAX; c++)
-                for (int s = -9; s <= 9; s++)
-                    for (int d = -9; d <= 9; d++) {
-                        int r = ui_chip_step(s, d, c);
-                        if (r < 0 || r >= (int)c) in_range = 0;
-                    }
-            check(in_range, "no selection and no detent produces an index off the labels");
+                for (int s = -9; s <= 9; s++) {
+                    int r = ui_chip_clamp(s, c);
+                    if (r < 0 || r >= (int)c) in_range = 0;
+                }
+            check(in_range, "no stored selection produces an index off the labels");
         }
     }
 
