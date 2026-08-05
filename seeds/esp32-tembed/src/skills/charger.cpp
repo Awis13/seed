@@ -6,29 +6,35 @@
  *
  * WHY THIS IS NOT IN battery.cpp
  * ------------------------------
- * Because battery.cpp promises, at length and in prose, that it does not do
- * this. "It writes NOTHING to the gauge — not an unseal, not a CONFIG UPDATE,
- * not a chemistry profile... The only byte this file ever puts on the wire is
- * a register pointer... That restraint is the point."
+ * The original reason was that battery.cpp promised, at length and in prose,
+ * that it wrote NOTHING to the gauge, and putting writes into a file whose
+ * header argues against writing would make that file lie about itself. That
+ * reason has since expired: battery.cpp now writes six parameters to the
+ * gauge's data memory, and its header says so. Both skills write.
  *
- * That promise is still correct and still worth keeping. The gauge reports a
- * state of charge that is wrong, fixing it means unsealing a sealed part and
- * rewriting data-flash parameters on the owner's live pager, and nobody yet
- * knows the right values — so battery.cpp stays a read-only diagnostic and
- * says so. The charger is a different part at a different address with a known
- * fix, and putting its writes into a file whose header argues against writing
- * would make that file lie about itself.
+ * The split stands anyway, on the reason that was always underneath the first
+ * one: they are two parts, at two addresses, with two independent failures and
+ * two different guards. The BQ25896 can drive 4.6 V into a lithium cell and
+ * bq25896_write_allowed() is what stands between a typo and a fire. The
+ * BQ27220 has no FET drivers and no charge control at all, so the worst its
+ * guard prevents is a silently corrupted gauge model. Those are not the same
+ * risk and they should not share a file, a bounds check, or a reviewer's
+ * attention budget.
  *
- * They are two skills for the same reason: one writes and one does not.
+ * The two fixes ARE related and land in order, which is worth knowing when
+ * reading either: this file makes the charger terminate at 128 mA, and
+ * battery.cpp then tells the gauge that 128 mA is what termination looks like.
+ * Change REG05's ITERM here and the gauge's TaperCurrent has to move with it —
+ * tools/test_battery.sh asserts that the two are equal, across both files, for
+ * exactly that reason.
  *
  * WHY A SEPARATE ENDPOINT RATHER THAN A SECTION OF /battery
  * --------------------------------------------------------
  * A caller thinks of all of this as "the battery", and there is a real case for
  * one endpoint. It is not taken, for one reason: serving charger data out of
- * /battery would mean battery.cpp reaching into this file's cache, which puts
- * an import from the writing skill into the non-writing one and reintroduces
- * the coupling this split exists to remove — the contradiction would just be
- * one level less visible.
+ * /battery would mean battery.cpp reaching into this file's cache, and a skill
+ * that reads another skill's private state has stopped being a separate skill —
+ * it is the same coupling this split exists to remove, one level less visible.
  *
  * So the two are found the way every other skill here is found: both are in the
  * skill registry, both list their endpoints in /capabilities, and /battery's
@@ -1102,8 +1108,15 @@ static const char *charger_describe() {
            "**re-compares** them every 60 s, re-issuing the whole table if the\n"
            "part is ever found holding something else.\n\n"
            "For cell voltage, state of charge and capacities, see `GET\n"
-           "/battery`. That skill never writes to anything; this one does, and\n"
-           "they are separate for that reason.\n\n"
+           "/battery`. That skill writes six parameters to the gauge's data\n"
+           "memory, three of which are deliberately the same numbers this one\n"
+           "writes to the charger — the gauge only recognises a finished charge\n"
+           "if it is told what this part does. In particular its TaperCurrent\n"
+           "must equal REG05's termination current below; change one and the\n"
+           "other has to move with it.\n\n"
+           "The two are separate skills because they are separate parts with\n"
+           "separate risks: this one can drive 4.6 V into a lithium cell, and\n"
+           "the gauge has no charge control at all.\n\n"
            "### Endpoints\n\n"
            "| Method | Path | Description |\n"
            "|--------|------|-------------|\n"

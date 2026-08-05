@@ -68,7 +68,7 @@
 #include <TFT_eSPI.h>
 
 // ===== Configuration =====
-#define SEED_VERSION        "0.16.0"
+#define SEED_VERSION        "0.17.0"
 #define HTTP_PORT           8080
 #define TOKEN_FILE          "/auth_token.txt"
 #define WIFI_CONFIG_FILE    "/wifi.json"
@@ -335,16 +335,24 @@ static void probe_cc1101() {
 // battery_probe() fills hw.has_battery/battery_v/battery_soc once at boot;
 // battery_refresh() re-reads them from loop(), because otherwise the figures on
 // the panel would stay frozen at the boot-time snapshot.
+//
+// battery_probe() ALSO WRITES, and it did not use to. It applies six charge
+// parameters to the gauge's data memory — the taper current above all, which at
+// its ROM default never matches what the charger does, so the gauge never sees
+// a charge finish and a full cell reports 80%. Data memory here is RAM and is
+// lost on a power-on reset, which is why this is a boot-time apply and not a
+// one-off calibration. The addresses, the values and the guard that bounds them
+// are at the head of skills/battery.cpp.
 static void battery_probe();
 static void battery_refresh();
 
-// The charger shares that I2C bus and is a separate skill for one reason:
-// charger_probe() WRITES. It sets four registers on the BQ25896 — the
-// termination current above all, which on the power-on value cuts charging
-// at 77% of this cell — and skills/battery.cpp is an extended argument for
-// writing nothing, which it must be allowed to go on being. The values, the
-// order they go out in and the guard that bounds them are at the head of
-// skills/charger.cpp.
+// The charger shares that I2C bus and is a separate skill because it is a
+// separate part with a separate failure: charger_probe() sets four registers on
+// the BQ25896 — the termination current above all, which on the power-on value
+// cuts charging at 77% of this cell. The two fixes are related and land in
+// order: the charger is made to terminate at 128 mA, and the gauge is told that
+// 128 mA is what termination looks like. The values, the order they go out in
+// and the guard that bounds them are at the head of skills/charger.cpp.
 //
 // Declared here, like the gauge's, because the probe has to run from hw_probe()
 // rather than from skills_init(): the charger should be off its power-on
@@ -2052,6 +2060,13 @@ void loop() {
     // the I2C rule at the head of skills/charger.cpp. Neither endpoint may ever
     // reach the bus itself — it would run the transaction on the AsyncTCP task,
     // interleaved with this one.
+    //
+    // Both refreshes READ, COMPARE, and write only when the comparison fails.
+    // battery_refresh() re-runs the gauge's data-memory sequence when the
+    // read-back is wrong or unreadable, which is what a power-on reset of the
+    // gauge looks like from here — capped at three attempts per boot, because
+    // that sequence suspends gauging for seconds and must not become a
+    // once-a-minute stutter on a part that will not take it.
     //
     // charger_refresh() READS, COMPARES, and writes only when the comparison
     // fails. The four writes happen once at boot in charger_probe(); after that

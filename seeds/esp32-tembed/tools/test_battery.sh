@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 #
-# Host-side regression test for the BQ27220 decode in src/skills/battery.cpp.
+# Host-side regression test for the BQ27220 decode and the data-memory
+# configuration in src/skills/battery.cpp.
 #
 # Why this exists: GET /battery is a diagnostic, and a diagnostic that reports
 # confidently and wrongly is worse than no diagnostic. The whole point of the
@@ -9,8 +10,22 @@
 # one bit in a mask does not fail a build, does not throw and does not look
 # broken — it looks like an answer.
 #
-# The two pieces below are pure computation over a uint16 and are therefore the
-# pieces a host can hold to account:
+# That was the original argument, and the writes have made it sharper rather
+# than replacing it. Everything in the data-memory path fails SILENTLY when it
+# is wrong:
+#
+#   - A wrong checksum is not signalled on the bus. The gauge declines to commit
+#     the block and keeps the old value, which is indistinguishable from a part
+#     that refused the parameter.
+#   - A wrong address is not signalled either. It writes a different parameter,
+#     successfully, and 0x929F (DesignCapacity) and 0x92A3 (Design Voltage) are
+#     each one keystroke from an address in the table.
+#   - The address goes out little-endian and the value big-endian. Swap either
+#     and the write succeeds, checksums, and reads back consistent with itself.
+#
+# None of that has a failure signal to test against, so what is tested is the
+# arithmetic that produces it. The pieces below are pure computation and are
+# therefore the pieces a host can hold to account:
 #
 #   1. The two-byte little-endian word assembly. Get it backwards and 4200 mV
 #      reads as 26640 mV — which the voltage gate then rejects, so the panel
@@ -18,23 +33,43 @@
 #   2. The status bit fields. Every mask below is checked against the position
 #      the TRM (SLUUBD4A, Tables 2-6 and 2-7) puts it at, and every named flag
 #      is checked to respond to ITS OWN bit and to no other.
+#   3. The data-memory block builder, byte for byte, both endiannesses.
+#   4. The checksum and length arithmetic, against the TRM's OWN WORKED EXAMPLE
+#      — address 0x9221 with one data byte, checksum 0x4C, length 5 — which is
+#      an oracle from the primary source rather than a restatement of the code.
+#   5. The address allowlist, swept across all 65536 addresses: exactly six are
+#      writable and every one of them is in the table.
+#   6. The parameter table itself, against the addresses TRM Table 3-2 gives.
+#   7. The verify mask and the verdict that decides what the endpoint claims.
+#   8. The one fact that spans two files: the gauge's TaperCurrent equals the
+#      charger's termination current. See the charger object built below.
 #
 # WHAT THIS DOES NOT COVER, said plainly rather than papered over: the I2C
-# transaction. bq27220_read16() is four calls into Arduino's TwoWire and its
-# failure modes are a NAK, a missing pull-up and a second task on the bus. None
-# of that has a host equivalent, nothing below simulates it, and the only proof
-# that half of the skill works is a reading taken off the device. The endpoint
-# layer is not here either — tools/test_routes.sh gates the exact matcher and
-# the body-handler wiring, which is the failure mode that layer actually has.
+# transactions, and that is a larger uncovered share than it was before the
+# writes. bq27220_read16(), bq27220_dm_write(), bq27220_dm_read(),
+# gauge_open_access() and gauge_wait_cfgupdate() are calls into Arduino's
+# TwoWire wrapped around timing this host has no equivalent for — a NAK, a
+# missing pull-up, a second task on the bus, a part that wanted another 200 ms.
+# Nothing below simulates any of it. Neither is gauge_configure()'s own control
+# flow: the read-first rule, the CONFIG UPDATE bracket, and the decision not to
+# write when the part already holds the table all sit above the slice markers on
+# the far side of Wire, and reaching them from the host would mean rearranging
+# the shipping source to suit the test.
+#
+# The only proof that half of this skill works is a reading taken off the
+# device, and it is a specific one: after a completed charge,
+# `battery_status.fc` must go true. It was false on a full cell before this.
+#
+# The endpoint layer is not here either — tools/test_routes.sh gates the exact
+# matcher and the body-handler wiring, which is the failure mode that layer
+# actually has.
 #
 # Nor is battery_read()'s at_boot gate: the rule that only the boot pass may set
 # hw.has_battery, so that a bus glitch during a later refresh cannot make a
-# device without a fuel gauge start claiming one. It sits above the slice
-# markers, on the far side of Wire and hw, and reaching it from the host would
-# mean rearranging the shipping source to suit the test. It is left uncovered on
+# device without a fuel gauge start claiming one. It is left uncovered on
 # purpose and named here so that nobody reads this file's green as covering it.
 #
-# The decode is sliced straight out of the shipping source between its
+# The logic is sliced straight out of the shipping source between its
 # `host-test:begin gauge` and `host-test:end` markers, the same way
 # tools/test_progress.sh and tools/test_voice_url.sh slice theirs, so this runs
 # the real implementation rather than a copy that could drift.
@@ -45,10 +80,12 @@ set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 src="$here/../src/skills/battery.cpp"
+charger_src="$here/../src/skills/charger.cpp"
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 
 [ -f "$src" ] || { echo "cannot find $src"; exit 1; }
+[ -f "$charger_src" ] || { echo "cannot find $charger_src"; exit 1; }
 
 slice() {
     awk -v tag="$2" '
@@ -137,6 +174,60 @@ static const FlagCase batt_flags[] = {
 };
 
 #define COUNT(a) ((int)(sizeof(a) / sizeof((a)[0])))
+
+/*
+ * The six parameters, with the address and value written out as LITERALS taken
+ * from TRM SLUUBD4A Table 3-2 — not as the macros the source uses, for the same
+ * reason FlagCase above spells out bit positions as numbers. Comparing a macro
+ * to itself passes whatever it is changed to.
+ *
+ * Looked up by NAME rather than by index, so reordering gauge_config[] (which
+ * the source explicitly says is free, unlike the charger's table) does not fail
+ * this, while changing an address or a value does.
+ */
+struct ParamCase {
+    const char *name;
+    uint16_t addr;
+    int16_t value;
+    uint8_t checksum;   /* 0xFF - (addr_lo + addr_hi + val_hi + val_lo), by hand */
+};
+
+static const ParamCase trm_params[] = {
+    /* 0x01+0x92+0x00+0x80 = 0x113 -> 0x13; 0xFF-0x13 = 0xEC */
+    {"TaperCurrent",                 0x9201,  128, 0xEC},
+    /* 0xFB+0x91+0x02+0x00 = 0x18E -> 0x8E; 0xFF-0x8E = 0x71 */
+    {"ChargingCurrent",              0x91FB,  512, 0x71},
+    /* 0xFD+0x91+0x10+0x70 = 0x20E -> 0x0E; 0xFF-0x0E = 0xF1 */
+    {"ChargingVoltage",              0x91FD, 4208, 0xF1},
+    /* 0xA5+0x92+0x00+0x64 = 0x19B -> 0x9B; 0xFF-0x9B = 0x64 */
+    {"CEDVChargeTerminationVoltage", 0x92A5,  100, 0x64},
+    /* 0x2A+0x92+0x00+0x4B = 0x107 -> 0x07; 0xFF-0x07 = 0xF8 */
+    {"ChargeDetectThreshold",        0x922A,   75, 0xF8},
+    /* 0x2C+0x92+0x00+0x28 = 0xE6;         0xFF-0xE6 = 0x19 */
+    {"QuitCurrent",                  0x922C,   40, 0x19},
+};
+
+/* The entry in the shipping table with this name, or NULL. */
+static const GaugeParam *param_named(const char *name) {
+    for (int i = 0; i < GAUGE_CONFIG_COUNT; i++) {
+        if (strcmp(gauge_config[i].name, name) == 0) return &gauge_config[i];
+    }
+    return NULL;
+}
+
+/* Its index, for the bit it owns in the verify mask. */
+static int param_index(const char *name) {
+    for (int i = 0; i < GAUGE_CONFIG_COUNT; i++) {
+        if (strcmp(gauge_config[i].name, name) == 0) return i;
+    }
+    return -1;
+}
+
+/* Three facts out of charger.cpp's own configuration table, compiled into a
+   separate object from the same shipping source. See the build below. */
+extern "C" int charger_table_iterm_ma(void);
+extern "C" int charger_table_ichg_ma(void);
+extern "C" int charger_table_vreg_mv(void);
 
 /*
  * bq_soc_from_capacity() with its arguments laundered through volatiles, and
@@ -348,12 +439,566 @@ int main(void) {
               "which is below the 76% the device actually reports");
     }
 
+    /* ================= the data-memory configuration ================= */
+
+    printf("the data-memory block, byte for byte\n");
+    {
+        uint8_t blk[BQ_DM_BLOCK_BYTES];
+
+        /*
+         * ChargingVoltage is the case worth leading with because all four of
+         * its bytes are different: address 0x91FD, value 4208 = 0x1070. Any
+         * swap of either half moves a byte that no other check would catch.
+         *
+         * Verified by swapping each half of bq_dm_block() in turn. Writing the
+         * address high byte first turns blk[0] into 0x91 and reddens ten checks
+         * here, starting with "the address goes out LOW byte first". Writing
+         * the value low byte first turns blk[2] into 0x70 and reddens twelve,
+         * starting with "the value goes out HIGH byte first" — twelve rather
+         * than four because the round trip and the checksums below are computed
+         * over the same block. Restored, green both times.
+         */
+        eq_int(bq_dm_block(0x91FD, 4208, blk), 4, "a block is four bytes");
+        eq_int(blk[0], 0xFD, "the address goes out LOW byte first");
+        eq_int(blk[1], 0x91, "then its high byte");
+        eq_int(blk[2], 0x10, "the value goes out HIGH byte first");
+        eq_int(blk[3], 0x70, "then its low byte");
+
+        /* The two orders are OPPOSITE, which is the part that reads like a bug
+           and is not. Said as its own check so that "surely both are
+           little-endian" fails here rather than on the device. */
+        bq_dm_block(0x91FB, 512, blk);
+        eq_int(blk[0], 0xFB, "0x91FB: address low byte");
+        eq_int(blk[1], 0x91, "0x91FB: address high byte");
+        eq_int(blk[2], 0x02, "512 = 0x0200: value high byte first");
+        eq_int(blk[3], 0x00, "and its low byte second — NOT the address order");
+
+        /* A value whose two bytes are equal proves nothing about order, so the
+           table's own 128 is checked for what it does prove: the low byte is
+           where the magnitude went. 128 little-endian would be 0x80,0x00 and
+           the gauge would store 32768. */
+        bq_dm_block(0x9201, 128, blk);
+        eq_int(blk[2], 0x00, "128 = 0x0080: high byte is zero");
+        eq_int(blk[3], 0x80, "and the magnitude is in the low byte");
+
+        /* Every parameter in the shipping table encodes to what the TRM
+           addresses say it should. */
+        for (int i = 0; i < COUNT(trm_params); i++) {
+            char what[128];
+            bq_dm_block(trm_params[i].addr, trm_params[i].value, blk);
+            snprintf(what, sizeof(what), "%s addresses 0x%04X",
+                     trm_params[i].name, trm_params[i].addr);
+            check(blk[0] == (uint8_t)(trm_params[i].addr & 0xFF) &&
+                  blk[1] == (uint8_t)(trm_params[i].addr >> 8), what);
+        }
+    }
+
+    printf("the value decode, which must undo the encode exactly\n");
+    {
+        uint8_t blk[BQ_DM_BLOCK_BYTES];
+
+        eq_int(bq_dm_decode((const uint8_t[]){0x10, 0x70}), 4208, "0x10,0x70 is 4208 mV");
+        /* The swap, named so that its absence from the encode is not the only
+           thing standing between 4208 and 28688. */
+        eq_int(bq_dm_decode((const uint8_t[]){0x70, 0x10}), 28688, "and the other way round is not");
+        eq_int(bq_dm_decode((const uint8_t[]){0x00, 0x00}), 0, "both bytes zero");
+
+        /* Signed, because every parameter is I2 and the guard's `value < 0`
+           refusal cannot fire on a value the decode cannot represent. */
+        eq_int(bq_dm_decode((const uint8_t[]){0xFF, 0xFF}), -1, "0xFFFF decodes as -1, not 65535");
+        eq_int(bq_dm_decode((const uint8_t[]){0x80, 0x00}), -32768, "and 0x8000 as the lowest int16");
+        eq_int(bq_dm_decode((const uint8_t[]){0x7F, 0xFF}), 32767, "0x7FFF as the highest");
+
+        /* Round trip, over the real table. */
+        for (int i = 0; i < GAUGE_CONFIG_COUNT; i++) {
+            char what[128];
+            bq_dm_block(gauge_config[i].addr, gauge_config[i].value, blk);
+            snprintf(what, sizeof(what), "%s survives encode then decode",
+                     gauge_config[i].name);
+            eq_int(bq_dm_decode(&blk[2]), gauge_config[i].value, what);
+        }
+    }
+
+    printf("the checksum, against the TRM's own worked example\n");
+    {
+        /*
+         * SLUUBD4A, the Hibernate note in section 3: address 0x9221, one data
+         * byte 0x00, then "Write (hex) 4C 05". This is the ONLY independent
+         * oracle this arithmetic has — every other case below is derived from
+         * the same formula the code uses, and would agree with a wrong formula.
+         *
+         * It settles two questions the TRM's prose leaves open: whether the
+         * address bytes are in the sum (they are — 0xFF - 0x00 would be 0xFF,
+         * not 0x4C), and what MACDataLen counts.
+         *
+         * Verified by summing from index 2 in bq_dm_checksum(), which drops the
+         * address bytes: this check goes red at 0xFF instead of 0x4C, and takes
+         * fourteen others with it — every hand-computed checksum below. It is
+         * the one of the fifteen that is evidence rather than agreement, since
+         * the others could all be regenerated from a wrong formula. Restored,
+         * green.
+         */
+        const uint8_t trm_block[3] = {0x21, 0x92, 0x00};
+        eq_int(bq_dm_checksum(trm_block, 3), 0x4C, "TRM 0x9221 + one 0x00 byte checksums to 0x4C");
+        eq_int(bq_dm_len(1), 0x05, "and its MACDataLen is 5");
+
+        /* And the address bytes named explicitly, because the check above is
+           the only thing that proves they are counted and it is worth two
+           lines to say what it proves. */
+        const uint8_t data_only[1] = {0x00};
+        check(bq_dm_checksum(trm_block, 3) != bq_dm_checksum(data_only, 1),
+              "the address bytes change the checksum, so they are in the sum");
+
+        /* Every parameter in the shipping table against a checksum computed by
+           hand in the trm_params table above. */
+        uint8_t blk[BQ_DM_BLOCK_BYTES];
+        for (int i = 0; i < COUNT(trm_params); i++) {
+            char what[160];
+            int n = bq_dm_block(trm_params[i].addr, trm_params[i].value, blk);
+            snprintf(what, sizeof(what), "%s (0x%04X = %d) checksums to 0x%02X",
+                     trm_params[i].name, trm_params[i].addr,
+                     trm_params[i].value, trm_params[i].checksum);
+            eq_int(bq_dm_checksum(blk, n), trm_params[i].checksum, what);
+        }
+
+        /*
+         * The defining property, over every block the table produces: the
+         * checksum and the sum of the block are complements. A checksum
+         * function that returned a constant, or dropped the wrap to 8 bits,
+         * fails here even if somebody also "fixed" the expected values above.
+         */
+        for (int i = 0; i < GAUGE_CONFIG_COUNT; i++) {
+            char what[128];
+            int n = bq_dm_block(gauge_config[i].addr, gauge_config[i].value, blk);
+            uint8_t sum = 0;
+            for (int b = 0; b < n; b++) sum = (uint8_t)(sum + blk[b]);
+            snprintf(what, sizeof(what), "%s: checksum + sum = 0xFF",
+                     gauge_config[i].name);
+            eq_int((uint8_t)(sum + bq_dm_checksum(blk, n)), 0xFF, what);
+        }
+
+        /* It wraps at 8 bits rather than saturating or overflowing an int:
+           four 0xFF bytes sum to 0x3FC, which is 0xFC in a byte. */
+        const uint8_t all_ones[4] = {0xFF, 0xFF, 0xFF, 0xFF};
+        eq_int(bq_dm_checksum(all_ones, 4), 0x03, "four 0xFF bytes checksum to 0x03");
+        const uint8_t zeroes[4] = {0, 0, 0, 0};
+        eq_int(bq_dm_checksum(zeroes, 4), 0xFF, "and four zero bytes to 0xFF");
+
+        /* A checksum that ignored its input would pass a table of expected
+           values that had been regenerated from it. This is the check that
+           does not. */
+        const uint8_t a[4] = {0x01, 0x92, 0x00, 0x80};
+        const uint8_t b[4] = {0x01, 0x92, 0x00, 0x81};
+        check(bq_dm_checksum(a, 4) != bq_dm_checksum(b, 4),
+              "one bit of difference in the value changes the checksum");
+    }
+
+    printf("MACDataLen, which is not the transfer length\n");
+    {
+        /*
+         * 2 address + N value + 1 checksum + 1 length. Five for the TRM's
+         * one-byte example, six for everything this file writes.
+         *
+         * Verified by changing bq_dm_len() to `2 + value_bytes` — LilyGO's
+         * transfer-length bug transplanted into the length field: all three
+         * below go red, and so does the TRM oracle above, which is the one that
+         * makes 5 a fact rather than a preference. Restored, green.
+         */
+        eq_int(bq_dm_len(1), 5, "one data byte");
+        eq_int(bq_dm_len(BQ_DM_VALUE_BYTES), 6, "the two this file writes");
+        eq_int(bq_dm_len(4), 8, "and a four-byte parameter, if one were added");
+
+        /* The number of bytes transferred to 0x60 is TWO — the checksum and the
+           length — and is a different quantity entirely. This is the vendor bug
+           the source declines to inherit, asserted as an inequality because
+           there is nothing else to assert it against. */
+        check(bq_dm_len(BQ_DM_VALUE_BYTES) != 2,
+              "MACDataLen is not the two bytes written to MACDataSum");
+        check(bq_dm_len(BQ_DM_VALUE_BYTES) != BQ_DM_VALUE_BYTES + 2,
+              "nor is it LilyGO's size + 2");
+    }
+
+    printf("the address allowlist, swept over every address there is\n");
+    {
+        /*
+         * The whole 16-bit space. Exactly six addresses are writable and every
+         * one of them is in the table — which is what `default: refuse` means,
+         * asserted rather than read.
+         *
+         * Verified by changing the guard's `default: return false` to
+         * `default: return true`: the count below reports 65536 instead of 6,
+         * the per-address check names 0x0000 as the first stranger, and
+         * twenty-one checks go red in all. Restored, green.
+         */
+        int allowed = 0;
+        int stranger = -1;
+        for (int a = 0; a <= 0xFFFF; a++) {
+            if (!bq_dm_write_allowed((uint16_t)a, 0)) continue;
+            allowed++;
+            int in_table = 0;
+            for (int i = 0; i < GAUGE_CONFIG_COUNT; i++) {
+                if (gauge_config[i].addr == (uint16_t)a) in_table = 1;
+            }
+            if (!in_table && stranger < 0) stranger = a;
+        }
+        eq_int(allowed, GAUGE_CONFIG_COUNT,
+               "exactly six addresses in the whole 16-bit space are writable");
+        if (stranger >= 0) {
+            printf("  FAIL: 0x%04X is writable and is not in the table\n", stranger);
+            failures++;
+        } else {
+            printf("  ok:   every writable address is one this file writes\n");
+        }
+
+        /* Named refusals, because a count does not say WHICH six, and these
+           are the specific addresses a mistake would land on. Each is real,
+           writable on the part, and would corrupt the gauge silently. */
+        check(!bq_dm_write_allowed(0x929F, 1300), "0x929F DesignCapacity is refused");
+        check(!bq_dm_write_allowed(0x929D, 1300), "0x929D FullChargeCapacity is refused");
+        check(!bq_dm_write_allowed(0x929B, 0),    "0x929B GaugingConfig is refused");
+        /* The address LilyGO's own header mislabels as EMF. Not a hypothetical
+           keystroke — a real one, already made upstream. */
+        check(!bq_dm_write_allowed(0x92A3, 3743), "0x92A3 Design Voltage is refused");
+        check(!bq_dm_write_allowed(0x92A7, 3743), "0x92A7 EMF is refused too");
+        check(!bq_dm_write_allowed(0x0000, 0),    "address zero is refused");
+        check(!bq_dm_write_allowed(0xFFFF, 0),    "and an all-ones address");
+
+        /* One either side of every allowed address: the off-by-one that a
+           two-byte address invites, and the reason no two entries in the table
+           are adjacent. */
+        for (int i = 0; i < GAUGE_CONFIG_COUNT; i++) {
+            char what[128];
+            uint16_t a = gauge_config[i].addr;
+            snprintf(what, sizeof(what), "0x%04X, one below %s, is refused",
+                     (unsigned)(a - 1), gauge_config[i].name);
+            check(!bq_dm_write_allowed((uint16_t)(a - 1), gauge_config[i].value), what);
+            snprintf(what, sizeof(what), "0x%04X, one above %s, is refused",
+                     (unsigned)(a + 1), gauge_config[i].name);
+            check(!bq_dm_write_allowed((uint16_t)(a + 1), gauge_config[i].value), what);
+        }
+    }
+
+    printf("the value bounds on the six addresses that are allowed\n");
+    {
+        /* Every shipping value passes its own guard. A table edited to
+           something the guard refuses would otherwise present on the device as
+           a silently short writes_ok. */
+        for (int i = 0; i < GAUGE_CONFIG_COUNT; i++) {
+            char what[128];
+            snprintf(what, sizeof(what), "%s = %d is allowed",
+                     gauge_config[i].name, gauge_config[i].value);
+            check(bq_dm_write_allowed(gauge_config[i].addr, gauge_config[i].value), what);
+        }
+
+        /* Negative is refused everywhere: every row of TRM Table 3-2 this file
+           writes has a minimum of zero, and all six are signed. */
+        for (int i = 0; i < GAUGE_CONFIG_COUNT; i++) {
+            char what[128];
+            snprintf(what, sizeof(what), "%s refuses -1", gauge_config[i].name);
+            check(!bq_dm_write_allowed(gauge_config[i].addr, -1), what);
+            snprintf(what, sizeof(what), "%s refuses the lowest int16", gauge_config[i].name);
+            check(!bq_dm_write_allowed(gauge_config[i].addr, -32768), what);
+        }
+
+        /* The TRM's maxima, travelled from both sides.
+           Verified on TaperCurrent by changing its `<=` to `<`: "TaperCurrent
+           at its 1000 mA maximum" goes red ALONE — one failing check in the
+           whole suite, which is what an off-by-one in a bound looks like and
+           why each of the five is asked separately. Restored, green. */
+        check(bq_dm_write_allowed(0x9201, 1000),  "TaperCurrent at its 1000 mA maximum");
+        check(!bq_dm_write_allowed(0x9201, 1001), "and one above it is refused");
+        check(bq_dm_write_allowed(0x91FB, 1000),  "ChargingCurrent at its maximum");
+        check(!bq_dm_write_allowed(0x91FB, 1001), "and one above it is refused");
+        check(bq_dm_write_allowed(0x922A, 2000),  "ChargeDetectThreshold at its 2000 mA maximum");
+        check(!bq_dm_write_allowed(0x922A, 2001), "and one above it is refused");
+        check(bq_dm_write_allowed(0x922C, 1000),  "QuitCurrent at its maximum");
+        check(!bq_dm_write_allowed(0x922C, 1001), "and one above it is refused");
+        check(bq_dm_write_allowed(0x92A5, 1000),  "CEDV taper voltage at its maximum");
+        check(!bq_dm_write_allowed(0x92A5, 1001), "and one above it is refused");
+
+        /*
+         * ChargingVoltage is the one bound that is NOT the TRM's. The TRM
+         * allows 4600 mV; this guard stops at 4208, the same ceiling
+         * bq25896_write_allowed() enforces on the charger. Telling the gauge to
+         * wait for a voltage the charger may not produce would recreate the
+         * never-terminates bug this commit fixes, one file over.
+         *
+         * Travelled from below, which makes it the bound most likely to rot —
+         * the shipping value sits exactly on it. Verified by raising
+         * BQ_DM_CHARGING_VOLTAGE_MAX to the TRM's 4600: the last two below go
+         * red, and so does the cross-file ceiling check at the end of this
+         * file, which is the one that says why the number is 4208. Restored,
+         * green.
+         */
+        check(bq_dm_write_allowed(0x91FD, 4208),  "ChargingVoltage at 4208 mV, the value written");
+        check(!bq_dm_write_allowed(0x91FD, 4209), "4209 mV is refused: one above the ceiling");
+        check(!bq_dm_write_allowed(0x91FD, 4600), "and so is the TRM's own 4600 mV maximum");
+    }
+
+    printf("the parameter table against TRM Table 3-2\n");
+    {
+        eq_int(GAUGE_CONFIG_COUNT, COUNT(trm_params), "six parameters");
+        /* The mask is a uint8_t. A seventh parameter is fine; a ninth silently
+           stops being tracked. */
+        check(GAUGE_CONFIG_COUNT <= 8, "and few enough to fit the verify mask");
+        eq_int(GAUGE_MASK_ALL, 0x3F, "so GAUGE_MASK_ALL is six bits");
+
+        for (int i = 0; i < COUNT(trm_params); i++) {
+            char what[160];
+            const GaugeParam *p = param_named(trm_params[i].name);
+            snprintf(what, sizeof(what), "%s is in the table", trm_params[i].name);
+            check(p != NULL, what);
+            if (!p) continue;
+
+            snprintf(what, sizeof(what), "%s is at 0x%04X",
+                     trm_params[i].name, trm_params[i].addr);
+            check(p->addr == trm_params[i].addr, what);
+
+            snprintf(what, sizeof(what), "%s is %d", trm_params[i].name, trm_params[i].value);
+            eq_int(p->value, trm_params[i].value, what);
+
+            snprintf(what, sizeof(what), "%s says what it is for", trm_params[i].name);
+            check(p->why != NULL && p->why[0] != '\0' &&
+                  p->units != NULL && p->units[0] != '\0', what);
+        }
+
+        /* No address written twice. Two entries at one address means the second
+           silently wins on the device and the first is a lie in the endpoint. */
+        int clash = 0;
+        for (int i = 0; i < GAUGE_CONFIG_COUNT; i++) {
+            for (int j = i + 1; j < GAUGE_CONFIG_COUNT; j++) {
+                if (gauge_config[i].addr == gauge_config[j].addr) clash = 1;
+            }
+        }
+        check(!clash, "no two parameters claim the same address");
+    }
+
+    printf("the verify mask\n");
+    {
+        int16_t live[GAUGE_CONFIG_COUNT];
+        for (int i = 0; i < GAUGE_CONFIG_COUNT; i++) live[i] = gauge_config[i].value;
+
+        eq_int(gauge_verify_mask(live), 0, "a gauge holding the whole table masks clean");
+
+        /* Each parameter owns its own bit and no other's — the same shape as
+           the flag tables above, and the same defect it is looking for. */
+        for (int i = 0; i < GAUGE_CONFIG_COUNT; i++) {
+            char what[128];
+            int16_t was = live[i];
+            live[i] = (int16_t)(was + 1);
+            snprintf(what, sizeof(what), "%s wrong sets bit %d and nothing else",
+                     gauge_config[i].name, i);
+            eq_int(gauge_verify_mask(live), 1 << i, what);
+            live[i] = was;
+        }
+
+        /* Off by one in either direction, on the parameter that matters: 100 is
+           the ROM default this whole commit is about, and it must not read as
+           agreement. */
+        {
+            int taper = param_index("TaperCurrent");
+            check(taper >= 0, "TaperCurrent has an index");
+            live[taper] = 100;
+            eq_int(gauge_verify_mask(live), 1 << taper,
+                   "a TaperCurrent still at its 100 mA ROM default is flagged");
+            live[taper] = gauge_config[taper].value;
+        }
+
+        for (int i = 0; i < GAUGE_CONFIG_COUNT; i++) live[i] = 0;
+        eq_int(gauge_verify_mask(live), GAUGE_MASK_ALL, "an all-zero read-back masks everything");
+    }
+
+    printf("the verdict the endpoint leads with\n");
+    {
+        int16_t good[GAUGE_CONFIG_COUNT];
+        int16_t bad[GAUGE_CONFIG_COUNT];
+        for (int i = 0; i < GAUGE_CONFIG_COUNT; i++) {
+            good[i] = gauge_config[i].value;
+            bad[i] = (int16_t)(gauge_config[i].value + 1);
+        }
+        GaugeVerdict v;
+
+        gauge_derive(v, true, true, good);
+        eq_int(v.live_mask, 0, "read ok, boot applied, values right: clean mask");
+        check(v.config_still_live, "and the configuration is still live");
+        check(v.applied, "and the endpoint may say applied");
+
+        /*
+         * "We could not check" must never read as "we checked and it was
+         * fine", and the buffer handed in here is PERFECT — so a derive that
+         * ignored read_ok would come out clean and applied.
+         *
+         * Verified by dropping the read_ok term from live_mask: the first of
+         * the three goes red, alone. The other two survive that mutation
+         * because config_still_live carries its own read_ok term — which is
+         * why the mask is asserted here separately rather than trusted to fall
+         * out of `applied`. Restored, green.
+         */
+        gauge_derive(v, false, true, good);
+        eq_int(v.live_mask, GAUGE_MASK_ALL, "a failed read-back masks everything");
+        check(!v.applied, "and cannot be reported as applied");
+        check(!v.config_still_live, "nor as still live");
+
+        /* A configuration that never landed is not made live by the part
+           agreeing with it later. */
+        gauge_derive(v, true, false, good);
+        eq_int(v.live_mask, 0, "values right but the boot write never verified");
+        check(v.config_still_live, "the comparison itself still passes");
+        check(!v.applied, "but applied is false, because boot did not verify");
+
+        /* And the case the whole re-derivation exists for: verified at boot,
+           gone now. This is a gauge that lost its RAM at 03:00 being reported
+           honestly at noon. */
+        gauge_derive(v, true, true, bad);
+        eq_int(v.live_mask, GAUGE_MASK_ALL, "every value changed since boot");
+        check(!v.config_still_live, "so nothing is still live");
+        check(!v.applied, "and a boot success does not survive it");
+
+        /* One parameter gone is enough. */
+        int16_t one_off[GAUGE_CONFIG_COUNT];
+        for (int i = 0; i < GAUGE_CONFIG_COUNT; i++) one_off[i] = gauge_config[i].value;
+        one_off[0] = (int16_t)(one_off[0] + 1);
+        gauge_derive(v, true, true, one_off);
+        check(!v.applied, "a single parameter out of place is enough to lose applied");
+    }
+
+    printf("the security field the endpoint renders from bits\n");
+    {
+        /* GET /battery reports sec_before and sec_after by synthesising a word
+           from two stored bits — `bits << BQ_OP_SEC_SHIFT` — and handing it to
+           the same decoder the live register goes through. If that synthesis
+           and bq_sec_bits() ever disagree, the endpoint reports the wrong
+           security state for the write it just performed. */
+        for (uint8_t bits = 0; bits <= 3; bits++) {
+            char what[128];
+            uint16_t word = (uint16_t)(bits << BQ_OP_SEC_SHIFT);
+            snprintf(what, sizeof(what), "SEC %u survives the round trip through a word", bits);
+            eq_int(bq_sec_bits(word), bits, what);
+        }
+        eq_str(bq_sec_name((uint16_t)(BQ_SEC_SEALED << BQ_OP_SEC_SHIFT)), "sealed",
+               "BQ_SEC_SEALED is the sealed code");
+        eq_str(bq_sec_name((uint16_t)(BQ_SEC_UNSEALED << BQ_OP_SEC_SHIFT)), "unsealed",
+               "BQ_SEC_UNSEALED is the unsealed code");
+        /* The state gauge_open_access() drives to and returns on. */
+        eq_str(bq_sec_name((uint16_t)(BQ_SEC_FULL << BQ_OP_SEC_SHIFT)), "full",
+               "BQ_SEC_FULL is the full-access code");
+        check(BQ_SEC_SEALED != BQ_SEC_UNSEALED && BQ_SEC_UNSEALED != BQ_SEC_FULL &&
+              BQ_SEC_SEALED != BQ_SEC_FULL, "and the three codes are distinct");
+    }
+
+    printf("the gauge and the charger agree about what a finished charge is\n");
+    {
+        /*
+         * The one fact that spans two files, and the reason this whole commit
+         * works. charger.cpp sets the BQ25896 to terminate at 128 mA; the gauge
+         * declares a pack full when it sees the current taper below ITS taper
+         * threshold. If those two numbers ever stop being equal, the gauge goes
+         * back to never seeing a charge finish — silently, with every other
+         * check in both suites still green.
+         *
+         * Both sides are read out of the shipping tables, so a change to either
+         * file alone fails here. Stated honestly, though: a change to either
+         * file alone ALSO fails that file's own suite, which pins both numbers
+         * — editing charger.cpp's REG05 to 0x12 turns tools/test_charger.sh red
+         * as well, so this check is not what catches that.
+         *
+         * What it catches, and nothing else does, is the two moving APART while
+         * each file's own expectations are kept consistent. Verified: the
+         * gauge's TaperCurrent moved to 192 mA and the trm_params pin above
+         * moved with it, charger.cpp untouched. tools/test_charger.sh stays
+         * green, every other check in this file stays green, and the equality
+         * below goes red alone. Restored, green.
+         *
+         * The other half of its value is the message. A pin failing says a
+         * number changed; this says the gauge and the charger no longer agree,
+         * which is the sentence somebody needs to read at that moment.
+         */
+        const GaugeParam *taper = param_named("TaperCurrent");
+        const GaugeParam *volts = param_named("ChargingVoltage");
+        const GaugeParam *amps  = param_named("ChargingCurrent");
+        check(taper && volts && amps, "the three mirrored parameters are in the table");
+
+        eq_int(charger_table_iterm_ma(), 128, "the charger terminates at 128 mA");
+        if (taper) {
+            eq_int(taper->value, charger_table_iterm_ma(),
+                   "and the gauge's TaperCurrent is that same number");
+        }
+
+        eq_int(charger_table_vreg_mv(), 4208, "the charger regulates at 4208 mV");
+        if (volts) {
+            eq_int(volts->value, charger_table_vreg_mv(),
+                   "and the gauge's ChargingVoltage is that same number");
+        }
+
+        eq_int(charger_table_ichg_ma(), 512, "the charger charges at 512 mA");
+        if (amps) {
+            eq_int(amps->value, charger_table_ichg_ma(),
+                   "and the gauge's ChargingCurrent is that same number");
+        }
+
+        /* The gauge's ceiling and the charger's are one number, not two that
+           happen to agree today. */
+        check(!bq_dm_write_allowed(0x91FD, (int16_t)(charger_table_vreg_mv() + 1)),
+              "the gauge may not be told to expect more than the charger's ceiling");
+    }
+
     printf("\n%s\n", failures ? "FAILED" : "all checks passed");
     return failures ? 1 : 0;
 }
 MAIN
 } > "$work/test.cpp"
 
+# The charger's configuration table, sliced out of ITS shipping source and
+# compiled into its own object, so that one relationship can be asserted across
+# the two files: the gauge's TaperCurrent must equal the charger's termination
+# current, or the gauge never sees a charge finish and none of this works.
+#
+# A separate translation unit rather than a second slice in test.cpp because
+# this test uses three values out of that block and none of its functions, and
+# twenty -Wunused-function warnings would bury the real output. The block's own
+# correctness is tools/test_charger.sh's job; here it is only a source of facts,
+# which is why -Wno-unused-function is acceptable on this object and would not
+# be on the one above.
+{
+    cat <<'CHARGER_PRELUDE'
+/* Generated by tools/test_battery.sh — do not edit. */
+#include <stdint.h>
+#include <string.h>
+
+CHARGER_PRELUDE
+    slice "$charger_src" charger
+    cat <<'CHARGER_FACTS'
+
+/* Looked up by REGISTER, never by index. charger.cpp's table order IS a
+   correctness property over there — REG07 has to go out first — and it is free
+   to change for that reason; indexing into it here would make a legal
+   reordering fail this suite in a file that has nothing to do with it. A
+   register that is not in the table returns 0, whose decoded value matches none
+   of the three expected figures, so a deletion fails rather than passes. */
+static uint8_t charger_reg(uint8_t reg) {
+    for (int i = 0; i < CHARGER_CONFIG_COUNT; i++) {
+        if (charger_config[i].reg == reg) return charger_config[i].val;
+    }
+    return 0;
+}
+
+extern "C" int charger_table_iterm_ma(void) {
+    return bq25896_iterm_ma(charger_reg(BQ25896_REG05_TERM));
+}
+
+extern "C" int charger_table_ichg_ma(void) {
+    return bq25896_ichg_ma(charger_reg(BQ25896_REG04_ICHG));
+}
+
+extern "C" int charger_table_vreg_mv(void) {
+    return bq25896_vreg_mv(charger_reg(BQ25896_REG06_VREG));
+}
+CHARGER_FACTS
+} > "$work/charger_facts.cpp"
+
 cxx="${CXX:-c++}"
-"$cxx" -std=c++17 -O2 -Wall -Wextra -Wno-unused-parameter -o "$work/test" "$work/test.cpp"
+"$cxx" -std=c++17 -O2 -Wall -Wextra -Wno-unused-parameter -Wno-unused-function \
+       -c -o "$work/charger_facts.o" "$work/charger_facts.cpp"
+"$cxx" -std=c++17 -O2 -Wall -Wextra -Wno-unused-parameter \
+       -o "$work/test" "$work/test.cpp" "$work/charger_facts.o"
 "$work/test"
