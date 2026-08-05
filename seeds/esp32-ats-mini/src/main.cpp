@@ -313,6 +313,48 @@ static bool ota_upload_ok = false;
 static bool ota_upload_error = false;
 static char ota_upload_error_msg[128] = "";
 static size_t ota_bytes_written = 0;
+// Per-request ownership of the in-flight OTA transfer. The flags above are
+// file-global with no identity, and before this the index==0 path wrote
+// ota_upload_error on auth-fail BEFORE checking whether another authenticated
+// upload already owned the slot. So while a token-holder was streaming an
+// image, any unauthenticated LAN peer POSTing to /firmware/upload set that
+// global, and the legit upload's remaining chunks then hit
+// `if (ota_upload_error) return;` and were silently dropped: Update.end() never
+// ran and ota_in_progress never cleared, DoSing the update channel until reboot.
+//
+// ota_session is the id of the transfer that owns the slot (0 = no owner). It
+// is a monotonic id, NOT the AsyncWebServerRequest pointer: the library
+// destroys the request object on client disconnect, so a later request landing
+// on the same freed address would pass a pointer-equality test and splice its
+// chunks into the abandoned transfer. The owner stamps its id into its own
+// request->_tempObject (a small heap tag), and a request that reused a freed
+// address starts with _tempObject NULL and cannot inherit the claim.
+static uint32_t ota_session = 0;
+static uint32_t ota_next_session = 1;  // monotonic; never hands out 0
+// millis() of the last accepted body chunk (or the claim), for the stall
+// watchdog in loop(). An owner that keeps streaming keeps pushing this deadline
+// out and is never watchdog-killed; a client that disconnects mid-stream stops
+// stamping it and the slot is reclaimed OTA_STALL_TIMEOUT_MS later.
+static uint32_t ota_last_chunk_ms = 0;
+// True between radio_encoder_pause() at claim and its matching resume. The
+// resume is owed to exactly one of two paths — normal completion or the
+// watchdog — whichever recovers first. Each checks this flag, resumes, and
+// clears it, so the encoder is re-attached exactly once and never twice.
+static bool ota_encoder_paused = false;
+#define OTA_STALL_TIMEOUT_MS 30000  // 30s; matches the cardputer watchdog
+// Serialises the OTA read-modify-write state below across tasks. platformio.ini
+// pins async_tcp (prio 10) and loopTask (prio 1) to the same core, so async_tcp
+// preempts loopTask mid-instruction: handle_firmware_upload_body (async_tcp) and
+// the stall watchdog (loopTask) both touch ota_in_progress / ota_session /
+// ota_encoder_paused / ota_last_chunk_ms / ota_upload_error and call Update.* /
+// radio_encoder_*. Without a lock, a retransmitted chunk for a still-live
+// session can Update.write() with the flash cache off while the watchdog
+// re-attaches the encoder ISR mid-write -> the ISR faults reading flash. The
+// body handler holds this across its Update.write(), so the watchdog blocks
+// until the chunk finishes, then zeroes ota_session under the lock; later chunks
+// fail the tag guard under the lock before any write. Mirrors eibi_mtx. Created
+// once in setup() before server.begin(); take/give are null-guarded defensively.
+static SemaphoreHandle_t ota_mtx = nullptr;
 static volatile bool pending_restart = false;
 static volatile bool pending_rollback = false;
 
@@ -842,26 +884,49 @@ static void handle_firmware_version(AsyncWebServerRequest *request) {
 
 static void handle_firmware_upload_body(AsyncWebServerRequest *request, uint8_t *data,
                                          size_t len, size_t index, size_t total) {
+    // Whole callback runs under ota_mtx so the watchdog on loopTask cannot
+    // interleave with the state writes and the Update.write() below. Every
+    // return must give the lock back — a missed give deadlocks the next upload.
+    if (ota_mtx) xSemaphoreTake(ota_mtx, portMAX_DELAY);
     if (index == 0) {
-        if (!check_auth(request)) {
-            ota_upload_error = true;
-            snprintf(ota_upload_error_msg, sizeof(ota_upload_error_msg), "auth required");
-            return;
-        }
-        if (ota_in_progress) {
-            ota_upload_error = true;
-            snprintf(ota_upload_error_msg, sizeof(ota_upload_error_msg), "already in progress");
-            return;
-        }
-        // OTA app slots are 4MB each (partitions/ats-mini_16mb_ota.csv)
+        // A transfer already owns the slot: touch NOTHING, write no shared
+        // globals. This must be first — before this, an unauth POST would write
+        // ota_upload_error here and poison the live owner's stream.
+        if (ota_in_progress) { if (ota_mtx) xSemaphoreGive(ota_mtx); return; }
+        // No token: write NO shared globals and claim nothing. The 401 is
+        // emitted by the paired completion handler handle_firmware_upload(),
+        // which runs its own require_auth() and sends. Setting a global here
+        // would let an unauthenticated peer poison state.
+        if (!check_auth(request)) { if (ota_mtx) xSemaphoreGive(ota_mtx); return; }
+        // OTA app slots are 4MB each (partitions/ats-mini_16mb_ota.csv). No
+        // owner exists yet (guarded above), so recording the error here cannot
+        // poison anyone; the next claim resets it.
         if (total == 0 || total > 0x400000) {
             ota_upload_error = true;
             snprintf(ota_upload_error_msg, sizeof(ota_upload_error_msg),
                      "invalid size: %u", (unsigned)total);
+            if (ota_mtx) xSemaphoreGive(ota_mtx);
             return;
         }
 
+        // Claim the slot. Stamp this request with a fresh session id, stored as
+        // the heap tag in its own _tempObject; a request that later reuses this
+        // freed address starts with _tempObject NULL and cannot inherit it.
+        uint32_t *tag = (uint32_t*)malloc(sizeof(uint32_t));
+        if (!tag) {
+            ota_upload_error = true;
+            snprintf(ota_upload_error_msg, sizeof(ota_upload_error_msg),
+                     "OOM claiming upload");
+            if (ota_mtx) xSemaphoreGive(ota_mtx);
+            return;
+        }
+        ota_session = ota_next_session++;
+        if (ota_next_session == 0) ota_next_session = 1;  // never hand out 0
+        *tag = ota_session;
+        request->_tempObject = tag;
+
         ota_in_progress = true;
+        ota_last_chunk_ms = millis();  // start the stall clock at the claim
         ota_upload_started = false;
         ota_upload_ok = false;
         ota_upload_error = false;
@@ -873,20 +938,36 @@ static void handle_firmware_upload_body(AsyncWebServerRequest *request, uint8_t 
         // Detach the encoder ISR for the whole OTA write: Update.write disables
         // the flash cache and the ISR reads flash (encoder.process()), so an edge
         // mid-write would crash. Re-attached in handle_firmware_upload(), which
-        // always runs once the stream finishes — every success and error path.
+        // resumes only for the owner (this request) on every path — success and
+        // error — so a non-owner completion cannot re-attach mid-flash.
         radio_encoder_pause();
+        ota_encoder_paused = true;  // a resume is now owed (completion or watchdog)
 
         if (!Update.begin(total, U_FLASH)) {
             ota_upload_error = true;
             snprintf(ota_upload_error_msg, sizeof(ota_upload_error_msg),
                      "Update.begin failed: %s", Update.errorString());
             ota_in_progress = false;
+            // Do NOT clear ota_session here: the completion handler identifies
+            // the owner by tag == ota_session to know it must resume the encoder
+            // this claim paused. Clearing it would strand the encoder detached.
+            if (ota_mtx) xSemaphoreGive(ota_mtx);
             return;
         }
         ota_upload_started = true;
     }
 
-    if (ota_upload_error) return;
+    // Chunks of a request that never claimed the slot (a non-owner, including
+    // the unauth attacker whose _tempObject is NULL) or whose session has been
+    // retired. Drop them before they can touch the owner's state.
+    uint32_t *tag = (uint32_t*)request->_tempObject;
+    if (!tag || *tag != ota_session) { if (ota_mtx) xSemaphoreGive(ota_mtx); return; }
+
+    // Owner chunk accepted: push the stall deadline out. A healthy multi-second
+    // upload restamps this every chunk and is never watchdog-killed.
+    ota_last_chunk_ms = millis();
+
+    if (ota_upload_error) { if (ota_mtx) xSemaphoreGive(ota_mtx); return; }
 
     if (ota_upload_started && Update.isRunning()) {
         if (Update.write(data, len) != len) {
@@ -895,6 +976,7 @@ static void handle_firmware_upload_body(AsyncWebServerRequest *request, uint8_t 
                      "write failed: %s", Update.errorString());
             Update.abort();
             ota_in_progress = false;
+            if (ota_mtx) xSemaphoreGive(ota_mtx);
             return;
         }
         ota_bytes_written += len;
@@ -911,14 +993,39 @@ static void handle_firmware_upload_body(AsyncWebServerRequest *request, uint8_t 
         }
         ota_in_progress = false;
     }
+    if (ota_mtx) xSemaphoreGive(ota_mtx);  // normal end-of-callback release
 }
 
 static void handle_firmware_upload(AsyncWebServerRequest *request) {
-    // The stream is done by the time this always-invoked completion handler runs,
-    // so re-attach the encoder ISR here — on every path, success or error —
-    // rather than in each body-handler branch. If no upload started (no body),
-    // radio_encoder_pause() never ran and this attach is a harmless idempotent.
-    radio_encoder_resume();
+    // Resume the encoder ISR ONLY for the request that actually paused it — the
+    // owner, identified by its heap tag matching the live session. A second POST
+    // to /firmware/upload (even the tiny unauth attacker, dropped at index==0
+    // with _tempObject NULL) must be a no-op here: resuming from a non-owner
+    // completion would re-attach the ISR while the owner is still mid-flash with
+    // the cache disabled, and the ISR's flash read would then fault. The owner's
+    // pause runs exactly once (at claim), so this resumes it exactly once, on
+    // every owner path — success, write-fail, begin-fail.
+    // Under ota_mtx so this owner recovery and the stall watchdog are mutually
+    // exclusive: whichever takes the lock first resumes the encoder and clears
+    // the flag, closing the double-resume TOCTOU on the final chunk.
+    if (ota_mtx) xSemaphoreTake(ota_mtx, portMAX_DELAY);
+    uint32_t *tag = (uint32_t*)request->_tempObject;
+    bool is_owner = (tag && *tag == ota_session);
+    if (is_owner) {
+        // Flag-mediated so completion and the stall watchdog resume exactly once
+        // total: whoever recovers first clears ota_encoder_paused; the other
+        // sees it false and does nothing. No double-resume, no stranded detach.
+        if (ota_encoder_paused) { radio_encoder_resume(); ota_encoder_paused = false; }
+        ota_session = 0;
+        ota_in_progress = false;
+    }
+    // Free this request's tag if it claimed one (only the owner ever does). The
+    // library also frees _tempObject on request destroy; nulling it here makes
+    // that a no-op rather than a double free. Reached only for /firmware/upload,
+    // whose body callback never runs the shared body collector, so there is no
+    // collision with the _tempObject those other routes use.
+    if (tag) { free(tag); request->_tempObject = nullptr; }
+    if (ota_mtx) xSemaphoreGive(ota_mtx);
 
     // The body handler authenticates the upload itself, but a POST with no body
     // never reaches it and would otherwise report the md5 and size of whatever
@@ -1366,6 +1473,7 @@ void setup() {
     wifi_setup();     // RF up first; also raises the setup AP if STA fails
     token_load();     // after wifi_setup(): needs RF up for a real hardware RNG
     skills_init();    // display can now show the token / AP password on screen
+    if (!ota_mtx) ota_mtx = xSemaphoreCreateMutex();  // before any upload is possible
     setup_routes();
     server.begin();
 
@@ -1397,6 +1505,40 @@ void loop() {
         firmware_confirmed = true;
         if (err == ESP_OK) event_add("firmware auto-confirmed");
     }
+
+    // Stall watchdog: recover a slot whose owning client disconnected mid-stream
+    // so the completion handler never ran. Without this ota_in_progress stays
+    // true (channel wedged until reboot) and the encoder stays detached (its
+    // resume lives only in the completion handler). The signed cast is
+    // load-bearing: ota_last_chunk_ms is stamped on the AsyncTCP task which
+    // preempts this one, so a chunk landing between millis() and the subtract
+    // leaves the stamp newer than the reading; in unsigned math that wraps to
+    // ~4.29e9 and would abort a healthy upload. Signed, it reads as a small
+    // negative ("not stalled"), and the same form survives millis() rollover.
+    // The whole check-and-recover runs under ota_mtx. Because the body handler
+    // holds the lock across its Update.write(), this blocks until any in-flight
+    // chunk finishes; it then aborts and resumes safely, and zeroes ota_session
+    // under the lock so a later chunk fails the tag guard (also under the lock)
+    // before it can Update.write() with the encoder ISR live.
+    if (ota_mtx) xSemaphoreTake(ota_mtx, portMAX_DELAY);
+    if (ota_in_progress &&
+        (int32_t)(millis() - ota_last_chunk_ms) > OTA_STALL_TIMEOUT_MS) {
+        Update.abort();
+        // Resume the encoder if the claim paused it and completion has not
+        // already resumed it (the flag makes this exactly-once with completion).
+        if (ota_encoder_paused) { radio_encoder_resume(); ota_encoder_paused = false; }
+        ota_in_progress = false;
+        // Retire the session so any late straggler from the dead connection
+        // fails the per-chunk `*tag != ota_session` guard and is inert.
+        ota_session = 0;
+        ota_upload_error = true;
+        // Do NOT free request->_tempObject here: the watchdog holds no request
+        // handle, and the library frees _tempObject when the abandoned request
+        // object is destroyed. Clearing ota_session is what neutralises a late
+        // chunk; the freed tag is never dereferenced against a live session.
+        event_add("ota upload timed out, slot released");
+    }
+    if (ota_mtx) xSemaphoreGive(ota_mtx);
 
     // WiFi reconnect
     static unsigned long last_wifi = 0;
