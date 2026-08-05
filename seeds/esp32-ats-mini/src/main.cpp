@@ -668,17 +668,46 @@ static void handle_capabilities(AsyncWebServerRequest *request) {
     request->send(200, "application/json", response);
 }
 
+// Body collector for POST /config.md and /clock/tz. Runs as the onBody callback,
+// which fires ahead of the paired onRequest handler (and so ahead of the auth
+// check there) — it must be safe against an unauthenticated LAN peer on its own.
+//
+// total is the declared body length and is authoritative here:
+//
+//   - total == 0 means the client sent Transfer-Encoding: chunked with no
+//     Content-Length. The library never fills a running total for a chunked
+//     body (_contentLength stays 0) and delivers chunks with a growing index
+//     while total stays 0. The non-chunked path's clamp does not run, so index
+//     and len are attacker-controlled and unbounded. A naive malloc(total+1)
+//     then returns a 1-byte block that every later chunk memcpys past — a
+//     pre-auth heap overflow. Unknown length cannot be served safely, so it is
+//     refused with 411.
+//
+//   - even with a known total, every chunk is bounds-checked before the memcpy
+//     and the buffer is NUL-terminated on every chunk rather than only when
+//     index + len == total, because the final chunk is not guaranteed to
+//     arrive and the handlers all read the buffer as a C string.
 static void handle_body_collect(AsyncWebServerRequest *request, uint8_t *data,
                                  size_t len, size_t index, size_t total) {
     if (index == 0) {
+        // Unknown length (chunked): cannot size the allocation, refuse. See above.
+        if (total == 0) { request->send(411, "application/json", "{\"error\":\"length required\"}"); return; }
         if (total > 4096) { request->send(413, "application/json", "{\"error\":\"too large\"}"); return; }
-        char *buf = (char*)malloc(total + 1);
+        // calloc so a body that never completes still leaves a defined,
+        // NUL-filled buffer rather than uninitialised heap.
+        char *buf = (char*)calloc(total + 1, 1);
         if (!buf) { request->send(500, "application/json", "{\"error\":\"OOM\"}"); return; }
         request->_tempObject = buf;
     }
     char *buf = (char*)request->_tempObject;
-    if (buf) memcpy(buf + index, data, len);
-    if (index + len == total && buf) buf[total] = '\0';
+    if (!buf) return;
+    // Drop anything that would land outside the allocation. index + len can run
+    // past total on a chunked stream the library did not clamp, and a single
+    // byte past the end is the whole bug.
+    if (index > total || len > total - index) return;
+    memcpy(buf + index, data, len);
+    // Terminate on every chunk: the final chunk is not guaranteed to arrive.
+    buf[index + len] = '\0';
 }
 
 static void handle_config_get(AsyncWebServerRequest *request) {
