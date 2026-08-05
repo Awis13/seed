@@ -227,7 +227,7 @@ static const char *gpio_warning(int pin) {
     if (gpio_is_audio(pin))     return "ES8311 audio codec (I2S) — configured, not started";
     if (gpio_is_ir(pin))        return "IR transmitter";
     if (gpio_is_led(pin))       return "RGB LED data line — M5.Led holds a live RMT TX channel on it";
-    if (gpio_is_vbat(pin))      return "battery sense divider";
+    if (gpio_is_vbat(pin))      return "battery sense divider, sampled by the header's battery indicator through the same ADC handle — readable, but write and mode are refused";
     if (gpio_is_strapping(pin)) return "strapping pin or module-internal line — may affect boot";
     if (gpio_is_unclassified(pin)) return "unclassified — no published assignment, treat as taken";
     return NULL;
@@ -312,9 +312,48 @@ static const char *gpio_refuse_reason(int pin) {
     return NULL;
 }
 
+/* Pins that must never be DRIVEN but that the ADC endpoint may still read.
+ *
+ * A separate list because gpio_refuse_reason() above is enforced on /gpio/adc
+ * as well, and for GPIO10 that would be exactly backwards: reading it is what
+ * this firmware itself does, five times a second, and the read is safe for the
+ * same reason the write is not.
+ *
+ * analogRead() and analogReadMilliVolts() ATTACH the pad to Arduino's ADC
+ * oneshot bus, or find it already attached and reuse the handle. pinMode() takes
+ * the pad the other way, and Arduino's peripheral manager runs the previous
+ * bus's deinit on the way out — for ESP32_BUS_TYPE_ADC_ONESHOT that is
+ * adcDetachBus() in esp32-hal-adc.c, which counts the ADC1 channels still
+ * attached and, when the count reaches one, calls adc_oneshot_del_unit() and
+ * adc_cali_delete_scheme_curve_fitting() and NULLs both handles. One is the
+ * ordinary count here: GPIO10 is the only ADC1 pin anything keeps attached.
+ *
+ * So a POST landing on the web server task while loop() is inside
+ * adc_oneshot_read() frees the unit under it. NOT from a second core, and the
+ * distinction matters only because someone checking this claim against the
+ * build flags would find it false and might then conclude there is no race at
+ * all: AsyncTCP is pinned to core 1 and the Arduino loop task runs there too,
+ * so what happens is a PREEMPTION, priority 10 over priority 1, exactly as the
+ * UI section's one-writer rule describes for the panel. For a delete landing
+ * inside a read that is no safer than a second core would be — Espressif
+ * document adc_oneshot_del_unit() as not thread-safe and say concurrent use
+ * breaks the read APIs. Even without the race it drives a push-pull output into
+ * the divider node and leaves the next tick to re-attach the pad and average the
+ * result into the window — where, because the window is a mean over six seconds,
+ * one bad sample is a sustained wrong reading rather than one wrong frame.
+ *
+ * This is the GPIO21 refusal's argument applied to a pin that had not acquired
+ * an owner yet when that one was written. It has one now: the header's battery
+ * indicator. */
+static const char *gpio_refuse_drive_reason(int pin) {
+    if (gpio_is_vbat(pin))
+        return "GPIO10 is the battery sense divider and the header samples it through Arduino's ADC driver — pinMode() detaches that bus, which deletes the oneshot unit and the calibration scheme while loop() may be mid-conversion, and drives the pad into the divider. Read it with GET /gpio/adc, which shares the driver rather than taking it";
+    return NULL;
+}
+
 /* Sends the 403 for a refused pin. Returns true if the request was answered. */
-static bool gpio_reject_if_refused(AsyncWebServerRequest *req, int pin) {
-    const char *refused = gpio_refuse_reason(pin);
+static bool gpio_send_refusal(AsyncWebServerRequest *req, int pin,
+                              const char *refused) {
     if (!refused) return false;
     JsonDocument err;
     err["error"] = refused;
@@ -324,6 +363,20 @@ static bool gpio_reject_if_refused(AsyncWebServerRequest *req, int pin) {
     serializeJson(err, out);
     req->send(403, "application/json", out);
     return true;
+}
+
+/* The gate for reads. Only the pins that no operation may touch. */
+static bool gpio_reject_if_refused(AsyncWebServerRequest *req, int pin) {
+    return gpio_send_refusal(req, pin, gpio_refuse_reason(pin));
+}
+
+/* The gate for anything that takes the pad: /gpio/write, /gpio/mode, and
+ * /serial/open's tx and rx — a UART drives a pin as hard as digitalWrite()
+ * does, which is why that skill has always shared this gate. */
+static bool gpio_reject_if_undrivable(AsyncWebServerRequest *req, int pin) {
+    const char *refused = gpio_refuse_reason(pin);
+    if (!refused) refused = gpio_refuse_drive_reason(pin);
+    return gpio_send_refusal(req, pin, refused);
 }
 
 /* --- Endpoints --- */
@@ -375,6 +428,20 @@ static const char *gpio_describe() {
            "The adc half of that is deliberate: `analogRead()` switches the pad to\n"
            "the ADC function and detaches whatever peripheral held it, so leaving\n"
            "it ungated would be a way straight through the gate.\n\n"
+           "### Refused with 403 on write and mode ONLY — adc still works\n\n"
+           "- `vbat` (10): the battery sense divider, and the header's battery\n"
+           "  indicator samples it about five times a second through Arduino's ADC\n"
+           "  driver. `pinMode()` detaches that bus, and Arduino's `adcDetachBus()`\n"
+           "  deletes the ADC1 oneshot unit and the calibration scheme outright\n"
+           "  once the last ADC1 channel goes — which this pin normally is. That\n"
+           "  frees the unit while `loop()` may be inside a conversion, and drives\n"
+           "  a push-pull output into the divider. `GET /gpio/adc?pin=10` is not\n"
+           "  refused and never will be: it shares the same driver and the same\n"
+           "  handle the firmware is already using, so the two do not contend.\n"
+           "  `/serial/open` refuses it on tx and rx for the same reason a write\n"
+           "  is refused\n\n"
+           "`/gpio/list` distinguishes the two lists: `refused` is true for both,\n"
+           "and `adc_refused` says whether the analog endpoint is closed as well.\n\n"
            "### Allowed, but warned — `class` in /gpio/list says which\n\n"
            "- `ext_header` (3,4,5,6,13,14,15,39,40): the EXT 2.54-14P header's SPI\n"
            "  and UART fan-out, shared with the microSD bus. Nothing of the\n"
@@ -383,7 +450,6 @@ static const char *gpio_describe() {
            "- `sdcard` (12): microSD chip select\n"
            "- `audio` (41,42,43,46): ES8311 codec, configured but never started\n"
            "- `ir` (44): IR transmitter\n"
-           "- `vbat` (10): battery sense divider\n"
            "- `strapping` (0,45): may affect boot. GPIO3 and GPIO46 are strapping\n"
            "  pins too, but they carry a more actionable class here and report as\n"
            "  `ext_header` and `audio`; GPIO3's warning carries the strapping note\n"
@@ -433,7 +499,18 @@ static void gpio_register_routes(AsyncWebServer &server) {
 
             /* safe = on the allowlist in main.cpp, nothing else */
             obj["safe"] = gpio_is_safe(pin);
-            if (gpio_refuse_reason(pin)) obj["refused"] = true;
+            /* `refused` means write and mode are refused. `adc_refused`
+               qualifies it, because the two lists are no longer the same: the
+               battery divider is refused for drive and readable through
+               /gpio/adc, and reporting only the first would tell an agent the
+               pin is unreachable when the endpoint it wants still works. */
+            if (gpio_refuse_reason(pin)) {
+                obj["refused"] = true;
+                obj["adc_refused"] = true;
+            } else if (gpio_refuse_drive_reason(pin)) {
+                obj["refused"] = true;
+                obj["adc_refused"] = false;
+            }
         }
 
         String response;
@@ -501,7 +578,7 @@ static void gpio_register_routes(AsyncWebServer &server) {
             req->send(400, "application/json", "{\"error\":\"invalid pin number\"}");
             return;
         }
-        if (gpio_reject_if_refused(req, pin)) return;
+        if (gpio_reject_if_undrivable(req, pin)) return;
 
         if (value != 0 && value != 1) {
             req->send(400, "application/json", "{\"error\":\"value must be 0 or 1\"}");
@@ -568,7 +645,7 @@ static void gpio_register_routes(AsyncWebServer &server) {
             req->send(400, "application/json", "{\"error\":\"invalid pin number\"}");
             return;
         }
-        if (gpio_reject_if_refused(req, pin)) return;
+        if (gpio_reject_if_undrivable(req, pin)) return;
 
         int arduino_mode;
         uint8_t track_mode;
@@ -623,8 +700,11 @@ static void gpio_register_routes(AsyncWebServer &server) {
             return;
         }
 
-        /* analogRead() re-muxes the pad to the ADC, so the refusal gate applies
-           here exactly as it does to write and mode. */
+        /* analogRead() re-muxes the pad to the ADC, so the all-operations gate
+           applies here exactly as it does to write and mode. The DRIVE-only
+           gate deliberately does not: its one member is the battery divider,
+           where reading is what the firmware itself does and taking the pad is
+           the only harmful direction. See gpio_refuse_drive_reason(). */
         if (gpio_reject_if_refused(req, pin)) return;
 
         if (!gpio_is_adc1(pin) && !gpio_is_adc2(pin)) {
@@ -669,6 +749,25 @@ static void gpio_register_routes(AsyncWebServer &server) {
         if (gpio_is_adc2(pin))
             doc["note"] = "ADC2 — readable because the radio is currently down; "
                           "this pin is refused whenever WiFi is up";
+        /* The one pin whose number here is routinely mistaken for something it
+           is not. `voltage` above is raw/4095*3.3 on every pin, which ignores
+           the chip's factory ADC calibration, and this pin sits behind a 2:1
+           divider — so it is neither calibrated nor half the pack. Doubling it
+           does not give the pack voltage and is not close: measured on this
+           node against the calibrated figure from the same pad, the doubled
+           number runs 0.12..0.35 V LOW, which is enough to put a charging node
+           on the wrong side of the external-supply threshold every time.
+           /capabilities and `battery` in GET /ui carry the calibrated reading.
+
+           Both of those are READS of one pad through one ADC handle, so neither
+           disturbs the other. That symmetry does not extend to writes, which is
+           why this pin is refused on write and mode — see
+           gpio_refuse_drive_reason(). */
+        else if (gpio_is_vbat(pin))
+            doc["note"] = "battery sense — the divider's midpoint WITHOUT the "
+                          "chip's ADC calibration, and it reads low: doubling "
+                          "this does not give the pack voltage. `battery` in "
+                          "GET /ui carries the calibrated figure";
 
         String response;
         serializeJson(doc, response);

@@ -310,8 +310,8 @@ static void serial_register_routes(AsyncWebServer &server) {
         /* The same gate POST /gpio/write applies. A UART drives its tx pin as
            hard as a digitalWrite() does, so anything refused there is refused
            here — otherwise this endpoint is a way around it. */
-        if (gpio_reject_if_refused(req, tx)) return;
-        if (gpio_reject_if_refused(req, rx)) return;
+        if (gpio_reject_if_undrivable(req, tx)) return;
+        if (gpio_reject_if_undrivable(req, rx)) return;
 
         SerialPort *sp = serial_find_uart(uart_num);
         if (!sp) {

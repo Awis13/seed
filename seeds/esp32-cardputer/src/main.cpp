@@ -30,14 +30,19 @@
 //     an expansion-header UART line, and doing that would be actively wrong.
 //   - No sub-GHz radio. The CC1101 probe the T-Embed seed runs has nothing to
 //     find on this mainboard.
-//   - No fuel gauge. The T-Embed's BQ27220 computes a charge percentage and
-//     hands it over I2C, which is what its status screen displays; there is no
-//     such chip here, so there is no percentage to display.
-//   - There IS a battery. It is sensed as a plain voltage divider on the ADC at
-//     GPIO10, and it is left unread because the divider ratio is documented
-//     nowhere: a guessed ratio would put a fabricated voltage in /capabilities,
-//     which states the pin number and stops there. Settling the ratio takes a
-//     meter across the cell, not a code change.
+//   - No fuel gauge, AND NO CHARGER STATUS LINE EITHER. The T-Embed's BQ27220
+//     computes a charge percentage and hands it over I2C; there is no such chip
+//     here, and nothing on this I2C bus reports the charger. So the pack
+//     voltage is the ONLY number available, and both "how full" and "charging
+//     or not" have to come out of it or not be answered at all.
+//   - There IS a battery, sensed as a 2:1 resistor divider on GPIO10, and it is
+//     now read. The ratio is not a guess and not a meter reading: M5Unified's
+//     own board table gives board_M5CardputerADV an _adc_ratio of 2.0f
+//     (Power_Class.cpp), which is the same figure its getBatteryVoltage() would
+//     apply. An earlier revision of this comment said the ratio was "documented
+//     nowhere" and left the pin unread on that basis; the library on disk
+//     documents it. See "The battery" in the UI section for what the header
+//     shows and, more to the point, what it declines to claim.
 //   - The mainboard I2C bus carries exactly three devices — the keyboard
 //     controller, the audio codec and the IMU — so it is scanned and reported
 //     but never reconfigured. A fourth address answering, 0x43, means a
@@ -186,7 +191,16 @@
 #define PIN_I2S_ASDOUT  46
 
 #define PIN_IR_TX       44
-#define PIN_VBAT_ADC    10  // battery divider; the ratio is unverified, so unread
+// Battery sense, ADC1 channel 9, behind a 2:1 divider. Read through the Arduino
+// core's calibrated path and NOT through M5.Power; see "The battery" in the UI
+// section for why the two cannot both be used in one boot.
+//
+// DRIVING THIS PIN IS REFUSED OVER HTTP now that the header samples it: taking
+// the pad with pinMode() makes Arduino's peripheral manager tear the ADC1
+// oneshot unit down under loop(). The gpio skill refuses it on write and mode
+// and the serial skill on tx and rx, while /gpio/adc stays open because a read
+// shares the driver instead of taking it. See gpio_refuse_drive_reason().
+#define PIN_VBAT_ADC    10
 
 // RGB LED data line, and DRIVEN — one WS2812B-2020, GRB, through M5Unified's
 // M5.Led over RMT. M5Unified's board table maps board_M5CardputerADV to this
@@ -301,7 +315,8 @@
 //                           the header, not to any one accessory — a Cap
 //                           LoRa-1262 drives all nine, and a bare board none.
 //   8,9,11                  I2C plus the keyboard controller's interrupt.
-//   10                      battery sense ADC.
+//   10                      battery sense ADC, sampled by the header. Readable
+//                           through /gpio/adc, refused on write and mode.
 //   12                      microSD chip select.
 //   33-38                   ST7789 panel; 38 also gates the RGB LED supply.
 //   41,42,43,46             ES8311 audio codec (I2S). 43 is nominally UART0 TX
@@ -1267,31 +1282,47 @@ static void wifi_setup() {
 #define UI_ROW_H       18
 #define UI_RULE2_Y    116
 #define UI_FOOT_Y     121
-// The header row, left to right, on the 240px-wide panel. Four spans that never
+// The header row, left to right, on the 240px-wide panel. Five spans that never
 // overlap, so no one of them can erase another's pixels:
 //
 //   4..70    screen title, left at x=4, padding 67
 //   72..78   badge dot, r=3 about cx=75
-//   81..100  badge count, left at x=81, padding 20
-//   102..235 network summary, right at x=236, padding 134
+//   81..95   badge count, left at x=81, padding 15
+//   97..208  network summary, right at x=209, padding 112
+//   210..235 battery, right at x=236, padding 26, in Font0
 //
 // Padding is what erases the previous value here, and M5GFX only fills the
 // REMAINDER of the band — and only when `padding > string width`, STRICTLY
 // greater. A string as wide as its padding erases nothing at all and the
 // previous value's tail stays on the glass, with no error and no clipping to
 // show for it. So every width below clears the widest string its field can
-// ever hold: 66px for "HARDWARE" and "MESSAGES", and 14px for "9+".
+// ever hold: 66px for "HARDWARE" and "MESSAGES", 14px for "9+", and 24px for
+// the battery's "100%".
 //
-// The network field is sized to the widest string its FORMAT can hold, which
-// is not the same thing. ui_net_summary() prints at most "AP " and a dotted
-// quad, so the structural bound is "AP 255.255.255.255" at 133px. What this
-// build can actually reach is narrower — ap_start() pins the AP to AP_IP_A..D
-// and refuses to raise it at all if the pin fails, so the AP branch tops out
-// at "AP 172.31.157.1" (109px) and the STA branch at 111px. The 124 this field
-// used before was therefore already sufficient, and no erase was ever missed.
-// 134 buys the field the freedom to keep working if AP_IP_A..D is ever moved
-// to wider octets, which is a one-line edit four hundred lines from here with
-// nothing to connect it to this number.
+// THE BATTERY IS THE FIFTH SPAN AND THE HEADER HAD NO FREE PIXELS, so it was
+// paid for out of the two fields that were carrying slack, and both of those
+// widths are now bounds that the compiler checks rather than round numbers:
+//
+//   - The badge count went from 20 to 15. It only ever holds "", a single digit
+//     or "9+", and ui_badge_text() is the sole producer of all three, so 14px
+//     is the whole of its range and 15 clears it.
+//   - The network summary went from 134 to 112. 134 was the bound for the
+//     widest string the FORMAT could hold — "AP 255.255.255.255" at 133px —
+//     which is not the same as the widest it can produce. Its three branches
+//     are a bare dotted quad (111px at worst, and that IS structural: any IPv4
+//     from WiFi.localIP() fits it), "AP " plus the AP's own address, and
+//     "offline" at 42px. The AP address is not free: ap_start() pins it to
+//     AP_IP_A..D and refuses to raise the AP at all if the pin fails, so the AP
+//     branch is 109px here — and that number now REACHES those four constants
+//     through UI_QUAD_W below instead of being asserted by a comment. Widening
+//     an octet four hundred lines from here used to be invisible to this
+//     number; it now fails the build.
+//
+// The battery field is Font0 rather than Font2, and that is the reason it fits
+// at all: "100%" is 33px in Font2 against 24px in the 6px fixed pitch, and 33
+// plus a seam was more than the two fields above could give up without one of
+// them ceasing to clear its own content. It is drawn 4px below the header's y
+// so the 8px cell sits on the centre line of the 16px cells either side of it.
 //
 // UI_PANEL_W exists so the seams below can be asserted at compile time; the
 // draw calls themselves still take the width from M5.Display at runtime. It is
@@ -1303,8 +1334,13 @@ static void wifi_setup() {
 #define UI_BADGE_CX     75
 #define UI_BADGE_R       3
 #define UI_BADGE_X      81
-#define UI_BADGE_W      20
-#define UI_HDR_NET_W   134
+#define UI_BADGE_W      15
+#define UI_HDR_NET_W   112
+#define UI_BAT_W        26
+// The gap between the network summary and the battery. One pixel, like every
+// other seam in this row, and named because both the layout note above and the
+// derivation of UI_HDR_NET_X below count it.
+#define UI_HDR_SEAM      1
 // Two columns on a data row: a dim label, then the value.
 #define UI_LABEL_X      4
 #define UI_LABEL_W     50
@@ -1312,6 +1348,41 @@ static void wifi_setup() {
 #define UI_VALUE_W    182
 #define UI_MENU_X       8
 #define UI_MENU_R_X   232
+// The two right-aligned header fields' anchors, as compile-time twins of the
+// runtime expressions ui_tick() draws them with. Both are UI_TR, so a field's
+// band is [x - padding, x - 1] — see LGFXBase::draw_string, which fills
+// writeFillRect(x - padx, y, padx - cwidth, cheight) for a right datum. The
+// seam between the two is guaranteed by this derivation and so is deliberately
+// NOT asserted below: an assertion that cannot fail is not a check.
+#define UI_BAT_X       (UI_PANEL_W - UI_LABEL_X)
+#define UI_HDR_NET_X   (UI_BAT_X - UI_BAT_W - UI_HDR_SEAM)
+
+// Font2 metrics the header's own arithmetic needs, transcribed from widtbl_f16
+// in lgfx/Fonts/Font16.h under exactly the caveat the clock face's block states
+// at length: these are a hand copy of one M5GFX release and nothing here can
+// check itself. Every decimal digit advances 8 and '.' advances 5, which is
+// what makes a dotted quad's width computable from its octets.
+#define UI_F2_DIGIT_W    8
+#define UI_F2_DOT_W      5
+#define UI_STRLEN(s)     ((int)(sizeof(s) - 1))
+#define UI_OCTET_W(n)    (UI_F2_DIGIT_W * ((n) < 10 ? 1 : (n) < 100 ? 2 : 3))
+#define UI_QUAD_W(a, b, c, d) \
+    (UI_OCTET_W(a) + UI_OCTET_W(b) + UI_OCTET_W(c) + UI_OCTET_W(d) + \
+     3 * UI_F2_DOT_W)
+// The three strings ui_net_summary() can produce, and their widths. The two
+// fixed parts are macros the formats are assembled from rather than literals
+// counted by eye at the producer, and their lengths are asserted so that
+// editing either one fails the build instead of silently invalidating the sum
+// beside it. That guards the LENGTH and not the glyphs — same-length text in
+// wider glyphs would still slip through, which is the standing limitation of
+// every hand-summed width in this file.
+#define UI_NET_AP_PFX      "AP "
+#define UI_NET_OFFLINE     "offline"
+#define UI_HDR_AP_PFX_W    22   // 'A' 8 + 'P' 8 + ' ' 6
+#define UI_HDR_OFFLINE_W   42   // o 8 + f 6 + f 6 + l 4 + i 4 + n 7 + e 7
+#define UI_HDR_STA_MAX_W   UI_QUAD_W(255, 255, 255, 255)
+#define UI_HDR_AP_MAX_W \
+    (UI_HDR_AP_PFX_W + UI_QUAD_W(AP_IP_A, AP_IP_B, AP_IP_C, AP_IP_D))
 
 // The header's spans are asserted and not merely written down, on the precedent
 // of the footer legend's counters further down this file. Every seam up there
@@ -1324,10 +1395,27 @@ static_assert(UI_LABEL_X + UI_HDR_TITLE_W <= UI_BADGE_CX - UI_BADGE_R,
               "the header title's erase band reaches into the badge dot");
 static_assert(UI_BADGE_CX + UI_BADGE_R < UI_BADGE_X,
               "the badge dot reaches into the badge count's erase band");
-static_assert(UI_BADGE_X + UI_BADGE_W <= UI_PANEL_W - UI_LABEL_X - UI_HDR_NET_W,
+static_assert(UI_BADGE_X + UI_BADGE_W <= UI_HDR_NET_X - UI_HDR_NET_W,
               "the badge count's erase band reaches into the network summary");
-static_assert(UI_PANEL_W - UI_LABEL_X - UI_HDR_NET_W >= 0,
+static_assert(UI_HDR_NET_X - UI_HDR_NET_W >= 0,
               "the network summary's erase band starts off the left of the panel");
+static_assert(UI_BAT_X <= UI_PANEL_W,
+              "the battery's erase band runs off the right of the panel");
+// Each of the three branches, against the one band that has to clear all of
+// them. Strictly greater, because a string exactly as wide as its pad erases
+// nothing — see the note on padding above.
+static_assert(UI_HDR_NET_W > UI_HDR_STA_MAX_W,
+              "the network summary cannot clear the widest dotted quad");
+static_assert(UI_HDR_NET_W > UI_HDR_AP_MAX_W,
+              "AP_IP_A..D grew wider than the network summary can clear");
+static_assert(UI_HDR_NET_W > UI_HDR_OFFLINE_W,
+              "the network summary cannot clear its offline string");
+static_assert(UI_STRLEN(UI_NET_AP_PFX) == 3,
+              "the AP prefix changed length; re-sum UI_HDR_AP_PFX_W over "
+              "widtbl_f16");
+static_assert(UI_STRLEN(UI_NET_OFFLINE) == 7,
+              "the offline string changed length; re-sum UI_HDR_OFFLINE_W over "
+              "widtbl_f16");
 // The dot is the one header element drawn as geometry rather than as a font
 // cell, so it is the one that can leave the row without a glyph metric stopping
 // it. UI_HDR_Y + 8 is the centre line of Font2's 16px cell.
@@ -1498,7 +1586,7 @@ static_assert(UI_HDR_Y + 8 + UI_BADGE_R < UI_RULE1_Y,
 // separators counted by eye against literals seven hundred lines away. Every
 // term below is either sizeof() over the exact text that gets printed or a
 // named length that its own producer also uses.
-#define UI_STRLEN(s)        ((int)(sizeof(s) - 1))
+// UI_STRLEN itself now lives with the header's spans, which needed it first.
 #define UI_CROW_AP_SEP      "  "
 #define UI_CROW_AP_PWPFX    "pw "
 #define UI_CROW_AP_LEFT     "m left"    // after the minute count
@@ -2168,11 +2256,11 @@ static void ui_net_summary(char *out, size_t n) {
                  (unsigned)((ip >> 24) & 0xFF));
     } else if (ap_active) {
         uint32_t ip = (uint32_t)WiFi.softAPIP();
-        snprintf(out, n, "AP %u.%u.%u.%u", (unsigned)(ip & 0xFF),
+        snprintf(out, n, UI_NET_AP_PFX "%u.%u.%u.%u", (unsigned)(ip & 0xFF),
                  (unsigned)((ip >> 8) & 0xFF), (unsigned)((ip >> 16) & 0xFF),
                  (unsigned)((ip >> 24) & 0xFF));
     } else {
-        snprintf(out, n, "offline");
+        snprintf(out, n, "%s", UI_NET_OFFLINE);
     }
 }
 
@@ -2918,6 +3006,355 @@ static void ui_draw_frame(ui_screen_t screen) {
     if (screen != UI_MESSAGE && screen != UI_STATUS) {
         M5.Display.drawFastHLine(0, UI_RULE2_Y, M5.Display.width(), COL_RULE);
     }
+}
+
+// ---- The battery ----
+//
+// One number — the voltage on GPIO10's divider — and everything the header can
+// honestly say about the pack has to come out of it. Most of this section is
+// therefore about what it declines to claim.
+//
+// READ THROUGH THE ARDUINO CORE'S CALIBRATED PATH AND NOT THROUGH M5.Power,
+// which is a departure worth stating plainly because M5.Power is the obvious
+// call. Both apply the same correction: analogReadMilliVolts() and M5Unified's
+// _getBatteryAdcRaw() each build an adc_cali_curve_fitting scheme on ADC unit 1
+// at 12dB attenuation and 12-bit width, and the Arduino core's defaults reach
+// that same pair (__analogAttenuation is ADC_11db, which is index 3 of
+// adc_attenuation_t and so the same value as ADC_ATTEN_DB_12; __analogWidth is
+// SOC_ADC_RTC_MAX_BITWIDTH, 12 on this chip). What differs is which of the two
+// OWNS the unit, and only one can: adc_oneshot_new_unit() claims it through
+// s_adc_unit_claimed — a static bool array, one byte per ADC unit, in the
+// adc_oneshot object of libesp_adc.a — and fails the second caller with
+// "adc%d is already in use".
+//
+// NEITHER SIDE LATCHES THE FAILURE, and the outcome is permanent anyway, which
+// is worth stating precisely because the two are easy to confuse. M5Unified
+// keeps its handle in a function-static that stays null after a failed claim,
+// so it re-attempts the claim on the next call; the Arduino core's
+// __analogInit() re-attempts it the same way. Both therefore retry forever and
+// both keep failing, because nothing in either library ever releases the claim
+// — there is no adc_oneshot_del_unit() on any path except the pad being
+// detached. So the loser answers 0 for the rest of the boot: getBatteryVoltage()
+// on M5Unified's side, or analogRead() on EVERY ADC1 pin on Arduino's. Whichever
+// runs first silently disables the other.
+//
+// /gpio/adc already reads pins 1..10 through the Arduino handle. So calling
+// M5.Power here would not have added a reading, it would have taken one away —
+// and with it the only means of comparing this figure against the uncalibrated
+// one on the same boot, which is the comparison that justifies calibrating at
+// all. The 2.0 divider ratio is still M5Unified's: its board table gives
+// board_M5CardputerADV an _adc_ratio of 2.0f, and that is where UI_BAT_RATIO
+// below comes from.
+//
+// AVERAGED, BECAUSE ONE SAMPLE IS NOT A MEASUREMENT — AND AVERAGED OVER TIME,
+// WHICH IS NOT THE SAME THING AND IS THE PART THAT WAS MEASURED THE HARD WAY.
+// Forty single isolated conversions of this pin, read over the network about
+// 50ms apart, span raw 2389..2583: 194 counts, roughly 156mV at the pin and
+// 313mV once doubled. The first version of this code answered that by averaging
+// 16 conversions taken back to back every five seconds, and the averaging
+// bought NOTHING — the reported figure still wandered over 4122..4401mV, a
+// 279mV spread, which is the same spread a single sample has. Sixteen
+// conversions taken inside a millisecond are not sixteen samples of a wandering
+// quantity; they are one sample of it, because whatever moves this reading
+// moves far slower than the burst takes. On a node whose threshold decision
+// sits inside that spread the visible result was an indicator alternating
+// between a percentage and the external-power text every five seconds.
+//
+// So the window below is spread across real time instead: one conversion per
+// tick, floored at UI_BAT_MIN_GAP_MS apart, kept in a ring of UI_BAT_WINDOW of
+// them, and the mean of the ring is what the header and GET /ui report. That
+// covers several seconds of rail behaviour rather than one instant of it.
+//
+// IT COSTS MORE CONVERSIONS, NOT FEWER, and the trade is worth naming rather
+// than dressing up: the burst was 16 every 5s, which is 3.2 a second; this is
+// one per 200ms tick, 5 a second, about 56% more. What that buys is that the
+// figure is a measurement instead of an instant, which the burst was not at any
+// price.
+//
+// CHARGING CANNOT BE DETECTED ON THIS BOARD AND THAT IS SETTLED, NOT OPEN. The
+// charger's status pins are routed nowhere, there is no charger on the I2C bus,
+// and USB presence is not visible to software on an ESP32-S3. A charger holds
+// this rail at roughly 4233..4281mV, and a half-empty pack under charge has
+// been measured at 4253mV — so "charging" and "resting full" overlap and no
+// threshold separates them. Hence no charging indication anywhere here; the
+// familiar "100% on USB, 58% on battery" surprise is this exact gap.
+//
+// THE ONE THING A SINGLE VOLTAGE DOES DECIDE IS THE OTHER DIRECTION. A cell at
+// rest cannot sit above its own float voltage of 4.2V, so a reading above
+// UI_BAT_EXT_MV means something external is holding the rail up. There the
+// header shows THAT, because a percentage read off a rail a charger is holding
+// is not a charge level. The converse does not hold and the code does not
+// pretend it does: below the threshold the node may still be on external power,
+// part-way through a charge. `external` in GET /ui therefore means "external
+// supply proven present", never "the pack is discharging".
+//
+// THAT RULE IS SOUND; ITS MARGIN IS 10mV AND THAT IS THINNER THAN THIS
+// MEASUREMENT CHAIN. An earlier draft of this comment called the conclusion
+// definitive "with no model in the way", which was wrong twice over. The
+// calibration removes most of the ADC's error but not all of it, and it is
+// specified as a band rather than as zero. More importantly the divider is
+// wholly uncompensated: this code applies exactly 2, and the real ratio is
+// whatever the two resistors happen to be. THE TOLERANCE IS ASSUMED AND NOT
+// SOURCED — M5Stack publish the divider but not the part's tolerance class, and
+// 1% is the assumption below, which is ordinary for this position and not a
+// fact about this board. On that assumption the ratio lands within ±1%, which
+// at 4.2V is ±42mV at the pack, an 84mV spread against 10mV of headroom. At 5%
+// parts the same arithmetic gives five times that. So a unit whose divider sits
+// high can
+// report a resting 4.19V pack as roughly 4.23V and hold the external-power
+// state on battery, and a unit that sits low can serve a percentage off a
+// charger. The threshold is still the right rule and still the only decidable
+// one; it is a good rule with a real error bar, not a proof. Anyone who wants
+// it tighter has to measure a known voltage on the specific unit and trim the
+// ratio, which is a per-device calibration this firmware does not carry.
+//
+// THE PERCENTAGE IS A MODEL, AND WHICH MODEL IS CHOSEN MATTERS FAR MORE THAN
+// THE ARITHMETIC. Published voltage-to-percent maps for a single Li-ion cell
+// disagree with each other across the middle of the range by tens of points. At
+// 3.67V the shipped ones surveyed for this run — Bangle.js, InfiniTime, WLED,
+// ZSWatch, Meshtastic and M5Unified — span roughly 9 to 67, and the top of that
+// range is WLED counted honestly: it ships THREE selectable curves and they do
+// not agree with each other, giving about 41 on its default, 24 on its LiPo
+// type and 67 on its Lion type. Quoting only the 24 would have put it at the
+// bottom of the spread and made the cluster this code joins look tighter than
+// it is. Nearly sixty points of disagreement over one voltage on one cell
+// chemistry, and a straight-line map is worst exactly there, which is why one
+// is not used.
+//
+// THAT SPREAD IS NOT ALL ERROR: the models split into two families that are
+// measuring different things. Meshtastic's is an open-circuit-voltage table and
+// the low readings come from charts of a RESTING cell, while a pack under load
+// sags, so the same voltage means a higher charge while current is being drawn
+// than it does at rest. Nothing here can tell those two conditions apart — this
+// node samples with the radio associated and the backlight on, and no reading
+// is ever taken at rest — so the split is a permanent uncertainty in the number
+// below and not something a better table would remove.
+//
+// M5.Power.getBatteryLevel() IS NOT USED, AND NOT ONLY BECAUSE OF THE ADC CLAIM
+// ABOVE. Its map is (mv - 3300) * 100 / (4150 - 3350): an offset of 3300
+// against a span of 800, a pair that is arithmetically inconsistent — with that
+// offset the span should be 850 — so it reaches 100% at 4100mV rather than the
+// 4150 it names. Two other Cardputer firmwares carry byte-identical copies of
+// it. Three implementations agreeing is one implementation counted three times,
+// not three pieces of evidence.
+//
+// THE TABLE BELOW IS INFINITIME'S, from the PineTime firmware's
+// components/battery/BatteryController.cpp: six points, linear between them,
+// integer arithmetic throughout. Chosen because it is a shipped implementation
+// rather than a derivation, and because at 12 it sits low in the spread above
+// without being its floor — Bangle.js is lower, and WLED's LiPo curve and the
+// published table it cites are near it. It is NOT chosen for being the
+// consensus, because the survey above does not have one. Erring low is the
+// deliberate half of the choice: a pack reported emptier than it is costs the
+// owner a charge he did not need, and one reported fuller than it is costs him
+// the device.
+//
+// WHAT IS DELIBERATELY NOT TAKEN FROM INFINITIME IS ITS HYSTERESIS. It ratchets
+// the displayed value, letting it rise only while charging and fall only while
+// discharging, and that gate is keyed on a charging flag. This board cannot
+// produce one — see above — so the ratchet cannot be ported. Copying its shape
+// without its input would be a smoothing rule keyed on nothing.
+//
+// SO, STATED ONCE AND PLAINLY: below about 3.8V this percentage is
+// model-dependent to within tens of points, and no amount of averaging or
+// integer care here narrows that. `mv` in GET /ui is the measurement and
+// `percent` is this table applied to it; a caller that wants the truth reads
+// the first.
+// One conversion per tick, floored at UI_BAT_MIN_GAP_MS apart, over a ring of
+// UI_BAT_WINDOW of them. 32 samples define 31 intervals, so the window spans
+// about 6.2 seconds at the ordinary tick rate — not 6.4, which is what
+// multiplying the count by the period gives and what this comment said first.
+//
+// THE FLOOR IS NOT AN INDEPENDENT CLOCK, and calling it one was wrong.
+// ui_bat_tick() is reached only from inside ui_tick(), past that function's own
+// gate, so sampling can never be finer than the tick and the floor can only
+// ever DROP a tick's sample, never add one. It used to be 200, equal to
+// UI_TICK_MS, which is the worst value it could have had: ui_tick() stamps its
+// deadline at the top of a pass and this stamps its own after part of the frame
+// is drawn, so the next tick arrived a few milliseconds short of 200 since the
+// last sample and silently lost it — irregularly, at a rate set by how heavy
+// the frame was, and frame weight is remotely triggerable through ui_force_net.
+// Below UI_TICK_MS an ordinary tick always samples, and the floor is left with
+// the one job it was added for: keeping the MSG_FADE_MS ticks, which run at
+// 40ms while a card fades, from bunching conversions back into the correlated
+// burst this whole design exists to avoid.
+#define UI_BAT_MIN_GAP_MS 150
+#define UI_BAT_WINDOW      32
+#define UI_BAT_RATIO        2      // M5Unified's _adc_ratio for this board
+#define UI_BAT_EXT_MV    4210
+// The pack floor: below this nothing is a live single-cell pack, since the
+// protection circuit cuts out around 2.5V. Applied to each SAMPLE, at the pin's
+// scale, and never to the mean — see ui_bat_tick().
+#define UI_BAT_MIN_MV    2500
+#define UI_BAT_MIN_PIN_MV (UI_BAT_MIN_MV / UI_BAT_RATIO)
+#define UI_BAT_TEXT_EXT  "PWR"
+// "100%" — the widest string this field can ever hold, and the reason for the
+// clamp in ui_bat_percent() rather than a comment hoping for one.
+#define UI_BAT_MAX_CHARS    4
+// Font0's 8px cell centred in the 16px cells either side of it in the header.
+#define UI_BAT_Y         (UI_HDR_Y + (UI_F2_H - UI_F0_H) / 2)
+
+// The width half of the header's fifth span, asserted here rather than beside
+// UI_BAT_W because UI_F0_W — the fixed pitch this depends on — belongs with the
+// clock face's font metrics and is not defined until after that block.
+static_assert(UI_BAT_W > UI_F0_W * UI_BAT_MAX_CHARS,
+              "the battery field cannot clear its own widest string");
+static_assert(UI_STRLEN(UI_BAT_TEXT_EXT) <= UI_BAT_MAX_CHARS,
+              "the external-power string outgrew the battery field's budget");
+static_assert(UI_BAT_Y + UI_F0_H <= UI_RULE1_Y,
+              "the battery field crosses the rule under the header");
+// The two ends of the sampling floor's usable range, both of them consequences
+// that are invisible at the call site.
+static_assert(UI_BAT_MIN_GAP_MS < UI_TICK_MS,
+              "the battery sample floor is at or above the tick period, so "
+              "ordinary ticks will drop their sample irregularly");
+static_assert(UI_BAT_MIN_GAP_MS > MSG_FADE_MS,
+              "the battery sample floor no longer bounds the card-fade ticks, "
+              "which would sample as a correlated burst");
+
+// What the draw path publishes, written by ui_bat_tick() on the loop task and
+// read by GET /ui and GET /capabilities on the web server task, the way the
+// badge and the clock caches are. Those two run on the SAME core — AsyncTCP is
+// pinned to core 1 and so is the Arduino loop — but the handler is priority 10
+// against the loop's 1, so it preempts a half-finished update exactly as it
+// preempts a half-finished draw. See the UI section's one-writer rule.
+//
+// WHAT IS GUARANTEED HERE IS A BOUND, NOT AN ORDER, on the precedent of the
+// body LED's four fields further down this file — which carries a correction of
+// exactly the claim this comment first made. These are five plain writes to
+// non-volatile statics with no barrier between them; the compiler may retire
+// them in any order it likes, and this build happening to keep source order
+// guarantees nothing about the next one.
+//
+// The part that does NOT depend on that is what makes it safe: ui_bat_pct holds
+// a real percentage AT ALL TIMES rather than a -1 sentinel for "not
+// applicable". It is computed on every accepted sample whether or not the
+// header shows it, and `external` alone decides whether it is published. So no
+// interleaving and no store ordering can put "percent": -1 on the wire, which
+// the previous arrangement could do whenever a sample crossed into the
+// external-power state while a request was in flight. That is unconditional.
+//
+// ui_bat_mv is written last as well, and THAT half is the weak one: a reader
+// finding it non-negative usually implies the others have been written, but
+// nothing enforces it and it must not be read as a guarantee. The bound is what
+// makes it acceptable rather than a fence — the worst a reader can catch is one
+// field a tick older than its neighbours, a pair of values that were both true
+// within 200ms of each other. It is the same exposure the LED and the breathing
+// rule carry, and the same policy, for the same reason: one writer, no lock.
+static int  ui_bat_mv    = -1;     // averaged pack mV, -1 until the first valid sample
+static bool ui_bat_ext   = false;  // the reading proves an external supply
+static int  ui_bat_pct   = 0;      // the curve's answer for ui_bat_mv, always 0..100
+static uint8_t ui_bat_samples = 0; // how many samples that mean is over
+static bool ui_bat_drawn = false;  // the field has been painted at least once
+static char ui_cache_bat[8];
+
+// The rolling window. `sum` is maintained incrementally rather than re-added
+// each pass, so the cost of a sample does not grow with the window; it holds PIN
+// millivolts, and the divider ratio is applied once at the end where the single
+// rounding step belongs, rather than to every element.
+static uint16_t ui_bat_ring[UI_BAT_WINDOW];
+static uint32_t ui_bat_sum  = 0;
+static uint8_t  ui_bat_head = 0;
+static uint8_t  ui_bat_have = 0;   // samples held, saturating at UI_BAT_WINDOW
+static_assert(UI_BAT_WINDOW <= 255,
+              "the window's counters are uint8_t and would wrap");
+
+static void ui_bat_push(uint16_t pin_mv) {
+    if (ui_bat_have == UI_BAT_WINDOW) {
+        ui_bat_sum -= ui_bat_ring[ui_bat_head];
+    } else {
+        ui_bat_have++;
+    }
+    ui_bat_ring[ui_bat_head] = pin_mv;
+    ui_bat_sum += pin_mv;
+    ui_bat_head = (uint8_t)((ui_bat_head + 1) % UI_BAT_WINDOW);
+}
+
+
+// InfiniTime's table, cited above. Returns 0..100 for any input, which is what
+// bounds the drawn string at UI_BAT_MAX_CHARS: both ends are returned directly
+// rather than falling out of the interpolation, so no rounding can put a fourth
+// digit on the glass.
+static int ui_bat_percent(int mv) {
+    static const int mv_pt[]  = {3500, 3616, 3723, 3776, 3979, 4180};
+    static const int pct_pt[] = {   0,    3,   22,   48,   79,  100};
+    // Element counts and not sizeof, which would also have compared equal for
+    // two tables of different element TYPES and unequal for two of the same
+    // length once either narrowed.
+    static_assert(sizeof(mv_pt) / sizeof(mv_pt[0]) ==
+                  sizeof(pct_pt) / sizeof(pct_pt[0]),
+                  "the battery curve's two tables have different lengths");
+    const int n = (int)(sizeof(mv_pt) / sizeof(mv_pt[0]));
+    if (mv <= mv_pt[0]) return 0;
+    for (int i = 1; i < n; i++) {
+        if (mv < mv_pt[i]) {
+            return pct_pt[i - 1] + (mv - mv_pt[i - 1]) *
+                                   (pct_pt[i] - pct_pt[i - 1]) /
+                                   (mv_pt[i] - mv_pt[i - 1]);
+        }
+    }
+    return 100;
+}
+
+// Sample the pack and repaint the header's battery field. Called from
+// ui_tick()'s header section, so `force` means there exactly what it means for
+// every other field: the frame was repainted and this one has to draw itself
+// back over the blank ground.
+static void ui_bat_tick(bool force) {
+    static unsigned long last_sample = 0;
+    // The floor, not a clock of its own — see UI_BAT_MIN_GAP_MS. The FIELD is
+    // still offered to ui_draw_field() on every pass, because a forced pass has
+    // to be able to repaint it on a tick that took no new sample.
+    if (ui_bat_have == 0 || millis() - last_sample >= UI_BAT_MIN_GAP_MS) {
+        last_sample = millis();
+        // GUARD THE SAMPLE, NOT THE MEAN, which is the whole reason this test
+        // is here and not below. __analogReadMilliVolts() returns 0 on every
+        // one of its error paths, and a 0 pushed into the ring does not show up
+        // as a failure, it shows up as a plausible number: one of them in a full
+        // window drags a 4100mV pack to about 3970 and holds it there for the
+        // life of the window, so the averaging that justifies this design is
+        // exactly what turns a 200ms glitch into a six-second lie. Worse at
+        // boot, where a failed first conversion put the early means below the
+        // curve's first knot and drew "0%" on a full pack. A rejected sample
+        // never enters the ring, so the window keeps describing the rail and a
+        // total ADC failure leaves the ring empty and the field blank, which is
+        // the honest output for a reading nobody has.
+        uint32_t pin_mv = analogReadMilliVolts(PIN_VBAT_ADC);
+        if (pin_mv >= UI_BAT_MIN_PIN_MV) {
+            ui_bat_push((uint16_t)pin_mv);
+            // ui_bat_have is at least 1 here because the push above guarantees
+            // it, which is why this divide needs no guard of its own.
+            int mv = (int)((ui_bat_sum * UI_BAT_RATIO + ui_bat_have / 2) /
+                           ui_bat_have);
+            int pct = ui_bat_percent(mv);
+            bool ext = mv > UI_BAT_EXT_MV;
+            // Published in the order the declarations above require: the
+            // percentage and the flag that decides whether to show it, then the
+            // sample count, then ui_bat_mv last as the readers' gate.
+            ui_bat_pct = pct;
+            ui_bat_ext = ext;
+            ui_bat_samples = ui_bat_have;
+            ui_bat_mv = mv;
+        }
+    }
+
+    char text[sizeof(ui_cache_bat)];
+    if (ui_bat_mv < 0) {
+        text[0] = '\0';
+    } else if (ui_bat_ext) {
+        snprintf(text, sizeof(text), "%s", UI_BAT_TEXT_EXT);
+    } else {
+        // Narrowed to uint8_t at the format site. ui_bat_percent() already
+        // returns 0..100 and nothing else writes this, but that bound lives in
+        // another function and -Wformat-truncation cannot see it — it costs one
+        // cast to make the three-digit ceiling local to the call that depends
+        // on it, and UI_BAT_MAX_CHARS is written against that ceiling.
+        snprintf(text, sizeof(text), "%u%%", (uint8_t)ui_bat_pct);
+    }
+    ui_draw_field(force, ui_cache_bat, sizeof(ui_cache_bat), text,
+                  M5.Display.width() - UI_LABEL_X, UI_BAT_Y, &fonts::Font0,
+                  COL_DIM, UI_TR, UI_BAT_W, COL_BG);
+    ui_bat_drawn = true;
 }
 
 // ---- The breathing rule ----
@@ -4223,8 +4660,13 @@ static void ui_tick() {
                   UI_TL, UI_HDR_TITLE_W, COL_BG);
     char buf[48];
     ui_net_summary(buf, sizeof(buf));
+    // The battery field now owns the corner, so this one is anchored a battery
+    // and a seam in from the right edge. The subtraction mirrors UI_HDR_NET_X
+    // term for term; that constant is what the seam assertions are written in,
+    // and this is the runtime twin the panel is actually drawn with.
     ui_draw_field(force, ui_cache_net, sizeof(ui_cache_net), buf,
-                  M5.Display.width() - UI_LABEL_X, UI_HDR_Y, &fonts::Font2,
+                  M5.Display.width() - UI_LABEL_X - UI_BAT_W - UI_HDR_SEAM,
+                  UI_HDR_Y, &fonts::Font2,
                   COL_DIM, UI_TR, UI_HDR_NET_W, COL_BG);
 
     // The unread badge, in the gap the two header fields leave between them.
@@ -4267,6 +4709,11 @@ static void ui_tick() {
         M5.Display.drawString(buf, UI_BADGE_X, UI_HDR_Y);
         M5.Display.setTextPadding(0);
     }
+
+    // The battery, in the corner the network summary gave up. On every screen,
+    // like the rest of the header, and gated on its own slow sampling clock
+    // inside.
+    ui_bat_tick(force);
 
     if (ui_screen == UI_MENU) {
         ui_menu_first = ui_window(ui_menu_index, ui_menu_first, UI_MENU_COUNT,
@@ -4564,6 +5011,49 @@ static void handle_capabilities(AsyncWebServerRequest *request) {
     doc["audio"] = peri;
     doc["ir_tx_pin"] = PIN_IR_TX;
     doc["battery_adc_pin"] = PIN_VBAT_ADC;
+    // The pin number above is kept because callers already read it; this says
+    // what is DONE with it. Its own buffer rather than `peri` because it does
+    // not fit in 384 bytes, and a fingerprint that describes the one measurement
+    // this board can make about its own power is worth the stack.
+    //
+    // The live reading comes from the draw path's own variable, so this and
+    // `battery` in GET /ui cannot disagree, and it is qualified rather than
+    // printed raw: before the first tick there is no reading and -1 is not a
+    // voltage.
+    // 832 against a worst case of 778 bytes, which is -Wformat-truncation's own
+    // arithmetic and not mine. Every guess made by eye at this buffer has been
+    // wrong — 512, then 768 twice, once for a longer draft of the string and
+    // once again after batstate grew to carry the sample count — and that
+    // warning, rather than any careful reading, caught all of them. Take the
+    // number from a build, not from counting the literal.
+    char batt[832], batstate[64];
+    int bat_mv = ui_bat_mv;
+    if (bat_mv < 0) {
+        snprintf(batstate, sizeof(batstate), "not sampled yet");
+    } else {
+        // The sample count goes out with the figure rather than being implied
+        // by it: until the ring fills this is a mean over fewer conversions
+        // than the window names, and saying so here is cheaper than a caller
+        // discovering it from a reading that moves.
+        snprintf(batstate, sizeof(batstate), "last read %d mV over %u samples",
+                 bat_mv, (unsigned)ui_bat_samples);
+    }
+    snprintf(batt, sizeof(batt),
+             "single-cell Li-ion on GPIO%d behind a 2:1 divider (M5Unified's "
+             "_adc_ratio for this board), read with the chip's factory ADC "
+             "calibration and averaged over a rolling window of up to %d "
+             "samples taken at least %d ms apart; %s. No fuel gauge and "
+             "no charger status line on this board, so charging cannot be "
+             "detected at all: above %d mV the header shows \"%s\", meaning an "
+             "external supply is proven present because a resting cell cannot "
+             "exceed its 4.2 V float; below it the header shows a percentage "
+             "from InfiniTime's published discharge curve, which is "
+             "model-dependent to within tens of points under about 3.8 V. See "
+             "`battery` in GET /ui, where the measured millivolts and the "
+             "modelled percentage are reported separately",
+             PIN_VBAT_ADC, UI_BAT_WINDOW, UI_BAT_MIN_GAP_MS, batstate,
+             UI_BAT_EXT_MV, UI_BAT_TEXT_EXT);
+    doc["battery"] = batt;
     // The one peripheral in this list that IS driven, so it follows the
     // `display` string's shape rather than ir_tx_pin's bare number: what it is
     // and where, then whether it is actually up. Two separate conditions have to
@@ -4900,6 +5390,69 @@ static void handle_ui(AsyncWebServerRequest *request) {
         // parse "9+" to learn that the header is capped. 10 is the cap and
         // means "more than nine", never "ten".
         badge["capped"] = ui_badge_drawn > 9;
+    }
+
+    // The header's battery indicator, REPORTED FROM THE DRAW PATH like `badge`
+    // above and for the same reason: `text` is ui_draw_field()'s own cache, so
+    // it is the string the glass carries and cannot be a second opinion about
+    // it. On every screen, because the header is.
+    //
+    // `mv` AND `percent` ARE NOT THE SAME KIND OF THING and are separated here
+    // deliberately. `mv` is the measurement — the averaged pack voltage, the
+    // only quantity this board actually observes. `percent` is a published
+    // discharge curve applied to it, and that curve disagrees with other
+    // published curves by tens of points below about 3.8V; see the battery
+    // section for which one and why. A caller that needs a fact reads `mv`.
+    //
+    // `percent` is present only when the pack is NOT on an external supply —
+    // there is no charge level to report off a rail a charger is holding up,
+    // and inventing one is the whole failure this indicator is written around.
+    // Absent keys, not stale or fabricated ones, on the card's principle.
+    //
+    // `samples` IS THE QUALIFICATION `mv` NEEDS, and without it this object was
+    // making a promise the firmware could not keep. The window fills one sample
+    // per tick, so for the first six seconds of a boot `mv` is the mean of
+    // somewhere between 1 and 31 conversions — and a single conversion on this
+    // pad measured 194 counts wide, about 313mV at the pack, which is enough to
+    // put a resting node in the external-power state or a percentage twenty
+    // points out with nothing in the reply to distinguish it from a settled
+    // reading. A caller that cares waits for `samples` to reach the window size;
+    // GET /capabilities names that size.
+    //
+    // `drawn` true with NO `mv`, `samples`, `external` or `percent` is a real
+    // state and not an oversight: the header is painted on the first tick, and
+    // until a conversion is accepted into the ring there is no reading to
+    // describe. It is also what a node whose ADC never answers reports forever.
+    // `text` is present throughout and is the empty string in that state, which
+    // is what the glass carries.
+    //
+    // EVERY FIELD IS SNAPSHOTTED BEFORE THE FIRST JSON STORE, and that is not
+    // tidiness. Setting a key on the document can allocate, which reaches the
+    // heap mutex, which can block this handler; the loop task is lower priority
+    // but it is on this same core and it runs while this one waits. A global
+    // read twice with a setter call between the two reads — which the compiler
+    // is entitled to emit, and did — lets a sample land in the gap and change
+    // it between them. For ui_bat_ext that produced `external: true` beside a
+    // `percent`, the exact pairing the paragraph above promises is impossible.
+    // For ui_bat_drawn, which is set once and never cleared, it produced
+    // `drawn: false` beside the very keys `drawn` false is documented to
+    // exclude. One read each, into locals, before anything is written; the
+    // object code has one load per global and no call between them.
+    JsonObject battery = doc["battery"].to<JsonObject>();
+    bool drawn = ui_bat_drawn;
+    int mv = ui_bat_mv;                   // stored last by the draw path
+    bool ext = ui_bat_ext;
+    int pct = ui_bat_pct;
+    unsigned samples = ui_bat_samples;
+    battery["drawn"] = drawn;
+    if (drawn) {
+        battery["text"] = ui_cache_bat;
+        if (mv >= 0) {
+            battery["mv"] = mv;
+            battery["samples"] = samples;
+            battery["external"] = ext;
+            if (!ext) battery["percent"] = pct;
+        }
     }
 
     JsonObject led = doc["led"].to<JsonObject>();
@@ -5579,6 +6132,17 @@ static void handle_skill(AsyncWebServerRequest *request) {
     s += "  `led` in GET /ui reports what it is doing and `rgb_led` in /capabilities\n";
     s += "  reports whether it is up. The channel holds two of the ESP32-S3's four RMT\n";
     s += "  TX blocks for the life of the boot. POST /gpio/write refuses the pin\n";
+    s += "- GPIO10 is the battery sense divider (2:1) and this firmware READS it, about\n";
+    s += "  five times a second, to drive the header's battery indicator — `battery` in\n";
+    s += "  GET /ui and in /capabilities. POST /gpio/write, POST /gpio/mode and\n";
+    s += "  POST /serial/open all refuse this pin, because pinMode() detaches the pad\n";
+    s += "  and Arduino's ADC teardown deletes the whole ADC1 oneshot unit and its\n";
+    s += "  calibration once the last ADC1 channel goes, which this pin normally is —\n";
+    s += "  and the HTTP task preempts the loop, so that can land inside a conversion.\n";
+    s += "  GET /gpio/adc?pin=10 is NOT refused and shares the same handle, but the\n";
+    s += "  voltage it reports is uncalibrated and reads low; use `battery` for the\n";
+    s += "  real figure. There is no fuel gauge and no charger status line on this\n";
+    s += "  board, so no endpoint here reports whether it is charging — nothing can\n";
     s += "- GPIO38 is the display backlight and also gates the RGB LED supply. It is\n";
     s += "  not a plain output here: M5GFX attaches it to an LEDC channel and dims it,\n";
     s += "  so the backlight is the brightness value in GET /ui rather than a pin\n";
@@ -5851,8 +6415,10 @@ static void handle_wifi_post(AsyncWebServerRequest *request) {
 // above without a header to keep in step with them.
 //
 // Order is load-bearing between these two. serial.cpp calls gpio_pin_exists()
-// and gpio_refuse_reason() from gpio.cpp, so that it validates UART pins
-// against exactly the list POST /gpio/write refuses.
+// and gpio_reject_if_undrivable() from gpio.cpp, so that it validates UART pins
+// against exactly the list POST /gpio/write refuses — which is the union of the
+// all-operations refusals and the drive-only ones, a UART holding a pad being
+// no gentler than digitalWrite().
 #include "skills/gpio.cpp"
 #include "skills/serial.cpp"
 
