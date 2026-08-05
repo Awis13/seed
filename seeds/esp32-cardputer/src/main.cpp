@@ -14,7 +14,8 @@
 // exists to make the panel's state answerable over the network: which screen is
 // up, which fields it is showing and what they read, the backlight, and the last
 // key pressed. It is the only way this firmware's display can be verified at all
-// from off the device.
+// from off the device — and, since the RGB LED on the case is driven now, the
+// only way that is answerable either.
 //
 // Board specifics vs the other ESP32 seeds in this tree:
 //   - ADVANCE, not v1.1. Nothing from the v1.1 pinout transfers: the keyboard
@@ -29,14 +30,19 @@
 //     an expansion-header UART line, and doing that would be actively wrong.
 //   - No sub-GHz radio. The CC1101 probe the T-Embed seed runs has nothing to
 //     find on this mainboard.
-//   - No fuel gauge. The T-Embed's BQ27220 computes a charge percentage and
-//     hands it over I2C, which is what its status screen displays; there is no
-//     such chip here, so there is no percentage to display.
-//   - There IS a battery. It is sensed as a plain voltage divider on the ADC at
-//     GPIO10, and it is left unread because the divider ratio is documented
-//     nowhere: a guessed ratio would put a fabricated voltage in /capabilities,
-//     which states the pin number and stops there. Settling the ratio takes a
-//     meter across the cell, not a code change.
+//   - No fuel gauge, AND NO CHARGER STATUS LINE EITHER. The T-Embed's BQ27220
+//     computes a charge percentage and hands it over I2C; there is no such chip
+//     here, and nothing on this I2C bus reports the charger. So the pack
+//     voltage is the ONLY number available, and both "how full" and "charging
+//     or not" have to come out of it or not be answered at all.
+//   - There IS a battery, sensed as a 2:1 resistor divider on GPIO10, and it is
+//     now read. The ratio is not a guess and not a meter reading: M5Unified's
+//     own board table gives board_M5CardputerADV an _adc_ratio of 2.0f
+//     (Power_Class.cpp), which is the same figure its getBatteryVoltage() would
+//     apply. An earlier revision of this comment said the ratio was "documented
+//     nowhere" and left the pin unread on that basis; the library on disk
+//     documents it. See "The battery" in the UI section for what the header
+//     shows and, more to the point, what it declines to claim.
 //   - The mainboard I2C bus carries exactly three devices — the keyboard
 //     controller, the audio codec and the IMU — so it is scanned and reported
 //     but never reconfigured. A fourth address answering, 0x43, means a
@@ -185,16 +191,31 @@
 #define PIN_I2S_ASDOUT  46
 
 #define PIN_IR_TX       44
-#define PIN_VBAT_ADC    10  // battery divider; the ratio is unverified, so unread
+// Battery sense, ADC1 channel 9, behind a 2:1 divider. Read through the Arduino
+// core's calibrated path and NOT through M5.Power; see "The battery" in the UI
+// section for why the two cannot both be used in one boot.
+//
+// DRIVING THIS PIN IS REFUSED OVER HTTP now that the header samples it: taking
+// the pad with pinMode() makes Arduino's peripheral manager tear the ADC1
+// oneshot unit down under loop(). The gpio skill refuses it on write and mode
+// and the serial skill on tx and rx, while /gpio/adc stays open because a read
+// shares the driver instead of taking it. See gpio_refuse_drive_reason().
+#define PIN_VBAT_ADC    10
 
-// RGB LED data line. M5Unified's board table maps board_M5CardputerADV to this
-// pin, and _setup_led() runs on every begin(), so the assignment is documented
-// rather than guessed. It only CONFIGURES the LED — it builds an RMT bus object
-// holding this pin number and drives nothing. The RMT peripheral is started by
-// M5.Led.begin(), which this firmware never calls, and cfg.led_brightness
-// defaults to 0, so the pin is idle at runtime. Idle, not free: the supply
-// behind it is gated by GPIO38 and anything that lights the LED takes the pin
-// back, which is why it is not on the safe list below.
+// RGB LED data line, and DRIVEN — one WS2812B-2020, GRB, through M5Unified's
+// M5.Led over RMT. M5Unified's board table maps board_M5CardputerADV to this
+// pin and _setup_led() runs on every begin(), so the assignment is the
+// library's rather than a guess; what M5.begin() builds is only the bus object,
+// and the RMT channel itself is created by the first mutator call, which is
+// ui_led_begin(). See "The body LED" in the UI section for what it shows and
+// what the GPIO38 coupling costs.
+//
+// FOR THE RECORD, BECAUSE IT WAS WRITTEN DOWN HERE AS FACT AND IS NOT ONE:
+// cfg.led_brightness has nothing to do with this LED. M5Unified declares it
+// "system LED brightness ... (not RGBcolorLED)" and uses it in exactly one
+// place, M5.Power.setLed(), which drives a monochrome power LED this board does
+// not have. When this pin was idle it was idle for one reason only — nothing
+// called an M5.Led mutator.
 //
 // The #undef is not tidying: the generic esp32s3 variant's pins_arduino.h, which
 // Arduino.h drags in above, already defines this name as 48 for a devkit's
@@ -294,7 +315,8 @@
 //                           the header, not to any one accessory — a Cap
 //                           LoRa-1262 drives all nine, and a bare board none.
 //   8,9,11                  I2C plus the keyboard controller's interrupt.
-//   10                      battery sense ADC.
+//   10                      battery sense ADC, sampled by the header. Readable
+//                           through /gpio/adc, refused on write and mode.
 //   12                      microSD chip select.
 //   33-38                   ST7789 panel; 38 also gates the RGB LED supply.
 //   41,42,43,46             ES8311 audio codec (I2S). 43 is nominally UART0 TX
@@ -306,10 +328,11 @@
 //                           and the recovery path with it.
 //   0,45,47,48              strapping pins and module-internal lines.
 //   26-32                   SPI flash. 22-25 do not exist on the ESP32-S3.
-//   21                      RGB LED data line — see PIN_RGB_LED above. A known
-//                           assignment from M5Unified's board table, not an
-//                           unknown one, and excluded because the LED owns the
-//                           pin even though nothing here starts the RMT.
+//   21                      RGB LED data line — see PIN_RGB_LED above. The
+//                           firmware drives it: M5.Led holds an RMT channel on
+//                           this pad for the life of the boot, so taking it is
+//                           taking the indicator. The gpio skill refuses it
+//                           outright rather than merely warning.
 //   16,17,18                UNCLASSIFIED — excluded because we do not know, not
 //                           because we know. M5Stack's published Cardputer-Adv
 //                           pinmap lists no assignment for these three, yet the
@@ -618,13 +641,28 @@ static void hw_probe() {
 static AsyncWebServer server(HTTP_PORT);
 static String auth_token = "";
 // FIXED BUFFER, not String, for the same reason wifi_ssid below is one: it is
-// read by ui_field() on the AsyncTCP task (GET /ui) and a String reassignment
-// frees the buffer a concurrent reader is walking. Written once in wifi_setup()
-// before the web server starts and never again, so today no writer races it —
-// but the panel's cross-task reader makes that a property to keep by
-// construction, not one to rely on staying true. "Seed-" + four hex + NUL fits
-// in ten; sized with headroom.
+// read on the AsyncTCP task (GET /ui, through ui_status_row() and ui_field())
+// and a String reassignment frees the buffer a concurrent reader is walking.
+// Written once in wifi_setup() before the web server starts and never again,
+// so today no writer races it — but the panel's cross-task reader makes that a
+// property to keep by construction, not one to rely on staying true. It is read
+// by both formatters: the clock face's AP line and the NETWORK screen's.
+// "Seed-" + four hex + NUL fits in ten; sized with headroom.
 static char ap_ssid[16] = "";
+// HOW LONG THAT IS, AS A NUMBER, because the clock face puts the SSID, the
+// session state and the password on ONE row and has to bound the total. The
+// buffer is no use for that — it is headroom, and three buffers' headroom on
+// one row overflows it.
+//
+// THE TWO PIECES AND NOT THE ANSWER, so that the length and the format that
+// builds it cannot drift apart. wifi_setup() formats with these same two
+// constants rather than with a matching pair of literals; widen the suffix
+// there and this number follows, instead of staying nine while the row prints
+// the first nine characters of a longer SSID — silently, and identically on the
+// panel and in GET /ui, which is the failure that has no witness.
+#define AP_SSID_PREFIX "Seed-"
+#define AP_SSID_HEX     4     // get_mac_suffix() returns exactly this many
+#define AP_SSID_CHARS  ((int)(sizeof(AP_SSID_PREFIX) - 1) + AP_SSID_HEX)
 static String mdns_name = "";
 static unsigned long boot_time = 0;
 
@@ -640,12 +678,18 @@ static unsigned long boot_time = 0;
 #define AP_SESSION_MS (10UL * 60UL * 1000UL)
 static bool ap_active = false;
 // FIXED BUFFER, not String. Written on the loop task (ap_start rolls it,
-// ap_stop clears it) and read on the AsyncTCP task by ui_field() — the exact
-// cross-task String reassignment that was a use-after-free for the WiFi
+// ap_stop clears it) and read on the AsyncTCP task by ui_status_row() — the
+// exact cross-task String reassignment that was a use-after-free for the WiFi
 // credentials. GET /ui never reaches the read (it passes redact=true and
 // returns a placeholder first), but the panel does, and defence here costs a
-// dozen bytes. The generated password is twelve chars; sized with headroom.
+// dozen bytes. The generated password is AP_PASSWORD_CHARS long; sized with
+// headroom.
 static char ap_password[16] = "";
+// The generated length, shared with ap_generate_password() rather than written
+// twice, for the reason AP_SSID_CHARS above exists: the clock face's AP row
+// bounds three variable parts against one buffer, and a password that grew by a
+// character somewhere else in the file would push that row over without a word.
+#define AP_PASSWORD_CHARS  12
 static bool ap_temporary = false;
 static unsigned long ap_expires_at = 0;
 // Set when a keyboard-raised AP failed to come up, so the menu entry can say so
@@ -699,9 +743,16 @@ static volatile bool ui_force = false;
 // So network raises wait for the gate. They are folded into `force` inside
 // ui_tick() and appear nowhere in the expression that decides whether this
 // tick runs at all, which bounds the panel at one repaint per UI_TICK_MS no
-// matter what arrives. The cost is up to 200ms of latency on a message card,
-// on a node with no buzzer and no LED where the panel is not the thing that
-// makes an arrival urgent.
+// matter what arrives. The cost is up to 200ms of latency on a message card.
+//
+// That cost got CHEAPER, not dearer, when the body LED started being driven.
+// The argument used to rest on there being no other annunciator at all, which
+// is no longer true; but the LED runs on its own 40ms gate and polls the store
+// rather than waiting on this flag, so an arrival is already showing on the
+// outside of the case up to 160ms before the panel repaints. The panel is even
+// less the thing that makes an arrival urgent than it was. A buzzer, if one is
+// ever started here, would be a one-shot and would want its own flag pair —
+// see the note below notify_arrived in skills/notify.cpp.
 //
 // Raised only from skills/notify.cpp, and there only on the endpoint paths.
 // notify_poll() runs on the loop task and correctly uses ui_force.
@@ -1010,12 +1061,12 @@ static bool wifi_save_config(const String &ssid, const String &pass) {
 static bool ap_seen_sta_down = false;
 
 // One session's password. No lookalike glyphs — this gets typed off a serial
-// console or, once the panel is driven, off a 240px screen; 12 chars out of a
-// 32-symbol alphabet is 60 bits.
+// console or, once the panel is driven, off a 240px screen; AP_PASSWORD_CHARS
+// out of a 32-symbol alphabet is 60 bits at twelve.
 static String ap_generate_password() {
     static const char charset[] = "abcdefghijkmnpqrstuvwxyz23456789";
     const uint32_t n = sizeof(charset) - 1;
-    char buf[13];
+    char buf[AP_PASSWORD_CHARS + 1];
     for (size_t i = 0; i < sizeof(buf) - 1; i++) {
         buf[i] = charset[esp_random() % n];
     }
@@ -1117,16 +1168,25 @@ static void wifi_setup() {
     // the WiFi stack (see get_mac_suffix), so this is free to sit ahead of the
     // radio and is already settled by the time anything advertises it.
     String suffix = get_mac_suffix();
-    // %.4s, not %s. get_mac_suffix() returns exactly four hex characters, so
-    // "Seed-" + suffix is nine and fits with room to spare — but the compiler
-    // cannot see inside the String and warned that up to 14 bytes could go into
-    // an 11-byte tail (-Wformat-truncation). The precision makes the invariant
-    // the source already relies on visible to the compiler instead of implied,
-    // and clamps the write if get_mac_suffix() ever returns something longer.
-    // Not silenced on the grounds that it looked like a false positive: the
-    // GNSS block in serial.cpp shipped truncated on a live node while the same
-    // warning was being reported and read as noise.
-    snprintf(ap_ssid, sizeof(ap_ssid), "Seed-%.4s", suffix.c_str());
+    // A PRECISION, not a bare %s. get_mac_suffix() returns exactly
+    // AP_SSID_HEX hex characters, so the SSID is AP_SSID_CHARS long and fits
+    // with room to spare — but the compiler cannot see inside the String and
+    // warned that up to 14 bytes could go into an 11-byte tail
+    // (-Wformat-truncation). The precision makes the invariant the source
+    // already relies on visible to the compiler instead of implied, and clamps
+    // the write if get_mac_suffix() ever returns something longer. Not silenced
+    // on the grounds that it looked like a false positive: the GNSS block in
+    // serial.cpp shipped truncated on a live node while the same warning was
+    // being reported and read as noise.
+    //
+    // BUILT FROM THE SAME TWO CONSTANTS AP_SSID_CHARS IS, and not from a
+    // matching pair of literals. The clock face puts this SSID on a shared row
+    // and clamps it there to AP_SSID_CHARS; a format widened here to a longer
+    // suffix would not truncate — ap_ssid has headroom — it would print short
+    // on the panel AND in GET /ui, identically, so nothing would look wrong and
+    // the one person standing at a stranded node could not find the network.
+    snprintf(ap_ssid, sizeof(ap_ssid), AP_SSID_PREFIX "%.*s", AP_SSID_HEX,
+             suffix.c_str());
     mdns_name = "seed-" + suffix;
     mdns_name.toLowerCase();
 
@@ -1195,17 +1255,25 @@ static void wifi_setup() {
 //    that changes nothing costs no SPI at all. See ui_draw_field().
 //
 // 3. WHAT IS ON THE SCREEN IS ANSWERABLE OVER HTTP. There is no camera on this
-//    node. GET /ui and the panel derive every value from the same ui_field()
-//    calls, so the endpoint reports the screen's real content rather than a
-//    second, parallel description of it that can drift.
+//    node. GET /ui and the panel derive every value from the same formatters —
+//    ui_field() for the label/value screens, ui_status_row() for the clock
+//    face's two rows — or, where a value only exists once it has been laid out,
+//    from the draw caches themselves. Either way the endpoint reports the
+//    screen's real content rather than a second, parallel description of it
+//    that can drift. A screen that grows a shape of its own grows a `content`
+//    kind and an object to match; it does not get described twice.
 
 // Layout, in pixels, for the 240x135 panel in landscape.
 //
-//   0..18    header: screen title left, network summary right
+//   0..18    header: screen title left, unread badge, network summary right
 //   20       rule
 //   26..114  five rows, 18px apart
 //   116      rule
 //   121..129 footer: the key legend for the current screen
+//
+// STATUS does not use the five rows, the lower rule or the footer; it is a
+// clock face and owns everything below the header. See the clock geometry
+// further down.
 #define UI_ROWS         5
 #define UI_HDR_Y        2
 #define UI_RULE1_Y     20
@@ -1214,6 +1282,65 @@ static void wifi_setup() {
 #define UI_ROW_H       18
 #define UI_RULE2_Y    116
 #define UI_FOOT_Y     121
+// The header row, left to right, on the 240px-wide panel. Five spans that never
+// overlap, so no one of them can erase another's pixels:
+//
+//   4..70    screen title, left at x=4, padding 67
+//   72..78   badge dot, r=3 about cx=75
+//   81..95   badge count, left at x=81, padding 15
+//   97..208  network summary, right at x=209, padding 112
+//   210..235 battery, right at x=236, padding 26, in Font0
+//
+// Padding is what erases the previous value here, and M5GFX only fills the
+// REMAINDER of the band — and only when `padding > string width`, STRICTLY
+// greater. A string as wide as its padding erases nothing at all and the
+// previous value's tail stays on the glass, with no error and no clipping to
+// show for it. So every width below clears the widest string its field can
+// ever hold: 66px for "HARDWARE" and "MESSAGES", 14px for "9+", and 24px for
+// the battery's "100%".
+//
+// THE BATTERY IS THE FIFTH SPAN AND THE HEADER HAD NO FREE PIXELS, so it was
+// paid for out of the two fields that were carrying slack, and both of those
+// widths are now bounds that the compiler checks rather than round numbers:
+//
+//   - The badge count went from 20 to 15. It only ever holds "", a single digit
+//     or "9+", and ui_badge_text() is the sole producer of all three, so 14px
+//     is the whole of its range and 15 clears it.
+//   - The network summary went from 134 to 112. 134 was the bound for the
+//     widest string the FORMAT could hold — "AP 255.255.255.255" at 133px —
+//     which is not the same as the widest it can produce. Its three branches
+//     are a bare dotted quad (111px at worst, and that IS structural: any IPv4
+//     from WiFi.localIP() fits it), "AP " plus the AP's own address, and
+//     "offline" at 42px. The AP address is not free: ap_start() pins it to
+//     AP_IP_A..D and refuses to raise the AP at all if the pin fails, so the AP
+//     branch is 109px here — and that number now REACHES those four constants
+//     through UI_QUAD_W below instead of being asserted by a comment. Widening
+//     an octet four hundred lines from here used to be invisible to this
+//     number; it now fails the build.
+//
+// The battery field is Font0 rather than Font2, and that is the reason it fits
+// at all: "100%" is 33px in Font2 against 24px in the 6px fixed pitch, and 33
+// plus a seam was more than the two fields above could give up without one of
+// them ceasing to clear its own content. It is drawn 4px below the header's y
+// so the 8px cell sits on the centre line of the 16px cells either side of it.
+//
+// UI_PANEL_W exists so the seams below can be asserted at compile time; the
+// draw calls themselves still take the width from M5.Display at runtime. It is
+// the landscape geometry setRotation(1) produces on this board, which is what
+// the layout note above already assumes throughout.
+#define UI_PANEL_W     240
+#define UI_PANEL_H     135
+#define UI_HDR_TITLE_W  67
+#define UI_BADGE_CX     75
+#define UI_BADGE_R       3
+#define UI_BADGE_X      81
+#define UI_BADGE_W      15
+#define UI_HDR_NET_W   112
+#define UI_BAT_W        26
+// The gap between the network summary and the battery. One pixel, like every
+// other seam in this row, and named because both the layout note above and the
+// derivation of UI_HDR_NET_X below count it.
+#define UI_HDR_SEAM      1
 // Two columns on a data row: a dim label, then the value.
 #define UI_LABEL_X      4
 #define UI_LABEL_W     50
@@ -1221,6 +1348,437 @@ static void wifi_setup() {
 #define UI_VALUE_W    182
 #define UI_MENU_X       8
 #define UI_MENU_R_X   232
+// The two right-aligned header fields' anchors, as compile-time twins of the
+// runtime expressions ui_tick() draws them with. Both are UI_TR, so a field's
+// band is [x - padding, x - 1] — see LGFXBase::draw_string, which fills
+// writeFillRect(x - padx, y, padx - cwidth, cheight) for a right datum. The
+// seam between the two is guaranteed by this derivation and so is deliberately
+// NOT asserted below: an assertion that cannot fail is not a check.
+#define UI_BAT_X       (UI_PANEL_W - UI_LABEL_X)
+#define UI_HDR_NET_X   (UI_BAT_X - UI_BAT_W - UI_HDR_SEAM)
+
+// Font2 metrics the header's own arithmetic needs, transcribed from widtbl_f16
+// in lgfx/Fonts/Font16.h under exactly the caveat the clock face's block states
+// at length: these are a hand copy of one M5GFX release and nothing here can
+// check itself. Every decimal digit advances 8 and '.' advances 5, which is
+// what makes a dotted quad's width computable from its octets.
+#define UI_F2_DIGIT_W    8
+#define UI_F2_DOT_W      5
+#define UI_STRLEN(s)     ((int)(sizeof(s) - 1))
+#define UI_OCTET_W(n)    (UI_F2_DIGIT_W * ((n) < 10 ? 1 : (n) < 100 ? 2 : 3))
+#define UI_QUAD_W(a, b, c, d) \
+    (UI_OCTET_W(a) + UI_OCTET_W(b) + UI_OCTET_W(c) + UI_OCTET_W(d) + \
+     3 * UI_F2_DOT_W)
+// The three strings ui_net_summary() can produce, and their widths. The two
+// fixed parts are macros the formats are assembled from rather than literals
+// counted by eye at the producer, and their lengths are asserted so that
+// editing either one fails the build instead of silently invalidating the sum
+// beside it. That guards the LENGTH and not the glyphs — same-length text in
+// wider glyphs would still slip through, which is the standing limitation of
+// every hand-summed width in this file.
+#define UI_NET_AP_PFX      "AP "
+#define UI_NET_OFFLINE     "offline"
+#define UI_HDR_AP_PFX_W    22   // 'A' 8 + 'P' 8 + ' ' 6
+#define UI_HDR_OFFLINE_W   42   // o 8 + f 6 + f 6 + l 4 + i 4 + n 7 + e 7
+#define UI_HDR_STA_MAX_W   UI_QUAD_W(255, 255, 255, 255)
+#define UI_HDR_AP_MAX_W \
+    (UI_HDR_AP_PFX_W + UI_QUAD_W(AP_IP_A, AP_IP_B, AP_IP_C, AP_IP_D))
+
+// The header's spans are asserted and not merely written down, on the precedent
+// of the footer legend's counters further down this file. Every seam up there
+// is one or two pixels wide and one #define away from a silent overlap: M5GFX
+// reports neither a collision nor a clip, so the first evidence of one would be
+// a smear on the glass that no build and no endpoint can show. ui_begin()'s
+// splash held the title's old width for exactly this reason — the invariant had
+// already drifted at one call site before it was ever written down.
+static_assert(UI_LABEL_X + UI_HDR_TITLE_W <= UI_BADGE_CX - UI_BADGE_R,
+              "the header title's erase band reaches into the badge dot");
+static_assert(UI_BADGE_CX + UI_BADGE_R < UI_BADGE_X,
+              "the badge dot reaches into the badge count's erase band");
+static_assert(UI_BADGE_X + UI_BADGE_W <= UI_HDR_NET_X - UI_HDR_NET_W,
+              "the badge count's erase band reaches into the network summary");
+static_assert(UI_HDR_NET_X - UI_HDR_NET_W >= 0,
+              "the network summary's erase band starts off the left of the panel");
+static_assert(UI_BAT_X <= UI_PANEL_W,
+              "the battery's erase band runs off the right of the panel");
+// Each of the three branches, against the one band that has to clear all of
+// them. Strictly greater, because a string exactly as wide as its pad erases
+// nothing — see the note on padding above.
+static_assert(UI_HDR_NET_W > UI_HDR_STA_MAX_W,
+              "the network summary cannot clear the widest dotted quad");
+static_assert(UI_HDR_NET_W > UI_HDR_AP_MAX_W,
+              "AP_IP_A..D grew wider than the network summary can clear");
+static_assert(UI_HDR_NET_W > UI_HDR_OFFLINE_W,
+              "the network summary cannot clear its offline string");
+static_assert(UI_STRLEN(UI_NET_AP_PFX) == 3,
+              "the AP prefix changed length; re-sum UI_HDR_AP_PFX_W over "
+              "widtbl_f16");
+static_assert(UI_STRLEN(UI_NET_OFFLINE) == 7,
+              "the offline string changed length; re-sum UI_HDR_OFFLINE_W over "
+              "widtbl_f16");
+// The dot is the one header element drawn as geometry rather than as a font
+// cell, so it is the one that can leave the row without a glyph metric stopping
+// it. UI_HDR_Y + 8 is the centre line of Font2's 16px cell.
+static_assert(UI_HDR_Y + 8 + UI_BADGE_R < UI_RULE1_Y,
+              "the badge dot crosses the rule under the header");
+
+// ---- The clock face ----
+//
+// STATUS is the screen this node sits on, so it is a clock and not a table: a
+// large HH:MM with the seconds beside it, the date under that, and two rows at
+// the bottom for how the node is reached. That stack needs 106 rows and only 95
+// are free between the two rules, so this one screen drops the lower rule and
+// the footer legend and takes 21..134 instead. ui_draw_frame() and ui_tick()
+// are where the two are suppressed.
+//
+// EVERY WIDTH BELOW IS A SUM OVER THE M5GFX FONT TABLES, and deliberately not a
+// runtime measurement. textWidth() and textLength() run the display's shared
+// UTF-8 decoder against the one M5.Display object and may only be called from
+// the loop task; GET /ui runs on AsyncTCP and measures nothing, and keeping the
+// figures constant is what lets it stay that way. They come from
+// lgfx/Fonts/Font7srle.h (Font7), Font32rle.h (Font4) and Font16.h (Font2).
+// RLEfont and BMPfont set x_advance to exactly the width-table entry and
+// text_width() sums those advances, so a string's width is the sum of its
+// glyphs' entries and there is no letter spacing to add.
+//
+// FONT0 IS THE EXCEPTION AND IT COMES FROM SOMEWHERE ELSE: lgfx/Fonts/
+// glcdfont.h for the bitmaps, and the GLCDfont constructed in lgfx_fonts.cpp
+// for the metrics. It is the one font here whose x_advance does NOT come from a
+// table through updateFontMetric() — that override takes its metrics pointer
+// unnamed and only range-checks the code point, so the advance stays whatever
+// getDefaultMetric() put there, which is the font's own `width`. That is not a
+// footnote: it is the entire basis of the fixed-pitch bound the bottom rows'
+// erase band is derived from.
+//
+// THESE ARE A SNAPSHOT OF ONE M5GFX RELEASE, hand-transcribed, and every
+// assertion below is expressed in terms of the copies rather than the tables.
+// fontHeight() is not constexpr and the width tables are not reachable from a
+// constant expression, so nothing here can check itself: a library bump that
+// retabulated a font would relay this screen silently, with a clean build and
+// every assert still passing.
+//
+// AND M5GFX IS NOT PINNED. platformio.ini asks for `^0.2.26`, which is a caret
+// RANGE and not a pin: any 0.2.x above that resolves, so the library can move
+// under these numbers on a machine that fetches dependencies afresh, with no
+// edit to this repository to notice. This comment used to say the version was
+// pinned and that whoever moved the pin would re-check the metrics — there is
+// no such moment. Whoever narrows that range, or finds it has drifted,
+// re-checks the metrics below against lgfx/Fonts/ in the same commit.
+//
+// FONT7 IS THE SEVEN-SEGMENT FACE, and its table is why the clock row carries
+// no padding at all: a digit and '-' both advance 32 and ':' advances 12, so
+// "00:00" and "--:--" are the same 140px. Every string that row can ever hold
+// covers exactly the same pixels, and the per-glyph opaque background erases
+// all of them — there is nothing left for a padding number to fill, and any
+// number written here would be a figure that never does anything.
+//
+// Font7 also has REAL GLYPHS ONLY FOR THE DIGITS, ':', '.' AND '-'. Its own
+// header says the rest print as a space, and they do it while still advancing
+// 12px, so a word placed on that row renders as a run of invisible cells. That
+// is why the pre-sync notice lives in the date row and never in the clock's.
+#define UI_F7_H         48   // chr_hgt_f7s
+#define UI_F4_H         26   // chr_hgt_f32
+#define UI_F2_H         16   // chr_hgt_f16
+#define UI_F0_H          8   // the 6x8 GLCD font the footer legend uses
+// FONT0 HAS NO WIDTH TABLE AT ALL, which is the one metric here that is a
+// property of the font's TYPE rather than a transcribed number. It is a
+// GLCDfont, whose updateFontMetric() only range-checks the code point and never
+// touches the metrics, so every glyph keeps the default x_advance — the font's
+// own `width` field, 6. A Font0 string is therefore exactly 6px a character
+// whatever characters it holds. Font2 and Font4 are BMP/RLE fonts and do carry
+// per-glyph tables, which is why their widths below are sums and this one is a
+// multiplication.
+#define UI_F0_W          6   // GLCDfont width field; fixed pitch, no table
+#define UI_F7_DIGIT_W   32   // widtbl_f7s, and the same entry for '-'
+#define UI_F7_COLON_W   12   // widtbl_f7s
+#define UI_F4_DIGIT_W   14   // widtbl_f32; '-' there is 8, which is what the pad covers
+#define UI_CLOCK_Y      22
+#define UI_CLOCK_W     (4 * UI_F7_DIGIT_W + UI_F7_COLON_W)
+#define UI_SEC_W       (2 * UI_F4_DIGIT_W)
+#define UI_CLOCK_GAP    12
+// Neither x is written down, because the clock and the seconds are centred as
+// one block: changing the gap or either width has to move both, and a literal
+// would move only one of them.
+#define UI_CLOCK_X     ((UI_PANEL_W - (UI_CLOCK_W + UI_CLOCK_GAP + UI_SEC_W)) / 2)
+#define UI_SEC_X       (UI_CLOCK_X + UI_CLOCK_W + UI_CLOCK_GAP)
+// BOTTOMS FLUSH, NOT BASELINES. fontHeight() returns the em box and this uses
+// it as one, so the bottom of the seconds' 26px cell lands on the bottom of the
+// clock's 48px cell. The SECONDS' digits then sit about six pixels above the
+// clock's, because Font4 leaves 7 rows of descender under its baseline (19 of
+// 26) where Font7 leaves 1 (47 of 48). Aligning the two baselines instead would
+// be UI_CLOCK_Y + 47 - 19 = 50, and a 26px cell starting there ends at 75 —
+// five rows inside the date band below. The mismatch is the deliberate choice;
+// the collision is what it avoids.
+#define UI_SEC_Y       (UI_CLOCK_Y + UI_F7_H - UI_F4_H)
+#define UI_DATE_Y       71
+// THE FORMAT AND ITS WIDEST RENDERING ARE ONE FACT AND LIVE TOGETHER. The pad
+// below has to cover the widest string this row can ever hold, and that number
+// is a property of the format string, not of the field — change one and the
+// other is wrong. "%a %d %b %Y" tops out at "Wed 28 May 2026": Wed is the
+// widest weekday at 52px in Font4, May the widest month at 48, the day and year
+// are 14px digits. The pre-sync notice is 170. Widening the format — "%A %d %B
+// %Y" would put "Wednesday 05 August 2026" on this row — means re-deriving
+// UI_DATE_MAX_W from the tables above, and the assertion below is what stops
+// the field silently overrunning its erase band in the meantime.
+#define UI_DATE_FMT    "%a %d %b %Y"
+#define UI_DATE_MAX_W  199
+#define UI_DATE_W      236
+#define UI_CROW0_Y      99
+#define UI_CROW1_Y     117
+// THE TWO BOTTOM ROWS ARE THREE MUTUALLY EXCLUSIVE MODES, AND THE MODE PICKS
+// THE FONT FOR BOTH ROWS AT ONCE. ui_status_row_mode() is the only place that
+// decides which mode is up, and each of its two callers asks it once per pass
+// and passes the answer down — ui_draw_clock() to both the font and the
+// formatter, GET /ui to both rows.
+//
+//   AP up      row 0   SSID, session state and password      Font0
+//              row 1   the auth token                        Font0
+//   connected  row 0   signal strength                       Font2
+//              row 1   the mDNS name and port                Font2
+//   offline    row 0   says so                               Font2
+//              row 1   the keys this screen answers to       Font2
+//
+// AP FIRST, BEFORE THE ASSOCIATED TEST, and the order is the whole point. A
+// setup AP raised from the menu on a node that is already on WiFi puts the
+// radio in WIFI_AP_STA and leaves both up until the session expires, so the two
+// states are simultaneously true — and the panel is the only place the AP
+// password exists at all. Testing the link first would show signal strength to
+// somebody standing in front of a node whose password they have no other way to
+// read. (ui_net_summary(), which feeds the HEADER, tests the link first and so
+// can show the STA address above rows showing AP credentials. That is a
+// pre-existing disagreement between the two and not one this introduces.)
+//
+// FONT0 ON THE AP ROWS IS A CONSTRAINT, NOT A PREFERENCE. The token is 32 hex
+// characters; Font2 gives a hex digit 8px, 'a'..'e' 7px and 'f' 6px, so the bare
+// token is 242px for the one this node happens to carry and 256px if it were
+// all digits. The panel is 240 wide and these rows start at x=4, so Font2
+// cannot put the token on the glass at all, with or without a word in front of
+// it. Font0 has no width table (see UI_F0_W), so "token " plus 32 characters is
+// a CONSTANT 228px whatever the token says — that is what makes the row safe
+// rather than lucky, and it leaves six pixels against this band. The AP's other
+// row carries an SSID, a session state and a twelve-character password on one
+// line, which is 260px in Font2 and 216 in Font0. The connected and offline
+// rows are short — 155px at their widest — and stay in the 16px face.
+#define UI_CROW_BYTES   40
+// The keys this screen answers to. The commit that made this screen a clock
+// face took the footer legend off it for the room, and said the hint would come
+// back into a bottom row when there was nothing else to say; the offline mode
+// is that case, and this is the hint. ENT and ` both open the menu
+// and `;`/`.` do nothing here, so naming ENT alone is the honest short form.
+// Deliberately NOT the sibling firmware's "hold KEY 3s for setup AP": there is
+// no such gesture in this firmware, where the AP is raised from the menu.
+#define UI_CROW_KEYS   "ENT menu  , / dim/bright"
+// token_load() makes a token of sixteen random bytes as hex. The precision at
+// the format site is what makes this 32 a property of the ROW rather than a
+// note about today: a token restored from SPIFFS is whatever that file holds.
+#define UI_CROW_TOKEN_LEN  32
+#define UI_CROW_TOKEN_PFX  "token "
+// What GET /ui puts where the panel puts the AP password. Deliberately no
+// longer than a real password, so the endpoint's copy of the row and the
+// panel's are the same shape and neither truncates where the other does not.
+#define UI_CROW_PW_HIDDEN  "(panel only)"
+// AP row 0 is "<ssid>  <session state>  pw <password>". It is the one row in
+// this file where three variable parts share a line, so its length is a
+// computed budget asserted against UI_CROW_BYTES rather than an eyeballed one,
+// and the two variable lengths are clamped by precisions at the format site.
+//
+// THE FIXED PARTS ARE MACROS THE FORMAT STRINGS ARE ASSEMBLED FROM, not
+// separators counted by eye against literals seven hundred lines away. Every
+// term below is either sizeof() over the exact text that gets printed or a
+// named length that its own producer also uses.
+// UI_STRLEN itself now lives with the header's spans, which needed it first.
+#define UI_CROW_AP_SEP      "  "
+#define UI_CROW_AP_PWPFX    "pw "
+#define UI_CROW_AP_LEFT     "m left"    // after the minute count
+#define UI_CROW_AP_PERM     "stays up"
+#define UI_CROW_AP0_TEMP_FMT \
+    "%.*s" UI_CROW_AP_SEP "%lu" UI_CROW_AP_LEFT UI_CROW_AP_SEP \
+    UI_CROW_AP_PWPFX "%.*s"
+#define UI_CROW_AP0_PERM_FMT \
+    "%.*s" UI_CROW_AP_SEP UI_CROW_AP_PERM UI_CROW_AP_SEP \
+    UI_CROW_AP_PWPFX "%.*s"
+// Two digits for the minute count: AP_SESSION_MS is asserted below to keep
+// ap_minutes_left() inside them. The permanent wording is asserted to be no
+// longer than the countdown it shares the budget with.
+#define UI_CROW_AP_STATE_CHARS  (2 + UI_STRLEN(UI_CROW_AP_LEFT))
+#define UI_CROW_AP0_CHARS  (AP_SSID_CHARS + 2 * UI_STRLEN(UI_CROW_AP_SEP) + \
+                            UI_CROW_AP_STATE_CHARS + \
+                            UI_STRLEN(UI_CROW_AP_PWPFX) + AP_PASSWORD_CHARS)
+// THE ERASE BAND IS SIZED FROM THE BUFFER AND NOT FROM TODAY'S STRINGS, which
+// is what makes the Font0 rows provable instead of re-derived by hand every
+// time somebody edits a format string forty lines away. Font0 is fixed pitch,
+// so the widest thing a UI_CROW_BYTES buffer can EVER put on the glass in it is
+// (UI_CROW_BYTES - 1) glyphs, and that bound holds for any string anyone writes
+// into it later. The Font2 rows get no such gift — Font2's widest advance is
+// 10px, so 39 glyphs there could be 390px — and are still summed by hand below.
+// 235 AND NOT 234, WHICH IS THE ONE PIXEL THAT MAKES THE ASSERT BELOW MEAN
+// SOMETHING. The erase rule this file states twice — at the header's spans and
+// again at ui_draw_field() — is that M5GFX fills only the REMAINDER of the
+// padding band, and only when the padding is STRICTLY wider than the string. A
+// band exactly as wide as its widest string erases nothing at all and leaves
+// the previous row's tail on the glass, with no clip and no error. The three
+// header pads are all strictly wider (67>66, 20>14, 134>133); this one was
+// 234 against a 234px bound, i.e. the single place on the panel where the rule
+// was stated correctly and applied at equality. Latent today, because the
+// widest Font0 row anybody writes is the token at 228 — real the day a 39-glyph
+// row exists. UI_LABEL_X + this is asserted against the panel edge below, and
+// at 235 that is 239 of 240.
+#define UI_CROW_W      235
+#define UI_CROW_MAX_W_F0  (UI_F0_W * (UI_CROW_BYTES - 1))
+// The widest string the Font2 modes can hold, summed over widtbl_f16:
+//
+//   "signal -128 dBm"       100px  — WiFi.RSSI() is an int8_t, so four
+//                                    characters is the whole numeric range
+//   "seed-0000.local:8080"  135px  — mdns_name is "seed-" plus four LOWERCASE
+//                                    hex, and the widest hex glyphs there are
+//                                    the digits at 8px, not the letters
+//   UI_CROW_KEYS            155px  <- the widest, and the one below is asserted
+//   "offline"                42px
+#define UI_CROW_MAX_W_F2  155
+// There is deliberately no single UI_CROW_MAX_W any more. It named one number
+// when one font drew both rows; with two fonts a single figure would hide which
+// of them it came from, and the two are established in completely different
+// ways — one from the buffer, one by hand from a width table.
+//
+// The band a mode change has to clear by hand: both rows, at the height of the
+// TALLER of the two fonts. See ui_draw_clock() for why a font change cannot be
+// left to ui_draw_field()'s padding.
+#define UI_CROW_BAND_H (UI_CROW1_Y + UI_F2_H - UI_CROW0_Y)
+
+// Which of the three the bottom rows are in. The value is remembered across
+// draws — see ui_clock_rows_drawn — so the enum is here with the geometry it
+// decides rather than beside the formatter that reads it.
+enum ui_crow_mode_t {
+    UI_CROW_AP = 0,   // the provisioning AP is up, with or without a link
+    UI_CROW_LINK,     // associated, no AP
+    UI_CROW_OFF       // neither
+};
+// For GET /ui, which reports the shape the rows were last DRAWN in. Indexed by
+// the enum, so the assert is what stops the two drifting apart.
+//
+// NO UI_CROW_COUNT SENTINEL, WHICH IS THE OPPOSITE OF WHAT ui_screen_t DOES,
+// and the difference is deliberate. ui_status_row() switches over this enum
+// with no `default:` on purpose, so that -Wswitch fails the build the day a
+// fourth mode exists and nobody has written its rows. A COUNT member would be a
+// fourth enumerator that switch does not handle, which turns that guard into a
+// permanent warning and then into a silenced one. The screens' switches all
+// carry a default and lose nothing to their sentinel; this one would. Bounding
+// the table by the last real enumerator gets the same check without spending
+// the better one.
+static const char *ui_crow_mode_name[] = {"ap", "link", "offline"};
+static_assert(sizeof(ui_crow_mode_name) / sizeof(ui_crow_mode_name[0]) ==
+                  UI_CROW_OFF + 1,
+              "ui_crow_mode_name is missing an entry for a bottom-row mode");
+// What the face reads before the first NTP sync. Named rather than written out
+// at each site because GET /ui decides whether the clock is synced by comparing
+// what the panel actually drew against this string, instead of asking the C
+// library a second time from a different task and possibly getting a different
+// answer than the glass has on it.
+#define UI_CLOCK_UNSYNCED  "--:--"
+#define UI_SEC_UNSYNCED    "--"
+#define UI_NTP_NOTICE      "waiting for NTP"
+
+static_assert(UI_CLOCK_X >= 0,
+              "the clock block is wider than the panel");
+static_assert(UI_CLOCK_Y > UI_RULE1_Y,
+              "the clock's cell crosses the rule under the header");
+static_assert(UI_SEC_X + UI_SEC_W <= UI_PANEL_W,
+              "the seconds' erase band leaves the right edge of the panel");
+static_assert(UI_CLOCK_Y + UI_F7_H <= UI_DATE_Y,
+              "the clock's cell reaches into the date row");
+static_assert(UI_SEC_Y >= UI_CLOCK_Y,
+              "the seconds sit above the top of the clock's cell");
+static_assert(UI_DATE_Y + UI_F4_H <= UI_CROW0_Y,
+              "the date's cell reaches into the row below it");
+// THE ROW CELLS ARE SPELT AT THE TALLER FONT ON PURPOSE. The bottom rows are
+// Font2 in two of their three modes and Font0 in the third, so UI_F2_H here is
+// the binding case and the Font0 mode has eight rows of slack under it. These
+// two would still pass at UI_F0_H and would then be asserting nothing about the
+// mode that actually fills the band.
+static_assert(UI_CROW0_Y + UI_F2_H <= UI_CROW1_Y,
+              "the two bottom rows overlap in the taller of their two fonts");
+static_assert(UI_CROW1_Y + UI_F2_H <= UI_PANEL_H,
+              "the lower row leaves the bottom of the panel in the taller of its two fonts");
+static_assert(UI_F2_H >= UI_F0_H,
+              "Font0 is now the taller row font, so every cell asserted at UI_F2_H "
+              "and the mode-change clear derived from it are all understated");
+static_assert(UI_PANEL_W / 2 - UI_DATE_W / 2 >= 0 &&
+              UI_PANEL_W / 2 + UI_DATE_W / 2 <= UI_PANEL_W,
+              "the date's centred erase band leaves the panel");
+static_assert(UI_LABEL_X + UI_CROW_W <= UI_PANEL_W,
+              "a bottom row's erase band leaves the right edge of the panel");
+// THE ONES THAT A CONTENT CHANGE BREAKS, rather than more restatements of the
+// geometry. An erase band narrower than the widest string its field can hold
+// leaves the previous value's tail on the glass, and M5GFX reports neither a
+// clip nor an overrun for it — the same silent failure the header's spans are
+// asserted against. These are the only numbers on this screen that a format
+// string or a message text can invalidate from somewhere else in the file.
+static_assert(UI_DATE_W >= UI_DATE_MAX_W,
+              "the date's erase band is narrower than the widest date its format can render");
+// Font0: derived from the buffer, so nothing anybody writes into a bottom row
+// can outrun the band. STRICTLY greater, not >=, because that is the erase rule
+// — see UI_CROW_W, which carries the one pixel this needs. The drift it catches
+// is a buffer grown without the band.
+static_assert(UI_CROW_W > UI_CROW_MAX_W_F0,
+              "a Font0 bottom row can outrun its erase band: the row buffer holds "
+              "more fixed-pitch glyphs than UI_CROW_W has room for");
+// Font2: NOT the same quality of guard, and worth saying so plainly rather than
+// letting the pair below look like the one above. The band carries 79px of
+// slack over the sum, so this assert will not fire for any realistic edit; the
+// length tie under it is what actually stands between the legend and a silent
+// overrun, and it catches only a change of LENGTH. A 24-character rewrite could
+// reach 240px — Font2's widest advance is 10 — and nothing here would say so.
+// Two of the four strings the sum is taken over are runtime-composed and tied
+// to nothing at all; they are bounded by their formats' numeric ranges, which
+// is an argument and not a check. Making this as strong as the Font0 bound
+// needs the width table transcribed into a constexpr array here, which is a
+// second copy of the thing this whole block already warns about drifting.
+static_assert(UI_CROW_W > UI_CROW_MAX_W_F2,
+              "a Font2 bottom row's erase band is narrower than the widest string it can hold");
+static_assert(UI_STRLEN(UI_CROW_KEYS) == 24,
+              "the key legend changed length; re-sum UI_CROW_MAX_W_F2 over "
+              "widtbl_f16 before changing this number to match");
+// The token row is the one string on this screen that a single byte of prefix
+// pushes past its buffer, and it would be cut identically on the panel and in
+// GET /ui — so nothing would look wrong and the token would simply be short.
+static_assert((int)sizeof(UI_CROW_TOKEN_PFX) + UI_CROW_TOKEN_LEN <= UI_CROW_BYTES,
+              "the token row does not fit its buffer and would be truncated silently");
+// GET /ui's copy of the AP row has to be the same shape as the panel's, and the
+// redaction goes through the SAME %.*s the password does — so a placeholder
+// longer than a password would not widen the row, it would be cut down to
+// twelve characters and read as something else entirely.
+static_assert(UI_STRLEN(UI_CROW_PW_HIDDEN) <= AP_PASSWORD_CHARS,
+              "the redaction is longer than the password it stands in for and would "
+              "be truncated by the row's own precision");
+static_assert(AP_SSID_CHARS < (int)sizeof(ap_ssid) &&
+              AP_PASSWORD_CHARS < (int)sizeof(ap_password),
+              "an AP row length budget is longer than the buffer it describes");
+static_assert(UI_CROW_AP0_CHARS < UI_CROW_BYTES,
+              "the AP's SSID, session state and password no longer fit one row buffer");
+// The session state's budget is the countdown's length, so the permanent
+// wording has to fit inside it, and the minute count has to stay at two digits.
+static_assert(UI_STRLEN(UI_CROW_AP_PERM) <= UI_CROW_AP_STATE_CHARS,
+              "the permanent AP's wording is longer than the countdown whose budget "
+              "UI_CROW_AP0_CHARS gives the session state");
+static_assert(AP_SESSION_MS <= 99UL * 60UL * 1000UL,
+              "a session over 99 minutes gives ap_minutes_left() a third digit and "
+              "overruns the two UI_CROW_AP_STATE_CHARS budgets for it");
+// WHY THE LOWER CHROME GOES, asserted rather than only asserted in prose, so
+// that a stack moved back up cannot leave two suppressions in place with
+// nothing left to justify them. The rule would fall in the two-pixel gap
+// between the bottom rows and read as a divider that separates nothing; the
+// footer legend's 8px band overlaps the lower row outright.
+//
+// THE SECOND ONE IS SPELT AT UI_F0_H AND NOT AT UI_F2_H, which is the opposite
+// choice from the cell asserts above and for the opposite reason. Font2 is on
+// the RIGHT of that comparison, where a taller font makes the claim EASIER: at
+// UI_F2_H it reads 121 < 133 and would go on passing while the Font0 mode's
+// lower row ended at 125 and left the footer band clear. At UI_F0_H it reads
+// 121 < 125 — four pixels of margin instead of twelve, and true in both fonts.
+static_assert(UI_CROW0_Y + UI_F2_H <= UI_RULE2_Y && UI_RULE2_Y < UI_CROW1_Y,
+              "the lower rule no longer falls between the clock face's bottom rows");
+static_assert(UI_CROW1_Y < UI_FOOT_Y + UI_F0_H && UI_FOOT_Y < UI_CROW1_Y + UI_F0_H,
+              "the footer legend no longer overlaps the clock face's lower row in its shorter font");
 
 // ---- Notification geometry ----
 //
@@ -1359,9 +1917,12 @@ static uint16_t ui_level_color(uint8_t level) {
 // ui_rgb() above already packs 5/6/5 in the order M5GFX expects, so the two
 // halves of the palette agree and nothing converts anything.
 //
-// Called by ui_draw_card(), for the tint, the border, the accent bar and both
-// text colours — five blends a fade frame.
-static uint16_t ui_blend(uint8_t alpha, uint16_t fg, uint16_t bg) {
+// Called by ui_draw_card() for the tint, the border, the accent bar, both text
+// colours and the outlines of the cards stacked behind it, and by
+// ui_rule_tick() for the breathing rule. The count a fade frame costs used to
+// be written down here and was wrong by the two stack outlines; it is not a
+// number anything depends on, so it is no longer kept.
+static constexpr uint16_t ui_blend(uint8_t alpha, uint16_t fg, uint16_t bg) {
     uint32_t a = alpha;
     uint32_t ia = 255u - a;
     uint32_t r = ((((uint32_t)fg >> 11) & 0x1F) * a +
@@ -1427,12 +1988,14 @@ struct UiMenuItem {
 // MESSAGES WENT IN AT THE TOP, NOT ON THE END, and that is a change to a menu
 // that already existed rather than an addition beside it: every entry below
 // moved down one, and the cursor a fresh boot starts on is now Messages where
-// it used to be Network. Deliberate, and worth the disruption for one reason —
-// this is the only row on the device that carries an unread count. There is no
-// badge on the status screen, no buzzer and no LED, so the queue gets noticed
-// here or not at all, and a row that has to be scrolled past five others to be
-// seen is not a notification. Everything below it is configuration a user goes
-// looking for; this is the row that has something to say without being asked.
+// it used to be Network. Deliberate, and still right now that the header
+// carries a badge — but for a different reason than the one it went in for.
+// The badge is what gets a message noticed; this row is where the reader is
+// sent once it has, and it is the only entry here whose state changes without
+// the user having touched anything. Everything below it is configuration, which
+// a user goes looking for and can find by looking. Landing a fresh boot's
+// cursor on the one row that may have something new on it costs the rest
+// nothing.
 //
 // Nothing keys off the old numbering. The indices are used in exactly three
 // places and all three take them from this table: ui_activate() by lookup,
@@ -1470,16 +2033,34 @@ static const UiMenuItem ui_menu[] = {
 // provisioning POST rewrites from the AsyncTCP task. Those are now fixed buffers
 // — see wifi_ssid above — precisely so the claim can be true.
 //
-// ui_field() also reads ap_ssid and ap_password, which were the last two
-// Strings on the /ui path; both are now fixed buffers too. Their write patterns
-// differ and the difference is why they were not the same risk. ap_password is
-// rolled by ap_start() and cleared by ap_stop(), both on the loop task, so a
-// raise or drop concurrent with a report on AsyncTCP was a genuine reassignment
-// race — narrowed only by /ui redacting it before the read. ap_ssid, despite
-// what this ledger once said, is NOT written in ap_start()/ap_stop() at all: it
-// is set once in wifi_setup() (before the web server exists) and never touched
-// again, so it never actually raced. Both are fixed buffers now regardless, so
-// the whole /ui path is String-free by construction rather than by argument.
+// ui_status_row() also reads ap_ssid and ap_password, which were the last two
+// Strings on the /ui path THAT A WRITER REASSIGNS. Their write patterns differ
+// and the difference is why they were not the same risk. ap_password is rolled
+// by ap_start() and cleared by ap_stop(), both on the loop task, so a raise or
+// drop concurrent with a report on AsyncTCP was a genuine reassignment race —
+// narrowed only by /ui redacting it before the read. ap_ssid, despite what this
+// ledger once said, is NOT written in ap_start()/ap_stop() at all: it is set
+// once in wifi_setup() (before the web server exists) and never touched again,
+// so it never actually raced. Both are fixed buffers now regardless.
+//
+// THIS LEDGER USED TO END "SO THE WHOLE /ui PATH IS STRING-FREE BY
+// CONSTRUCTION". It is not, and it was not when that was written. Three Strings
+// are read on this path today and all three are safe for the SAME reason, which
+// is not "no String" but "no reassignment after server.begin()":
+//
+//   mdns_name    set once in wifi_setup(); read by UI_NETWORK row 3 and now by
+//                the clock face's connected row.
+//   auth_token   set once in token_load(), which setup() runs before
+//                server.begin(); read by the clock face's AP row.
+//   WiFi.SSID()  returns a String BY VALUE — a fresh object per call, so there
+//                is nothing for another task to free under it. It is a heap
+//                allocation on every tick of UI_NETWORK, which is why our own
+//                copy is preferred, not a race.
+//
+// So the property to keep is narrower than the old sentence and worth stating
+// exactly: nothing read from AsyncTCP may be a String that a writer reassigns
+// after the web server starts. A String written once before that, or returned
+// by value, is fine; a fixed buffer is required only where a writer exists.
 static bool ui_ready = false;          // panel initialised and drawable
 // What M5GFX's panel autodetection actually answered, as opposed to what
 // M5.getBoard() reports after cfg.fallback_board has papered over a failure.
@@ -1535,6 +2116,28 @@ static volatile unsigned long ui_last_key_ms = 0;
 // changes nothing costs no SPI.
 static char ui_cache_hdr[16];
 static char ui_cache_net[24];
+// The unread badge is a dot and a count that always move together, so one
+// remembered value covers both. It is not a string cache: the dot has no string
+// to key on. Quantised the same way the drawn value is, so everything above
+// nine compares equal. -1 is a state nothing can quantise to.
+static int ui_badge_drawn = -1;
+
+// The badge's count as a string, and THE ONLY PLACE THE QUANTISE TO "9+"
+// HAPPENS. The header draws through this and GET /ui reports through it, on the
+// UI section's third rule — the endpoint used to serve notify_unread_count()
+// raw, which is a second, parallel description of a screen element and the
+// exact failure that rule forbids. Two unread reads as "2" in both places, and
+// twelve reads as "9+" in both places, because there is one producer.
+//
+// `badge` is the quantised value, so 10 stands for everything above nine and -1
+// for a header that has never been painted; both give an empty string, which is
+// what the glass carries in the first case and what handle_ui() declines to
+// report in the second.
+static void ui_badge_text(int badge, char *out, size_t n) {
+    if (badge <= 0)      out[0] = '\0';
+    else if (badge > 9)  snprintf(out, n, "9+");
+    else                 snprintf(out, n, "%d", badge);
+}
 // Sized to hold a whole value rather than a prefix of one: the change test is a
 // strncmp against the cache, so a cache shorter than the strings it stores
 // would silently stop repainting fields that differ only past its end.
@@ -1566,6 +2169,48 @@ static char ui_cache_note[16];
 // glass actually has on it. See handle_ui() for why the endpoint reads this
 // cache instead of wrapping the body itself.
 static char ui_card_body[2][NOTIFY_BODY_LEN + 4];
+// The clock face's five fields. Each is sized from the string it stores and not
+// from the one next to it: ui_draw_field() compares with strncmp over cache_n-1,
+// so a cache shorter than its own content silently compares a prefix and stops
+// repainting on a change past the cut. The date is 15 characters either way
+// ("Wed 28 May 2026" and the pre-sync notice both); 24 is headroom.
+//
+// THE BOTTOM ROWS' SIZE IS NO LONGER HEADROOM AND IS NOT SPELT HERE. It is
+// UI_CROW_BYTES, up with the geometry, because the erase band is derived from
+// it: Font0 is fixed pitch, so the buffer's length is what bounds the widest
+// thing the AP rows can ever put on the glass. The tightest content is the
+// token row at 39 of those 40 bytes, which is one byte of slack — a longer
+// prefix than "token " truncates the token, and truncates it identically on the
+// panel and in GET /ui, so nothing would look wrong. That is asserted.
+//
+// SEPARATE FROM ui_cache_value[] AND NOT SHARING IT. That array is written by
+// ui_begin()'s splash and by three other screens, and the fields here are a
+// different shape in a different font at different coordinates.
+static char ui_clock_time[8];
+static char ui_clock_sec[4];
+static char ui_clock_date[24];
+static char ui_clock_row[2][UI_CROW_BYTES];
+// WHICH MODE THOSE TWO ROWS WERE LAST DRAWN IN, remembered the way the header's
+// badge remembers its drawn state and for the same class of reason: the thing
+// that changes is not the string, so the per-field cache cannot see it. Here it
+// is the FONT. -1 is a value no mode has, so the first draw always clears.
+static int ui_clock_rows_drawn = -1;
+// WHETHER A DRAW HAS EVER FILLED THEM, on the same principle as ui_card_body_id
+// and for a sharper reason. Only ui_draw_clock() writes those caches, and
+// ui_tick() returns before reaching it whenever !ui_ready — so on a node whose
+// panel autodetect failed they stay empty for the whole boot, and on every
+// normal boot they are empty from the moment the web server starts until the
+// first tick. An ungated read reports "" for all three, and, worse, computes
+// synced=true from an empty string that is not the pre-sync placeholder: /ui
+// would assert the clock had synced while /clock said it had not, on a node
+// whose screen shows nothing at all. Absence is what handle_ui() reports
+// instead, because an absent key reads as "not known yet" and an empty one
+// reads as "the panel is showing a blank clock".
+//
+// One-way: set once by the first draw and never cleared. A screen change does
+// not invalidate it — the caches still hold what that screen last had on it,
+// which is what they are for.
+static bool ui_clock_drawn = false;
 // WHICH MESSAGE THOSE TWO LINES BELONG TO, and the report is worthless without
 // it. The cache is only ever refilled by a draw, and a draw happens on the tick
 // after the card opens — so between ui_enter_card() and the first
@@ -1580,26 +2225,29 @@ static uint32_t ui_card_body_id = 0;
 
 // ---- Field values ----
 
-static void ui_uptime(char *out, size_t n) {
-    unsigned long s = (millis() - boot_time) / 1000;
-    unsigned long d = s / 86400;
-    s %= 86400;
-    if (d > 0) {
-        snprintf(out, n, "%lud %02lu:%02lu:%02lu", d, s / 3600, (s / 60) % 60, s % 60);
-    } else {
-        snprintf(out, n, "%02lu:%02lu:%02lu", s / 3600, (s / 60) % 60, s % 60);
-    }
-}
+// THE PANEL NO LONGER SHOWS AN UPTIME ANYWHERE. ui_uptime() lived here and had
+// exactly one caller, the clock face's lower row in its non-AP case; the three
+// modes below give that row to the mDNS name and the key legend instead, which
+// leaves the function with no caller at all and -Wunused-function would say so.
+// It is removed rather than kept for a future caller. The number itself has not
+// gone anywhere — GET /health and GET /firmware/version both report
+// uptime_sec, and they compute it from millis() and boot_time directly rather
+// than through this formatter, so nothing on the network path changes.
 
 // One line summarising where the node can be reached, for the header.
 //
 // The octets are formatted by hand rather than through IPAddress::toString().
 // That method builds and returns a String — a heap allocation, a copy and a
-// free every time — and this function runs on every UI tick, twice per tick on
-// the STATUS screen, which is the header plus the "net" row. At 5Hz that was
-// roughly ten allocate/free pairs a second for the life of the boot, on a board
-// with no PSRAM and a single 300-odd KB heap that also has to find a contiguous
-// 6KB block whenever GET /skill is called. Nothing here needs the heap at all.
+// free every time — and it runs on every UI tick on every screen, because the
+// header is on every screen. It used to run TWICE per tick on STATUS, once for
+// the header and once for the clock face's first row; the three row modes below
+// took the second call away. That does not make it dead code, and the saving is
+// one call in five per second and not a reason for anything: two callers remain
+// and both matter — the header, and UI_NETWORK's `ip` row while that screen is
+// up. At 5Hz this was roughly ten allocate/free pairs a second for the life of
+// the boot, on a board with no PSRAM and a single 300-odd KB heap that also has
+// to find a contiguous 6KB block whenever GET /skill is called. Nothing here
+// needs the heap at all.
 static void ui_net_summary(char *out, size_t n) {
     if (WiFi.status() == WL_CONNECTED) {
         uint32_t ip = (uint32_t)WiFi.localIP();
@@ -1608,11 +2256,11 @@ static void ui_net_summary(char *out, size_t n) {
                  (unsigned)((ip >> 24) & 0xFF));
     } else if (ap_active) {
         uint32_t ip = (uint32_t)WiFi.softAPIP();
-        snprintf(out, n, "AP %u.%u.%u.%u", (unsigned)(ip & 0xFF),
+        snprintf(out, n, UI_NET_AP_PFX "%u.%u.%u.%u", (unsigned)(ip & 0xFF),
                  (unsigned)((ip >> 8) & 0xFF), (unsigned)((ip >> 16) & 0xFF),
                  (unsigned)((ip >> 24) & 0xFF));
     } else {
-        snprintf(out, n, "offline");
+        snprintf(out, n, "%s", UI_NET_OFFLINE);
     }
 }
 
@@ -1637,11 +2285,11 @@ static void ui_menu_state(int i, char *out, size_t n) {
             snprintf(out, n, "%u", (unsigned)ui_brightness);
             break;
         case UI_ACT_SCREEN:
-            // The Messages row carries the queue's state, and it is the only
-            // place on this firmware that an unread count is visible without
-            // navigating to it. There is no badge on the status screen and no
-            // buzzer and no LED on this node, so the menu is where a message
-            // gets noticed.
+            // The Messages row carries the queue's state in full: how many are
+            // unread AND how many are held. The header's badge is the thing
+            // that gets a message noticed — it is on every screen and this row
+            // is not — but it is quantised at "9+" and says nothing about the
+            // read ones, so this is still where the queue is actually read.
             //
             // Both calls take the store's spinlock and are safe from any task,
             // which matters because GET /ui calls this from AsyncTCP.
@@ -1658,91 +2306,146 @@ static void ui_menu_state(int i, char *out, size_t n) {
     }
 }
 
-// The single source of truth for what a screen shows. The panel calls this to
-// draw a row; GET /ui calls it to report one. Both get their own buffers, so
-// there is no shared string for the two tasks to race over, and the two can
-// never describe the screen differently.
+// Which of the three shapes the clock face's bottom rows are in. THE ONE PLACE
+// THAT DECIDES, AND ASKED ONCE PER PASS — the answer is then passed to the
+// formatter rather than recomputed by it. That is why ui_status_row() takes a
+// mode instead of calling this itself: this function reads WiFi.status(), a
+// live radio state, so three calls in one draw are three chances to get three
+// answers, and a row drawn in one mode's font holding another mode's text is a
+// failure with no error, no clip and no report behind it.
 //
-// `redact` is the whole reason this takes an argument at all. The provisioning
-// AP's password is on the STATUS screen while the AP is up, because the screen
-// is its only channel — setup() no longer prints it and it is never persisted.
-// It must not leave the device. /ui passes redact=true and gets a placeholder;
-// the panel passes false. Anything secret added here must go the same way.
+// Today's arrangement would survive the sloppier version for a narrow reason —
+// ap_active is written only from the loop task, so the AP edge cannot land
+// mid-draw, and the one pair that CAN flip under us shares a font. Neither of
+// those is a property of this design, only of its current three modes: a fourth
+// mode with a font of its own would break it silently. One read per pass costs
+// nothing and does not depend on either.
+//
+// AP IS TESTED FIRST AND THE LINK SECOND. Both can be true: a setup AP raised
+// from the menu on an associated node puts the radio in WIFI_AP_STA and leaves
+// both up until the session expires. Signal strength is available from a dozen
+// places; the AP password is available from this screen and nowhere else in the
+// universe, so it wins the tie. See the geometry block for the note on the
+// header disagreeing with these rows while that is true.
+static ui_crow_mode_t ui_status_row_mode() {
+    if (ap_active) return UI_CROW_AP;
+    if (WiFi.status() == WL_CONNECTED) return UI_CROW_LINK;
+    return UI_CROW_OFF;
+}
+
+// The clock face's two bottom rows, as one string each: how this node is
+// reached right now. The panel draws them and GET /ui reports them, from here
+// and from nowhere else, for the same reason ui_field() exists — one formatter
+// means the endpoint cannot describe the screen differently from the screen.
+//
+// THIS IS WHERE THE PROVISIONING AP'S PASSWORD LIVES, and it is the only place
+// it exists at all: rolled on every raise, never persisted, never sent
+// anywhere. `redact` is what keeps it that way — the panel passes false and
+// gets the password, /ui passes true and gets a placeholder. Anything secret
+// that lands on these rows later must go through the same argument.
+//
+// THE TOKEN IS NOT REDACTED AND THAT IS NOT AN OVERSIGHT. GET /ui will not
+// answer without it, so a caller reading it back out of this row already had
+// it; there is nothing to leak. The password is the opposite case, which is
+// why the two are treated differently on rows that sit one above the other.
+// If a later row ever carries both at once, the redaction has to survive the
+// merge — it is the row, not the field, that /ui serialises.
+//
+// While the AP is up BOTH rows are given to it, which is the same deliberate
+// swap the five-row screen this replaced already made: everything else these
+// rows could say is worth less than the only copy of a password that exists,
+// and the token beside it is what turns a joined phone into a working client
+// without a second trip to a terminal. Which kind of session it is goes beside
+// the SSID, because the two behave differently and the difference matters to
+// somebody standing here — a keyboard-raised AP closes on a timer, the boot AP
+// stays up until the node is provisioned.
+//
+// Safe from either task. Everything read here is a scalar, one of the two fixed
+// char buffers that exist precisely so that a String reassignment on the loop
+// task cannot free an array an AsyncTCP reader is walking, or one of the two
+// write-once Strings the /ui ledger up in the UI state block accounts for.
+//
+// `mode` IS A PARAMETER AND NOT A CALL, for the reason ui_draw_field()'s
+// `force` is one: a pass has to see one answer throughout. Both callers take it
+// once — the panel so the font it installs matches the text it draws, the
+// endpoint so its two rows describe the same instant.
+static void ui_status_row(ui_crow_mode_t mode, int row, char *out, size_t n,
+                          bool redact) {
+    out[0] = '\0';
+    switch (mode) {
+    case UI_CROW_AP:
+        // ap_minutes_left() RETURNS 0 FOR A SESSION THAT DOES NOT EXPIRE, and
+        // the boot AP — raised because the stored credentials did not work, and
+        // the only way into the node when that happens — is exactly that
+        // session. Formatting it through the countdown branch would read
+        // "Seed-f1f8  0m left" to the one user who has no other way in. The
+        // guard is ap_temporary and not a zero test, because zero is also what
+        // the last few seconds of a real session round to.
+        //
+        // THE TWO PRECISIONS ARE THE BOUND, not decoration. ap_ssid and
+        // ap_password are both sixteen-byte buffers with headroom, and this is
+        // the one row in the file where three variable parts share a line — the
+        // compiler said so, with -Wformat-truncation, before they were added.
+        // They clamp to the lengths UI_CROW_AP0_CHARS was derived from, which
+        // is the same trick wifi_setup() plays with %.4s and for the same
+        // reason: make the invariant visible instead of implied.
+        if (row == 0) {
+            if (ap_temporary) {
+                snprintf(out, n, UI_CROW_AP0_TEMP_FMT,
+                         AP_SSID_CHARS, ap_ssid, ap_minutes_left(),
+                         AP_PASSWORD_CHARS,
+                         redact ? UI_CROW_PW_HIDDEN : ap_password);
+            } else {
+                snprintf(out, n, UI_CROW_AP0_PERM_FMT,
+                         AP_SSID_CHARS, ap_ssid, AP_PASSWORD_CHARS,
+                         redact ? UI_CROW_PW_HIDDEN : ap_password);
+            }
+        } else if (row == 1) {
+            // THE PRECISION IS THE INVARIANT. UI_CROW_TOKEN_LEN is what the
+            // erase band and the buffer assert are derived from, and
+            // token_load() reads its token back out of SPIFFS — so clamp the
+            // row to the length that was asserted rather than assume the file.
+            snprintf(out, n, UI_CROW_TOKEN_PFX "%.*s", UI_CROW_TOKEN_LEN,
+                     auth_token.c_str());
+        }
+        break;
+    case UI_CROW_LINK:
+        // WiFi.RSSI() RETURNS 0 WHEN NOT ASSOCIATED — not a sentinel, not a
+        // very negative number, just zero, which reads as an unusually strong
+        // signal. This branch is only reached with the link up, which is what
+        // makes the reading mean anything; the mode test above is the gate.
+        if (row == 0)      snprintf(out, n, "signal %d dBm", (int)WiFi.RSSI());
+        else if (row == 1) snprintf(out, n, "%s.local:%d", mdns_name.c_str(),
+                                    HTTP_PORT);
+        break;
+    case UI_CROW_OFF:
+        // Nothing to say about how the node is reached, so the row that would
+        // have said it carries the keys instead. See UI_CROW_KEYS.
+        if (row == 0)      snprintf(out, n, "offline");
+        else if (row == 1) snprintf(out, n, "%s", UI_CROW_KEYS);
+        break;
+    }
+}
+
+// The single source of truth for what a label/value screen shows. The panel
+// calls this to draw a row; GET /ui calls it to report one. Both get their own
+// buffers, so there is no shared string for the two tasks to race over, and the
+// two can never describe the screen differently.
+//
+// STATUS IS NO LONGER ONE OF THEM. It is a clock face with two full-width rows
+// under it, so it reports through its own object exactly as the menu, the list
+// and the card do, and ui_status_row() above is its formatter — including the
+// redaction that used to live here.
 //
 // Returns false when the screen has no row at that index (the menu has no
 // fields at all — it has entries, which GET /ui reports separately).
 static bool ui_field(ui_screen_t screen, int idx, char *label, size_t label_n,
-                     char *value, size_t value_n, bool redact) {
+                     char *value, size_t value_n) {
     label[0] = '\0';
     value[0] = '\0';
     if (idx < 0 || idx >= UI_ROWS) return false;
 
     switch (screen) {
-    case UI_STATUS: {
-        // While the AP is up the bottom two rows become the credentials
-        // somebody standing in front of the node needs to type into a phone.
-        // That is a deliberate swap, not an extra screen: those two rows are
-        // worth less than the only copy of a password that exists.
-        switch (idx) {
-        case 0: {
-            snprintf(label, label_n, "time");
-            struct tm now;
-            if (clock_local_time(now)) {
-                strftime(value, value_n, "%Y-%m-%d %H:%M:%S", &now);
-            } else {
-                snprintf(value, value_n, "waiting for NTP");
-            }
-            return true;
-        }
-        case 1:
-            snprintf(label, label_n, "net");
-            ui_net_summary(value, value_n);
-            return true;
-        case 2:
-            snprintf(label, label_n, "up");
-            ui_uptime(value, value_n);
-            return true;
-        case 3:
-            if (ap_active) {
-                snprintf(label, label_n, "ap");
-                // Which kind of session this is, next to the SSID, because the
-                // two behave differently and the difference matters to somebody
-                // standing here: a keyboard-raised AP closes on a timer, the
-                // boot AP stays up until the node is actually provisioned.
-                if (ap_temporary) {
-                    snprintf(value, value_n, "%s  %lum left", ap_ssid,
-                             ap_minutes_left());
-                } else {
-                    snprintf(value, value_n, "%s  stays up", ap_ssid);
-                }
-            } else {
-                snprintf(label, label_n, "heap");
-                snprintf(value, value_n, "%lu KB free",
-                         (unsigned long)(ESP.getFreeHeap() / 1024));
-            }
-            return true;
-        case 4:
-            if (ap_active) {
-                snprintf(label, label_n, "pw");
-                if (redact) {
-                    snprintf(value, value_n, "(on the panel only)");
-                } else {
-                    // Nothing but the password on this row. The session's
-                    // remaining time moved up to the "ap" row above, where it
-                    // does not compete for width with the one string on this
-                    // screen that has to be transcribed without a typo.
-                    snprintf(value, value_n, "%s", ap_password);
-                }
-            } else {
-                snprintf(label, label_n, "seed");
-                snprintf(value, value_n, "v%s", SEED_VERSION);
-            }
-            return true;
-        default:
-            return false;
-        }
-    }
-
     case UI_NETWORK:
         switch (idx) {
         case 0:
@@ -1889,11 +2592,13 @@ static bool ui_field(ui_screen_t screen, int idx, char *label, size_t label_n,
             return false;
         }
 
-    // Three screens have no label/value rows at all. The menu has entries, the
-    // list has messages and the card has one message, and GET /ui reports each
-    // of them through its own object rather than through fields[]. An empty
-    // fields[] on those three is therefore not a screen failing to describe
-    // itself; doc["content"] names where its content actually is.
+    // Four screens have no label/value rows at all. Status has a clock face,
+    // the menu has entries, the list has messages and the card has one message,
+    // and GET /ui reports each of them through its own object rather than
+    // through fields[]. An empty fields[] on those four is therefore not a
+    // screen failing to describe itself; doc["content"] names where its content
+    // actually is.
+    case UI_STATUS:
     case UI_MENU:
     case UI_MESSAGES:
     case UI_MESSAGE:
@@ -1906,11 +2611,13 @@ static bool ui_field(ui_screen_t screen, int idx, char *label, size_t label_n,
 // the node gets. Kept in sync with ui_handle_key() by being right next to it.
 //
 // THE SCROLL COUNTER LIVES HERE AND NOT IN THE HEADER. The source firmware puts
-// its `n/m` in the header bar, which on this panel is already full: the title
-// field runs 0..114 and the network summary 112..236, and those two overlap by
-// 2px as it is. The footer has the room, but not much of it — Font0 is fixed
-// at 6px a glyph, so the 236px field holds 39 characters, and the longest
-// legend below is the card's at exactly 39 with a two-digit counter on it:
+// its `n/m` in the header bar, which on this panel has nowhere to put it: the
+// four spans up there — title, badge dot, badge count, network summary — are
+// asserted not to touch, and what they leave between them is one pixel in two
+// places and two in a third. The footer has the room, but not much of it —
+// Font0 is fixed at 6px a glyph, so the 236px field holds 39 characters, and
+// the longest legend below is the card's at exactly 39 with a two-digit
+// counter on it:
 // "; . next  ENT ack  ` keep unread  20/20" measures 234px into 236. Two
 // pixels of slack, so a legend that grows by one character does not fit.
 //
@@ -1921,9 +2628,32 @@ static bool ui_field(ui_screen_t screen, int idx, char *label, size_t label_n,
 // — the user loses the end of the sentence that tells them backtick keeps a
 // message unread. Fail the build instead and let whoever raises the cap shorten
 // the legend in the same commit.
+// The band, named. It was a bare 236 at the one call site that paints it, three
+// hundred lines from the paragraph above that reasons about it and beside a
+// UI_CROW_W that is asserted twice — the same panel edge, the same silent
+// failure mode, one of them guarded and one of them a literal. Both are named
+// and both are checked now.
+#define UI_FOOT_W      236
+// The longest legend ui_footer() can compose, in characters — the card's, at 39
+// with a two-digit counter, which the paragraph above audits string by string.
+// NOT derived from ui_cache_foot: that buffer is 48 bytes and 47 Font0 glyphs
+// would be 282px, so the cache bounds nothing useful here. This is the audited
+// figure, and naming it is what lets the band be checked against it instead of
+// against a number recomputed by hand every time a legend is edited.
+#define UI_FOOT_MAX_CHARS 39
+// STRICTLY greater, the same erase rule UI_CROW_W carries: 236 > 234 is the two
+// pixels of slack the paragraph above spends, now asserted. A band merely EQUAL
+// to its widest legend erases nothing and leaves the previous one's tail on the
+// glass.
+static_assert(UI_FOOT_W > UI_F0_W * UI_FOOT_MAX_CHARS,
+              "the footer legend's erase band is no wider than the longest legend "
+              "it has to erase, so a shorter legend would leave the previous "
+              "one's tail on the glass");
+static_assert(UI_LABEL_X + UI_FOOT_W <= UI_PANEL_W,
+              "the footer legend's erase band leaves the right edge of the panel");
 static_assert(NOTIFY_MAX <= 99,
               "the card's footer legend is 39 of the 39 characters Font0 fits "
-              "across 236px with a two-digit counter; a three-digit queue "
+              "across UI_FOOT_W with a two-digit counter; a three-digit queue "
               "overflows it off the panel — shorten the legend first");
 static_assert(UI_MENU_COUNT <= 99,
               "the menu's footer legend needs a two-digit counter to fit");
@@ -1932,10 +2662,22 @@ static_assert(UI_MENU_COUNT <= 99,
 // is documented, because it is the only place it can be. Enter acknowledges and
 // backtick does not, and a user who cannot be told that will assume looking at
 // a message is what marks it read.
+//
+// AN EMPTY LEGEND MEANS NO FOOTER AT ALL, not an empty footer. ui_tick() skips
+// the field entirely when this comes back empty, and it has to: the field's
+// padding is what erases the band, so drawing an empty string there would wipe
+// whatever the screen has put in those rows. The clock face is exactly that
+// case — it owns the panel down to the last row and has no legend.
 static void ui_footer(ui_screen_t screen, char *out, size_t n) {
     switch (screen) {
     case UI_STATUS:
-        snprintf(out, n, "ENT menu   , / dim/bright");
+        // No legend on the clock face. Its lower row occupies the footer band —
+        // and now carries the legend itself, as UI_CROW_KEYS, but only in the
+        // offline mode, where that row has nothing better to say. On a node
+        // that is on the network or offering a setup AP the keys are still
+        // undocumented on the glass, because the row is spent on the address
+        // and the credentials.
+        out[0] = '\0';
         break;
     case UI_MENU:
         snprintf(out, n, "; . move  ENT select  ` back  %d/%d",
@@ -2190,15 +2932,30 @@ static void ui_wrap2(const char *src, char *l1, size_t n1, char *l2, size_t n2,
 // Repaint one text field, and only if its content changed.
 //
 // The opaque background plus a fixed padding width is what erases the previous
-// value, so nothing here ever needs fillScreen and nothing ever flickers. The
-// cache keys on the text alone, so a field whose colours change but whose
-// string does not will not repaint on its own — MOVING A FIELD ONTO OR OFF A
-// COLOURED GROUND IS THE CALLER'S PROBLEM TO SOLVE, and there are two answers
-// to it in this file. A screen transition sets ui_force and every field
-// repaints. The menu selection bar does not: it slides one row on every arrow
-// key with no transition and no ui_force, and pays for that with the explicit
-// `moved` test below, which fills the new ground and blanks the two affected
-// rows' caches by hand so the fields draw themselves back over it.
+// value, so nothing here ever needs fillScreen and nothing ever flickers.
+//
+// THE ERASE IS `padding` WIDE AND ONE CELL OF THE FONT BEING DRAWN TALL, and
+// the second half of that is a real bound, not a detail. M5GFX fills the
+// remainder of the pad at the height it gets from the font's metrics, so a
+// field redrawn in a SHORTER font than it last used repaints only the top of
+// its old band and leaves the rest of the previous glyphs on the glass. The
+// cache cannot catch it, because the font is not part of the key. (It also
+// fills only when `padding` is STRICTLY greater than the string's width: a
+// string exactly as wide as its pad erases nothing at all.)
+//
+// The cache keys on the text alone, so a field whose colours change, or whose
+// FONT changes, but whose string does not, will not repaint on its own —
+// MOVING A FIELD ONTO OR OFF A COLOURED GROUND, OR INTO A DIFFERENT FACE, IS
+// THE CALLER'S PROBLEM TO SOLVE, and there are three answers to it in this
+// file. A screen transition sets ui_force and every field repaints. The menu
+// selection bar does not: it slides one row on every arrow key with no
+// transition and no ui_force, and pays for that with the explicit `moved` test
+// below, which fills the new ground and blanks the two affected rows' caches by
+// hand so the fields draw themselves back over it. The clock face's bottom rows
+// change FONT with their mode, and pay for it the same way: ui_draw_clock()
+// remembers the mode it drew, clears the band and blanks those caches when it
+// moves. All three do the caller's half by hand; none of them is something this
+// function can do for them.
 //
 // `force` is a PARAMETER AND NOT A READ OF ui_force, and that is the whole
 // reason ui_tick() can clear the flag before it draws instead of after. One
@@ -2228,19 +2985,900 @@ static int32_t ui_row_y(int row) {
 }
 
 // Everything the frame owns rather than a field: the two rules. Drawn on a full
-// repaint only, because nothing ever erases them.
+// repaint, because nothing else ever erases them — with one exception, and it
+// is directly below: ui_rule_tick() repaints the upper rule in place, on its
+// own faster gate, while an unacknowledged critical is outstanding. Those two
+// functions are the only writers of row 20 in this file.
 //
-// The card is the exception and takes the lower rule with it. That rule sits at
-// y=116, inside the rows the card's fade envelope repaints (21..120), so on the
-// card screen it would survive only as an 8px stub either side of the card. A
-// rule with a hole in it reads as a drawing bug; the footer below is perfectly
-// legible without one.
+// Two screens are exceptions and take the lower rule with them.
+//
+// The card: that rule sits at y=116, inside the rows the card's fade envelope
+// repaints (21..120), so on the card screen it would survive only as an 8px
+// stub either side of the card. A rule with a hole in it reads as a drawing
+// bug; the footer below is perfectly legible without one.
+//
+// The clock face: the rule lands in the two-pixel gap between its bottom two
+// rows, where it separates two halves of one thing. See the clock geometry and
+// the assertions over it.
 static void ui_draw_frame(ui_screen_t screen) {
     M5.Display.fillScreen(COL_BG);
     M5.Display.drawFastHLine(0, UI_RULE1_Y, M5.Display.width(), COL_RULE);
-    if (screen != UI_MESSAGE) {
+    if (screen != UI_MESSAGE && screen != UI_STATUS) {
         M5.Display.drawFastHLine(0, UI_RULE2_Y, M5.Display.width(), COL_RULE);
     }
+}
+
+// ---- The battery ----
+//
+// One number — the voltage on GPIO10's divider — and everything the header can
+// honestly say about the pack has to come out of it. Most of this section is
+// therefore about what it declines to claim.
+//
+// READ THROUGH THE ARDUINO CORE'S CALIBRATED PATH AND NOT THROUGH M5.Power,
+// which is a departure worth stating plainly because M5.Power is the obvious
+// call. Both apply the same correction: analogReadMilliVolts() and M5Unified's
+// _getBatteryAdcRaw() each build an adc_cali_curve_fitting scheme on ADC unit 1
+// at 12dB attenuation and 12-bit width, and the Arduino core's defaults reach
+// that same pair (__analogAttenuation is ADC_11db, which is index 3 of
+// adc_attenuation_t and so the same value as ADC_ATTEN_DB_12; __analogWidth is
+// SOC_ADC_RTC_MAX_BITWIDTH, 12 on this chip). What differs is which of the two
+// OWNS the unit, and only one can: adc_oneshot_new_unit() claims it through
+// s_adc_unit_claimed — a static bool array, one byte per ADC unit, in the
+// adc_oneshot object of libesp_adc.a — and fails the second caller with
+// "adc%d is already in use".
+//
+// NEITHER SIDE LATCHES THE FAILURE, and the outcome is permanent anyway, which
+// is worth stating precisely because the two are easy to confuse. M5Unified
+// keeps its handle in a function-static that stays null after a failed claim,
+// so it re-attempts the claim on the next call; the Arduino core's
+// __analogInit() re-attempts it the same way. Both therefore retry forever and
+// both keep failing, because nothing in either library ever releases the claim
+// — there is no adc_oneshot_del_unit() on any path except the pad being
+// detached. So the loser answers 0 for the rest of the boot: getBatteryVoltage()
+// on M5Unified's side, or analogRead() on EVERY ADC1 pin on Arduino's. Whichever
+// runs first silently disables the other.
+//
+// /gpio/adc already reads pins 1..10 through the Arduino handle. So calling
+// M5.Power here would not have added a reading, it would have taken one away —
+// and with it the only means of comparing this figure against the uncalibrated
+// one on the same boot, which is the comparison that justifies calibrating at
+// all. The 2.0 divider ratio is still M5Unified's: its board table gives
+// board_M5CardputerADV an _adc_ratio of 2.0f, and that is where UI_BAT_RATIO
+// below comes from.
+//
+// AVERAGED, BECAUSE ONE SAMPLE IS NOT A MEASUREMENT — AND AVERAGED OVER TIME,
+// WHICH IS NOT THE SAME THING AND IS THE PART THAT WAS MEASURED THE HARD WAY.
+// Forty single isolated conversions of this pin, read over the network about
+// 50ms apart, span raw 2389..2583: 194 counts, roughly 156mV at the pin and
+// 313mV once doubled. The first version of this code answered that by averaging
+// 16 conversions taken back to back every five seconds, and the averaging
+// bought NOTHING — the reported figure still wandered over 4122..4401mV, a
+// 279mV spread, which is the same spread a single sample has. Sixteen
+// conversions taken inside a millisecond are not sixteen samples of a wandering
+// quantity; they are one sample of it, because whatever moves this reading
+// moves far slower than the burst takes. On a node whose threshold decision
+// sits inside that spread the visible result was an indicator alternating
+// between a percentage and the external-power text every five seconds.
+//
+// So the window below is spread across real time instead: one conversion per
+// tick, floored at UI_BAT_MIN_GAP_MS apart, kept in a ring of UI_BAT_WINDOW of
+// them, and the mean of the ring is what the header and GET /ui report. That
+// covers several seconds of rail behaviour rather than one instant of it.
+//
+// IT COSTS MORE CONVERSIONS, NOT FEWER, and the trade is worth naming rather
+// than dressing up: the burst was 16 every 5s, which is 3.2 a second; this is
+// one per 200ms tick, 5 a second, about 56% more. What that buys is that the
+// figure is a measurement instead of an instant, which the burst was not at any
+// price.
+//
+// CHARGING CANNOT BE DETECTED ON THIS BOARD AND THAT IS SETTLED, NOT OPEN. The
+// charger's status pins are routed nowhere, there is no charger on the I2C bus,
+// and USB presence is not visible to software on an ESP32-S3. A charger holds
+// this rail at roughly 4233..4281mV, and a half-empty pack under charge has
+// been measured at 4253mV — so "charging" and "resting full" overlap and no
+// threshold separates them. Hence no charging indication anywhere here; the
+// familiar "100% on USB, 58% on battery" surprise is this exact gap.
+//
+// THE ONE THING A SINGLE VOLTAGE DOES DECIDE IS THE OTHER DIRECTION. A cell at
+// rest cannot sit above its own float voltage of 4.2V, so a reading above
+// UI_BAT_EXT_MV means something external is holding the rail up. There the
+// header shows THAT, because a percentage read off a rail a charger is holding
+// is not a charge level. The converse does not hold and the code does not
+// pretend it does: below the threshold the node may still be on external power,
+// part-way through a charge. `external` in GET /ui therefore means "external
+// supply proven present", never "the pack is discharging".
+//
+// THAT RULE IS SOUND; ITS MARGIN IS 10mV AND THAT IS THINNER THAN THIS
+// MEASUREMENT CHAIN. An earlier draft of this comment called the conclusion
+// definitive "with no model in the way", which was wrong twice over. The
+// calibration removes most of the ADC's error but not all of it, and it is
+// specified as a band rather than as zero. More importantly the divider is
+// wholly uncompensated: this code applies exactly 2, and the real ratio is
+// whatever the two resistors happen to be. THE TOLERANCE IS ASSUMED AND NOT
+// SOURCED — M5Stack publish the divider but not the part's tolerance class, and
+// 1% is the assumption below, which is ordinary for this position and not a
+// fact about this board. On that assumption the ratio lands within ±1%, which
+// at 4.2V is ±42mV at the pack, an 84mV spread against 10mV of headroom. At 5%
+// parts the same arithmetic gives five times that. So a unit whose divider sits
+// high can
+// report a resting 4.19V pack as roughly 4.23V and hold the external-power
+// state on battery, and a unit that sits low can serve a percentage off a
+// charger. The threshold is still the right rule and still the only decidable
+// one; it is a good rule with a real error bar, not a proof. Anyone who wants
+// it tighter has to measure a known voltage on the specific unit and trim the
+// ratio, which is a per-device calibration this firmware does not carry.
+//
+// THE PERCENTAGE IS A MODEL, AND WHICH MODEL IS CHOSEN MATTERS FAR MORE THAN
+// THE ARITHMETIC. Published voltage-to-percent maps for a single Li-ion cell
+// disagree with each other across the middle of the range by tens of points. At
+// 3.67V the shipped ones surveyed for this run — Bangle.js, InfiniTime, WLED,
+// ZSWatch, Meshtastic and M5Unified — span roughly 9 to 67, and the top of that
+// range is WLED counted honestly: it ships THREE selectable curves and they do
+// not agree with each other, giving about 41 on its default, 24 on its LiPo
+// type and 67 on its Lion type. Quoting only the 24 would have put it at the
+// bottom of the spread and made the cluster this code joins look tighter than
+// it is. Nearly sixty points of disagreement over one voltage on one cell
+// chemistry, and a straight-line map is worst exactly there, which is why one
+// is not used.
+//
+// THAT SPREAD IS NOT ALL ERROR: the models split into two families that are
+// measuring different things. Meshtastic's is an open-circuit-voltage table and
+// the low readings come from charts of a RESTING cell, while a pack under load
+// sags, so the same voltage means a higher charge while current is being drawn
+// than it does at rest. Nothing here can tell those two conditions apart — this
+// node samples with the radio associated and the backlight on, and no reading
+// is ever taken at rest — so the split is a permanent uncertainty in the number
+// below and not something a better table would remove.
+//
+// M5.Power.getBatteryLevel() IS NOT USED, AND NOT ONLY BECAUSE OF THE ADC CLAIM
+// ABOVE. Its map is (mv - 3300) * 100 / (4150 - 3350): an offset of 3300
+// against a span of 800, a pair that is arithmetically inconsistent — with that
+// offset the span should be 850 — so it reaches 100% at 4100mV rather than the
+// 4150 it names. Two other Cardputer firmwares carry byte-identical copies of
+// it. Three implementations agreeing is one implementation counted three times,
+// not three pieces of evidence.
+//
+// THE TABLE BELOW IS INFINITIME'S, from the PineTime firmware's
+// components/battery/BatteryController.cpp: six points, linear between them,
+// integer arithmetic throughout. Chosen because it is a shipped implementation
+// rather than a derivation, and because at 12 it sits low in the spread above
+// without being its floor — Bangle.js is lower, and WLED's LiPo curve and the
+// published table it cites are near it. It is NOT chosen for being the
+// consensus, because the survey above does not have one. Erring low is the
+// deliberate half of the choice: a pack reported emptier than it is costs the
+// owner a charge he did not need, and one reported fuller than it is costs him
+// the device.
+//
+// WHAT IS DELIBERATELY NOT TAKEN FROM INFINITIME IS ITS HYSTERESIS. It ratchets
+// the displayed value, letting it rise only while charging and fall only while
+// discharging, and that gate is keyed on a charging flag. This board cannot
+// produce one — see above — so the ratchet cannot be ported. Copying its shape
+// without its input would be a smoothing rule keyed on nothing.
+//
+// SO, STATED ONCE AND PLAINLY: below about 3.8V this percentage is
+// model-dependent to within tens of points, and no amount of averaging or
+// integer care here narrows that. `mv` in GET /ui is the measurement and
+// `percent` is this table applied to it; a caller that wants the truth reads
+// the first.
+// One conversion per tick, floored at UI_BAT_MIN_GAP_MS apart, over a ring of
+// UI_BAT_WINDOW of them. 32 samples define 31 intervals, so the window spans
+// about 6.2 seconds at the ordinary tick rate — not 6.4, which is what
+// multiplying the count by the period gives and what this comment said first.
+//
+// THE FLOOR IS NOT AN INDEPENDENT CLOCK, and calling it one was wrong.
+// ui_bat_tick() is reached only from inside ui_tick(), past that function's own
+// gate, so sampling can never be finer than the tick and the floor can only
+// ever DROP a tick's sample, never add one. It used to be 200, equal to
+// UI_TICK_MS, which is the worst value it could have had: ui_tick() stamps its
+// deadline at the top of a pass and this stamps its own after part of the frame
+// is drawn, so the next tick arrived a few milliseconds short of 200 since the
+// last sample and silently lost it — irregularly, at a rate set by how heavy
+// the frame was, and frame weight is remotely triggerable through ui_force_net.
+// Below UI_TICK_MS an ordinary tick always samples, and the floor is left with
+// the one job it was added for: keeping the MSG_FADE_MS ticks, which run at
+// 40ms while a card fades, from bunching conversions back into the correlated
+// burst this whole design exists to avoid.
+#define UI_BAT_MIN_GAP_MS 150
+#define UI_BAT_WINDOW      32
+#define UI_BAT_RATIO        2      // M5Unified's _adc_ratio for this board
+#define UI_BAT_EXT_MV    4210
+// The pack floor: below this nothing is a live single-cell pack, since the
+// protection circuit cuts out around 2.5V. Applied to each SAMPLE, at the pin's
+// scale, and never to the mean — see ui_bat_tick().
+#define UI_BAT_MIN_MV    2500
+#define UI_BAT_MIN_PIN_MV (UI_BAT_MIN_MV / UI_BAT_RATIO)
+#define UI_BAT_TEXT_EXT  "PWR"
+// "100%" — the widest string this field can ever hold, and the reason for the
+// clamp in ui_bat_percent() rather than a comment hoping for one.
+#define UI_BAT_MAX_CHARS    4
+// Font0's 8px cell centred in the 16px cells either side of it in the header.
+#define UI_BAT_Y         (UI_HDR_Y + (UI_F2_H - UI_F0_H) / 2)
+
+// The width half of the header's fifth span, asserted here rather than beside
+// UI_BAT_W because UI_F0_W — the fixed pitch this depends on — belongs with the
+// clock face's font metrics and is not defined until after that block.
+static_assert(UI_BAT_W > UI_F0_W * UI_BAT_MAX_CHARS,
+              "the battery field cannot clear its own widest string");
+static_assert(UI_STRLEN(UI_BAT_TEXT_EXT) <= UI_BAT_MAX_CHARS,
+              "the external-power string outgrew the battery field's budget");
+static_assert(UI_BAT_Y + UI_F0_H <= UI_RULE1_Y,
+              "the battery field crosses the rule under the header");
+// The two ends of the sampling floor's usable range, both of them consequences
+// that are invisible at the call site.
+static_assert(UI_BAT_MIN_GAP_MS < UI_TICK_MS,
+              "the battery sample floor is at or above the tick period, so "
+              "ordinary ticks will drop their sample irregularly");
+static_assert(UI_BAT_MIN_GAP_MS > MSG_FADE_MS,
+              "the battery sample floor no longer bounds the card-fade ticks, "
+              "which would sample as a correlated burst");
+
+// What the draw path publishes, written by ui_bat_tick() on the loop task and
+// read by GET /ui and GET /capabilities on the web server task, the way the
+// badge and the clock caches are. Those two run on the SAME core — AsyncTCP is
+// pinned to core 1 and so is the Arduino loop — but the handler is priority 10
+// against the loop's 1, so it preempts a half-finished update exactly as it
+// preempts a half-finished draw. See the UI section's one-writer rule.
+//
+// WHAT IS GUARANTEED HERE IS A BOUND, NOT AN ORDER, on the precedent of the
+// body LED's four fields further down this file — which carries a correction of
+// exactly the claim this comment first made. These are five plain writes to
+// non-volatile statics with no barrier between them; the compiler may retire
+// them in any order it likes, and this build happening to keep source order
+// guarantees nothing about the next one.
+//
+// The part that does NOT depend on that is what makes it safe: ui_bat_pct holds
+// a real percentage AT ALL TIMES rather than a -1 sentinel for "not
+// applicable". It is computed on every accepted sample whether or not the
+// header shows it, and `external` alone decides whether it is published. So no
+// interleaving and no store ordering can put "percent": -1 on the wire, which
+// the previous arrangement could do whenever a sample crossed into the
+// external-power state while a request was in flight. That is unconditional.
+//
+// ui_bat_mv is written last as well, and THAT half is the weak one: a reader
+// finding it non-negative usually implies the others have been written, but
+// nothing enforces it and it must not be read as a guarantee. The bound is what
+// makes it acceptable rather than a fence — the worst a reader can catch is one
+// field a tick older than its neighbours, a pair of values that were both true
+// within 200ms of each other. It is the same exposure the LED and the breathing
+// rule carry, and the same policy, for the same reason: one writer, no lock.
+static int  ui_bat_mv    = -1;     // averaged pack mV, -1 until the first valid sample
+static bool ui_bat_ext   = false;  // the reading proves an external supply
+static int  ui_bat_pct   = 0;      // the curve's answer for ui_bat_mv, always 0..100
+static uint8_t ui_bat_samples = 0; // how many samples that mean is over
+static bool ui_bat_drawn = false;  // the field has been painted at least once
+static char ui_cache_bat[8];
+
+// The rolling window. `sum` is maintained incrementally rather than re-added
+// each pass, so the cost of a sample does not grow with the window; it holds PIN
+// millivolts, and the divider ratio is applied once at the end where the single
+// rounding step belongs, rather than to every element.
+static uint16_t ui_bat_ring[UI_BAT_WINDOW];
+static uint32_t ui_bat_sum  = 0;
+static uint8_t  ui_bat_head = 0;
+static uint8_t  ui_bat_have = 0;   // samples held, saturating at UI_BAT_WINDOW
+static_assert(UI_BAT_WINDOW <= 255,
+              "the window's counters are uint8_t and would wrap");
+
+static void ui_bat_push(uint16_t pin_mv) {
+    if (ui_bat_have == UI_BAT_WINDOW) {
+        ui_bat_sum -= ui_bat_ring[ui_bat_head];
+    } else {
+        ui_bat_have++;
+    }
+    ui_bat_ring[ui_bat_head] = pin_mv;
+    ui_bat_sum += pin_mv;
+    ui_bat_head = (uint8_t)((ui_bat_head + 1) % UI_BAT_WINDOW);
+}
+
+
+// InfiniTime's table, cited above. Returns 0..100 for any input, which is what
+// bounds the drawn string at UI_BAT_MAX_CHARS: both ends are returned directly
+// rather than falling out of the interpolation, so no rounding can put a fourth
+// digit on the glass.
+static int ui_bat_percent(int mv) {
+    static const int mv_pt[]  = {3500, 3616, 3723, 3776, 3979, 4180};
+    static const int pct_pt[] = {   0,    3,   22,   48,   79,  100};
+    // Element counts and not sizeof, which would also have compared equal for
+    // two tables of different element TYPES and unequal for two of the same
+    // length once either narrowed.
+    static_assert(sizeof(mv_pt) / sizeof(mv_pt[0]) ==
+                  sizeof(pct_pt) / sizeof(pct_pt[0]),
+                  "the battery curve's two tables have different lengths");
+    const int n = (int)(sizeof(mv_pt) / sizeof(mv_pt[0]));
+    if (mv <= mv_pt[0]) return 0;
+    for (int i = 1; i < n; i++) {
+        if (mv < mv_pt[i]) {
+            return pct_pt[i - 1] + (mv - mv_pt[i - 1]) *
+                                   (pct_pt[i] - pct_pt[i - 1]) /
+                                   (mv_pt[i] - mv_pt[i - 1]);
+        }
+    }
+    return 100;
+}
+
+// Sample the pack and repaint the header's battery field. Called from
+// ui_tick()'s header section, so `force` means there exactly what it means for
+// every other field: the frame was repainted and this one has to draw itself
+// back over the blank ground.
+static void ui_bat_tick(bool force) {
+    static unsigned long last_sample = 0;
+    // The floor, not a clock of its own — see UI_BAT_MIN_GAP_MS. The FIELD is
+    // still offered to ui_draw_field() on every pass, because a forced pass has
+    // to be able to repaint it on a tick that took no new sample.
+    if (ui_bat_have == 0 || millis() - last_sample >= UI_BAT_MIN_GAP_MS) {
+        last_sample = millis();
+        // GUARD THE SAMPLE, NOT THE MEAN, which is the whole reason this test
+        // is here and not below. __analogReadMilliVolts() returns 0 on every
+        // one of its error paths, and a 0 pushed into the ring does not show up
+        // as a failure, it shows up as a plausible number: one of them in a full
+        // window drags a 4100mV pack to about 3970 and holds it there for the
+        // life of the window, so the averaging that justifies this design is
+        // exactly what turns a 200ms glitch into a six-second lie. Worse at
+        // boot, where a failed first conversion put the early means below the
+        // curve's first knot and drew "0%" on a full pack. A rejected sample
+        // never enters the ring, so the window keeps describing the rail and a
+        // total ADC failure leaves the ring empty and the field blank, which is
+        // the honest output for a reading nobody has.
+        uint32_t pin_mv = analogReadMilliVolts(PIN_VBAT_ADC);
+        if (pin_mv >= UI_BAT_MIN_PIN_MV) {
+            ui_bat_push((uint16_t)pin_mv);
+            // ui_bat_have is at least 1 here because the push above guarantees
+            // it, which is why this divide needs no guard of its own.
+            int mv = (int)((ui_bat_sum * UI_BAT_RATIO + ui_bat_have / 2) /
+                           ui_bat_have);
+            int pct = ui_bat_percent(mv);
+            bool ext = mv > UI_BAT_EXT_MV;
+            // Published in the order the declarations above require: the
+            // percentage and the flag that decides whether to show it, then the
+            // sample count, then ui_bat_mv last as the readers' gate.
+            ui_bat_pct = pct;
+            ui_bat_ext = ext;
+            ui_bat_samples = ui_bat_have;
+            ui_bat_mv = mv;
+        }
+    }
+
+    char text[sizeof(ui_cache_bat)];
+    if (ui_bat_mv < 0) {
+        text[0] = '\0';
+    } else if (ui_bat_ext) {
+        snprintf(text, sizeof(text), "%s", UI_BAT_TEXT_EXT);
+    } else {
+        // Narrowed to uint8_t at the format site. ui_bat_percent() already
+        // returns 0..100 and nothing else writes this, but that bound lives in
+        // another function and -Wformat-truncation cannot see it — it costs one
+        // cast to make the three-digit ceiling local to the call that depends
+        // on it, and UI_BAT_MAX_CHARS is written against that ceiling.
+        snprintf(text, sizeof(text), "%u%%", (uint8_t)ui_bat_pct);
+    }
+    ui_draw_field(force, ui_cache_bat, sizeof(ui_cache_bat), text,
+                  M5.Display.width() - UI_LABEL_X, UI_BAT_Y, &fonts::Font0,
+                  COL_DIM, UI_TR, UI_BAT_W, COL_BG);
+    ui_bat_drawn = true;
+}
+
+// ---- The breathing rule ----
+//
+// While an unacknowledged critical is outstanding the hairline under the header
+// breathes: its colour ramps from the ordinary rule toward red and back, one
+// full cycle every two seconds, and returns to COL_RULE when the last critical
+// is acknowledged.
+//
+// BREATHING RATHER THAN BLINKING IS THE WHOLE POINT. A blink is a hard edge the
+// eye keeps re-detecting, which is right for an alarm demanding an action in the
+// next second and wrong for a device sitting on a shelf saying "there is
+// something here for you". The ramp reads as present rather than urgent, and it
+// never goes dark, so the rule never looks broken.
+//
+// THE ARRIVAL OF A CRITICAL IS NOT ONE OF THE MOMENTS THIS IS VISIBLE, which is
+// worth knowing before wondering why the panel looked idle. A POST raises the
+// card: ui_tick() consumes the arrival, ui_enter_card() calls ui_goto(), and the
+// screen is UI_MESSAGE within one tick of the message landing, at which point
+// the guard below stops drawing. So the breath gets at most a step or two on the
+// way past. The two ways to actually see it are a critical that was already
+// unread at boot — the flag is persisted, so the node comes up on the clock with
+// the rule already breathing — and walking back to status from the card without
+// acknowledging, which is ` three times: the card leaves to the message list,
+// the list to the menu, the menu to status, and only Enter ever acks. GET /ui
+// reports the state on either route; see ui_rule_breathing below.
+//
+// FULL WIDTH, x=0..239, because that is what ui_draw_frame() above draws. The
+// firmware this is ported from insets its rule by 8px at each end; ours does
+// not, and repainting an inset span here would leave an 8px stub of the original
+// colour at each end of a rule that is otherwise moving.
+//
+// The ramp runs from COL_RULE at alpha 0 toward a ceiling of 160/255 of COL_CRIT
+// over it. In 5/6/5 the rule is (7,15,7) and that ceiling is (21,17,7), so red
+// climbs fourteen of its thirty-two steps, green two, and blue does not move at
+// all — the ramp never darkens and never arrives at full red.
+//
+// THE PEAK ACTUALLY REACHED IS 20 OR 21 IN RED AND WHICH ONE IS NOT FIXED. The
+// phase is sampled rather than stepped through (see the ramp below), so where
+// the steps happen to fall against the cycle decides whether any of them lands
+// above alpha 156, which is where red rounds up from 20 to 21. Both occur, and
+// on real timings both occur within a session. Fifteen distinct reds exist
+// between the two ends and a given phase visits most but not all of them, so the
+// ramp does skip a level here and there rather than walking every one.
+//
+// Cost is one drawFastHLine of 240 pixels per step. At 16 bits a pixel on this
+// board's 40MHz panel bus that is under 0.1ms, so at most about 0.13% of the bus.
+// When nothing is outstanding no pixel is written at all — but the step gate is
+// time-based only, so the notification store is still walked once per step while
+// status is up, outstanding or not. That takes the queue from being read about
+// once a second by ui_tick() to about a dozen times a second, permanently, on
+// the screen this device idles on. It is a few microseconds under a spinlock
+// each time and it is the price of the gate being this simple. A forced repaint,
+// for scale, is a fillScreen and every field on top of it, ~13ms.
+#define UI_RULE_BREATHE_MS      80    // minimum interval between steps
+// SHARED WITH ui_led_tick(), WHICH IS WHY THE TWO BREATHS ARE IN PHASE. Both
+// derive their position from millis() % this, and neither keeps any state, so
+// one constant is the entire synchronising mechanism between them — there is no
+// handshake to notice if it goes. Re-tuning the hairline here silently re-times
+// the body LED on the outside of the case, which is a feature and not a hazard,
+// but only for somebody who knows it happens. The other two constants in this
+// group are the rule's alone; this one is not.
+#define UI_RULE_BREATHE_CYCLE 2000    // a full ramp up and back down
+#define UI_RULE_BREATHE_MAX    160    // ceiling on the blend of COL_CRIT over COL_RULE
+
+// ui_blend() takes the alpha as a uint8_t and the ramp below computes it in
+// unsigned long, so the ceiling has to fit that cast. No realistic edit reaches
+// this, which is the point of asserting it rather than trusting it.
+static_assert(UI_RULE_BREATHE_MAX <= 255,
+              "the breathing rule's alpha ceiling does not fit ui_blend()'s uint8_t");
+
+// "NEVER DARKENS" IS THE ONE CLAIM ABOVE THAT A LATER EDIT CAN BREAK, so it is
+// asserted rather than written down. ui_blend() is a weighted sum per channel
+// between the two colours, so it is monotone in alpha exactly when COL_CRIT is
+// no darker than COL_RULE in every channel separately — a palette re-tune that
+// made red darker than the rule anywhere would turn the breath into a dip toward
+// black, which reads as the rule flickering out rather than as anything present.
+static_assert(((COL_CRIT >> 11) & 0x1F) >= ((COL_RULE >> 11) & 0x1F) &&
+              ((COL_CRIT >>  5) & 0x3F) >= ((COL_RULE >>  5) & 0x3F) &&
+              ( COL_CRIT        & 0x1F) >= ( COL_RULE        & 0x1F),
+              "COL_CRIT is darker than COL_RULE in some channel, so the "
+              "breathing rule would dip toward black instead of toward red");
+
+// And the ceiling colour itself, which the note above names. ui_blend() is
+// constexpr and ui_rgb() constant-initialises both colours, so this is the
+// actual returned value and not a restatement of the arithmetic.
+static_assert(ui_blend(UI_RULE_BREATHE_MAX, COL_CRIT, COL_RULE) ==
+                  (uint16_t)((21u << 11) | (17u << 5) | 7u),
+              "the breathing rule's ceiling colour is no longer (21,17,7)");
+
+// What the last step actually put on row 20, for GET /ui.
+//
+// RULE 3 OF THE UI SECTION, AND THIS FEATURE IS THE REASON IT IS A RULE. There
+// is no camera on this node, and the breathing rule is the one thing the panel
+// can show that has no other witness at all: the clock face reports its strings,
+// the card reports its body, and until these three exist the rule reports
+// nothing. It is derivable by cross-referencing GET /notify against GET /ui, but
+// that derivation is precisely the "second, parallel description that can drift"
+// the rule forbids — it would keep saying "breathing" for a critical that is
+// unread while the panel sits on the menu, which is not what the glass shows.
+//
+// So they are written from the draw path and nowhere else, the way the clock
+// caches are: whatever is here is what was last painted, or was last decided not
+// to paint. ui_rule_breathing IS the falling-edge latch as well as the report,
+// deliberately one variable and not two — the latch's question ("does row 20
+// currently carry a tint?") and the endpoint's are the same question, and two
+// variables holding one fact is how a report starts drifting from the thing it
+// reports. ui_rule_alpha and ui_rule_steps describe the animation and are
+// meaningless without it, so handle_ui() omits them when it is false rather than
+// serving the last value from a breath that has already ended.
+//
+// Written on the loop task and read from AsyncTCP, which preempts it, exactly as
+// for ui_clock_drawn and ui_card_body_id — hence the ordering at each write
+// below, and no new locking policy.
+static bool     ui_rule_breathing = false;
+static uint8_t  ui_rule_alpha = 0;
+static uint32_t ui_rule_steps = 0;
+
+static void ui_rule_tick() {
+    static unsigned long last_step = 0;
+
+    // THE STEP GATE COMES FIRST AND THE STORE IS ASKED SECOND, and that order is
+    // the point of the function's shape. notify_crit_unread() walks the queue
+    // under portENTER_CRITICAL(&notify_mux), a spinlock that disables interrupts
+    // on this core. loop() ends in delay(10), so an ungated call would take that
+    // lock on every pass — of the order of ninety times a second — against at
+    // most twelve or thirteen through the gate. The ratio is what matters here
+    // and it is about seven to one; both figures are ceilings, since a pass
+    // costs the delay plus whatever else loop() did.
+    //
+    // Unsigned subtraction, which is what this file uses everywhere the stamp is
+    // written only by the loop task, and it is correct across the millis()
+    // rollover. Deliberately NOT the signed cast the abandoned-OTA check uses:
+    // that one exists because AsyncTCP stamps ota_last_chunk_ms and can leave it
+    // newer than the reading it is subtracted from. Nothing but this function
+    // ever writes last_step.
+    if (millis() - last_step < UI_RULE_BREATHE_MS) return;
+    last_step = millis();
+
+    // ui_tick() tests ui_ready at its top; a tick called straight from loop()
+    // inherits none of that. When panel autodetect fails ui_begin() returns
+    // before setRotation(1) and before any frame is drawn, and an ungated line
+    // here would go to an uninitialised panel — which M5GFX would clip in
+    // silence, with no error and no return value to notice it by.
+    if (!ui_ready) return;
+    // Every other screen owns its own header and none of them wants this. The
+    // read needs no guarding and the screen cannot be mid-change here: ui_screen
+    // is written only by ui_goto(), only ever on the loop task, and every caller
+    // of it — ui_key_poll() and ui_tick()'s arrival handling — runs earlier in
+    // the same pass than this does. ui_goto() also raises ui_force, which
+    // bypasses the tick gate, so the repaint that follows a change has already
+    // landed by the time this line reads the result. Being last in the pass is
+    // what buys that.
+    if (ui_screen != UI_STATUS) return;
+
+    if (!notify_crit_unread()) {
+        // Put the plain rule back exactly once, on the falling edge.
+        //
+        // THE LATCH IS FOR DETERMINISM AND NOT BECAUSE IT IS LOAD-BEARING. Every
+        // true->false transition already coincides with a forced full repaint
+        // today: notify_ack_id() and notify_ack_all() both raise ui_force_net
+        // when something actually changed, the keyboard ack additionally leaves
+        // the card through ui_goto(), and eviction raises it on the POST path —
+        // while expiry cannot clear a critical at all, since notify_expire()
+        // skips unread ones by design. Without the latch the failure mode is
+        // therefore not a stuck red rule but a rule that is correct late, by up
+        // to one UI_TICK_MS. The clock's drawn-mode latch is here for the same
+        // reason and the argument is the same one: correctness should not rest
+        // on where ui_force happens to be raised today.
+        if (ui_rule_breathing) {
+            // Cleared BEFORE the draw, which is the opposite of how the clock
+            // stamps ui_clock_drawn and is right for the opposite reason: that
+            // flag promises a cache is filled and must not be believed early,
+            // this one promises row 20 carries a tint and must not be believed
+            // late. A reader arriving mid-function is told the plainer of the
+            // two states in both cases.
+            ui_rule_breathing = false;
+            M5.Display.drawFastHLine(0, UI_RULE1_Y, M5.Display.width(), COL_RULE);
+        }
+        return;
+    }
+
+    // PHASE FROM ABSOLUTE TIME, NOT FROM AN ACCUMULATED DELTA. The ramp is a
+    // function of the clock and of nothing this function remembers, so the first
+    // step never depends on a previous one — which matters, because the unread
+    // flag is persisted and restored at boot and a critical can therefore be
+    // outstanding on the very first loop() pass, with nobody having touched
+    // anything. It is also why a step the loop was too busy to take costs one
+    // frame of the breath instead of shifting the whole of it.
+    //
+    // The one consequence worth writing down: 2^32 mod 2000 is 1296, so at the
+    // millis() rollover every 49.7 days the phase jumps 1296ms and the ramp shows
+    // a single discontinuity. That is the price of the stateless form, it is
+    // gone by the next step, and it is not a bug.
+    //
+    // THE PHASE IS SAMPLED, NOT STEPPED THROUGH, and that is why the ceiling
+    // above is a ceiling rather than a value. The stamp is re-taken from
+    // millis() rather than advanced by the period, so a step costs a whole loop
+    // quantum and the real interval is the gate plus whatever the pass took —
+    // eighty-something milliseconds, not eighty. Successive cycles therefore
+    // sample the ramp at drifting offsets and no fixed set of alphas repeats.
+    unsigned long pos  = millis() % UI_RULE_BREATHE_CYCLE;
+    unsigned long half = UI_RULE_BREATHE_CYCLE / 2;
+    unsigned long up   = (pos < half) ? pos : (UI_RULE_BREATHE_CYCLE - pos);
+    uint8_t alpha = (uint8_t)(up * UI_RULE_BREATHE_MAX / half);
+    M5.Display.drawFastHLine(0, UI_RULE1_Y, M5.Display.width(),
+                             ui_blend(alpha, COL_CRIT, COL_RULE));
+
+    // AFTER the draw, and the flag last of the three, so that a reader on the
+    // other task never sees ui_rule_breathing true beside an alpha from the
+    // previous step. ui_rule_steps is what distinguishes a live ramp from a
+    // stuck one: alpha alone revisits its values twice a cycle, so two polls
+    // that agree prove nothing, whereas this only ever counts up.
+    ui_rule_alpha = alpha;
+    ui_rule_steps++;
+    ui_rule_breathing = true;
+}
+
+// ---- The body LED ----
+//
+// THE HAIRLINE ANSWERS "IS THIS SCREEN URGENT", THE LED ANSWERS "IS THERE
+// ANYTHING FOR ME", and the two are deliberately not the same signal. The rule
+// above is a screen element: it lives on UI_STATUS, it exists only while a
+// critical is unread, and it is gone the moment the panel shows anything else.
+// This one is on the body of the device. It is what answers the question from
+// across the room with the keyboard facing away, so it runs on every screen,
+// for every level, and it takes its colour from the most severe thing
+// outstanding.
+//
+// That colour is the whole reason notify_top_unread_level() finally has a
+// caller. Under a critical-only trigger it would return NOTIFY_CRIT every time
+// and the function would be an elaborate way of writing a constant.
+//
+// WHAT THE HARDWARE IS: one WS2812B-2020 on PIN_RGB_LED, GRB on the wire,
+// driven by M5Unified's M5.Led over RMT. M5.begin() already built the bus
+// object, and builds it even when panel autodetect fails, because
+// cfg.fallback_board names this board — but the RMT channel itself is created
+// lazily, by LED_Class::begin(), which every mutator calls for itself and which
+// nothing here had ever reached. ui_led_begin() below calls it outright.
+//
+// WHAT A STEP COSTS: 24 bits at 1.2us plus a 280us reset latch, about 309us on
+// the wire, transmitted by the peripheral rather than by the CPU.
+// LedBus_RMT::write() waits on the PREVIOUS frame before queueing the next, so
+// at UI_LED_BREATHE_MS apart that wait is long since satisfied and the call
+// costs only the queueing. Measured on this board: ten writes made to queue
+// behind one another take 3.28ms, i.e. 329us each — the 309us of wire time plus
+// the queueing, which is the shape the figure should have.
+//
+// WHAT IT TAKES AND DOES NOT GIVE BACK: rmt_new_tx_channel() is asked for 64
+// symbols against the ESP32-S3's 48 per block, so the channel occupies two of
+// the four RMT TX blocks for the life of the boot. A later IR skill on
+// PIN_IR_TX has two left, which is enough for it, but it is not four.
+//
+// THE SUPPLY IS THE BACKLIGHT'S, and no amount of care here works around it.
+// GPIO38 is one net doing two jobs: it enables the panel backlight and it gates
+// this LED's power. So at brightness 0 the LED is dark whatever the RMT is
+// transmitting, and brightness 0 is not an exotic state — the Backlight menu
+// row toggles straight to it, and `,` reaches it from the default 96 in three
+// presses. Below full brightness the rail is chopped by LEDC at 256Hz; at 96
+// the duty works out at 41.6%, a 2.28ms gap every 3.9ms. Only at 255 does the
+// duty go full-scale and the rail stop being chopped at all.
+//
+// WHETHER THE PART SURVIVES THE CHOPPED RAIL IS UNKNOWN AND IS NOT KNOWABLE
+// FROM IN HERE. It depends on bulk capacitance that no published schematic for
+// this board shows. The part's 280us figure is a data-line latch timeout and
+// not a supply-hold spec, so it does not answer the question either way. What
+// WAS established on this device is the firmware half: ten steady writes cost
+// 3.28ms at backlight 96, 3.29ms at 255 and 3.34ms at 0, so the RMT path
+// neither notices the rail nor stalls on it, and nothing hung, reset or
+// disturbed the panel at any of the three. Whether light comes out at 96 is a
+// question for somebody with eyes on the board.
+//
+// Hence: ui_led_supplied() qualifies every REPORT, and nothing gates the DRIVE.
+// A step transmitted into a dead rail costs 309us of a peripheral that is
+// otherwise idle, and it leaves the LED correct the instant the backlight comes
+// back — where a gated drive would owe the transition a repaint it has no other
+// reason to watch for.
+
+// The step gate, and deliberately NOT UI_RULE_BREATHE_MS. That number is the
+// panel's, chosen against a 240-pixel drawFastHLine and the notification
+// spinlock; this animation shares neither cost, and one name over two decisions
+// is how the next edit moves both by accident. 40ms is 25 steps a second, which
+// puts 50 samples in a cycle where the rule gets about 25, and holds the RMT
+// channel busy under 1% of the time. It also offers the notification store's
+// spinlock 25 takes a second against the ~90 passes loop() makes, which is the
+// same ratio argument ui_rule_tick() makes for its own gate.
+#define UI_LED_BREATHE_MS   40
+
+// The envelope's floor, in envelope units before gamma. Zero would take the LED
+// to black at the bottom of every cycle, and "there is something for you" must
+// not blink out of existence — the bottom of a breath is an ember, not a gap.
+// The sibling T-Embed firmware floors its ring at this same value for this same
+// reason. Through the curve below it comes out as 13/255 of drive.
+#define UI_LED_BREATHE_MIN  80
+
+static_assert(UI_LED_BREATHE_MIN < 255,
+              "the LED breath's floor is at or above its ceiling, so the envelope "
+              "would never move");
+
+// pow(i / 255, 2.6) * 255, rounded. A WS2812's output is close to linear in the
+// PWM value it is given and the eye is not, so a linear ramp reads as a snap to
+// full followed by a plateau. 2.6 is the exponent Adafruit's LED work settles
+// on and the one the sibling firmware's ring uses; this table was regenerated
+// rather than copied and comes out identical to it.
+//
+// Applied to the ENVELOPE and not to the product of envelope and channel, which
+// is where this differs from the sibling. Gamma-encoding the channels too would
+// pull the palette's own three colours about as it dimmed them; encoding only
+// the envelope scales all three channels by one factor, so the hue is exactly
+// the palette's at every point of the breath.
+//
+// The whole 256 entries are kept although only 80..255 are reachable while the
+// floor above stands. A table trimmed to the reachable range would have to be
+// indexed through that constant, and then moving the floor down would walk off
+// the front of it silently — 176 bytes is not worth buying that.
+static const uint8_t ui_led_gamma[256] = {
+      0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,
+      0,   0,   0,   0,   0,   0,   0,   0,   1,   1,   1,   1,   1,   1,   1,   1,
+      1,   1,   1,   1,   2,   2,   2,   2,   2,   2,   2,   2,   3,   3,   3,   3,
+      3,   3,   4,   4,   4,   4,   5,   5,   5,   5,   5,   6,   6,   6,   6,   7,
+      7,   7,   8,   8,   8,   9,   9,   9,  10,  10,  10,  11,  11,  11,  12,  12,
+     13,  13,  13,  14,  14,  15,  15,  16,  16,  17,  17,  18,  18,  19,  19,  20,
+     20,  21,  21,  22,  22,  23,  24,  24,  25,  25,  26,  27,  27,  28,  29,  29,
+     30,  31,  31,  32,  33,  34,  34,  35,  36,  37,  38,  38,  39,  40,  41,  42,
+     42,  43,  44,  45,  46,  47,  48,  49,  50,  51,  52,  53,  54,  55,  56,  57,
+     58,  59,  60,  61,  62,  63,  64,  65,  66,  68,  69,  70,  71,  72,  73,  75,
+     76,  77,  78,  80,  81,  82,  84,  85,  86,  88,  89,  90,  92,  93,  94,  96,
+     97,  99, 100, 102, 103, 105, 106, 108, 109, 111, 112, 114, 115, 117, 119, 120,
+    122, 124, 125, 127, 129, 130, 132, 134, 136, 137, 139, 141, 143, 145, 146, 148,
+    150, 152, 154, 156, 158, 160, 162, 164, 166, 168, 170, 172, 174, 176, 178, 180,
+    182, 184, 186, 188, 191, 193, 195, 197, 199, 202, 204, 206, 209, 211, 213, 215,
+    218, 220, 223, 225, 227, 230, 232, 235, 237, 240, 242, 245, 247, 250, 252, 255,
+};
+
+// Did the RMT channel come up. Written once at boot, read from AsyncTCP.
+static bool     ui_led_ready = false;
+// What the LED currently carries, and the falling-edge latch, one variable for
+// the same reason ui_rule_breathing is one: "does the part hold a colour?" is
+// both the latch's question and the endpoint's, and two variables holding one
+// fact is how a report starts drifting from the thing it reports.
+//
+// Written on the loop task and read from AsyncTCP, which preempts it — the same
+// arrangement as ui_rule_breathing and ui_clock_drawn, with the same ordering
+// at each write below and no new locking policy.
+static bool     ui_led_lit = false;
+static uint8_t  ui_led_level = NOTIFY_INFO;
+static uint8_t  ui_led_env = 0;
+static uint32_t ui_led_steps = 0;
+
+// Whether GPIO38 is actually holding the LED's supply up, which is the
+// qualification every report of this LED needs and the drive deliberately does
+// not take.
+//
+// ui_ready is in the test as well as the brightness, and it is not belt and
+// braces: when panel autodetect fails, M5GFX never attaches GPIO38 to an LEDC
+// channel at all and ui_begin() returns before it sets a brightness, so
+// ui_brightness is then a stored preference that nothing acted on. Reporting on
+// the number alone would claim a raised rail on a board whose backlight pin was
+// never driven.
+static bool ui_led_supplied() {
+    return ui_ready && ui_brightness > 0;
+}
+
+// The rail in words, and THREE STATES RATHER THAN TWO.
+//
+// ui_led_supplied() answers the question the drive path asks — is there any
+// supply at all — and that is a boolean. What a caller reading /capabilities
+// needs is finer than that, because the middle state is the one this firmware
+// cannot vouch for. Below full brightness LEDC chops the supply at 256Hz (41.6%
+// duty at the default 96, a 2.28ms gap every 3.9ms), and whether the part
+// survives that was never established — see "The body LED" for why it is not
+// establishable from in here. Only at 255 does the duty go full-scale and the
+// rail stop being chopped at all.
+//
+// Collapsing those two into "the LED can light" would report the one thing that
+// is genuinely open as though it were settled, on the endpoint whose whole job
+// is telling an agent what is true about hardware it cannot see. GET /ui can be
+// read alongside `brightness` and a caller there can work it out; /capabilities
+// carries no brightness at all, so it has to say this itself.
+static const char *ui_led_rail_state() {
+    if (!ui_led_supplied())
+        return "the LED is dark until the backlight comes up";
+    if (ui_brightness == 255)
+        return "the backlight is at full, so the supply is continuous and the "
+               "LED can light";
+    return "the backlight is dimmed, so the supply is chopped at 256Hz and "
+           "whether the LED lights through that is UNVERIFIED";
+}
+
+static void ui_led_begin() {
+    // begin() is what creates the RMT channel, and its return value is the only
+    // report of that anyone gets: every mutator calls it internally and then
+    // returns in silence when it fails. Calling it here rather than leaving the
+    // first step to do it lazily keeps channel allocation out of the animation's
+    // path and makes a failure answerable at boot instead of never.
+    ui_led_ready = M5.Led.begin();
+    if (!ui_led_ready) {
+        Serial.println("[led] RMT channel not created; the body LED is dead");
+        return;
+    }
+    // LED_Strip_Class starts at brightness 63 and its scaler is ((b+1)^2) >> 16,
+    // which at 63 is a divide by 16: the ramp would be four bits wide and would
+    // reach black well above the floor UI_LED_BREATHE_MIN sets, looking like an
+    // arithmetic error rather than a library default. 255 makes that scaler
+    // exactly 1 and is the only value that leaves an 8-bit channel 8 bits wide.
+    // THIS IS THE LIBRARY'S OWN SCALER AND NOT THE PANEL'S BRIGHTNESS — the two
+    // share a supply pin and nothing else.
+    //
+    // It also transmits a frame, because auto-display is on, and that is wanted
+    // here: LED_Strip_Class::begin() has just resized a zero-initialised colour
+    // buffer, so the frame is black and the first thing this pin carries after a
+    // boot is an explicit off rather than whatever the part powered up holding.
+    M5.Led.setBrightness(255);
+}
+
+static void ui_led_tick() {
+    static unsigned long last_step = 0;
+
+    // THE STEP GATE COMES FIRST AND THE STORE IS ASKED SECOND, for the reason
+    // ui_rule_tick() sets out above: notify_top_unread_level() walks the queue
+    // under portENTER_CRITICAL(&notify_mux), which disables interrupts on this
+    // core, and an ungated call would offer it every pass of loop() instead of
+    // roughly one pass in four — measured, 23.8 steps a second against the ~90
+    // passes delay(10) allows.
+    if (millis() - last_step < UI_LED_BREATHE_MS) return;
+    last_step = millis();
+
+    // The only guard, and the two that are absent are absent on purpose. NO
+    // ui_screen TEST: being independent of what the panel shows is the entire
+    // point of an indicator on the body. NO ui_ready TEST EITHER — that flag
+    // means the panel is drawable, and this shares no surface with the panel. It
+    // does share GPIO38, so a board whose panel never came up has a dark LED as
+    // well; that is a fact about the rail, ui_led_supplied() reports it, and
+    // gating the drive on it would buy nothing but a lag when it changed.
+    if (!ui_led_ready) return;
+
+    uint8_t top;
+    // Leaves `top` untouched on a false return, so it is read only inside the
+    // branch that got a true one.
+    if (!notify_top_unread_level(top)) {
+        // THE FALLING EDGE, AND HERE THE LATCH IS LOAD-BEARING RATHER THAN
+        // MERELY DETERMINISTIC. The rule's equivalent is a convenience: a forced
+        // repaint puts COL_RULE back anyway, so without it the rule would only
+        // be correct late. Nothing whatever clears this LED. It holds the last
+        // frame it accepted until something sends it another, and there is no
+        // fillScreen for a part on the outside of the case — so without this
+        // branch an acknowledged queue would leave the device lit until reboot.
+        if (ui_led_lit) {
+            // Cleared BEFORE the transmit, the way ui_rule_breathing is cleared
+            // before its draw and for the same reason: this flag promises the
+            // part is carrying a colour and must not be believed late.
+            ui_led_lit = false;
+            M5.Led.setAllColor(0, 0, 0);
+        }
+        return;
+    }
+
+    // THE SAME PHASE EXPRESSION AND THE SAME CYCLE CONSTANT AS ui_rule_tick(),
+    // which is the whole of what keeps the two in step. Both are pure functions
+    // of millis() and neither remembers anything across a step, so they need no
+    // shared state to stay in phase — including across the millis() rollover at
+    // 49.7 days, which they reach together and where both jump by the same
+    // 1296ms. Their step rates differ and their envelopes differ; the cycle they
+    // are sampling does not.
+    unsigned long pos  = millis() % UI_RULE_BREATHE_CYCLE;
+    unsigned long half = UI_RULE_BREATHE_CYCLE / 2;
+    unsigned long up   = (pos < half) ? pos : (UI_RULE_BREATHE_CYCLE - pos);
+    uint8_t tri = (uint8_t)(up * 255 / half);
+    uint8_t env = (uint8_t)(UI_LED_BREATHE_MIN +
+                            (255 - UI_LED_BREATHE_MIN) * (uint32_t)tri / 255);
+
+    // THE RAMP IS SCALED ON 8-BIT CHANNELS AND NOT BY BLENDING THE 565 VALUE,
+    // and that is the one place this departs from ui_rule_tick(). ui_blend()
+    // would have been one line, but what it scales is a 5/6/5 palette entry:
+    // COL_INFO's red is 10 of 31 against its blue's 28, so that channel would
+    // have had ten distinct levels across the whole ramp, and at the bottom of
+    // the breath the three round to (1,2,1) — an info notification that reads
+    // white at the ember instead of blue. Scaling the expanded channels keeps
+    // all three on the palette colour's own ray, to within the half-step per
+    // channel that 8 bits can represent at all; it is NOT exact below full
+    // envelope and nothing integer could be. m5gfx::convert_to_bgr888() is the
+    // library's own 565->888 expansion, i.e. the same three numbers
+    // setAllColor() derives from a packed value, so at env 255 this IS exact —
+    // bit-identical to handing it the uint16_t.
+    const RGBColor base = m5gfx::convert_to_bgr888(ui_level_color(top));
+    uint8_t scale = ui_led_gamma[env];
+
+    // ONE WRITE AND NOT THREE. Auto-display is on, so each setAllColor() call
+    // transmits a whole frame; the three channels have to go in one.
+    //
+    // + 127 BEFORE THE DIVIDE, which is ui_blend()'s own rounding convention and
+    // is here for its reason: truncation biases every channel up to a whole step
+    // dark, and it biases them by DIFFERENT fractions, so the ratios between
+    // them — the hue — drift as the envelope falls. COL_INFO at the floor is
+    // exactly (4.18, 7.65, 11.78); truncated that is (4, 7, 11) and rounded it
+    // is (4, 8, 12), which is the nearest representable colour on that ray. The
+    // rounding costs three additions a step and it is what lets the claim above
+    // be about the hue rather than about the arithmetic.
+    M5.Led.setAllColor((uint8_t)((base.R8() * scale + 127) / 255),
+                       (uint8_t)((base.G8() * scale + 127) / 255),
+                       (uint8_t)((base.B8() * scale + 127) / 255));
+
+    // Written after the transmit, and ui_led_lit written last of the four
+    // because that is the order a reader on the AsyncTCP task should see.
+    //
+    // NOTHING ENFORCES THAT ORDER AND THIS COMMENT USED TO CLAIM IT DID. These
+    // are four plain writes to non-volatile statics with no barrier between
+    // them; the compiler may retire them in any order it likes, and the store
+    // that publishes ui_led_lit may land before the level beside it. The bound
+    // is what makes that acceptable rather than a fence: the only pair a reader
+    // can catch mid-update is lit=true beside the previous step's level and
+    // envelope, i.e. a report at most one 40ms step stale, and only in the 40ms
+    // after a level actually changed. It is the same exposure ui_rule_breathing
+    // has and the same policy — see the UI section's one-writer rule for why the
+    // file buys this rather than locking. What must NOT be read from this is a
+    // guarantee, because there is not one.
+    //
+    // ui_led_steps is what separates a live ramp from a stuck one: the envelope
+    // revisits every value twice a cycle, so two polls that agree prove nothing
+    // on their own.
+    ui_led_level = top;
+    ui_led_env = env;
+    ui_led_steps++;
+    ui_led_lit = true;
 }
 
 // ---- The message list ----
@@ -2481,6 +4119,110 @@ static void ui_draw_card(bool force) {
     ui_card_body_id = v.id;
 
     if (fading) ui_card_fade++;
+}
+
+// ---- The clock face ----
+//
+// The whole of STATUS: HH:MM, the seconds beside it, the date under both, and
+// the two rows ui_status_row() formats. Geometry and every width are up with
+// the UI_CLOCK_* constants; nothing is measured here.
+//
+// THE BOTTOM TWO ROWS HAVE THREE MODES AND THE MODE PICKS THEIR FONT. This
+// function asks ui_status_row_mode() ONCE and hands the answer to both the font
+// it installs and the formatter that fills the rows, so the text and the face
+// it is drawn in cannot come from two different reads of a live radio. What
+// that costs and why it needs remembering is at the fillRect below.
+//
+// NOTHING ON THIS SCREEN CAN PRINT 1970. clock_local_time() returns false for
+// anything at or below TIME_VALID_EPOCH, which is the whole pre-NTP epoch, and
+// the placeholders below are what a caller sees until the first sync lands. The
+// notice goes in the date row because Font7 draws letters as blank cells.
+//
+// The clock field is drawn with NO PADDING, which is correct and not an
+// omission: "00:00" and "--:--" are both 140px in Font7, so the per-glyph
+// opaque background of whichever one is being drawn covers every pixel the
+// other one left. There is nothing outside the glyphs for a pad to erase.
+static void ui_draw_clock(bool force) {
+    char hhmm[8], ss[4], date[24], row[UI_CROW_BYTES];
+    struct tm now;
+    if (clock_local_time(now)) {
+        strftime(hhmm, sizeof(hhmm), "%H:%M", &now);
+        strftime(ss, sizeof(ss), "%S", &now);
+        strftime(date, sizeof(date), UI_DATE_FMT, &now);
+    } else {
+        snprintf(hhmm, sizeof(hhmm), "%s", UI_CLOCK_UNSYNCED);
+        snprintf(ss, sizeof(ss), "%s", UI_SEC_UNSYNCED);
+        snprintf(date, sizeof(date), "%s", UI_NTP_NOTICE);
+    }
+
+    ui_draw_field(force, ui_clock_time, sizeof(ui_clock_time), hhmm,
+                  UI_CLOCK_X, UI_CLOCK_Y, &fonts::Font7, COL_TEXT, UI_TL,
+                  0, COL_BG);
+    // The one field here that does need its pad: "00" is 28px and "--" only 16,
+    // so the wide-to-narrow step leaves 12px of the previous value behind
+    // without a side-fill to take them.
+    ui_draw_field(force, ui_clock_sec, sizeof(ui_clock_sec), ss,
+                  UI_SEC_X, UI_SEC_Y, &fonts::Font4, COL_DIM, UI_TL,
+                  UI_SEC_W, COL_BG);
+    ui_draw_field(force, ui_clock_date, sizeof(ui_clock_date), date,
+                  M5.Display.width() / 2, UI_DATE_Y, &fonts::Font4, COL_DIM,
+                  UI_TC, UI_DATE_W, COL_BG);
+
+    // ONE FONT FOR BOTH ROWS, CHOSEN ONCE FROM THE MODE. Not one choice per
+    // row: the two rows are one block and a mode that splits them across two
+    // faces would put an 8px row above a 16px one with the gap between them
+    // still sized for two 16px cells.
+    //
+    // The casts are not decoration: fonts::Font0 is a GLCDfont and fonts::Font2
+    // a BMPfont (an RLEfont is Font4, Font6, Font7 and Font8 — not this one),
+    // two unrelated concrete types, so the conditional has no common pointer
+    // type without them. ui_draw_field() takes the base IFont anyway.
+    ui_crow_mode_t mode = ui_status_row_mode();
+    const lgfx::IFont *row_font =
+        (mode == UI_CROW_AP) ? (const lgfx::IFont *)&fonts::Font0
+                             : (const lgfx::IFont *)&fonts::Font2;
+
+    // THE FONT CHANGES WITH THE MODE AND ui_draw_field() CANNOT SEE THAT.
+    // It caches on the TEXT alone and its padding erases only the CURRENT
+    // font's cell height — eight rows under Font0 where Font2 painted sixteen —
+    // so the AP mode drawing over a Font2 row repaints the top half and leaves
+    // the bottom half of the old glyphs on the glass. No clip, no error, no
+    // difference in what GET /ui reports; the only witness is the panel, and
+    // this project has no camera.
+    //
+    // ap_start() and ap_stop() both raise ui_force, so today the two edges into
+    // and out of the AP mode happen to repaint in full — but that is an
+    // incidental property of two call sites, and the connected/offline edge
+    // raises nothing whatsoever. Remembering what was drawn is what makes the
+    // screen correct wherever ui_force is or is not raised.
+    //
+    // The band is both rows at UI_F2_H, which covers the Font0 rows too, and it
+    // is exactly the span the fields themselves can paint: UI_CROW_W is asserted
+    // to be at least as wide as anything either font can put here.
+    if (mode != ui_clock_rows_drawn) {
+        M5.Display.fillRect(UI_LABEL_X, UI_CROW0_Y, UI_CROW_W, UI_CROW_BAND_H,
+                            COL_BG);
+        // Blanked, not left alone: the fillRect took the text off the glass and
+        // a cache still holding it would compare equal and decline to draw it
+        // back. No mode's rows are ever empty, so "" can never match one.
+        ui_clock_row[0][0] = '\0';
+        ui_clock_row[1][0] = '\0';
+        ui_clock_rows_drawn = mode;
+    }
+
+    for (int r = 0; r < 2; r++) {
+        // false: the panel is the password's only channel, so this is the one
+        // caller that asks for it unredacted.
+        ui_status_row(mode, r, row, sizeof(row), false);
+        ui_draw_field(force, ui_clock_row[r], sizeof(ui_clock_row[r]), row,
+                      UI_LABEL_X, r == 0 ? UI_CROW0_Y : UI_CROW1_Y,
+                      row_font, COL_TEXT, UI_TL, UI_CROW_W, COL_BG);
+    }
+    // AFTER every field, never before, exactly as ui_card_body_id is stamped.
+    // The flag is the promise that the caches hold a drawn screen, and GET /ui
+    // runs on the AsyncTCP task and preempts this one — a flag raised first
+    // would be true for a reader arriving mid-function.
+    ui_clock_drawn = true;
 }
 
 // Leave the current screen for another one. The frame is repainted from
@@ -2915,12 +4657,63 @@ static void ui_tick() {
     ui_draw_field(force, ui_cache_hdr, sizeof(ui_cache_hdr),
                   ui_screen_title[ui_screen],
                   UI_LABEL_X, UI_HDR_Y, &fonts::Font2, COL_ACCENT,
-                  UI_TL, 110, COL_BG);
+                  UI_TL, UI_HDR_TITLE_W, COL_BG);
     char buf[48];
     ui_net_summary(buf, sizeof(buf));
+    // The battery field now owns the corner, so this one is anchored a battery
+    // and a seam in from the right edge. The subtraction mirrors UI_HDR_NET_X
+    // term for term; that constant is what the seam assertions are written in,
+    // and this is the runtime twin the panel is actually drawn with.
     ui_draw_field(force, ui_cache_net, sizeof(ui_cache_net), buf,
-                  M5.Display.width() - UI_LABEL_X, UI_HDR_Y, &fonts::Font2,
-                  COL_DIM, UI_TR, 124, COL_BG);
+                  M5.Display.width() - UI_LABEL_X - UI_BAT_W - UI_HDR_SEAM,
+                  UI_HDR_Y, &fonts::Font2,
+                  COL_DIM, UI_TR, UI_HDR_NET_W, COL_BG);
+
+    // The unread badge, in the gap the two header fields leave between them.
+    // The header is on every screen, so this is the one place that says a
+    // message arrived without having to navigate to Messages for it.
+    //
+    // Not a ui_draw_field, and it cannot be one: that caches on the text, and
+    // the dot has no text. A single explicit test drives both halves, which is
+    // correct because they never disagree — the dot is lit exactly when the
+    // count is non-empty.
+    //
+    // The quantise is what makes this cheap. Everything above nine draws the
+    // same "9+", so collapsing it to one value before the comparison means a
+    // queue churning between ten and twenty unread costs no SPI at all.
+    //
+    // notify_unread_count() takes the store's spinlock, which disables
+    // interrupts on this core for the length of the walk, so the dot and the
+    // count are driven from ONE call and not one each. That is this call site
+    // only — a MENU tick still reaches the store again through ui_menu_state().
+    int unread = notify_unread_count();
+    int badge = unread > 9 ? 10 : unread;
+    // `force` and not ui_force: a forced pass has already run fillScreen, so
+    // the dot is gone from the glass whatever ui_badge_drawn still says.
+    if (force || badge != ui_badge_drawn) {
+        ui_badge_drawn = badge;
+        // Cleared by painting the same circle in the background colour, so the
+        // dot gives back exactly the pixels it took and no more. The +8 is half
+        // of Font2's 16px cell, which puts the dot on the centre line of the
+        // two strings either side of it.
+        M5.Display.fillCircle(UI_BADGE_CX, UI_HDR_Y + 8, UI_BADGE_R,
+                              badge ? COL_ACCENT : COL_BG);
+        ui_badge_text(badge, buf, sizeof(buf));
+        // Drawn straight rather than through the field cache: the test above
+        // has already decided, and a second gate keyed on the text alone would
+        // be a second answer to a question the dot's half cannot ask.
+        M5.Display.setFont(&fonts::Font2);
+        M5.Display.setTextDatum(UI_TL);
+        M5.Display.setTextColor(COL_ACCENT, COL_BG);
+        M5.Display.setTextPadding(UI_BADGE_W);
+        M5.Display.drawString(buf, UI_BADGE_X, UI_HDR_Y);
+        M5.Display.setTextPadding(0);
+    }
+
+    // The battery, in the corner the network summary gave up. On every screen,
+    // like the rest of the header, and gated on its own slow sampling clock
+    // inside.
+    ui_bat_tick(force);
 
     if (ui_screen == UI_MENU) {
         ui_menu_first = ui_window(ui_menu_index, ui_menu_first, UI_MENU_COUNT,
@@ -2968,12 +4761,13 @@ static void ui_tick() {
         ui_draw_msglist(force);
     } else if (ui_screen == UI_MESSAGE) {
         ui_draw_card(force);
+    } else if (ui_screen == UI_STATUS) {
+        ui_draw_clock(force);
     } else {
         char label[16], value[48];
         for (int row = 0; row < UI_ROWS; row++) {
             int32_t y = ui_row_y(row);
-            ui_field(ui_screen, row, label, sizeof(label), value, sizeof(value),
-                     false);
+            ui_field(ui_screen, row, label, sizeof(label), value, sizeof(value));
             ui_draw_field(force, ui_cache_label[row],
                           sizeof(ui_cache_label[row]), label,
                           UI_LABEL_X, y, &fonts::Font2, COL_DIM,
@@ -2985,10 +4779,19 @@ static void ui_tick() {
         }
     }
 
+    // An empty legend is drawn as nothing at all rather than as an empty field,
+    // because the field's padding is the erase and the clock face has its lower
+    // row in that band. Leaving ui_cache_foot holding the previous screen's
+    // legend is safe: every screen change goes through ui_goto(), which raises
+    // ui_force, and a forced pass fillScreen()s the panel and repaints this
+    // field with force=true — so a stale cache can never survive a transition
+    // into a screen that does draw a legend.
     ui_footer(ui_screen, buf, sizeof(buf));
-    ui_draw_field(force, ui_cache_foot, sizeof(ui_cache_foot), buf, UI_LABEL_X,
-                  UI_FOOT_Y, &fonts::Font0, COL_DIM, UI_TL,
-                  236, COL_BG);
+    if (buf[0] != '\0') {
+        ui_draw_field(force, ui_cache_foot, sizeof(ui_cache_foot), buf,
+                      UI_LABEL_X, UI_FOOT_Y, &fonts::Font0, COL_DIM, UI_TL,
+                      UI_FOOT_W, COL_BG);
+    }
 }
 
 // Bring up M5Unified, the panel and the keyboard. Must run before hw_probe(),
@@ -3097,7 +4900,7 @@ static void ui_begin() {
     ui_draw_frame(ui_screen);
     ui_draw_field(true, ui_cache_hdr, sizeof(ui_cache_hdr), "SEED", UI_LABEL_X,
                   UI_HDR_Y, &fonts::Font2, COL_ACCENT, UI_TL,
-                  110, COL_BG);
+                  UI_HDR_TITLE_W, COL_BG);
     ui_draw_field(true, ui_cache_value[0], sizeof(ui_cache_value[0]),
                   "starting...",
                   UI_VALUE_X, ui_row_y(0), &fonts::Font2, COL_TEXT,
@@ -3159,15 +4962,25 @@ static void handle_capabilities(AsyncWebServerRequest *request) {
     doc["flash_mhz"] = (unsigned long)(hw.flash_speed / 1000000);
     doc["has_psram"] = hw.psram_size > 0;
 
-    // Peripherals present but not driven by this firmware. Reported so an agent
-    // growing the node knows what is there and on which pins.
+    // The peripherals this board carries, and for each one whether this
+    // firmware drives it. Reported so an agent growing the node knows what is
+    // there and on which pins.
     //
     // Every pin number below is formatted from the #defines at the top of this
     // file rather than typed into the string. The pin map is meant to have one
     // source of truth; a hand-written "MOSI=35" in here is a second one that
     // goes stale in silence the day the define is corrected, and it goes stale
     // in the one endpoint an agent trusts to describe hardware it cannot see.
-    char peri[256];
+    //
+    // 384 AND NOT 256, AND THE HEADROOM IS THE POINT. snprintf() truncates
+    // without saying so, and a truncated string in this handler is a hardware
+    // description that stops mid-sentence in the one place nobody can check it
+    // against the board. `rgb_led` is the longest producer here at 305 bytes in
+    // its worst branch — it is the only entry with three substitutions, two of
+    // them whole clauses — and 256 would have cut it. The others are all under
+    // 200. Anything added below that can reach 384 needs this raised again,
+    // which is why the figure is written down rather than left to be measured.
+    char peri[384];
     snprintf(peri, sizeof(peri),
              "ST7789V2 240x135 IPS, driven via M5GFX (RST=%d,DC=%d,MOSI=%d,"
              "SCLK=%d,CS=%d,BL=%d PWM). %s; see GET /ui for what it is showing",
@@ -3198,6 +5011,63 @@ static void handle_capabilities(AsyncWebServerRequest *request) {
     doc["audio"] = peri;
     doc["ir_tx_pin"] = PIN_IR_TX;
     doc["battery_adc_pin"] = PIN_VBAT_ADC;
+    // The pin number above is kept because callers already read it; this says
+    // what is DONE with it. Its own buffer rather than `peri` because it does
+    // not fit in 384 bytes, and a fingerprint that describes the one measurement
+    // this board can make about its own power is worth the stack.
+    //
+    // The live reading comes from the draw path's own variable, so this and
+    // `battery` in GET /ui cannot disagree, and it is qualified rather than
+    // printed raw: before the first tick there is no reading and -1 is not a
+    // voltage.
+    // 832 against a worst case of 778 bytes, which is -Wformat-truncation's own
+    // arithmetic and not mine. Every guess made by eye at this buffer has been
+    // wrong — 512, then 768 twice, once for a longer draft of the string and
+    // once again after batstate grew to carry the sample count — and that
+    // warning, rather than any careful reading, caught all of them. Take the
+    // number from a build, not from counting the literal.
+    char batt[832], batstate[64];
+    int bat_mv = ui_bat_mv;
+    if (bat_mv < 0) {
+        snprintf(batstate, sizeof(batstate), "not sampled yet");
+    } else {
+        // The sample count goes out with the figure rather than being implied
+        // by it: until the ring fills this is a mean over fewer conversions
+        // than the window names, and saying so here is cheaper than a caller
+        // discovering it from a reading that moves.
+        snprintf(batstate, sizeof(batstate), "last read %d mV over %u samples",
+                 bat_mv, (unsigned)ui_bat_samples);
+    }
+    snprintf(batt, sizeof(batt),
+             "single-cell Li-ion on GPIO%d behind a 2:1 divider (M5Unified's "
+             "_adc_ratio for this board), read with the chip's factory ADC "
+             "calibration and averaged over a rolling window of up to %d "
+             "samples taken at least %d ms apart; %s. No fuel gauge and "
+             "no charger status line on this board, so charging cannot be "
+             "detected at all: above %d mV the header shows \"%s\", meaning an "
+             "external supply is proven present because a resting cell cannot "
+             "exceed its 4.2 V float; below it the header shows a percentage "
+             "from InfiniTime's published discharge curve, which is "
+             "model-dependent to within tens of points under about 3.8 V. See "
+             "`battery` in GET /ui, where the measured millivolts and the "
+             "modelled percentage are reported separately",
+             PIN_VBAT_ADC, UI_BAT_WINDOW, UI_BAT_MIN_GAP_MS, batstate,
+             UI_BAT_EXT_MV, UI_BAT_TEXT_EXT);
+    doc["battery"] = batt;
+    // The one peripheral in this list that IS driven, so it follows the
+    // `display` string's shape rather than ir_tx_pin's bare number: what it is
+    // and where, then whether it is actually up. Two separate conditions have to
+    // hold before this LED can be seen and an agent needs both — the RMT channel
+    // has to exist, and GPIO38 has to be holding the supply. Either one alone is
+    // a claim of light into a dark part.
+    snprintf(peri, sizeof(peri),
+             "WS2812B-2020 on GPIO%d (GRB), driven via M5.Led over RMT; %s. "
+             "GPIO%d gates its supply as well as the backlight — %s. Breathes "
+             "while anything is unread; see `led` in GET /ui",
+             PIN_RGB_LED,
+             ui_led_ready ? "RMT channel up" : "RMT channel NOT created",
+             PIN_TFT_BL, ui_led_rail_state());
+    doc["rgb_led"] = peri;
     // The EXT 2.54-14P header is on every ADVANCE; what is plugged into it is
     // not. Both halves of that are hardware facts an agent needs, and getting
     // either one wrong costs the same. Claiming a GNSS unconditionally puts
@@ -3445,11 +5315,18 @@ static void handle_events(AsyncWebServerRequest *request) {
 // — none of that is observable here, and this endpoint agreeing with
 // expectations is not a substitute for somebody looking at the glass.
 //
-// This handler runs on the AsyncTCP task and therefore draws NOTHING; see the
-// note at the top of the UI section. It reads word-sized scalars and calls
-// ui_field() into its own buffers, which is why there is no lock and nothing to
-// tear. It passes redact=true, so the provisioning AP's password — which lives
-// only in RAM and on the panel — does not travel the network.
+// This handler runs on the AsyncTCP task and therefore draws NOTHING, and
+// measures nothing either; see the note at the top of the UI section. It reads
+// word-sized scalars and calls the screens' formatters into its own buffers,
+// which is why there is no lock and nothing to tear. It passes redact=true to
+// ui_status_row(), so the provisioning AP's password — which lives only in RAM
+// and on the panel — does not travel the network.
+//
+// The clock face's other AP row is the auth token, and that one goes out AS IT
+// IS. require_auth() above is why: this handler answers nothing without the
+// token, so a caller reading it back off a reported row is being shown what
+// they already presented. Redacting it would hide the row's shape from the only
+// window anyone has onto this screen and protect nothing.
 static void handle_ui(AsyncWebServerRequest *request) {
     if (!require_auth(request)) return;
 
@@ -3468,13 +5345,139 @@ static void handle_ui(AsyncWebServerRequest *request) {
     doc["brightness"] = ui_brightness;
     doc["backlight"] = ui_brightness > 0;
 
-    // WHICH KEY BELOW CARRIES THIS SCREEN'S CONTENT. Four screens fill
-    // fields[]; the menu, the message list and the card have no label/value
-    // rows at all and report through "menu", "messages" and "card" instead. An
-    // empty fields[] is a true statement about those three, but only if
-    // something says where to look instead — otherwise a caller reasonably
-    // reads it as a screen that failed to describe itself.
+    // The body LED, reported beside the backlight because the backlight is what
+    // decides whether it can be seen, and reported OUTSIDE the per-screen switch
+    // below because it runs on all of them. That is the difference between it
+    // and `rule`, which is absent on every screen that does not drive it.
+    //
+    // `supplied` is the qualification the other keys need: GPIO38 gates this
+    // LED's power as well as the backlight, so `lit` says what the firmware last
+    // transmitted and `supplied` says whether that could have become light. The
+    // two are separate because the firmware can only ever know the first — see
+    // ui_led_supplied() for why the panel's readiness is in that test as well as
+    // the brightness.
+    //
+    // Written from the drive path, the way `rule` is, so these are what the LED
+    // IS rather than what an unread message implies it ought to be.
+    // The header's unread badge, REPORTED FROM THE DRAW PATH like the clock
+    // caches and not derived from the store a second time. It is on every
+    // screen, so it goes out on every screen.
+    //
+    // Serving notify_unread_count() here instead — which is what this endpoint
+    // did — was the one screen element described in parallel rather than
+    // reported, and it was wrong in three ways that all matter on a node with no
+    // camera. Between a POST landing on the AsyncTCP task and the next 200ms
+    // tick, the store says one unread and the header carries no dot. On a node
+    // where ui_ready is false the header is never painted at all, and the store
+    // count would have claimed a badge indefinitely — the case ui_clock_drawn
+    // exists to prevent for the clock. And the glass quantises everything above
+    // nine to "9+" while the store does not, so no caller could learn what the
+    // corner actually reads.
+    //
+    // `drawn` false means the header has not been painted since boot and the
+    // other keys are absent, exactly as the clock's strings are absent until
+    // ui_clock_drawn. `text` is what the glass carries, through the one
+    // producer; empty string means the count is suppressed, which is what a
+    // zero-unread header shows.
+    JsonObject badge = doc["badge"].to<JsonObject>();
+    badge["drawn"] = (ui_badge_drawn >= 0);
+    if (ui_badge_drawn >= 0) {
+        char btxt[8];
+        ui_badge_text(ui_badge_drawn, btxt, sizeof(btxt));
+        badge["dot"] = ui_badge_drawn > 0;
+        badge["text"] = btxt;
+        // The quantised value behind the string, so a caller does not have to
+        // parse "9+" to learn that the header is capped. 10 is the cap and
+        // means "more than nine", never "ten".
+        badge["capped"] = ui_badge_drawn > 9;
+    }
+
+    // The header's battery indicator, REPORTED FROM THE DRAW PATH like `badge`
+    // above and for the same reason: `text` is ui_draw_field()'s own cache, so
+    // it is the string the glass carries and cannot be a second opinion about
+    // it. On every screen, because the header is.
+    //
+    // `mv` AND `percent` ARE NOT THE SAME KIND OF THING and are separated here
+    // deliberately. `mv` is the measurement — the averaged pack voltage, the
+    // only quantity this board actually observes. `percent` is a published
+    // discharge curve applied to it, and that curve disagrees with other
+    // published curves by tens of points below about 3.8V; see the battery
+    // section for which one and why. A caller that needs a fact reads `mv`.
+    //
+    // `percent` is present only when the pack is NOT on an external supply —
+    // there is no charge level to report off a rail a charger is holding up,
+    // and inventing one is the whole failure this indicator is written around.
+    // Absent keys, not stale or fabricated ones, on the card's principle.
+    //
+    // `samples` IS THE QUALIFICATION `mv` NEEDS, and without it this object was
+    // making a promise the firmware could not keep. The window fills one sample
+    // per tick, so for the first six seconds of a boot `mv` is the mean of
+    // somewhere between 1 and 31 conversions — and a single conversion on this
+    // pad measured 194 counts wide, about 313mV at the pack, which is enough to
+    // put a resting node in the external-power state or a percentage twenty
+    // points out with nothing in the reply to distinguish it from a settled
+    // reading. A caller that cares waits for `samples` to reach the window size;
+    // GET /capabilities names that size.
+    //
+    // `drawn` true with NO `mv`, `samples`, `external` or `percent` is a real
+    // state and not an oversight: the header is painted on the first tick, and
+    // until a conversion is accepted into the ring there is no reading to
+    // describe. It is also what a node whose ADC never answers reports forever.
+    // `text` is present throughout and is the empty string in that state, which
+    // is what the glass carries.
+    //
+    // EVERY FIELD IS SNAPSHOTTED BEFORE THE FIRST JSON STORE, and that is not
+    // tidiness. Setting a key on the document can allocate, which reaches the
+    // heap mutex, which can block this handler; the loop task is lower priority
+    // but it is on this same core and it runs while this one waits. A global
+    // read twice with a setter call between the two reads — which the compiler
+    // is entitled to emit, and did — lets a sample land in the gap and change
+    // it between them. For ui_bat_ext that produced `external: true` beside a
+    // `percent`, the exact pairing the paragraph above promises is impossible.
+    // For ui_bat_drawn, which is set once and never cleared, it produced
+    // `drawn: false` beside the very keys `drawn` false is documented to
+    // exclude. One read each, into locals, before anything is written; the
+    // object code has one load per global and no call between them.
+    JsonObject battery = doc["battery"].to<JsonObject>();
+    bool drawn = ui_bat_drawn;
+    int mv = ui_bat_mv;                   // stored last by the draw path
+    bool ext = ui_bat_ext;
+    int pct = ui_bat_pct;
+    unsigned samples = ui_bat_samples;
+    battery["drawn"] = drawn;
+    if (drawn) {
+        battery["text"] = ui_cache_bat;
+        if (mv >= 0) {
+            battery["mv"] = mv;
+            battery["samples"] = samples;
+            battery["external"] = ext;
+            if (!ext) battery["percent"] = pct;
+        }
+    }
+
+    JsonObject led = doc["led"].to<JsonObject>();
+    led["ready"] = ui_led_ready;
+    led["supplied"] = ui_led_supplied();
+    led["lit"] = ui_led_lit;
+    if (ui_led_lit) {
+        // Omitted when it is not lit, the way `rule` omits its alpha and step
+        // count: all three describe a breath that is running and none of them
+        // means anything without one. `steps` is the proof that the ramp is
+        // live — `envelope` revisits its values twice a cycle, so two polls that
+        // agree establish nothing by themselves.
+        led["level"] = notify_level_name(ui_led_level);
+        led["envelope"] = ui_led_env;
+        led["steps"] = ui_led_steps;
+    }
+
+    // WHICH KEY BELOW CARRIES THIS SCREEN'S CONTENT. Three screens fill
+    // fields[]; status, the menu, the message list and the card have no
+    // label/value rows at all and report through "clock", "menu", "messages"
+    // and "card" instead. An empty fields[] is a true statement about those
+    // four, but only if something says where to look instead — otherwise a
+    // caller reasonably reads it as a screen that failed to describe itself.
     switch (ui_screen) {
+    case UI_STATUS:   doc["content"] = "clock";    break;
     case UI_MENU:     doc["content"] = "menu";     break;
     case UI_MESSAGES: doc["content"] = "messages"; break;
     case UI_MESSAGE:  doc["content"] = "card";     break;
@@ -3484,13 +5487,127 @@ static void handle_ui(AsyncWebServerRequest *request) {
     JsonArray fields = doc["fields"].to<JsonArray>();
     char label[16], value[48];
     for (int row = 0; row < UI_ROWS; row++) {
-        if (!ui_field(ui_screen, row, label, sizeof(label), value, sizeof(value),
-                      true)) {
+        if (!ui_field(ui_screen, row, label, sizeof(label), value,
+                      sizeof(value))) {
             break;
         }
         JsonObject f = fields.add<JsonObject>();
         f["label"] = label;
         f["value"] = value;
+    }
+
+    // The clock face, only while it is up, for the same reason the card object
+    // is: the caches below are what one screen last drew, and reporting them
+    // from another screen would describe a panel nobody is looking at.
+    //
+    // THE TOP THREE COME FROM THE DRAW CACHES, exactly as the card's body lines
+    // do. Re-deriving them here would call localtime_r() and strftime() from a
+    // second task and land on a different second than the panel is showing —
+    // "what is on the glass" is the whole contract of this endpoint, and a
+    // clock is the one field where a plausible-looking second answer is
+    // indistinguishable from the right one.
+    //
+    // ONLY ONCE A DRAW HAS FILLED THEM. See ui_clock_drawn: the caches are
+    // empty until the first tick paints this screen, and never filled at all on
+    // a node whose panel did not come up. Omitted rather than emptied, on the
+    // card's principle — an absent key reads as "not known yet" where an empty
+    // string reads as a blank clock — and because `synced` computed from an
+    // unwritten cache does not merely read wrong, it reads TRUE: "" is not the
+    // pre-sync placeholder, so an ungated report would claim a synced clock on
+    // a node with a dead panel and an unsynced clock. GET /clock is the
+    // endpoint that answers the time itself; this one answers the screen.
+    //
+    // THE TWO ROWS DO NOT COME FROM THE CACHE, AND CANNOT. It holds the AP
+    // password verbatim, because the panel is that password's only channel;
+    // emitting it would put the password on the network. They go back through
+    // the formatter with redact=true instead — the same route the five-row
+    // screen used, and the same one the panel takes with redact=false.
+    //
+    // That is a deliberate exception to the cache policy above and it has a
+    // price: these two are recomputed here, so on a minute boundary a
+    // time-boxed AP's countdown can come back one minute ahead of the glass,
+    // and they are reported even before the first draw, when the glass has
+    // nothing on it. Both are the cost of the password never leaving RAM, and
+    // both are visible to a caller through the absence of the fields above.
+    if (ui_screen == UI_STATUS) {
+        JsonObject clock = doc["clock"].to<JsonObject>();
+        if (ui_clock_drawn) {
+            clock["time"] = ui_clock_time;
+            clock["seconds"] = ui_clock_sec;
+            clock["date"] = ui_clock_date;
+            // Derived from what was drawn rather than from a second call into
+            // the C library, so it cannot disagree with the three strings
+            // beside it.
+            clock["synced"] = strcmp(ui_clock_time, UI_CLOCK_UNSYNCED) != 0;
+        }
+        JsonArray rows = clock["rows"].to<JsonArray>();
+        // Sized from the draw cache and not from `value` above, so that a row
+        // long enough to be cut is cut at the same place here as it is on the
+        // glass. That is no longer a hypothetical margin: the AP mode's lower
+        // row is "token " and thirty-two hex characters, 38 of the buffer's 39
+        // usable bytes, and its upper row is 36 with room for 39. A `value`-
+        // sized buffer here would cut both at a different byte from the panel
+        // and the report would quietly stop describing the screen.
+        char row[sizeof(ui_clock_row[0])];
+        // ONE READ OF THE MODE FOR BOTH ROWS, for the reason the card object
+        // below takes one read of ui_msg_id: the mode is derived from live
+        // radio state, and two reads could put row 0 from one shape beside
+        // row 1 from another — a pair that never existed on the glass.
+        //
+        // AND IT IS THE DRAWN MODE, NOT A FRESH ONE. ui_status_row_mode() reads
+        // ap_active and WiFi.status() as they are right now, which is a
+        // different question from what shape the panel is currently in. The two
+        // edges into and out of the AP mode raise ui_force and so repaint at
+        // once, but the connected/offline edge raises nothing at all — so a
+        // link that has just dropped leaves the glass carrying "signal -52 dBm"
+        // for up to one UI_TICK_MS while a freshly computed mode here would
+        // already be composing the offline rows. Reporting the drawn mode is
+        // what keeps this endpoint a report of the screen rather than a second
+        // opinion about the radio. ui_clock_rows_drawn is the same value the
+        // draw path keyed its band-clear on, so `rows` and `mode` below cannot
+        // disagree with each other or with the panel's shape.
+        //
+        // Before the first draw there is nothing drawn to report, and the live
+        // mode is the only answer available; that is the one case where these
+        // rows can lead the glass, and it is the same case the clock's strings
+        // are absent for.
+        ui_crow_mode_t mode = ui_clock_drawn
+                                  ? (ui_crow_mode_t)ui_clock_rows_drawn
+                                  : ui_status_row_mode();
+        for (int r = 0; r < 2; r++) {
+            ui_status_row(mode, r, row, sizeof(row), true);
+            rows.add(row);
+        }
+        // WHICH OF THE THREE SHAPES THOSE ROWS ARE, named. The strings alone do
+        // not say it unambiguously — the offline mode's lower row is a key hint
+        // and so is nothing else's, but a caller should not have to pattern-match
+        // prose to learn which branch the panel took, and the mode also decides
+        // the FONT the rows are drawn in, which no string here can show.
+        // Reported only once a draw has fixed it, like the strings above.
+        if (ui_clock_drawn) clock["mode"] = ui_crow_mode_name[mode];
+
+        // The hairline under the header, which on this screen is the one thing
+        // on the panel with no other witness. ONLY ON THIS SCREEN, because this
+        // is the only screen where anything drives it: elsewhere ui_rule_tick()
+        // returns at its screen guard and these would be whatever the last
+        // status visit left behind. An absent key says "nothing is driving the
+        // rule here", which is the truth, where a false would claim the tick had
+        // looked and found nothing outstanding.
+        //
+        // See ui_rule_breathing: written from the draw path, so this is what the
+        // rule IS rather than what an unread critical implies it ought to be.
+        JsonObject rule = doc["rule"].to<JsonObject>();
+        rule["breathing"] = ui_rule_breathing;
+        if (ui_rule_breathing) {
+            // The blend of the last step, 0..UI_RULE_BREATHE_MAX, and the count
+            // of steps drawn since boot. Both describe the animation and neither
+            // means anything without it, so both are omitted when it is not
+            // running rather than left to go stale. Poll twice: `steps` moving
+            // is the proof that the ramp is live and not stuck at one colour,
+            // which no single reading can establish.
+            rule["alpha"] = ui_rule_alpha;
+            rule["steps"] = ui_rule_steps;
+        }
     }
 
     // The menu goes out on every screen, not just while it is open: it is the
@@ -3514,6 +5631,13 @@ static void handle_ui(AsyncWebServerRequest *request) {
     // The message list's position, on every screen for the same reason the menu
     // is: it is retained state, and it is where the list will be when it is
     // next opened.
+    // THE QUEUE, NOT THE HEADER. `count` and `unread` come from the store and
+    // are the truth about what is queued; the `badge` object above is the truth
+    // about what the top-right corner of the glass says. They are different
+    // questions and they legitimately disagree for up to one UI_TICK_MS after a
+    // POST lands, so they are reported separately rather than one standing in
+    // for the other. `unread` used to be the only answer available, which made
+    // it look like a report of the badge and it never was.
     JsonObject msgs = doc["messages"].to<JsonObject>();
     msgs["count"] = notify_count();
     msgs["unread"] = notify_unread_count();
@@ -3999,13 +6123,32 @@ static void handle_skill(AsyncWebServerRequest *request) {
     s += "  labels G13 UART_RX and G15 UART_TX from the accessory's side, so reading it\n";
     s += "  as an ESP32-side name gives a UART wired backwards. M5Stack's own Cap\n";
     s += "  LoRa-1262 example opens it as `Serial1.begin(115200, SERIAL_8N1, 15, 13)`\n";
-    s += "- GPIO16,17,18,21 are not on the safe list either, and not because they are\n";
+    s += "- GPIO16,17,18 are not on the safe list either, and not because they are\n";
     s += "  known to be taken: M5Stack's pinmap simply does not mention them, while the\n";
     s += "  board has a microphone and an NS4150B amplifier documented on no pins at all\n";
+    s += "- GPIO21 is the on-body RGB LED (one WS2812B-2020, GRB) and this firmware\n";
+    s += "  DRIVES it, through M5Unified's M5.Led over RMT. It breathes while anything\n";
+    s += "  is unread, in the colour of the most severe unread level, on every screen —\n";
+    s += "  `led` in GET /ui reports what it is doing and `rgb_led` in /capabilities\n";
+    s += "  reports whether it is up. The channel holds two of the ESP32-S3's four RMT\n";
+    s += "  TX blocks for the life of the boot. POST /gpio/write refuses the pin\n";
+    s += "- GPIO10 is the battery sense divider (2:1) and this firmware READS it, about\n";
+    s += "  five times a second, to drive the header's battery indicator — `battery` in\n";
+    s += "  GET /ui and in /capabilities. POST /gpio/write, POST /gpio/mode and\n";
+    s += "  POST /serial/open all refuse this pin, because pinMode() detaches the pad\n";
+    s += "  and Arduino's ADC teardown deletes the whole ADC1 oneshot unit and its\n";
+    s += "  calibration once the last ADC1 channel goes, which this pin normally is —\n";
+    s += "  and the HTTP task preempts the loop, so that can land inside a conversion.\n";
+    s += "  GET /gpio/adc?pin=10 is NOT refused and shares the same handle, but the\n";
+    s += "  voltage it reports is uncalibrated and reads low; use `battery` for the\n";
+    s += "  real figure. There is no fuel gauge and no charger status line on this\n";
+    s += "  board, so no endpoint here reports whether it is charging — nothing can\n";
     s += "- GPIO38 is the display backlight and also gates the RGB LED supply. It is\n";
     s += "  not a plain output here: M5GFX attaches it to an LEDC channel and dims it,\n";
     s += "  so the backlight is the brightness value in GET /ui rather than a pin\n";
-    s += "  level. A brightness of 0 also cuts the RGB LED's supply\n";
+    s += "  level. A brightness of 0 also cuts the RGB LED's supply, so a dark panel\n";
+    s += "  is a dark LED whatever the RMT is transmitting — which is why every report\n";
+    s += "  of the LED carries the state of the rail beside it\n";
     s += "- The mainboard I2C bus (SDA=8/SCL=9) carries exactly three devices: TCA8418\n";
     s += "  keyboard controller 0x34, ES8311 codec 0x18, BMI270 IMU 0x69. Anything else\n";
     s += "  in /capabilities' i2c_devices came from a cap or the Grove port. Entries\n";
@@ -4059,15 +6202,47 @@ static void handle_skill(AsyncWebServerRequest *request) {
     s += "dark / lit).\n\n";
     s += "A notification arriving while the node sits on its status screen raises\n";
     s += "its own card, fading in over three 40ms frames. It does NOT interrupt any\n";
-    s += "other screen — the unread count in the menu is how it gets noticed then.\n\n";
+    s += "other screen, and it does not have to: the header carries an unread\n";
+    s += "BADGE — a dot and a count in the top-right gap, on every screen — so an\n";
+    s += "arrival is visible without navigating anywhere. The count is capped at\n";
+    s += "`9+`. GET /ui reports it as `badge`, from the draw path, so `badge.text`\n";
+    s += "is what the corner of the glass says and `messages.unread` is what the\n";
+    s += "queue holds; they differ for up to one tick after a POST lands, and on a\n";
+    s += "node whose panel never came up `badge.drawn` is false while the queue\n";
+    s += "count is not. The RGB LED on the case is the other annunciator, and it\n";
+    s += "needs no screen at all.\n\n";
     s += "You cannot see this screen. GET /ui answers what is on it: the active\n";
     s += "screen, the backlight level, whether the panel came up, whether M5\n";
     s += "identified the board, and the last key the firmware saw. Its `content`\n";
     s += "field names where that screen's content is reported, because not every\n";
-    s += "screen has rows: four fill `fields[]`, the menu fills `menu` (entries,\n";
-    s += "selection and window offset, since it scrolls), the message list fills\n";
-    s += "`messages` (count, unread, selection and window), and the card fills\n";
-    s += "`card`. An empty `fields[]` on those three is correct, not a failure.\n\n";
+    s += "screen has rows: three fill `fields[]`, status fills `clock`, the menu\n";
+    s += "fills `menu` (entries, selection and window offset, since it scrolls),\n";
+    s += "the message list fills `messages` (count, unread, selection and window),\n";
+    s += "and the card fills `card`. An empty `fields[]` on those four is correct,\n";
+    s += "not a failure.\n\n";
+    s += "Status is a clock face, not a table: a large HH:MM, the seconds beside\n";
+    s += "it, the date under both, and two rows for how the node is reached. It\n";
+    s += "has no key legend along the bottom — the stack needs the room — but ENT\n";
+    s += "still opens the menu and `,` / `/` still change the brightness — and\n";
+    s += "the lower row says exactly that while the node is offline and has\n";
+    s += "nothing better to report. `clock`\n";
+    s += "reports `time`, `seconds` and `date` as the panel drew them, plus\n";
+    s += "`synced` — false until the first NTP sync, when the face reads `--:--`\n";
+    s += "and the date row says so. Those four are ABSENT until a draw has\n";
+    s += "actually filled them: for the first tick after boot, and for the whole\n";
+    s += "boot on a node whose panel did not come up. Absent means the screen is\n";
+    s += "not known, not that it is blank; GET /clock answers the time itself.\n";
+    s += "`rows` is always present and is recomputed per request rather than\n";
+    s += "read back from the panel, because one of its three shapes carries the\n";
+    s += "setup AP's password and that has to be redacted here. The shapes are\n";
+    s += "mutually exclusive. AP up: the SSID, how long the session has left and\n";
+    s += "the password — REDACTED, it exists on the panel and nowhere else —\n";
+    s += "then the auth token, which is NOT redacted, because this endpoint\n";
+    s += "already required it and there is nothing left to leak. On the network:\n";
+    s += "signal strength, then the mDNS name and port. Offline: says so, then\n";
+    s += "the key hint. The AP shape is tested FIRST and both it and the link\n";
+    s += "can be true at once, so a node with a live AP reports credentials and\n";
+    s += "not signal strength.\n\n";
     s += "The card reports its subject by id, plus `body1` and `body2` — THE TWO\n";
     s += "LINES THE PANEL ACTUALLY WRAPPED, not the raw body. A body is 96\n";
     s += "characters and the report buffers are 48, so the raw string would be cut\n";
@@ -4077,6 +6252,24 @@ static void handle_skill(AsyncWebServerRequest *request) {
     s += "It reports content, not pixels — it says nothing about layout or\n";
     s += "legibility, and the AP password is redacted there even though it is on\n";
     s += "the screen.\n\n";
+    s += "`led` is the one key there that is not about the panel at all: it is the\n";
+    s += "RGB LED on the body of the case, which breathes while anything is unread\n";
+    s += "in the colour of the most severe unread level, on EVERY screen. `lit` is\n";
+    s += "what the firmware last transmitted to it and `supplied` is whether GPIO38\n";
+    s += "was holding its power up at the time, which is the only honest way to\n";
+    s += "read `lit` — the two are separate because a dark backlight means a dark\n";
+    s += "LED and no code here can tell that a colour became light. `level`,\n";
+    s += "`envelope` and `steps` describe the breath and are absent when it is not\n";
+    s += "running. `envelope` is where the ramp is, 80 at the floor to 255 at the\n";
+    s += "top, BEFORE the gamma curve that turns it into drive. It is linear in the\n";
+    s += "same triangle the status screen's `rule.alpha` samples, but the two are\n";
+    s += "on different scales and different step gates, so they compare through a\n";
+    s += "formula rather than side by side: `rule.alpha`/160 and\n";
+    s += "(`led.envelope`-80)/175 are the same fraction of the same ramp, to within\n";
+    s += "the 80ms the slower gate can be stale by. `steps` only counts up, so it\n";
+    s += "is what\n";
+    s += "distinguishes a live ramp from one stuck at a value the envelope happens\n";
+    s += "to revisit twice a cycle.\n\n";
     s += "The display is written only from loop(). If you add a handler, it may READ\n";
     s += "UI state and must never draw: handlers run on the AsyncTCP task and will\n";
     s += "preempt a half-finished paint, corrupting M5GFX's font/datum/SPI state.\n\n";
@@ -4222,8 +6415,10 @@ static void handle_wifi_post(AsyncWebServerRequest *request) {
 // above without a header to keep in step with them.
 //
 // Order is load-bearing between these two. serial.cpp calls gpio_pin_exists()
-// and gpio_refuse_reason() from gpio.cpp, so that it validates UART pins
-// against exactly the list POST /gpio/write refuses.
+// and gpio_reject_if_undrivable() from gpio.cpp, so that it validates UART pins
+// against exactly the list POST /gpio/write refuses — which is the union of the
+// all-operations refusals and the drive-only ones, a UART holding a pad being
+// no gentler than digitalWrite().
 #include "skills/gpio.cpp"
 #include "skills/serial.cpp"
 
@@ -4286,6 +6481,13 @@ void setup() {
     // and it is the seed's only I2C owner. See the ownership note above
     // hw_probe() for what happens to a second one.
     ui_begin();
+    // After ui_begin() because M5.begin() is what constructs the LED instance,
+    // and outside it because this is not the panel: ui_begin() returns early
+    // when autodetect leaves nothing to draw on, and the body LED's channel does
+    // not depend on there being a panel. It does depend on GPIO38, which the
+    // panel raises — but that decides whether the LED lights, not whether the
+    // RMT channel can be created, and the two are reported separately.
+    ui_led_begin();
     hw_probe();       // I2C scan, through M5's bus
     tz_load();        // before wifi_setup(): configTzTime() needs the TZ string
     wifi_setup();     // RF up first; also raises the setup AP if STA fails
@@ -4472,11 +6674,36 @@ void loop() {
     // latency owes nothing to this placement.
     notify_poll();
 
-    // The keyboard and the screen, in that order and only from here. Every
-    // HTTP handler runs on the AsyncTCP task and must never draw; see the note
-    // at the top of the UI section for what a second writer does to M5GFX.
+    // The keyboard and the screen, in that order and only from here. TWO
+    // FUNCTIONS DRAW AND NOT ONE: ui_tick() paints the frame and every field,
+    // and ui_rule_tick() repaints a single line of that frame on a faster gate
+    // of its own. Both run on the loop task, so the one-writer rule the UI
+    // section opens with still holds — every HTTP handler runs on the AsyncTCP
+    // task and must never draw; see that note for what a second writer does to
+    // M5GFX.
     ui_key_poll();
     ui_tick();
+    // AFTER ui_tick() AND NEVER BEFORE IT. A forced pass on the same loop() pass
+    // runs fillScreen and would paint over a step taken above it, leaving the
+    // rule flat until the next step, which is 80ms away at the very soonest.
+    // Being last is also what lets it read ui_screen without a race; see there.
+    //
+    // Its own gate rather than a home inside ui_tick(): an 80ms breath from in
+    // there would mean dropping the global tick interval to 80ms, which runs
+    // strftime, getFreeHeap and the notification spinlock two and a half times
+    // more often on every screen, for one line on one of them.
+    ui_rule_tick();
+    // AFTER ui_rule_tick(), and adjacent to it rather than anywhere else in this
+    // function, so that both takes of the notification store's spinlock sit in
+    // one place and can be reasoned about together.
+    //
+    // It inherits NONE of the ordering constraint above. That one is about the
+    // framebuffer — a forced repaint painting over a step — and this drives a
+    // part on the outside of the case that shares no surface with the panel. It
+    // would be correct first, or between the two; it is here because the two
+    // ticks answer the same question of the same store and reading them apart
+    // would be worse than reading them together.
+    ui_led_tick();
 
     delay(10);
 }

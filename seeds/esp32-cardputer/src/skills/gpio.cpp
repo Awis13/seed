@@ -81,9 +81,26 @@ static bool gpio_is_panel(int pin) {
             pin == PIN_TFT_SCLK || pin == PIN_TFT_CS);
 }
 
-/* Backlight. Not a plain output: M5GFX attaches it to LEDC channel 7 and dims
+/* Backlight. Not a plain output: M5GFX attaches it to an LEDC channel and dims
  * it, so the PWM peripheral drives the pad and digitalWrite() fights it rather
- * than setting a level. It also gates the RGB LED's supply. */
+ * than setting a level. It also gates the RGB LED's supply.
+ *
+ * WHICH LEDC CHANNEL IS NOT 7, AND IS NOT DECIDED AT COMPILE TIME. Every line
+ * in this file used to say 7, taken from the `pwm_channel` field of M5GFX's
+ * Light_PWM config — but that field is read only on the library's bare-IDF
+ * path. Under Arduino 3.x, which is what platformio.ini pins this seed to,
+ * Light_PWM::init() takes its LEDC_USE_IDF_V5 branch and calls
+ * ledcAttach(pin, freq, bits), which does not take a channel argument at all:
+ * it allocates `~used & (used + 1)`, the lowest free channel. The backlight is
+ * the first and only LEDC attach in this firmware, so on this build it lands on
+ * channel 0.
+ *
+ * The number is not what matters and is deliberately not restated anywhere an
+ * agent reads. What matters is that "7 is taken" was the one claim here that
+ * could actively cause harm: an agent that believed it would attach its own
+ * PWM to channel 0, take the pad from the backlight and put out the panel and
+ * the RGB LED together — the same silent re-mux this skill refuses GPIO21 to
+ * prevent. Do not assume any channel is free; ask ledcAttach() for one. */
 static bool gpio_is_backlight(int pin) {
     return (pin == PIN_TFT_BL);
 }
@@ -118,15 +135,19 @@ static bool gpio_is_ir(int pin) {
     return (pin == PIN_IR_TX);
 }
 
-/* RGB LED data line.
+/* RGB LED data line, and DRIVEN.
  *
  * A known assignment, not an unknown one: M5Unified's board table maps
- * board_M5CardputerADV to GPIO21 and _setup_led() runs on every begin(). It
- * only *configures* the LED — it builds an RMT bus object and stores the pin —
- * and the RMT peripheral is not started until M5.Led.begin(), which this
- * firmware never calls, with cfg.led_brightness defaulting to 0. So the pin is
- * idle at runtime. Idle is not free, though: anything that later lights the LED
- * takes it back, so it stays off the safe list and warns. */
+ * board_M5CardputerADV to GPIO21 and _setup_led() runs on every begin(). That
+ * only builds the bus object; the RMT channel is created by the first mutator
+ * call, and ui_led_begin() in main.cpp makes it at boot. M5.Led has held a live
+ * RMT TX channel on this pad ever since, so the pin is not idle and this is no
+ * longer a warning — see gpio_refuse_reason() for why it is a refusal.
+ *
+ * An earlier revision of this comment also justified the idle pin by
+ * cfg.led_brightness defaulting to 0. That field is unrelated: M5Unified
+ * declares it "system LED brightness ... (not RGBcolorLED)" and uses it only in
+ * M5.Power.setLed(), the monochrome power LED. */
 static bool gpio_is_led(int pin) {
     return (pin == PIN_RGB_LED);
 }
@@ -198,15 +219,15 @@ static const char *gpio_warning(int pin) {
     if (gpio_is_i2c(pin))       return "live I2C bus (keyboard controller, audio codec, IMU)";
     if (gpio_is_kbd(pin))       return "TCA8418 interrupt output — the controller drives this line";
     if (gpio_is_panel(pin))     return "ST7789 panel SPI bus, driven from loop()";
-    if (gpio_is_backlight(pin)) return "backlight on LEDC channel 7, and the RGB LED supply gate";
+    if (gpio_is_backlight(pin)) return "backlight on an LEDC channel chosen at runtime, and the RGB LED supply gate";
     if (gpio_is_ext(pin))       return (pin == 3)
         ? "EXT 2.54-14P header (SPI/UART fan-out, shared with microSD); also an S3 strapping pin (JTAG source select) — may affect boot"
         : "EXT 2.54-14P header (SPI/UART fan-out, shared with microSD)";
     if (gpio_is_sd(pin))        return "microSD chip select";
     if (gpio_is_audio(pin))     return "ES8311 audio codec (I2S) — configured, not started";
     if (gpio_is_ir(pin))        return "IR transmitter";
-    if (gpio_is_led(pin))       return "RGB LED data line — configured by M5Unified, RMT not started";
-    if (gpio_is_vbat(pin))      return "battery sense divider";
+    if (gpio_is_led(pin))       return "RGB LED data line — M5.Led holds a live RMT TX channel on it";
+    if (gpio_is_vbat(pin))      return "battery sense divider, sampled by the header's battery indicator through the same ADC handle — readable, but write and mode are refused";
     if (gpio_is_strapping(pin)) return "strapping pin or module-internal line — may affect boot";
     if (gpio_is_unclassified(pin)) return "unclassified — no published assignment, treat as taken";
     return NULL;
@@ -237,7 +258,7 @@ static const char *gpio_class(int pin) {
  *
  * The test for membership is not "is this pin important" — most of the board is
  * important — but "does driving it break something that cannot be put back over
- * the same HTTP connection that broke it". Five groups pass that test:
+ * the same HTTP connection that broke it". Six groups pass that test:
  *
  *   19,20  native USB. Ends the console session, and with it the way back in if
  *          WiFi ever drops. Nothing over HTTP can undo it.
@@ -251,9 +272,19 @@ static const char *gpio_class(int pin) {
  *   33-37  the ST7789's SPI bus. M5GFX is mid-transaction on the loop() task
  *          whenever the panel repaints, and handlers run on the AsyncTCP task,
  *          so there is no moment at which this is merely rude.
- *   38     the backlight, on LEDC channel 7. digitalWrite() here does not set a
+ *   38     the backlight, on an LEDC channel. digitalWrite() here does not set a
  *          level, it fights the PWM peripheral for the pad — and the same pin
  *          gates the RGB LED supply, so the failure is a dark screen.
+ *   21     the RGB LED, which M5.Led drives over RMT. This one is refused
+ *          because of HOW it fails rather than how badly: pinMode() registers
+ *          the pad through Arduino's peripheral manager, M5Unified took the
+ *          channel through the raw IDF API and is not registered there, so no
+ *          previous owner is found, no detach handler runs and nothing returns
+ *          an error. The call answers 200, the pad leaves the RMT matrix, and
+ *          the indicator on the outside of the case goes dark and stays dark —
+ *          there is no HTTP path that re-creates the channel, because
+ *          LED_Class::begin() will not run a second time. A 200 followed by a
+ *          silently dead peripheral is the worst answer this skill can give.
  *
  * Everything else warns and proceeds. In particular the EXT header (3,4,5,6,13,
  * 14,15,39,40) is NOT refused: the mainboard has nothing behind those pins, and
@@ -275,13 +306,54 @@ static const char *gpio_refuse_reason(int pin) {
     if (gpio_is_panel(pin))
         return "GPIO33-37 are the ST7789 SPI bus — the panel driver is mid-transaction on another task";
     if (gpio_is_backlight(pin))
-        return "GPIO38 is the backlight on LEDC channel 7 and the RGB LED supply gate — a pin level cannot win against the PWM peripheral";
+        return "GPIO38 is the backlight (an LEDC channel) and the RGB LED supply gate — a pin level cannot win against the PWM peripheral";
+    if (gpio_is_led(pin))
+        return "GPIO21 is the RGB LED, driven over RMT by M5.Led — pinMode() would take the pad silently and the indicator would not come back without a reboot";
+    return NULL;
+}
+
+/* Pins that must never be DRIVEN but that the ADC endpoint may still read.
+ *
+ * A separate list because gpio_refuse_reason() above is enforced on /gpio/adc
+ * as well, and for GPIO10 that would be exactly backwards: reading it is what
+ * this firmware itself does, five times a second, and the read is safe for the
+ * same reason the write is not.
+ *
+ * analogRead() and analogReadMilliVolts() ATTACH the pad to Arduino's ADC
+ * oneshot bus, or find it already attached and reuse the handle. pinMode() takes
+ * the pad the other way, and Arduino's peripheral manager runs the previous
+ * bus's deinit on the way out — for ESP32_BUS_TYPE_ADC_ONESHOT that is
+ * adcDetachBus() in esp32-hal-adc.c, which counts the ADC1 channels still
+ * attached and, when the count reaches one, calls adc_oneshot_del_unit() and
+ * adc_cali_delete_scheme_curve_fitting() and NULLs both handles. One is the
+ * ordinary count here: GPIO10 is the only ADC1 pin anything keeps attached.
+ *
+ * So a POST landing on the web server task while loop() is inside
+ * adc_oneshot_read() frees the unit under it. NOT from a second core, and the
+ * distinction matters only because someone checking this claim against the
+ * build flags would find it false and might then conclude there is no race at
+ * all: AsyncTCP is pinned to core 1 and the Arduino loop task runs there too,
+ * so what happens is a PREEMPTION, priority 10 over priority 1, exactly as the
+ * UI section's one-writer rule describes for the panel. For a delete landing
+ * inside a read that is no safer than a second core would be — Espressif
+ * document adc_oneshot_del_unit() as not thread-safe and say concurrent use
+ * breaks the read APIs. Even without the race it drives a push-pull output into
+ * the divider node and leaves the next tick to re-attach the pad and average the
+ * result into the window — where, because the window is a mean over six seconds,
+ * one bad sample is a sustained wrong reading rather than one wrong frame.
+ *
+ * This is the GPIO21 refusal's argument applied to a pin that had not acquired
+ * an owner yet when that one was written. It has one now: the header's battery
+ * indicator. */
+static const char *gpio_refuse_drive_reason(int pin) {
+    if (gpio_is_vbat(pin))
+        return "GPIO10 is the battery sense divider and the header samples it through Arduino's ADC driver — pinMode() detaches that bus, which deletes the oneshot unit and the calibration scheme while loop() may be mid-conversion, and drives the pad into the divider. Read it with GET /gpio/adc, which shares the driver rather than taking it";
     return NULL;
 }
 
 /* Sends the 403 for a refused pin. Returns true if the request was answered. */
-static bool gpio_reject_if_refused(AsyncWebServerRequest *req, int pin) {
-    const char *refused = gpio_refuse_reason(pin);
+static bool gpio_send_refusal(AsyncWebServerRequest *req, int pin,
+                              const char *refused) {
     if (!refused) return false;
     JsonDocument err;
     err["error"] = refused;
@@ -291,6 +363,20 @@ static bool gpio_reject_if_refused(AsyncWebServerRequest *req, int pin) {
     serializeJson(err, out);
     req->send(403, "application/json", out);
     return true;
+}
+
+/* The gate for reads. Only the pins that no operation may touch. */
+static bool gpio_reject_if_refused(AsyncWebServerRequest *req, int pin) {
+    return gpio_send_refusal(req, pin, gpio_refuse_reason(pin));
+}
+
+/* The gate for anything that takes the pad: /gpio/write, /gpio/mode, and
+ * /serial/open's tx and rx — a UART drives a pin as hard as digitalWrite()
+ * does, which is why that skill has always shared this gate. */
+static bool gpio_reject_if_undrivable(AsyncWebServerRequest *req, int pin) {
+    const char *refused = gpio_refuse_reason(pin);
+    if (!refused) refused = gpio_refuse_drive_reason(pin);
+    return gpio_send_refusal(req, pin, refused);
 }
 
 /* --- Endpoints --- */
@@ -330,10 +416,32 @@ static const char *gpio_describe() {
            "- `i2c` (8,9): the live 400 kHz bus — keyboard, codec, IMU\n"
            "- `keyboard` (11): the TCA8418's interrupt output, driven by the controller\n"
            "- `panel` (33-37): ST7789 SPI, in use from loop() while you call this\n"
-           "- `backlight` (38): LEDC channel 7, and the RGB LED supply gate\n\n"
+           "- `backlight` (38): an LEDC channel, and the RGB LED supply gate.\n"
+           "  The channel number is allocated by `ledcAttach()` at panel init and\n"
+           "  is not fixed: do not assume any channel is free, ask for one\n"
+           "- `led` (21): the on-body RGB LED, driven over RMT by `M5.Led`.\n"
+           "  Refused for how quietly it would fail rather than for how badly:\n"
+           "  `pinMode()` registers the pad through Arduino's peripheral manager,\n"
+           "  M5Unified took the RMT channel through the raw IDF API and is not\n"
+           "  registered there, so nothing detaches and nothing errors. You would\n"
+           "  get a 200 and a dead indicator until the next reboot\n\n"
            "The adc half of that is deliberate: `analogRead()` switches the pad to\n"
            "the ADC function and detaches whatever peripheral held it, so leaving\n"
            "it ungated would be a way straight through the gate.\n\n"
+           "### Refused with 403 on write and mode ONLY — adc still works\n\n"
+           "- `vbat` (10): the battery sense divider, and the header's battery\n"
+           "  indicator samples it about five times a second through Arduino's ADC\n"
+           "  driver. `pinMode()` detaches that bus, and Arduino's `adcDetachBus()`\n"
+           "  deletes the ADC1 oneshot unit and the calibration scheme outright\n"
+           "  once the last ADC1 channel goes — which this pin normally is. That\n"
+           "  frees the unit while `loop()` may be inside a conversion, and drives\n"
+           "  a push-pull output into the divider. `GET /gpio/adc?pin=10` is not\n"
+           "  refused and never will be: it shares the same driver and the same\n"
+           "  handle the firmware is already using, so the two do not contend.\n"
+           "  `/serial/open` refuses it on tx and rx for the same reason a write\n"
+           "  is refused\n\n"
+           "`/gpio/list` distinguishes the two lists: `refused` is true for both,\n"
+           "and `adc_refused` says whether the analog endpoint is closed as well.\n\n"
            "### Allowed, but warned — `class` in /gpio/list says which\n\n"
            "- `ext_header` (3,4,5,6,13,14,15,39,40): the EXT 2.54-14P header's SPI\n"
            "  and UART fan-out, shared with the microSD bus. Nothing of the\n"
@@ -342,10 +450,6 @@ static const char *gpio_describe() {
            "- `sdcard` (12): microSD chip select\n"
            "- `audio` (41,42,43,46): ES8311 codec, configured but never started\n"
            "- `ir` (44): IR transmitter\n"
-           "- `led` (21): RGB LED data. M5Unified configures it on every begin();\n"
-           "  the RMT peripheral is only started by `M5.Led.begin()`, which this\n"
-           "  firmware does not call\n"
-           "- `vbat` (10): battery sense divider\n"
            "- `strapping` (0,45): may affect boot. GPIO3 and GPIO46 are strapping\n"
            "  pins too, but they carry a more actionable class here and report as\n"
            "  `ext_header` and `audio`; GPIO3's warning carries the strapping note\n"
@@ -395,7 +499,18 @@ static void gpio_register_routes(AsyncWebServer &server) {
 
             /* safe = on the allowlist in main.cpp, nothing else */
             obj["safe"] = gpio_is_safe(pin);
-            if (gpio_refuse_reason(pin)) obj["refused"] = true;
+            /* `refused` means write and mode are refused. `adc_refused`
+               qualifies it, because the two lists are no longer the same: the
+               battery divider is refused for drive and readable through
+               /gpio/adc, and reporting only the first would tell an agent the
+               pin is unreachable when the endpoint it wants still works. */
+            if (gpio_refuse_reason(pin)) {
+                obj["refused"] = true;
+                obj["adc_refused"] = true;
+            } else if (gpio_refuse_drive_reason(pin)) {
+                obj["refused"] = true;
+                obj["adc_refused"] = false;
+            }
         }
 
         String response;
@@ -463,7 +578,7 @@ static void gpio_register_routes(AsyncWebServer &server) {
             req->send(400, "application/json", "{\"error\":\"invalid pin number\"}");
             return;
         }
-        if (gpio_reject_if_refused(req, pin)) return;
+        if (gpio_reject_if_undrivable(req, pin)) return;
 
         if (value != 0 && value != 1) {
             req->send(400, "application/json", "{\"error\":\"value must be 0 or 1\"}");
@@ -530,7 +645,7 @@ static void gpio_register_routes(AsyncWebServer &server) {
             req->send(400, "application/json", "{\"error\":\"invalid pin number\"}");
             return;
         }
-        if (gpio_reject_if_refused(req, pin)) return;
+        if (gpio_reject_if_undrivable(req, pin)) return;
 
         int arduino_mode;
         uint8_t track_mode;
@@ -585,8 +700,11 @@ static void gpio_register_routes(AsyncWebServer &server) {
             return;
         }
 
-        /* analogRead() re-muxes the pad to the ADC, so the refusal gate applies
-           here exactly as it does to write and mode. */
+        /* analogRead() re-muxes the pad to the ADC, so the all-operations gate
+           applies here exactly as it does to write and mode. The DRIVE-only
+           gate deliberately does not: its one member is the battery divider,
+           where reading is what the firmware itself does and taking the pad is
+           the only harmful direction. See gpio_refuse_drive_reason(). */
         if (gpio_reject_if_refused(req, pin)) return;
 
         if (!gpio_is_adc1(pin) && !gpio_is_adc2(pin)) {
@@ -631,6 +749,25 @@ static void gpio_register_routes(AsyncWebServer &server) {
         if (gpio_is_adc2(pin))
             doc["note"] = "ADC2 — readable because the radio is currently down; "
                           "this pin is refused whenever WiFi is up";
+        /* The one pin whose number here is routinely mistaken for something it
+           is not. `voltage` above is raw/4095*3.3 on every pin, which ignores
+           the chip's factory ADC calibration, and this pin sits behind a 2:1
+           divider — so it is neither calibrated nor half the pack. Doubling it
+           does not give the pack voltage and is not close: measured on this
+           node against the calibrated figure from the same pad, the doubled
+           number runs 0.12..0.35 V LOW, which is enough to put a charging node
+           on the wrong side of the external-supply threshold every time.
+           /capabilities and `battery` in GET /ui carry the calibrated reading.
+
+           Both of those are READS of one pad through one ADC handle, so neither
+           disturbs the other. That symmetry does not extend to writes, which is
+           why this pin is refused on write and mode — see
+           gpio_refuse_drive_reason(). */
+        else if (gpio_is_vbat(pin))
+            doc["note"] = "battery sense — the divider's midpoint WITHOUT the "
+                          "chip's ADC calibration, and it reads low: doubling "
+                          "this does not give the pack voltage. `battery` in "
+                          "GET /ui carries the calibrated figure";
 
         String response;
         serializeJson(doc, response);

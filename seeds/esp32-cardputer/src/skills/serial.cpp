@@ -140,8 +140,8 @@ static const char *serial_describe() {
            "back in. An open call without both pins is refused, not defaulted.\n\n"
            "Pins are also checked against the gpio skill's refusal list, so a UART\n"
            "cannot be routed onto the I2C bus (8,9), the keyboard controller's\n"
-           "interrupt (11), the panel bus (33-37), the backlight (38) or USB\n"
-           "(19,20). `GET /gpio/list` shows which pins those are.\n\n"
+           "interrupt (11), the RGB LED (21), the panel bus (33-37), the backlight\n"
+           "(38) or USB (19,20). `GET /gpio/list` shows which pins those are.\n\n"
            "### UARTs\n\n"
            "- UART1 and UART2 are available. Both are unclaimed peripherals here:\n"
            "  the console is USB-CDC, not a UART\n"
@@ -310,8 +310,8 @@ static void serial_register_routes(AsyncWebServer &server) {
         /* The same gate POST /gpio/write applies. A UART drives its tx pin as
            hard as a digitalWrite() does, so anything refused there is refused
            here — otherwise this endpoint is a way around it. */
-        if (gpio_reject_if_refused(req, tx)) return;
-        if (gpio_reject_if_refused(req, rx)) return;
+        if (gpio_reject_if_undrivable(req, tx)) return;
+        if (gpio_reject_if_undrivable(req, rx)) return;
 
         SerialPort *sp = serial_find_uart(uart_num);
         if (!sp) {
@@ -478,7 +478,17 @@ static void serial_register_routes(AsyncWebServer &server) {
                identical reason before stamping ui_last_key, which GET /ui puts
                in a JSON string the same way. Tab, CR and LF are kept: those
                three are on the escape table, they come out correct, and
-               line-oriented peers are the ordinary case. */
+               line-oriented peers are the ordinary case.
+
+               skills/notify.cpp's notify_copy_text() is the third site, and
+               the one that does NOT match these two. It replaces the same
+               control bytes with a space instead of '.', keeps no count, and
+               flattens tab, CR and LF rather than keeping them — but it lets
+               every well-formed multi-byte UTF-8 sequence through, where both
+               of the sites above throw the whole upper half away. It has to:
+               a serial dump and a keypress are ASCII, and a notification body
+               is text the API promised to return as it was given. See the
+               comment over that function for the rest of the reasoning. */
             if (c == '\t' || c == '\r' || c == '\n') {
                 data[n++] = (char)c;
             } else if (c < 0x20 || c > 0x7E) {
