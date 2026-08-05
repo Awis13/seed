@@ -29,6 +29,7 @@
 /* Accessors defined in radio.cpp (included just before this file). */
 uint16_t radio_get_freq();
 const char *radio_get_mode_str();
+bool radio_chip_present();
 const char *radio_get_band_name();
 uint8_t radio_get_rssi();
 uint8_t radio_get_volume();
@@ -694,20 +695,31 @@ static void draw_radio_screen(const char *band, const char *mode, uint16_t freq,
     }
 
     /* Big frequency: MHz for FM (freq is 10 kHz units), kHz otherwise. FONT7 is
-     * the 7-segment face — digits and '.' only, all a frequency needs. */
-    char freq_str[24];
-    const char *unit;
-    if (strcmp(mode, "FM") == 0) {
-        snprintf(freq_str, sizeof(freq_str), "%.2f", freq / 100.0f);
-        unit = "MHz";
+     * the 7-segment face — digits and '.' only, all a frequency needs.
+     *
+     * No SI4732 detected at boot: radio_freq/radio_mode are still their zeroed
+     * file-static defaults (mode 0 == FM, freq 0), which would paint a misleading
+     * "FM 0.00 MHz" as if a tuner were live. Draw a plain "NO RADIO" sentinel
+     * instead and skip the unit row. The proportional face is used (FONT7 has no
+     * letters). The chip-present path below is unchanged. */
+    if (!radio_chip_present()) {
+        gfx->setTextColor(freq_color, t.bg);
+        gfx->drawString("NO RADIO", DISPLAY_CX, 60, 4);
     } else {
-        snprintf(freq_str, sizeof(freq_str), "%u", (unsigned)freq);
-        unit = "kHz";
+        char freq_str[24];
+        const char *unit;
+        if (strcmp(mode, "FM") == 0) {
+            snprintf(freq_str, sizeof(freq_str), "%.2f", freq / 100.0f);
+            unit = "MHz";
+        } else {
+            snprintf(freq_str, sizeof(freq_str), "%u", (unsigned)freq);
+            unit = "kHz";
+        }
+        gfx->setTextColor(freq_color, t.bg);
+        gfx->drawString(freq_str, DISPLAY_CX, 48, 7);
+        gfx->setTextColor(t.unit, t.bg);
+        gfx->drawString(unit, DISPLAY_CX, 90, 4);
     }
-    gfx->setTextColor(freq_color, t.bg);
-    gfx->drawString(freq_str, DISPLAY_CX, 48, 7);
-    gfx->setTextColor(t.unit, t.bg);
-    gfx->drawString(unit, DISPLAY_CX, 90, 4);
 
     /* Station name row, in the narrow band between the unit and the signal line: the
      * decoded RDS PS name on FM, or the EIBI "now broadcasting" name on AM/SSB. One

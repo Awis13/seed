@@ -881,6 +881,12 @@ uint16_t radio_get_freq() { return radio_freq; }
 
 const char *radio_get_mode_str() { return radio_mode_str(radio_mode); }
 
+/* True once the SI4732 answered on I2C at boot (see skill_radio_init). The display
+ * gates the frequency/mode draw on this: with no chip, radio_freq/radio_mode are
+ * still their file-static zero (== FM 0 kHz), so an ungated draw paints a bogus
+ * "FM 0.00 MHz". A lone bool read, no lock. */
+bool radio_chip_present() { return radio_ok; }
+
 uint8_t radio_get_volume() { return radio_volume; }
 
 /* Kept named radio_get_tune_target() (returning the UI_VFO/UI_VOLUME value) so
