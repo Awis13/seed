@@ -478,7 +478,17 @@ static void serial_register_routes(AsyncWebServer &server) {
                identical reason before stamping ui_last_key, which GET /ui puts
                in a JSON string the same way. Tab, CR and LF are kept: those
                three are on the escape table, they come out correct, and
-               line-oriented peers are the ordinary case. */
+               line-oriented peers are the ordinary case.
+
+               skills/notify.cpp's notify_copy_text() is the third site, and
+               the one that does NOT match these two. It replaces the same
+               control bytes with a space instead of '.', keeps no count, and
+               flattens tab, CR and LF rather than keeping them — but it lets
+               every well-formed multi-byte UTF-8 sequence through, where both
+               of the sites above throw the whole upper half away. It has to:
+               a serial dump and a keypress are ASCII, and a notification body
+               is text the API promised to return as it was given. See the
+               comment over that function for the rest of the reasoning. */
             if (c == '\t' || c == '\r' || c == '\n') {
                 data[n++] = (char)c;
             } else if (c < 0x20 || c > 0x7E) {

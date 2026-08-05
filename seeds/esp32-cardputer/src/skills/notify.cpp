@@ -267,7 +267,8 @@ static bool notify_level_parse(const char *s, uint8_t &out) {
 
 /* --- Text ---
  *
- * Copy into a bounded field, cutting on a character rather than on a byte.
+ * Copy into a bounded field, cutting on a character rather than on a byte, and
+ * then scrub whatever is left into something a JSON reader has to accept.
  *
  * snprintf() alone cuts at whatever byte the limit lands on, and a byte in the
  * middle of a UTF-8 sequence is half a character: the field then ends in a
@@ -275,11 +276,80 @@ static bool notify_level_parse(const char *s, uint8_t &out) {
  * JSON reader is entitled to reject. The screen is indifferent — it measures
  * in pixels and ellipsises — so this is about the wire and the snapshot file.
  *
- * Input that was not valid UTF-8 to begin with is not repaired, only left no
- * worse than it arrived.
+ * The cut only ever looks at the tail, though, and two other kinds of byte
+ * break the same documents from the middle:
+ *
+ *   - A control byte. ArduinoJson escapes exactly seven sequences — quote,
+ *     backslash and the five whitespace ones, see the table in
+ *     EscapeSequence.hpp — and emits every other byte below 0x20 raw, which
+ *     RFC 8259 s7 forbids outright. GET /notify, the card object in GET /ui
+ *     and the snapshot file are then all malformed for as long as one is
+ *     stored, and the reader loses the whole document, not just the field.
+ *   - A byte that cannot be part of a well-formed UTF-8 sequence. That
+ *     document is valid JSON grammar and still unreadable: RFC 8259 s8.1 asks
+ *     for UTF-8, and a reader that decodes before it parses fails on it.
+ *
+ * Neither needs a malformed request to arrive. ARDUINOJSON_DECODE_UNICODE is
+ * on by default and a JSON unicode escape below 0x80 is decoded straight to
+ * one raw byte, so an escaped U+0001 inside an entirely well-formed POST body
+ * arrives here as a raw 0x01 and never looks malformed to anyone upstream.
+ *
+ * Both are replaced by a single space — one byte in, one byte out, so no
+ * offset the cut just settled moves. Replaced rather than refused because this
+ * is a pager: a message that arrives flattened is still a message, and a
+ * message that is refused is silence.
+ *
+ * This is the third control-byte policy on the notification path's neighbours,
+ * and it matches neither of them, so it is worth saying where it sits against
+ * each. serial.cpp turns everything outside 0x20-0x7E into '.' and counts it,
+ * but keeps tab, CR and LF verbatim and uncounted. main.cpp's ui_handle_key()
+ * refuses that same range, but exempts Enter, so 0x0A is stamped and served.
+ * (A fourth site, main.cpp's tz_valid(), refuses below 0x21 outright — it is
+ * enforcing POSIX TZ grammar rather than protecting a document, and it rejects
+ * the space too, so it is not really one of this set.)
+ *
+ * Against those, this policy is the loosest in the upper half and the
+ * strictest in the lower. Looser above 0x7F: both of the others throw the
+ * whole upper half away, and this one cannot, because GET /notify is
+ * contracted to hand back the UTF-8 it was given and Cyrillic titles are
+ * ordinary traffic — so every well-formed multi-byte sequence passes through
+ * untouched and only bytes that cannot belong to one are replaced. Stricter on
+ * 0x09, 0x0A and 0x0D: it is the only one of the three that destroys them,
+ * because the card draws two fixed lines and a pasted newline buys shape that
+ * cannot be shown anyway. Neither of those three needed fixing for JSON — the
+ * serialiser escapes them correctly — so that part is the price of one rule
+ * rather than a rule with a carve-out.
+ *
+ * 0x7F is in the set even though RFC 8259 permits it raw, and the reason is
+ * local rather than principled: ui_handle_key() already refuses it in a key,
+ * and one rule for every string this skill stores is easier to state than two.
+ * It is nearly free on the panel too — 6 px in Font2, exactly what a space
+ * costs there, and 1 px against a space's 5 px in the Font4 card title.
+ *
+ * The bytes below 0x20 are the ones that do cost pixels, and the direction is
+ * wider, not narrower: M5GFX skips them outright in its UTF-8 loop (the
+ * `while (uniCode < 0x20)` in LGFXBase.cpp), so each measures 0 px today and
+ * 6 px as a space in the Font2 body. A body pasted from command output gains
+ * that per newline and therefore ellipsises earlier than it used to. Accepted:
+ * a line that is one run-on line but readable beats a document nobody can
+ * parse.
+ *
+ * What this does not fix: NUL, which never reaches the filter at all. An
+ * escaped U+0000 ends the field at that NUL because everything from the copy
+ * down is a C string, so the remainder is dropped rather than blanked — and an
+ * empty title is a 400 from the endpoint above, which means one control
+ * character CAN refuse a message after all. A raw 0x00 does not even get that
+ * far: the parser stops on it and the whole request is a 400. Both are a
+ * separate and smaller problem than the two above, and the served description
+ * has to say so, because "no message is refused over a control byte" would
+ * otherwise be a promise this code does not keep.
  */
-static void notify_copy_text(char *dst, size_t size, const char *src) {
-    snprintf(dst, size, "%s", src);
+
+/* Split out so that it keeps its two early returns while the scrub below still
+   runs on every path through the copy. Appended to the end of this function
+   instead, the scrub would be unreachable for any value that fits its field
+   whole — which is nearly all of them. */
+static void notify_cut_utf8(char *dst, const char *src) {
     size_t len = strlen(dst);
     if (len == 0 || strlen(src) <= len) return;  /* nothing was cut */
 
@@ -296,6 +366,46 @@ static void notify_copy_text(char *dst, size_t size, const char *src) {
                 : (lead & 0xF8) == 0xF0 ? 4
                 : 1;
     if (start + need > len) dst[start] = '\0';
+}
+
+static void notify_copy_text(char *dst, size_t size, const char *src) {
+    snprintf(dst, size, "%s", src);
+    notify_cut_utf8(dst, src);
+
+    unsigned char *p = (unsigned char *)dst;
+    while (*p) {
+        unsigned char c = *p;
+        if (c < 0x20 || c == 0x7F) { *p++ = ' '; continue; }
+        if (c < 0x80)              { p++;        continue; }
+
+        /* The lead byte fixes the length and narrows what its first
+           continuation may be, which is what rules out the encodings that are
+           well-formed in shape but not in UTF-8: 0xC0/0xC1 and the tightened
+           0xE0/0xF0 bounds reject overlongs, 0xED reserves the UTF-16
+           surrogates, and 0xF4 stops at U+10FFFF. RFC 3629 s4. */
+        size_t need;
+        unsigned char lo = 0x80, hi = 0xBF;
+        if      (c >= 0xC2 && c <= 0xDF) { need = 2; }
+        else if (c == 0xE0)              { need = 3; lo = 0xA0; }
+        else if (c >= 0xE1 && c <= 0xEC) { need = 3; }
+        else if (c == 0xED)              { need = 3; hi = 0x9F; }
+        else if (c >= 0xEE && c <= 0xEF) { need = 3; }
+        else if (c == 0xF0)              { need = 4; lo = 0x90; }
+        else if (c >= 0xF1 && c <= 0xF3) { need = 4; }
+        else if (c == 0xF4)              { need = 4; hi = 0x8F; }
+        else                             { *p++ = ' '; continue; }
+
+        /* A NUL fails the first of these comparisons and stops the walk, so a
+           sequence running off the end of the string is caught here rather
+           than read past. Only the lead is replaced; each byte that followed
+           it is judged on its own on the next pass round, which is what keeps
+           this one-for-one. */
+        bool ok = (p[1] >= lo && p[1] <= hi);
+        for (size_t i = 2; ok && i < need; i++)
+            ok = (p[i] >= 0x80 && p[i] <= 0xBF);
+        if (!ok) { *p++ = ' '; continue; }
+        p += need;
+    }
 }
 
 /* --- Age ---
@@ -842,6 +952,25 @@ static const char *notify_describe() {
            "for ASCII and fewer for anything else. The cut lands on a character\n"
            "boundary, so a multi-byte one is dropped whole rather than left\n"
            "half-written in the JSON.\n\n"
+           "Text is rewritten on the way in, so what you read back may not be\n"
+           "byte-for-byte what you sent. Every byte below 0x20, plus 0x7F, and\n"
+           "every byte that is not part of a well-formed UTF-8 sequence becomes\n"
+           "a single space — newlines and tabs included, so a body pasted from\n"
+           "command output comes back as one run-on line. Nothing is dropped,\n"
+           "nothing moves, and no message is refused over one. Valid multi-byte\n"
+           "UTF-8 is handed back untouched.\n\n"
+           "NUL is the one exception to all of that. A field ends at the first\n"
+           "NUL, whether you sent it escaped or raw, because everything here is\n"
+           "a C string: the rest of that field is dropped rather than blanked,\n"
+           "and if it was the title that leaves the title empty, which is a 400.\n"
+           "A raw NUL is worse — it ends the JSON document too, so the whole\n"
+           "request is a 400. Strip NULs before you post; the filter above never\n"
+           "sees them.\n\n"
+           "`id` goes through the space substitution too, which changes what\n"
+           "the key means:\n"
+           "two ids differing only in a control byte are ONE key here, so the\n"
+           "second post replaces the first one's message instead of queueing\n"
+           "beside it.\n\n"
            "### Behaviour\n\n"
            "Twenty entries are held in RAM and the newest six survive a reboot.\n"
            "A full queue drops the oldest read entry first, and only ever drops\n"
