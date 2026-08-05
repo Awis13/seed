@@ -418,9 +418,10 @@ static unsigned long boot_time = 0;
 // password is rolled on every raise and exists only in this variable and on the
 // screen — never persisted, never sent anywhere.
 //
-// A gesture-raised session is time-boxed: someone may have leaned on the key,
-// and the radio must not then stay up forever. The boot-time session does not
-// expire, because with no working credentials the AP is the only way in.
+// A session raised from the menu is time-boxed: somebody opens it, walks away
+// and forgets, and the radio must not then stay up forever. The boot-time
+// session does not expire, because with no working credentials the AP is the
+// only way in.
 #define AP_SESSION_MS (10UL * 60UL * 1000UL)
 static bool ap_active = false;
 static String ap_password = "";
@@ -546,7 +547,7 @@ static bool clock_local_time(struct tm &out) {
 //
 // The last two rows switch with the connectivity mode: on the network they
 // carry RSSI and the mDNS name, in setup mode the AP name, its one-shot
-// password and the auth token, and offline the gesture that raises the AP.
+// password and the auth token, and offline the way back to the setup AP.
 //
 // Three colours only: warm white for the digits, slate for everything
 // secondary, one amber accent (seconds, and the AP password in setup mode).
@@ -817,7 +818,7 @@ static void display_tick() {
     // screen is their only channel, so nothing else has to carry them.
     char row1l[32], row1r[32], row2[48];
     if (ap_active) {
-        // A gesture-raised AP is time-boxed, so say how long it has left.
+        // An AP raised from the menu is time-boxed, so say how long it has left.
         unsigned long mins = ap_minutes_left();
         if (mins > 0) {
             snprintf(row1l, sizeof(row1l), "AP %s  %lum", ap_ssid.c_str(), mins);
@@ -833,13 +834,17 @@ static void display_tick() {
     } else {
         snprintf(row1l, sizeof(row1l), "WiFi offline");
         row1r[0] = '\0';
-        snprintf(row2, sizeof(row2), "hold KEY 3s for setup AP");
+        // The route in, said on the one screen somebody standing in front of
+        // an offline device is looking at. It names the menu row rather than a
+        // key to hold: the AP is raised from Setup AP in the menu, and from
+        // nowhere else on the device.
+        snprintf(row2, sizeof(row2), "click for menu > Setup AP");
     }
     // A running job borrows the note row for its label and the band under it
     // for its bar, but only when the row is otherwise empty: the token and the
-    // setup gesture have nowhere else to be displayed. Whose job it is has
-    // already been decided by then — this reads the winner, it does not choose
-    // between suppliers.
+    // way back to the setup AP have nowhere else to be displayed. Whose job it
+    // is has already been decided by then — this reads the winner, it does not
+    // choose between suppliers.
     int bar_pct = -1;
     if (row2[0] == '\0') progress_status_line(row2, sizeof(row2), &bar_pct);
 
@@ -999,9 +1004,6 @@ static bool wifi_save_config(const String &ssid, const String &pass) {
 // POST /firmware/upload, i.e. arbitrary code on a box behind the firewall.
 // The other seeds still ship that pattern and need the same treatment.
 
-// How long the user key must be held to raise the AP.
-#define AP_KEY_HOLD_MS 3000
-
 // The AP subnet is pinned rather than left on the ESP-IDF default of
 // 192.168.4.1/24. from_setup_ap() decides "this client came in over the setup
 // AP" by matching the first three octets, so an AP subnet that a STA network
@@ -1096,31 +1098,12 @@ static void ap_poll() {
         ap_stop();
         return;
     }
-    // Nobody reprovisioned in time: close the window the gesture opened. The
+    // Nobody reprovisioned in time: close the window the menu opened. The
     // subtraction is rollover-safe as long as it stays in signed arithmetic.
     if (ap_temporary && (long)(millis() - ap_expires_at) >= 0) {
         event_add("setup AP expired");
         ap_stop();
     }
-}
-
-// The only way to raise the AP after boot: hold the user key for three seconds.
-// Physical presence, not network reachability, is what authorises provisioning,
-// so nothing remote can ask for the AP back. Contact bounce reads as a release
-// and restarts the timer, which is debounce enough for a hold this long.
-static void ap_key_poll() {
-    static unsigned long held_since = 0;
-    static bool fired = false;
-
-    if (digitalRead(PIN_USER_KEY) != LOW) {  // active low
-        held_since = 0;
-        fired = false;
-        return;
-    }
-    if (held_since == 0) held_since = millis();
-    if (fired || millis() - held_since < AP_KEY_HOLD_MS) return;
-    fired = true;
-    if (!ap_active) ap_start(true);  // time-boxed: see AP_SESSION_MS
 }
 
 static void wifi_setup() {
@@ -1582,9 +1565,9 @@ static void handle_skill(AsyncWebServerRequest *request) {
     s += "- Battery telemetry: BQ27220 fuel gauge at I2C 0x55 (SDA=8, SCL=18), not an ADC\n";
     s += "- Flashing over USB-Serial/JTAG needs `--after watchdog_reset`\n";
     s += "- The clock runs on UTC until POST /clock/tz stores a POSIX TZ string in SPIFFS\n";
-    s += "- The setup AP is only up during provisioning: hold the user key (GPIO6) 3s to\n";
-    s += "  raise it, with a fresh random password shown on the device screen. A\n";
-    s += "  gesture-raised AP closes itself after 10 minutes if nothing reprovisions\n";
+    s += "- The setup AP is only up during provisioning: raise it from Setup AP in the\n";
+    s += "  on-device menu, with a fresh random password shown on the device screen. An\n";
+    s += "  AP raised that way closes itself after 10 minutes if nothing reprovisions\n";
     s += "- POST /wifi/config needs the token unless the request comes over that AP\n";
     s += "- Paths match exactly: `/health/` is not `/health` and returns 404. Nothing\n";
     s += "  here generates a trailing slash, but a client that appends one will break.\n";
@@ -1844,7 +1827,7 @@ void setup() {
     pinMode(PIN_SD_CS, OUTPUT);
     digitalWrite(PIN_SD_CS, HIGH);
 
-    // Read-only: the hold-to-raise-AP gesture is the only user of this pin.
+    // Read-only: ui_button_poll() is the only user of this pin.
     pinMode(PIN_USER_KEY, INPUT_PULLUP);
 
     Serial.begin(115200);
@@ -1945,10 +1928,8 @@ void loop() {
         last_wifi = millis();
     }
 
-    // Retire the provisioning AP once it has done its job, and watch the user
-    // key for the gesture that brings it back. Both polls are non-blocking.
+    // Retire the provisioning AP once it has done its job. Non-blocking.
     ap_poll();
-    ap_key_poll();
 
     // Starts frames and collects completions; the transmission itself runs in
     // the RMT peripheral. Advances as far as it can each pass and never blocks.
@@ -1984,8 +1965,8 @@ void loop() {
     // drain of whatever the I2S receive DMA has collected. Before ui_poll() so
     // that a recording started on this pass puts its screen up on this pass —
     // and it is here rather than inside ui_poll() because the gesture reads the
-    // pin level directly, the way ap_key_poll() does, and shares nothing with
-    // the click state machine but the pin itself. Idle cost is a digitalRead.
+    // pin level directly rather than through the click state machine, and
+    // shares nothing with it but the pin itself. Idle cost is a digitalRead.
     mic_poll();
 
     // The uploader's loop-task half, and only that half: the transfer itself

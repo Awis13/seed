@@ -126,10 +126,10 @@
 #define NOTIFY_PERSIST       6
 #define NOTIFY_SOURCE_LEN   17   /* 16 chars, e.g. "home-rig", "k1c" */
 #define NOTIFY_TITLE_LEN    65   /* 64 chars */
-/* 256 chars. The card still draws exactly two lines and ui_wrap2() ends the
-   second with an ellipsis, so what is stored is again wider than what is shown
-   — the whole of it is served by GET /notify, which is where a body this long
-   is read. */
+/* 256 chars, and the card now scrolls through all of them: ui_wrap_lines()
+   breaks the body over as many lines as it takes and the knob moves a window
+   of two or four over them. GET /notify still serves the whole of it in one
+   piece, which is where a body this long is read at length. */
 #define NOTIFY_BODY_LEN    257
 #define NOTIFY_KEY_LEN      25   /* 24 chars of client-supplied dedup key */
 /* The range an id may take is 1..NOTIFY_ID_MAX, and both ends are excluded for
@@ -337,8 +337,11 @@ static bool notify_level_parse(const char *s, uint8_t &out) {
  * notify_option_check() below already refuses it in a label, and one rule for
  * every string this skill stores is worth more than the byte. The five the
  * serialiser does escape correctly — tab, newline and the rest — are flattened
- * for a third reason again: two body lines on a 300px card show a pasted
- * command's shape as gaps, not as lines. Neither is part of the JSON fix.
+ * for a third reason again: nothing that draws this text honours a line break.
+ * The card wraps the body on width alone, however many lines it scrolls
+ * through, so a pasted command's newlines arrive as gaps in the middle of a
+ * line rather than as the shape it had — and a space is what they are worth
+ * there. Neither is part of the JSON fix.
  *
  * Input that was not valid UTF-8 to begin with is not repaired, only left no
  * worse than it arrived.
@@ -1339,16 +1342,20 @@ static const char *notify_describe() {
            "Control bytes come back as spaces. Anything below 0x20, and 0x7F,\n"
            "is replaced by a single space on the way in — including newlines\n"
            "and tabs — so a body built by pasting command output reads as one\n"
-           "run-on line here rather than as the shape it had. Nothing is\n"
+           "run-on paragraph rather than as the shape it had: nothing that\n"
+           "draws it honours a line break, on the device or here. Nothing is\n"
            "dropped and no byte moves: a message is never refused over one.\n"
            "`id` goes through the same rule, so two keys differing only in a\n"
            "control byte are one key here and replace each other's message.\n\n"
            "### Asking a question\n\n"
-           "`options` is up to four short labels. The knob picks one and the\n"
-           "index is stored on the device — nothing is sent anywhere, so ask,\n"
-           "then come back and read `chosen` with `GET /notify/one?id=N`. It is\n"
-           "-1 until somebody answers, and both `options` and `chosen` are\n"
-           "absent from an entry that carries no question at all.\n\n"
+           "`options` is up to four short labels. On the device the knob\n"
+           "scrolls the body, and the labels sit past its last line: picking\n"
+           "one means turning to the end of the message first, so a question\n"
+           "cannot be answered by somebody who has not read it. The index is\n"
+           "stored on the device — nothing is sent anywhere, so ask, then come\n"
+           "back and read `chosen` with `GET /notify/one?id=N`. It is -1 until\n"
+           "somebody answers, and both `options` and `chosen` are absent from\n"
+           "an entry that carries no question at all.\n\n"
            "Three labels fit the screen comfortably; four are tight, about\n"
            "seven capitals each, so `Yes`/`No`/`Later` reads well and\n"
            "`Restart now` does not — and a label over 15 bytes is cut like any\n"
