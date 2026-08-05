@@ -68,7 +68,7 @@
 #include <TFT_eSPI.h>
 
 // ===== Configuration =====
-#define SEED_VERSION        "0.14.0"
+#define SEED_VERSION        "0.15.0"
 #define HTTP_PORT           8080
 #define TOKEN_FILE          "/auth_token.txt"
 #define WIFI_CONFIG_FILE    "/wifi.json"
@@ -325,39 +325,18 @@ static void probe_cc1101() {
     hw.has_cc1101 = (hw.cc1101_version != 0x00 && hw.cc1101_version != 0xFF);
 }
 
-static bool bq27220_read16(uint8_t reg, uint16_t &val) {
-    Wire.beginTransmission(BQ27220_ADDR);
-    Wire.write(reg);
-    if (Wire.endTransmission(false) != 0) return false;
-    if (Wire.requestFrom((int)BQ27220_ADDR, 2) != 2) return false;
-    val = Wire.read() | (Wire.read() << 8);
-    return true;
-}
-
-static void probe_battery() {
-    // BQ27220 standard commands: 0x08 = Voltage (mV), 0x2C = StateOfCharge (%)
-    uint16_t mv = 0, soc = 0;
-    if (bq27220_read16(0x08, mv) && mv > 2000 && mv < 6000) {
-        hw.has_battery = true;
-        hw.battery_v = mv / 1000.0f;
-        if (bq27220_read16(0x2C, soc) && soc <= 100) {
-            hw.battery_soc = soc;
-        } else {
-            hw.battery_soc = -1;
-        }
-    }
-}
-
-// probe_battery() runs once at boot, so the cached figures would otherwise stay
-// frozen at the boot-time snapshot. Re-read the same two registers periodically
-// to keep the on-screen charge level honest.
-static void battery_refresh() {
-    if (!hw.has_battery) return;
-    uint16_t mv = 0, soc = 0;
-    if (!bq27220_read16(0x08, mv) || mv <= 2000 || mv >= 6000) return;
-    hw.battery_v = mv / 1000.0f;
-    hw.battery_soc = (bq27220_read16(0x2C, soc) && soc <= 100) ? (int)soc : -1;
-}
+// Defined in skills/battery.cpp, which is included further down with the other
+// skills. The fuel gauge is the skill's hardware and every register read now
+// lives there, but the probe has to happen HERE, from hw_probe(): before
+// tft.init() claims the SPI bus and before the first clock face is drawn with a
+// charge level on it. So it is declared here and called below, the same
+// arrangement the clock face already has with progress.cpp and notify.cpp.
+//
+// battery_probe() fills hw.has_battery/battery_v/battery_soc once at boot;
+// battery_refresh() re-reads them from loop(), because otherwise the figures on
+// the panel would stay frozen at the boot-time snapshot.
+static void battery_probe();
+static void battery_refresh();
 
 static void hw_probe() {
     memset(&hw, 0, sizeof(hw));
@@ -376,7 +355,7 @@ static void hw_probe() {
     i2c_scan(Wire, hw.i2c0, hw.i2c0_count);
 
     probe_cc1101();
-    probe_battery();
+    battery_probe();
 
     // Board detection heuristic
     bool fuel_gauge = false;
@@ -1712,6 +1691,11 @@ static void handle_wifi_post(AsyncWebServerRequest *request) {
 #include "skills/serial.cpp"
 #include "skills/ir.cpp"
 #include "skills/notify.cpp"
+/* After notify.cpp, for the JSON response helpers, and after nothing else: the
+   fuel gauge is its own hardware and no skill reads it. Its probe runs earlier
+   than this, from hw_probe(), through the two forward declarations above it —
+   the panel needs a charge level before any skill exists. */
+#include "skills/battery.cpp"
 /* After notify.cpp, for the three JSON response helpers its endpoints already
    own — the same borrowing voice.cpp does, rather than a fourth copy of
    serializeJson into a String. It depends on no skill of its own: suppliers
@@ -1741,6 +1725,9 @@ static void skills_init() {
     skill_serial_init();
     skill_ir_init();
     skill_notify_init();
+    /* Only a registration: the gauge was read at boot by hw_probe() and the
+       cache behind GET /battery was filled there. */
+    skill_battery_init();
     /* Nothing to bring up: no hardware, no stored state, and a store that is
        already zeroed. It is here rather than first only to match the include
        order above. */
@@ -2035,7 +2022,10 @@ void loop() {
     // line, so it does not need the tick above and must not wait for it.
     if (ui_screen == UI_CLOCK) clock_rule_tick();
 
-    // Keep the fuel gauge reading current — probe_battery() only ran at boot.
+    // Keep the fuel gauge reading current — battery_probe() only ran at boot.
+    // Nothing else touches the I2C bus once hw_probe() has finished, and this
+    // is the only place the diagnostic registers behind GET /battery are
+    // read: see the cadence argument at the head of skills/battery.cpp.
     static unsigned long last_battery = 0;
     if (millis() - last_battery > 60000) {
         last_battery = millis();
