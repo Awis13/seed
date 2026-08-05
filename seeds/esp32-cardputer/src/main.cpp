@@ -1523,7 +1523,19 @@ static_assert(UI_HDR_Y + 8 + UI_BADGE_R < UI_RULE1_Y,
 // (UI_CROW_BYTES - 1) glyphs, and that bound holds for any string anyone writes
 // into it later. The Font2 rows get no such gift — Font2's widest advance is
 // 10px, so 39 glyphs there could be 390px — and are still summed by hand below.
-#define UI_CROW_W      234
+// 235 AND NOT 234, WHICH IS THE ONE PIXEL THAT MAKES THE ASSERT BELOW MEAN
+// SOMETHING. The erase rule this file states twice — at the header's spans and
+// again at ui_draw_field() — is that M5GFX fills only the REMAINDER of the
+// padding band, and only when the padding is STRICTLY wider than the string. A
+// band exactly as wide as its widest string erases nothing at all and leaves
+// the previous row's tail on the glass, with no clip and no error. The three
+// header pads are all strictly wider (67>66, 20>14, 134>133); this one was
+// 234 against a 234px bound, i.e. the single place on the panel where the rule
+// was stated correctly and applied at equality. Latent today, because the
+// widest Font0 row anybody writes is the token at 228 — real the day a 39-glyph
+// row exists. UI_LABEL_X + this is asserted against the panel edge below, and
+// at 235 that is 239 of 240.
+#define UI_CROW_W      235
 #define UI_CROW_MAX_W_F0  (UI_F0_W * (UI_CROW_BYTES - 1))
 // The widest string the Font2 modes can hold, summed over widtbl_f16:
 //
@@ -1553,6 +1565,22 @@ enum ui_crow_mode_t {
     UI_CROW_LINK,     // associated, no AP
     UI_CROW_OFF       // neither
 };
+// For GET /ui, which reports the shape the rows were last DRAWN in. Indexed by
+// the enum, so the assert is what stops the two drifting apart.
+//
+// NO UI_CROW_COUNT SENTINEL, WHICH IS THE OPPOSITE OF WHAT ui_screen_t DOES,
+// and the difference is deliberate. ui_status_row() switches over this enum
+// with no `default:` on purpose, so that -Wswitch fails the build the day a
+// fourth mode exists and nobody has written its rows. A COUNT member would be a
+// fourth enumerator that switch does not handle, which turns that guard into a
+// permanent warning and then into a silenced one. The screens' switches all
+// carry a default and lose nothing to their sentinel; this one would. Bounding
+// the table by the last real enumerator gets the same check without spending
+// the better one.
+static const char *ui_crow_mode_name[] = {"ap", "link", "offline"};
+static_assert(sizeof(ui_crow_mode_name) / sizeof(ui_crow_mode_name[0]) ==
+                  UI_CROW_OFF + 1,
+              "ui_crow_mode_name is missing an entry for a bottom-row mode");
 // What the face reads before the first NTP sync. Named rather than written out
 // at each site because GET /ui decides whether the clock is synced by comparing
 // what the panel actually drew against this string, instead of asking the C
@@ -1600,9 +1628,10 @@ static_assert(UI_LABEL_X + UI_CROW_W <= UI_PANEL_W,
 static_assert(UI_DATE_W >= UI_DATE_MAX_W,
               "the date's erase band is narrower than the widest date its format can render");
 // Font0: derived from the buffer, so nothing anybody writes into a bottom row
-// can outrun the band. Binding at equality today by construction, and the drift
-// it catches is a buffer grown without the band.
-static_assert(UI_CROW_W >= UI_CROW_MAX_W_F0,
+// can outrun the band. STRICTLY greater, not >=, because that is the erase rule
+// — see UI_CROW_W, which carries the one pixel this needs. The drift it catches
+// is a buffer grown without the band.
+static_assert(UI_CROW_W > UI_CROW_MAX_W_F0,
               "a Font0 bottom row can outrun its erase band: the row buffer holds "
               "more fixed-pitch glyphs than UI_CROW_W has room for");
 // Font2: NOT the same quality of guard, and worth saying so plainly rather than
@@ -1616,7 +1645,7 @@ static_assert(UI_CROW_W >= UI_CROW_MAX_W_F0,
 // is an argument and not a check. Making this as strong as the Font0 bound
 // needs the width table transcribed into a constexpr array here, which is a
 // second copy of the thing this whole block already warns about drifting.
-static_assert(UI_CROW_W >= UI_CROW_MAX_W_F2,
+static_assert(UI_CROW_W > UI_CROW_MAX_W_F2,
               "a Font2 bottom row's erase band is narrower than the widest string it can hold");
 static_assert(UI_STRLEN(UI_CROW_KEYS) == 24,
               "the key legend changed length; re-sum UI_CROW_MAX_W_F2 over "
@@ -1630,7 +1659,7 @@ static_assert((int)sizeof(UI_CROW_TOKEN_PFX) + UI_CROW_TOKEN_LEN <= UI_CROW_BYTE
 // redaction goes through the SAME %.*s the password does — so a placeholder
 // longer than a password would not widen the row, it would be cut down to
 // twelve characters and read as something else entirely.
-static_assert((int)sizeof(UI_CROW_PW_HIDDEN) - 1 <= AP_PASSWORD_CHARS,
+static_assert(UI_STRLEN(UI_CROW_PW_HIDDEN) <= AP_PASSWORD_CHARS,
               "the redaction is longer than the password it stands in for and would "
               "be truncated by the row's own precision");
 static_assert(AP_SSID_CHARS < (int)sizeof(ap_ssid) &&
@@ -2004,6 +2033,23 @@ static char ui_cache_net[24];
 // to key on. Quantised the same way the drawn value is, so everything above
 // nine compares equal. -1 is a state nothing can quantise to.
 static int ui_badge_drawn = -1;
+
+// The badge's count as a string, and THE ONLY PLACE THE QUANTISE TO "9+"
+// HAPPENS. The header draws through this and GET /ui reports through it, on the
+// UI section's third rule — the endpoint used to serve notify_unread_count()
+// raw, which is a second, parallel description of a screen element and the
+// exact failure that rule forbids. Two unread reads as "2" in both places, and
+// twelve reads as "9+" in both places, because there is one producer.
+//
+// `badge` is the quantised value, so 10 stands for everything above nine and -1
+// for a header that has never been painted; both give an empty string, which is
+// what the glass carries in the first case and what handle_ui() declines to
+// report in the second.
+static void ui_badge_text(int badge, char *out, size_t n) {
+    if (badge <= 0)      out[0] = '\0';
+    else if (badge > 9)  snprintf(out, n, "9+");
+    else                 snprintf(out, n, "%d", badge);
+}
 // Sized to hold a whole value rather than a prefix of one: the change test is a
 // strncmp against the cache, so a cache shorter than the strings it stores
 // would silently stop repainting fields that differ only past its end.
@@ -2494,9 +2540,32 @@ static bool ui_field(ui_screen_t screen, int idx, char *label, size_t label_n,
 // — the user loses the end of the sentence that tells them backtick keeps a
 // message unread. Fail the build instead and let whoever raises the cap shorten
 // the legend in the same commit.
+// The band, named. It was a bare 236 at the one call site that paints it, three
+// hundred lines from the paragraph above that reasons about it and beside a
+// UI_CROW_W that is asserted twice — the same panel edge, the same silent
+// failure mode, one of them guarded and one of them a literal. Both are named
+// and both are checked now.
+#define UI_FOOT_W      236
+// The longest legend ui_footer() can compose, in characters — the card's, at 39
+// with a two-digit counter, which the paragraph above audits string by string.
+// NOT derived from ui_cache_foot: that buffer is 48 bytes and 47 Font0 glyphs
+// would be 282px, so the cache bounds nothing useful here. This is the audited
+// figure, and naming it is what lets the band be checked against it instead of
+// against a number recomputed by hand every time a legend is edited.
+#define UI_FOOT_MAX_CHARS 39
+// STRICTLY greater, the same erase rule UI_CROW_W carries: 236 > 234 is the two
+// pixels of slack the paragraph above spends, now asserted. A band merely EQUAL
+// to its widest legend erases nothing and leaves the previous one's tail on the
+// glass.
+static_assert(UI_FOOT_W > UI_F0_W * UI_FOOT_MAX_CHARS,
+              "the footer legend's erase band is no wider than the longest legend "
+              "it has to erase, so a shorter legend would leave the previous "
+              "one's tail on the glass");
+static_assert(UI_LABEL_X + UI_FOOT_W <= UI_PANEL_W,
+              "the footer legend's erase band leaves the right edge of the panel");
 static_assert(NOTIFY_MAX <= 99,
               "the card's footer legend is 39 of the 39 characters Font0 fits "
-              "across 236px with a two-digit counter; a three-digit queue "
+              "across UI_FOOT_W with a two-digit counter; a three-digit queue "
               "overflows it off the panel — shorten the legend first");
 static_assert(UI_MENU_COUNT <= 99,
               "the menu's footer legend needs a two-digit counter to fit");
@@ -4187,9 +4256,7 @@ static void ui_tick() {
         // two strings either side of it.
         M5.Display.fillCircle(UI_BADGE_CX, UI_HDR_Y + 8, UI_BADGE_R,
                               badge ? COL_ACCENT : COL_BG);
-        if (badge == 0)      buf[0] = '\0';
-        else if (badge > 9)  snprintf(buf, sizeof(buf), "9+");
-        else                 snprintf(buf, sizeof(buf), "%d", badge);
+        ui_badge_text(badge, buf, sizeof(buf));
         // Drawn straight rather than through the field cache: the test above
         // has already decided, and a second gate keyed on the text alone would
         // be a second answer to a question the dot's half cannot ask.
@@ -4276,7 +4343,7 @@ static void ui_tick() {
     if (buf[0] != '\0') {
         ui_draw_field(force, ui_cache_foot, sizeof(ui_cache_foot), buf,
                       UI_LABEL_X, UI_FOOT_Y, &fonts::Font0, COL_DIM, UI_TL,
-                      236, COL_BG);
+                      UI_FOOT_W, COL_BG);
     }
 }
 
@@ -4802,6 +4869,39 @@ static void handle_ui(AsyncWebServerRequest *request) {
     //
     // Written from the drive path, the way `rule` is, so these are what the LED
     // IS rather than what an unread message implies it ought to be.
+    // The header's unread badge, REPORTED FROM THE DRAW PATH like the clock
+    // caches and not derived from the store a second time. It is on every
+    // screen, so it goes out on every screen.
+    //
+    // Serving notify_unread_count() here instead — which is what this endpoint
+    // did — was the one screen element described in parallel rather than
+    // reported, and it was wrong in three ways that all matter on a node with no
+    // camera. Between a POST landing on the AsyncTCP task and the next 200ms
+    // tick, the store says one unread and the header carries no dot. On a node
+    // where ui_ready is false the header is never painted at all, and the store
+    // count would have claimed a badge indefinitely — the case ui_clock_drawn
+    // exists to prevent for the clock. And the glass quantises everything above
+    // nine to "9+" while the store does not, so no caller could learn what the
+    // corner actually reads.
+    //
+    // `drawn` false means the header has not been painted since boot and the
+    // other keys are absent, exactly as the clock's strings are absent until
+    // ui_clock_drawn. `text` is what the glass carries, through the one
+    // producer; empty string means the count is suppressed, which is what a
+    // zero-unread header shows.
+    JsonObject badge = doc["badge"].to<JsonObject>();
+    badge["drawn"] = (ui_badge_drawn >= 0);
+    if (ui_badge_drawn >= 0) {
+        char btxt[8];
+        ui_badge_text(ui_badge_drawn, btxt, sizeof(btxt));
+        badge["dot"] = ui_badge_drawn > 0;
+        badge["text"] = btxt;
+        // The quantised value behind the string, so a caller does not have to
+        // parse "9+" to learn that the header is capped. 10 is the cap and
+        // means "more than nine", never "ten".
+        badge["capped"] = ui_badge_drawn > 9;
+    }
+
     JsonObject led = doc["led"].to<JsonObject>();
     led["ready"] = ui_led_ready;
     led["supplied"] = ui_led_supplied();
@@ -4900,11 +5000,38 @@ static void handle_ui(AsyncWebServerRequest *request) {
         // below takes one read of ui_msg_id: the mode is derived from live
         // radio state, and two reads could put row 0 from one shape beside
         // row 1 from another — a pair that never existed on the glass.
-        ui_crow_mode_t mode = ui_status_row_mode();
+        //
+        // AND IT IS THE DRAWN MODE, NOT A FRESH ONE. ui_status_row_mode() reads
+        // ap_active and WiFi.status() as they are right now, which is a
+        // different question from what shape the panel is currently in. The two
+        // edges into and out of the AP mode raise ui_force and so repaint at
+        // once, but the connected/offline edge raises nothing at all — so a
+        // link that has just dropped leaves the glass carrying "signal -52 dBm"
+        // for up to one UI_TICK_MS while a freshly computed mode here would
+        // already be composing the offline rows. Reporting the drawn mode is
+        // what keeps this endpoint a report of the screen rather than a second
+        // opinion about the radio. ui_clock_rows_drawn is the same value the
+        // draw path keyed its band-clear on, so `rows` and `mode` below cannot
+        // disagree with each other or with the panel's shape.
+        //
+        // Before the first draw there is nothing drawn to report, and the live
+        // mode is the only answer available; that is the one case where these
+        // rows can lead the glass, and it is the same case the clock's strings
+        // are absent for.
+        ui_crow_mode_t mode = ui_clock_drawn
+                                  ? (ui_crow_mode_t)ui_clock_rows_drawn
+                                  : ui_status_row_mode();
         for (int r = 0; r < 2; r++) {
             ui_status_row(mode, r, row, sizeof(row), true);
             rows.add(row);
         }
+        // WHICH OF THE THREE SHAPES THOSE ROWS ARE, named. The strings alone do
+        // not say it unambiguously — the offline mode's lower row is a key hint
+        // and so is nothing else's, but a caller should not have to pattern-match
+        // prose to learn which branch the panel took, and the mode also decides
+        // the FONT the rows are drawn in, which no string here can show.
+        // Reported only once a draw has fixed it, like the strings above.
+        if (ui_clock_drawn) clock["mode"] = ui_crow_mode_name[mode];
 
         // The hairline under the header, which on this screen is the one thing
         // on the panel with no other witness. ONLY ON THIS SCREEN, because this
@@ -4951,6 +5078,13 @@ static void handle_ui(AsyncWebServerRequest *request) {
     // The message list's position, on every screen for the same reason the menu
     // is: it is retained state, and it is where the list will be when it is
     // next opened.
+    // THE QUEUE, NOT THE HEADER. `count` and `unread` come from the store and
+    // are the truth about what is queued; the `badge` object above is the truth
+    // about what the top-right corner of the glass says. They are different
+    // questions and they legitimately disagree for up to one UI_TICK_MS after a
+    // POST lands, so they are reported separately rather than one standing in
+    // for the other. `unread` used to be the only answer available, which made
+    // it look like a report of the badge and it never was.
     JsonObject msgs = doc["messages"].to<JsonObject>();
     msgs["count"] = notify_count();
     msgs["unread"] = notify_unread_count();
@@ -5504,7 +5638,15 @@ static void handle_skill(AsyncWebServerRequest *request) {
     s += "dark / lit).\n\n";
     s += "A notification arriving while the node sits on its status screen raises\n";
     s += "its own card, fading in over three 40ms frames. It does NOT interrupt any\n";
-    s += "other screen — the unread count in the menu is how it gets noticed then.\n\n";
+    s += "other screen, and it does not have to: the header carries an unread\n";
+    s += "BADGE — a dot and a count in the top-right gap, on every screen — so an\n";
+    s += "arrival is visible without navigating anywhere. The count is capped at\n";
+    s += "`9+`. GET /ui reports it as `badge`, from the draw path, so `badge.text`\n";
+    s += "is what the corner of the glass says and `messages.unread` is what the\n";
+    s += "queue holds; they differ for up to one tick after a POST lands, and on a\n";
+    s += "node whose panel never came up `badge.drawn` is false while the queue\n";
+    s += "count is not. The RGB LED on the case is the other annunciator, and it\n";
+    s += "needs no screen at all.\n\n";
     s += "You cannot see this screen. GET /ui answers what is on it: the active\n";
     s += "screen, the backlight level, whether the panel came up, whether M5\n";
     s += "identified the board, and the last key the firmware saw. Its `content`\n";
