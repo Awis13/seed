@@ -173,6 +173,37 @@ static const FlagCase batt_flags[] = {
     {"FD",       BQ_BS_FD,       15},
 };
 
+/*
+ * GaugingStatus, TRM SLUUBD4A Table 2-4. Bit numbers are of the assembled
+ * 16-bit word, so the table's "high byte bit 7" is 15 here — the conversion
+ * done by hand from the datasheet, which is the point.
+ *
+ * The four reserved positions (1, 3, 4, 12) are absent on purpose and the body
+ * of the test asserts their absence.
+ */
+static const FlagCase gauging_flags[] = {
+    {"FD",   BQ_GS_FD,    0},
+    {"FC",   BQ_GS_FC,    1},
+    {"TD",   BQ_GS_TD,    2},
+    {"TC",   BQ_GS_TC,    3},
+    {"EDV",  BQ_GS_EDV,   5},
+    {"DSG",  BQ_GS_DSG,   6},
+    {"CF",   BQ_GS_CF,    7},
+    {"FCCX", BQ_GS_FCCX, 10},
+    {"EDV1", BQ_GS_EDV1, 13},
+    {"EDV2", BQ_GS_EDV2, 14},
+    {"VDQ",  BQ_GS_VDQ,  15},
+};
+
+/* CONTROL_STATUS, Table 2-3. Three flags; BATT_ID is a three-bit field and is
+   checked separately, because flag_table's "reads false off all fifteen other
+   bits" rule is exactly what a field does not obey. */
+static const FlagCase control_flags[] = {
+    {"SNOOZE", BQ_CS_SNOOZE, 3},
+    {"BCA",    BQ_CS_BCA,    4},
+    {"CCA",    BQ_CS_CCA,    5},
+};
+
 #define COUNT(a) ((int)(sizeof(a) / sizeof((a)[0])))
 
 /*
@@ -884,6 +915,195 @@ int main(void) {
                "BQ_SEC_FULL is the full-access code");
         check(BQ_SEC_SEALED != BQ_SEC_UNSEALED && BQ_SEC_UNSEALED != BQ_SEC_FULL &&
               BQ_SEC_SEALED != BQ_SEC_FULL, "and the three codes are distinct");
+    }
+
+    printf("GaugingStatus, the word that is reached by subcommand\n");
+    {
+        flag_table(gauging_flags, COUNT(gauging_flags), "gauging_status");
+
+        /*
+         * The five bits Table 2-4 marks RSVD.
+         *
+         * Stated honestly, because this one is weaker than it looks: it reads
+         * the BIT NUMBERS in the table above, not the masks in the source, so
+         * moving a mask onto bit 12 does NOT trip it — verified, the position
+         * checks in flag_table() fire instead and this stays green.
+         *
+         * What it catches is the other direction, which is the one that
+         * matters here: a future reader ADDING a decoded flag at a reserved
+         * position. That is precisely the ITPOR mistake the source file
+         * refuses to make — inventing a name for a bit the datasheet does not
+         * define — and it would otherwise sail through, because a brand-new
+         * mask at bit 12 is internally consistent and every other check in
+         * this file would pass it.
+         */
+        static const int reserved[] = {4, 8, 9, 11, 12};
+        for (int i = 0; i < COUNT(reserved); i++) {
+            int claimed = 0;
+            for (int j = 0; j < COUNT(gauging_flags); j++) {
+                if (gauging_flags[j].bit == reserved[i]) claimed = 1;
+            }
+            char what[96];
+            snprintf(what, sizeof(what),
+                     "gauging_status bit %d is reserved and is not decoded",
+                     reserved[i]);
+            check(!claimed, what);
+        }
+    }
+
+    printf("CONTROL_STATUS\n");
+    {
+        flag_table(control_flags, COUNT(control_flags), "control_status");
+
+        /* BATT_ID is a field, not a flag, so flag_table cannot speak for it. */
+        eq_int(bq_batt_id(0x0000), 0, "batt_id of an empty word");
+        eq_int(bq_batt_id(0x0007), 7, "batt_id reads all three of its bits");
+        eq_int(bq_batt_id(0x0005), 5, "and reads them in the right order");
+        /* The bits immediately above the field must not leak into it. CCA,
+           BCA and SNOOZE are bits 5, 4 and 3 and a mask of 0xF or wider would
+           swallow SNOOZE — which would report a gauge in SNOOZE as chemistry
+           profile 8 and never look wrong. */
+        eq_int(bq_batt_id(0xFFF8), 0, "and nothing above bit 2 leaks into it");
+        eq_int(bq_batt_id((uint16_t)BQ_CS_SNOOZE), 0, "SNOOZE is not batt_id");
+    }
+
+    printf("the MAC echo, which is what stops a stale frame being decoded\n");
+    {
+        /* TRM 2.2's own worked example: subcommand 0x0001 answers with a frame
+           beginning 0x01 0x00. An oracle from the primary source rather than a
+           restatement of the code. */
+        const uint8_t device_number_frame[4] = {0x01, 0x00, 0x20, 0x03};
+        check(bq_mac_echo_ok(0x0001, device_number_frame),
+              "the TRM's DEVICE_NUMBER frame echoes 0x0001");
+        eq_int(bq_word(device_number_frame[2], device_number_frame[3]), 0x0320,
+               "and its payload is the device type, little-endian");
+
+        const uint8_t gauging_frame[4] = {0x56, 0x00, 0x84, 0x00};
+        check(bq_mac_echo_ok(BQ_MAC_GAUGING_STATUS, gauging_frame),
+              "a GaugingStatus frame echoes 0x0056 low byte first");
+        eq_int(bq_word(gauging_frame[2], gauging_frame[3]), 0x0084,
+               "and its payload assembles little-endian too");
+
+        /* The failures this exists for. A frame left over from another
+           subcommand, and a frame with the echo bytes swapped — both carry
+           sixteen perfectly decodable bits that are about something else. */
+        const uint8_t stale[4] = {0x54, 0x00, 0x84, 0x00};
+        check(!bq_mac_echo_ok(BQ_MAC_GAUGING_STATUS, stale),
+              "a frame left over from OPERATION_STATUS is refused");
+        const uint8_t swapped[4] = {0x00, 0x56, 0x84, 0x00};
+        check(!bq_mac_echo_ok(BQ_MAC_GAUGING_STATUS, swapped),
+              "and so is one with the echo bytes the wrong way round");
+        const uint8_t empty[4] = {0x00, 0x00, 0x00, 0x00};
+        check(!bq_mac_echo_ok(BQ_MAC_GAUGING_STATUS, empty),
+              "a dead bus reads all zeroes and is refused");
+    }
+
+    printf("the subcommand allowlist, swept\n");
+    {
+        /* The same sweep the data-memory allowlist gets, and for a sharper
+           reason: this space contains RESET. */
+        int allowed = 0;
+        for (long s = 0; s <= 0xFFFF; s++) {
+            if (bq_mac_read_allowed((uint16_t)s)) allowed++;
+        }
+        eq_int(allowed, 2, "exactly two subcommands are readable");
+
+        check(bq_mac_read_allowed(BQ_MAC_GAUGING_STATUS), "GaugingStatus 0x0056");
+        check(bq_mac_read_allowed(BQ_MAC_OPERATION_STATUS), "OperationStatus 0x0054");
+
+        /* Every destructive subcommand in TRM Table 2-2, by name, because
+           "everything else is refused" is a sentence and these are the ones
+           that would cost something. */
+        check(!bq_mac_read_allowed(0x0041), "RESET 0x0041 is refused");
+        check(!bq_mac_read_allowed(0x0030), "SEALED 0x0030 is refused");
+        check(!bq_mac_read_allowed(0x0090), "ENTER_CFG_UPDATE 0x0090 is refused");
+        check(!bq_mac_read_allowed(0x0091), "EXIT_CFG_UPDATE_REINIT is refused");
+        check(!bq_mac_read_allowed(0x0F00), "RETURN_TO_ROM 0x0F00 is refused");
+        check(!bq_mac_read_allowed(0x000A), "CC_OFFSET 0x000A is refused");
+        check(!bq_mac_read_allowed(0x0081), "ENTER_CAL 0x0081 is refused");
+        /* One digit from GaugingStatus in each direction. */
+        check(!bq_mac_read_allowed(0x0055), "0x0055 is refused");
+        check(!bq_mac_read_allowed(0x0057), "0x0057 is refused");
+    }
+
+    printf("the signed currents\n");
+    {
+        eq_int(bq_signed(0x0000), 0, "zero is zero");
+        eq_int(bq_signed(0x0200), 512, "512 mA into the cell");
+        eq_int(bq_signed(0x0080), 128, "128 mA, the charger's termination current");
+        eq_int(bq_signed(0xFFB0), -80, "an 80 mA discharge is negative");
+        /* The small readings are the ones an unsigned mistake still flatters:
+           65531 does not look like a current, but it does not look like -5
+           either, and this device idles in exactly that range. */
+        eq_int(bq_signed(0xFFFB), -5, "and so is a 5 mA one");
+        eq_int(bq_signed(0x7FFF), 32767, "the largest positive value");
+        eq_int(bq_signed(0x8000), -32768, "and the most negative one");
+    }
+
+    printf("the taper band, which is what FC is actually waiting for\n");
+    {
+        /* TRM 4.4.1 conditions 1 and 2 read together. The floor is the half of
+           it that reads like a footnote and is not one. */
+        eq_int((int)bq_taper_floor_ua(), 22500,
+               "0.25 mAh per 40 s window is a floor of 22500 uA");
+        eq_int(BQ_TAPER_WINDOW_S, 40, "the window is the TRM's 40 s");
+        eq_int(BQ_TAPER_MIN_CAP_UAH, 250, "and the capacity is its 0.25 mAh");
+
+        /*
+         * The second floor, which is a different mechanism: below Quit Current
+         * the gauge leaves CHARGE mode after Chg Relax Time, and the TRM's
+         * default 60 s is SHORTER than the 80 s two windows take. So the
+         * qualification is pre-empted before it can complete, and the floor
+         * that binds is whichever is higher.
+         */
+        check(bq_relax_pre_empts_taper(),
+              "60 s of Chg Relax Time is shorter than two 40 s windows");
+        eq_int(BQ_CHG_RELAX_TIME_S, 60, "Chg Relax Time is the TRM's 60 s");
+        eq_int(BQ_TAPER_WINDOWS, 2, "and two windows are required");
+
+        /* QuitCurrent 40 mA is above the 22.5 mA capacity floor, so on THIS
+           device it is the binding one. */
+        eq_int((int)bq_termination_floor_ua(40), 40000,
+               "QuitCurrent 40 mA binds over the capacity floor");
+        /* And below it, the capacity condition takes over again. */
+        eq_int((int)bq_termination_floor_ua(10), 22500,
+               "a QuitCurrent of 10 mA does not, so the capacity floor binds");
+        eq_int((int)bq_termination_floor_ua(0), 22500,
+               "nor does a QuitCurrent of zero");
+
+        /* The shipping QuitCurrent is the one the endpoint reports against. */
+        const GaugeParam *quit_p = param_named("QuitCurrent");
+        check(quit_p != NULL, "QuitCurrent is in the table");
+        if (quit_p) {
+            eq_int((int)bq_termination_floor_ua(quit_p->value), 40000,
+                   "so the floor this build actually waits on is 40000 uA");
+        }
+
+        /*
+         * THE CHECK THIS WHOLE COMMIT IS ABOUT, stated as a fact rather than
+         * as an assertion about what the values should be.
+         *
+         * Termination needs the current between the floor and the ceiling for
+         * two windows. The charger stops delivering at its termination
+         * current. So the band is only reachable while charging if the gauge's
+         * ceiling is ABOVE the charger's cut-off — and today it is not, it is
+         * equal to it, which is why this reports rather than asserts.
+         *
+         * Deliberately NOT written as check(taper->value > iterm): that would
+         * be red on the shipping configuration, and this commit was asked to
+         * diagnose without changing behaviour. When the taper current is
+         * raised, this check is the one to invert.
+         */
+        const GaugeParam *taper_p = param_named("TaperCurrent");
+        check(taper_p != NULL, "TaperCurrent is in the table");
+        if (taper_p) {
+            check((long)taper_p->value * 1000L > bq_taper_floor_ua(),
+                  "the taper ceiling is above the capacity floor at all");
+            eq_int(taper_p->value, charger_table_iterm_ma(),
+                   "TODAY the ceiling EQUALS the charger's cut-off, so the "
+                   "band the gauge watches is the range the charger will not "
+                   "operate in — this is the defect, pinned, not endorsed");
+        }
     }
 
     printf("the gauge and the charger agree about what a finished charge is\n");

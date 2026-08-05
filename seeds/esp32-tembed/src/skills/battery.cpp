@@ -74,9 +74,23 @@
  *   0x922A  Charge Detection Threshold        75 mA
  *   0x922C  Quit Current                      40 mA
  *
- * 0x9201 IS THE ONE THAT MATTERS. The charger now stops at 128 mA; the gauge
- * was watching for 100 mA, its ROM default, and a taper that stops at 128 never
- * crosses 100. Nothing else in this table would fix the bug on its own.
+ * 0x9201 WAS CLAIMED HERE TO BE "THE ONE THAT MATTERS", on the argument that
+ * the charger stops at 128 mA while the gauge watched for its 100 mA default,
+ * so a taper that stops at 128 never crosses 100. THAT ARGUMENT WAS RIGHT ABOUT
+ * THE MECHANISM AND WRONG ABOUT THE DIRECTION, and the device said so: with
+ * 0x9201 = 128 applied and verified, the next completed charge still ended with
+ * fc false.
+ *
+ * The correction is above, under WHY THE LAST FOUR WERE ADDED, and it is one
+ * sentence: TRM 4.4.1 condition 2 is a floor on the current, so termination
+ * needs the current INSIDE a band, and setting Taper Current equal to the
+ * charger's termination current makes that band the one range the charger
+ * refuses to operate in. The number that would satisfy the condition is a
+ * number ABOVE the charger's ITERM, not equal to it.
+ *
+ * The table below is nevertheless UNCHANGED in this commit, deliberately. Three
+ * plausible theories have already been acted on before being measured, and this
+ * commit exists to measure. Every value here is still what 0.2.0 wrote.
  *
  * 0x92A5 is not an absolute voltage despite its name — the TRM calls it the
  * taper voltage in prose, and it is a delta BELOW Charging Voltage: termination
@@ -176,23 +190,61 @@
  *
  * The registers
  * -------------
- * All seven are STANDARD COMMANDS: write the command code, read two bytes,
+ * Ten are STANDARD COMMANDS: write the command code, read two bytes,
  * little-endian. No sealing gets in the way of any of them, which is why the
  * whole diagnostic is available without touching the security state.
  *
+ *   0x00 Control              reads CONTROL_STATUS, decoded below
  *   0x08 Voltage              mV
  *   0x0A BatteryStatus        flags, decoded below
+ *   0x0C Current              mA, SIGNED
  *   0x10 RemainingCapacity    mAh
  *   0x12 FullChargeCapacity   mAh
+ *   0x14 AverageCurrent       mA, SIGNED
  *   0x2C RelativeStateOfCharge  %
  *   0x3A OperationStatus      flags, decoded below
  *   0x3C DesignCapacity       mAh
  *
- * The first and the fifth are the two the clock face uses; the other five are
- * diagnostic and go nowhere near it. All seven are read and none is written —
- * the six writes are to data memory, which is a separate space reached through
- * a different mechanism entirely, and no standard command above is touched by
- * any of them.
+ * One is not a register at all. GaugingStatus has no command code: it is MAC
+ * subcommand 0x0056, written to 0x3E and read back as a four-byte frame whose
+ * first two bytes echo the subcommand. See the MAC SUBCOMMAND READS section.
+ *
+ * Voltage and RelativeStateOfCharge are the two the clock face uses; everything
+ * else is diagnostic and goes nowhere near it. All of them are read and none is
+ * written — the six writes are to data memory, which is a separate space
+ * reached through a different mechanism entirely, and no command above is
+ * touched by any of them.
+ *
+ * WHY THE LAST FOUR WERE ADDED, WHICH IS A DIAGNOSIS AND NOT A FIX
+ * ---------------------------------------------------------------
+ * The commit above this one wrote the six parameters and predicted that FC
+ * would set on the next completed charge. It did not. Measured after it, on a
+ * charge the charger declared complete: 1256 mAh, 4171 mV, soc 97, fc false,
+ * vdq false, and all six parameters reading back exactly as written.
+ *
+ * Two theories were worth money and both are now closed by measurement rather
+ * than by argument:
+ *
+ * 1. "We are reading the wrong FC." GaugingStatus has its own FC and its own
+ *    TC. It is not a second opinion — TRM Table 2-4 says of each bit that it
+ *    "is identical to" its BatteryStatus counterpart. Reading it settles the
+ *    question rather than answering it, which is worth doing once and is why
+ *    it is here.
+ *
+ * 2. "The gauge cannot see current at all." It can. The board schematic
+ *    (T-Embed-CC1101 V1.0 24-07-29, page 1) fits R36 = 0.01R in series between
+ *    the charger's BAT net and the cell, with SRP and SRN across it. 128 mA
+ *    develops 1.28 mV, which is a measurement, not noise. Current() and
+ *    AverageCurrent() are added so that the next charge produces a reading
+ *    instead of another inference from capacities.
+ *
+ * What the arithmetic says instead is in bq_taper_floor_ua() and is served as
+ * `charge_termination`. In one line: TRM 4.4.1's second condition is a FLOOR on
+ * the current, so termination needs the current to sit inside a band for eighty
+ * seconds — and Taper Current was set equal to the charger's termination
+ * current, which makes that band exactly the range the charger refuses to
+ * operate in. NOTHING IS CHANGED HERE ON THE STRENGTH OF THAT. This commit adds
+ * reads and says what they mean; the table is untouched.
  *
  * A word about ITPOR, because somebody will look for it
  * ----------------------------------------------------
@@ -209,16 +261,29 @@
  *
  * Naming a decoded flag ITPOR here would mean guessing a bit position, and a
  * guessed diagnostic that reads "itpor: false" is worse than no diagnostic at
- * all — it answers the question wrongly and confidently. So both status words
- * are also reported RAW, in hex, reserved bits and all. If TI populates
+ * all — it answers the question wrongly and confidently. So all four status
+ * words are also reported RAW, in hex, reserved bits and all. If TI populates
  * something undocumented, the hex shows it and a human decides what it means.
+ *
+ * That paragraph used to name CONTROL_STATUS and GaugingStatus as places ITPOR
+ * is absent from without this firmware having read either of them. Both are
+ * read now, and it is still absent from both. The claim was right; it is no
+ * longer only a claim.
  *
  * Cadence: everything on one 60-second tick
  * -----------------------------------------
- * All seven registers, and the read-back of all six data-memory parameters, are
- * read on the SAME 60 s tick as Voltage and StateOfCharge, in one pass, from
+ * Every register above, the GaugingStatus subcommand, and the read-back of all
+ * six data-memory parameters are read on the SAME 60 s tick, in one pass, from
  * loop(); GET /battery serves the cache and reports how old it is. Reading them
  * only on request would be cheaper still, and cost is not the reason.
+ *
+ * ⚠️ Current() is the one reading in this file for which 60 s is genuinely
+ * coarse. The TRM updates it every second, and a taper lasts minutes — so a
+ * one-minute sample sees the shape of a taper but will not catch its last few
+ * seconds. That is a real limit of this diagnostic and it is stated rather than
+ * fixed, because fixing it means either an I2C transaction on the request path,
+ * which the rule below forbids for good reason, or a faster tick for every
+ * other register that does not need one.
  *
  * 🔴 The reason is that loop() must stay the only task that touches the I2C
  * bus. Arduino's TwoWire is not re-entrant and there is exactly one bus here,
@@ -254,11 +319,12 @@
  * Testing
  * -------
  * tools/test_battery.sh compiles the block below on the host, straight out of
- * this file: the little-endian word assembly, both status decoders, the sanity
- * gates, the RM/FCC cross-check, and — new with the writes — the data-memory
- * block builder, its checksum and length arithmetic against the TRM's own
- * worked example, the address allowlist, the parameter table, and the rule
- * that decides whether the configuration is still live.
+ * this file: the little-endian word assembly, all four status decoders, the
+ * signed current conversion, the sanity gates, the RM/FCC cross-check, the
+ * data-memory block builder, its checksum and length arithmetic against the
+ * TRM's own worked example, the address allowlist, the subcommand allowlist,
+ * the MAC echo check, the taper floor, the parameter table, and the rule that
+ * decides whether the configuration is still live.
  *
  * It also slices charger.cpp's table into the same binary and asserts that the
  * gauge's taper current equals the charger's termination current. That single
@@ -277,10 +343,13 @@
  */
 
 /* Standard commands. Every one is a two-byte little-endian read. */
+#define BQ_CMD_CONTROL            0x00   /* reads CONTROL_STATUS, see below */
 #define BQ_CMD_VOLTAGE            0x08
 #define BQ_CMD_BATTERY_STATUS     0x0A
+#define BQ_CMD_CURRENT            0x0C   /* SIGNED mA */
 #define BQ_CMD_REMAINING_CAP      0x10
 #define BQ_CMD_FULL_CHARGE_CAP    0x12
+#define BQ_CMD_AVERAGE_CURRENT    0x14   /* SIGNED mA */
 #define BQ_CMD_SOC                0x2C
 #define BQ_CMD_OPERATION_STATUS   0x3A
 #define BQ_CMD_DESIGN_CAP         0x3C
@@ -299,6 +368,23 @@
    is the piece that turns 4200 mV into 26640 mV when it is. */
 static uint16_t bq_word(uint8_t lo, uint8_t hi) {
     return (uint16_t)((uint16_t)lo | ((uint16_t)hi << 8));
+}
+
+/*
+ * The same two bytes read as a SIGNED value, which is what Current() 0x0C and
+ * AverageCurrent() 0x14 are — TRM 2.8: "a signed integer value that is the
+ * instantaneous current flow through the sense resistor", positive into the
+ * cell and negative out of it.
+ *
+ * A one-line conversion with a comment on it because getting it wrong is not
+ * visible: an 80 mA discharge is 0xFFB0 on the wire, and read as unsigned that
+ * is 65456 mA — a number no reader would believe. But a 5 mA discharge is
+ * 65531, and a gauge that has stopped measuring reads 0 either way. The
+ * interesting readings on this device are the small ones, which are exactly the
+ * ones where an unsigned mistake still looks like a current.
+ */
+static int16_t bq_signed(uint16_t raw) {
+    return (int16_t)raw;
 }
 
 /* The gates the older code applied inline, unchanged in meaning. Both bounds
@@ -346,6 +432,69 @@ static bool bq_soc_ok(uint16_t soc) {
 #define BQ_BS_OCVFAIL    (1u << 13)  /* an open-circuit reading failed        */
 #define BQ_BS_OCVCOMP    (1u << 14)  /* an open-circuit update completed      */
 #define BQ_BS_FD         (1u << 15)  /* full discharge detected               */
+
+/*
+ * GaugingStatus, TRM SLUUBD4A Table 2-4 — AND WHY IT IS NOT A SECOND OPINION
+ * ON BatteryStatus[FC].
+ *
+ * It was worth reading precisely because it might have been one: this word has
+ * its own FC bit and its own TC bit, and "we are reading the wrong FC" was a
+ * live theory. The TRM closes it in Table 2-4's own footnotes, which say of
+ * each bit that it "is identical to" its BatteryStatus counterpart — FC to
+ * BatteryStatus[FC], TC to [TCA], TD to [TDA], FD to [FD]. Section 2.2.18 says
+ * the same thing from the other end: "the most often checked flags from this
+ * register are copied to the OperationStatus() direct read register for easier
+ * access". One state, two windows onto it. A reading of GaugingStatus[FC]
+ * disagreeing with BatteryStatus[FC] would be news about the silicon, not the
+ * answer to why a full cell reads 97%.
+ *
+ * What it adds that nothing else exposes is CF, DSG, EDV and EDV1 — and DSG is
+ * the useful one here, because it distinguishes CHARGING from DISCHARGE and
+ * RELAXATION, which is the state machine the taper conditions run inside.
+ *
+ * Bit numbering is of the assembled 16-bit word, so Table 2-4's "high byte bit
+ * 7" is bit 15 here. Five of the sixteen are reserved and are not named: 4, 8,
+ * 9, 11 and 12. They are in the raw hex like every other reserved bit here.
+ */
+#define BQ_GS_FD         (1u << 0)   /* full discharge — same bit of state as
+                                        BatteryStatus[FD]                     */
+#define BQ_GS_FC         (1u << 1)   /* FULL CHARGE — the same state as
+                                        BatteryStatus[FC], not a second one   */
+#define BQ_GS_TD         (1u << 2)   /* terminate discharge = [TDA]           */
+#define BQ_GS_TC         (1u << 3)   /* terminate charge = [TCA]              */
+#define BQ_GS_EDV        (1u << 5)   /* cell below the EDV0 threshold         */
+#define BQ_GS_DSG        (1u << 6)   /* set in DISCHARGE or RELAXATION, clear
+                                        in CHARGING — not exposed elsewhere   */
+#define BQ_GS_CF         (1u << 7)   /* battery conditioning is needed        */
+#define BQ_GS_FCCX       (1u << 10)  /* coulomb-counter clock: 0 = 1 Hz,
+                                        1 = 16 Hz                             */
+#define BQ_GS_EDV1       (1u << 13)  /* cell below the EDV1 threshold         */
+#define BQ_GS_EDV2       (1u << 14)  /* cell below the EDV2 threshold         */
+#define BQ_GS_VDQ        (1u << 15)  /* this discharge qualifies for an FCC
+                                        update — the same state as
+                                        OperationStatus[VDQ]                  */
+
+/*
+ * CONTROL_STATUS, TRM SLUUBD4A Table 2-3.
+ *
+ * The whole high byte is reserved and so are bits 6 and 7 of the low byte, so
+ * three flags and a three-bit field is all there is. It is read here for CCA:
+ * the coulomb counter's calibration routine runs about a minute after
+ * initialisation and again as conditions change, and a gauge caught mid
+ * calibration is a gauge whose current readings are not to be argued from.
+ */
+#define BQ_CS_BATT_ID_SHIFT 0        /* BATT_ID[2:0] at bits 2:0              */
+#define BQ_CS_BATT_ID_MASK  0x7u
+#define BQ_CS_SNOOZE     (1u << 3)   /* SNOOZE power mode enabled             */
+#define BQ_CS_BCA        (1u << 4)   /* board calibration routine active      */
+#define BQ_CS_CCA        (1u << 5)   /* coulomb counter calibration active    */
+
+/* The chemistry-profile selector, as a number rather than as three bits. Read
+   out for the same reason sec_bits is: a caller looking at a decoded name
+   should be able to see what produced it. */
+static uint8_t bq_batt_id(uint16_t control_status) {
+    return (uint8_t)((control_status >> BQ_CS_BATT_ID_SHIFT) & BQ_CS_BATT_ID_MASK);
+}
 
 /*
  * The security mode, as a word rather than as two bits.
@@ -404,6 +553,160 @@ static bool bq_flag(uint16_t word, uint16_t mask) {
 static int bq_soc_from_capacity(uint16_t remaining_mah, uint16_t full_mah) {
     if (full_mah == 0) return -1;
     return (int)(((uint32_t)remaining_mah * 100u + full_mah / 2u) / full_mah);
+}
+
+/* ---------------------------------------------------------------------------
+ * WHAT THE GAUGE IS WAITING FOR, as arithmetic rather than as prose
+ *
+ * TRM SLUUBD4A section 4.4.1 gives three conditions, ALL required, for the
+ * primary charge termination that sets BatteryStatus[FC]:
+ *
+ *   1. two consecutive 40 s windows with the current below Taper Current
+ *   2. during those same windows, accumulated capacity > 0.25 mAh per window
+ *   3. Voltage() > Charging Voltage - Taper Voltage
+ *
+ * CONDITION 2 IS A FLOOR ON THE CURRENT AND READS LIKE A FOOTNOTE. That is the
+ * reason it is computed here instead of being left in the manual: it turns the
+ * termination test into a BAND rather than a threshold. The gauge is not
+ * waiting for the current to fall below Taper Current; it is waiting for the
+ * current to spend eighty seconds BETWEEN the capacity floor and Taper Current,
+ * above the taper voltage. A charge that jumps from above the ceiling to zero
+ * passes through the band without ever being in it, and never terminates.
+ *
+ * The floor is 0.25 mAh in 40 s. In microamps, exactly and with no rounding to
+ * argue about: 250 uAh * 3600 s/h / 40 s = 22500 uA.
+ * ------------------------------------------------------------------------- */
+#define BQ_TAPER_WINDOW_S       40    /* TRM 4.4.1, not configurable on this
+                                         part — there is no Current Taper
+                                         Window row in Table 3-2             */
+#define BQ_TAPER_MIN_CAP_UAH   250    /* 0.25 mAh, likewise fixed            */
+#define BQ_TAPER_WINDOWS       2      /* "two consecutive periods"           */
+
+/* Returned in microamps because 22.5 mA is not an integer and this figure is
+   the edge of a band somebody will compare a reading against. Rounding it
+   either way here would be inventing a bound the TRM does not state. */
+static long bq_taper_floor_ua(void) {
+    return (long)BQ_TAPER_MIN_CAP_UAH * 3600L / (long)BQ_TAPER_WINDOW_S;
+}
+
+/*
+ * THE CAPACITY FLOOR IS NOT ALWAYS THE FLOOR THAT BINDS, and this is a second
+ * mechanism rather than a restatement of the first.
+ *
+ * Qualifying a termination takes two 40 s windows, so eighty seconds. But the
+ * gauge leaves CHARGE mode for RELAXATION when the current stays below Quit
+ * Current for Chg Relax Time — TRM 4.9.60, and Chg Relax Time's ROM default is
+ * SIXTY seconds (Table 3-2, 0x9230). Sixty is less than eighty. So a current
+ * that settles below Quit Current has the gauge out of CHARGE mode, and out of
+ * the termination algorithm entirely, twenty seconds before the second window
+ * would have closed.
+ *
+ * Below Quit Current the qualification therefore cannot complete no matter what
+ * the capacity condition says. The real floor is whichever of the two is
+ * higher, and on this device it is Quit Current at 40 mA rather than the
+ * capacity condition's 22.5 mA.
+ *
+ * The comparison is written out rather than assumed because both figures are
+ * ROM defaults that a later commit may move: raise Chg Relax Time above eighty
+ * seconds and the relax exit stops pre-empting anything, at which point the
+ * capacity floor is the floor again and this function says so.
+ */
+#define BQ_CHG_RELAX_TIME_S    60     /* Table 3-2, 0x9230, ROM default      */
+
+static bool bq_relax_pre_empts_taper(void) {
+    return BQ_CHG_RELAX_TIME_S < (BQ_TAPER_WINDOW_S * BQ_TAPER_WINDOWS);
+}
+
+static long bq_termination_floor_ua(int16_t quit_current_ma) {
+    long capacity_floor = bq_taper_floor_ua();
+    if (!bq_relax_pre_empts_taper()) return capacity_floor;
+    long quit_floor = (long)quit_current_ma * 1000L;
+    return quit_floor > capacity_floor ? quit_floor : capacity_floor;
+}
+
+/* ===========================================================================
+ * MAC SUBCOMMAND READS — how GaugingStatus is reached at all
+ * =========================================================================*/
+
+/*
+ * GaugingStatus is NOT a standard command. There is no register to point at:
+ * it is a Control()/ManufacturerAccessControl() subcommand, and reading it
+ * means writing the subcommand code and then reading the answer back.
+ *
+ * TRM section 2.2 gives the procedure with DEVICE_NUMBER as the worked example:
+ * "Write the data bytes 0x01 0x00 to the device address 0xAA starting at
+ * command 0x00. Then read the response using an incremental read... starting at
+ * command 0x3E, read four bytes. The result would be 0x01 0x00 0x20 0x03 with
+ * the first two bytes reflecting subcommand, and the second two bytes
+ * representing the device type in little endian order."
+ *
+ * So the frame is four bytes: the subcommand echoed back, then the value. The
+ * echo is the whole reason this is worth doing carefully — see
+ * bq_mac_echo_ok().
+ *
+ * CONTROL_STATUS does not need any of this. Section 2.2 again: "Reading the
+ * Control() registers will always report the CONTROL_STATUS() data field",
+ * and "Writing a 0x0000 to Control() is no longer necessary to read the
+ * CONTROL_STATUS(), although it is okay if it is done." So it is a plain
+ * two-byte read of register 0x00 with nothing written at all, and this file
+ * does it that way: the genuinely read-only path is available, so it is taken.
+ */
+#define BQ_MAC_CONTROL_STATUS    0x0000
+#define BQ_MAC_OPERATION_STATUS  0x0054
+#define BQ_MAC_GAUGING_STATUS    0x0056
+
+/*
+ * THE GUARD ON SUBCOMMANDS, and this one IS about damage in a way the
+ * data-memory guard explicitly is not.
+ *
+ * bq_dm_write_allowed() stands between a typo and a silently corrupted gauge
+ * model. This stands between a typo and a gauge that has thrown the model away:
+ * the subcommand space puts RESET (0x0041) seven hex digits from GaugingStatus
+ * (0x0056), with SEALED (0x0030), ENTER_CFG_UPDATE (0x0090) and RETURN_TO_ROM
+ * (0x0F00) in the same small space. RESET on this part discards the six
+ * parameters, the accumulated learning and the FULL ACCESS state in one
+ * transaction, acknowledged, with no error anywhere.
+ *
+ * So the read path takes an allowlist rather than a subcommand, and the list
+ * holds exactly the status words: both are read-only by definition, both are
+ * available while SEALED (Table 2-2), and neither changes any state. Everything
+ * else is refused before a byte reaches the wire.
+ *
+ * OPERATION_STATUS is on the list and is not currently read through it — the
+ * standard command at 0x3A returns the same word for one transaction instead of
+ * two. It is here because it is the one other status subcommand that is safe by
+ * the same argument, and leaving it out would invite the next reader to widen
+ * the guard rather than to use it.
+ */
+static bool bq_mac_read_allowed(uint16_t subcmd) {
+    switch (subcmd) {
+        case BQ_MAC_GAUGING_STATUS:   return true;
+        case BQ_MAC_OPERATION_STATUS: return true;
+        default:                      return false;
+    }
+}
+
+/*
+ * Does this four-byte frame answer the subcommand that was asked?
+ *
+ * This is the difference between a diagnostic and a plausible zero, and it is
+ * the same call the file already made about ITPOR. A MAC read has three ways to
+ * come back wrong that all look like data: the part may not have finished
+ * processing the subcommand and still hold the previous one's frame; another
+ * transaction may have re-pointed the MAC register between the write and the
+ * read; and a part that does not implement the subcommand at all answers
+ * something. In every one of those cases bytes arrive, bq_word() assembles them
+ * happily, and the endpoint prints sixteen named flags that are about a
+ * different question.
+ *
+ * The echo makes it checkable. The first two bytes must be the subcommand, low
+ * byte first — TRM 2.2's example reads 0x01 0x00 back from subcommand 0x0001.
+ * If they are not, the read did not happen and the endpoint says so instead of
+ * decoding whatever did arrive.
+ */
+static bool bq_mac_echo_ok(uint16_t subcmd, const uint8_t *frame) {
+    return frame[0] == (uint8_t)(subcmd & 0xFFu) &&
+           frame[1] == (uint8_t)((subcmd >> 8) & 0xFFu);
 }
 
 /* ===========================================================================
@@ -581,10 +884,69 @@ struct GaugeParam {
 };
 
 static const GaugeParam gauge_config[] = {
+    /*
+     * ⚠️ THIS VALUE IS KNOWN WRONG AND IS DELIBERATELY LEFT ALONE. DO NOT
+     * "TIDY" IT INTO AGREEMENT WITH THE CHARGER. THAT AGREEMENT IS THE BUG.
+     *
+     * It reads like a matching pair with charger.cpp's ITERM and that is
+     * exactly the trap: 128 here equals 128 there, the two files look
+     * consistent, and the consistency is what stops FC ever setting. Every
+     * instinct a reader has on arriving at these two numbers is to preserve
+     * their equality. TI's guidance is the opposite of that instinct.
+     *
+     * SLUA777 3.2, SLUA903 2.2 and SLUA917, in identical words across three
+     * independent application reports: "It is very important to set the taper
+     * current programmed in the data flash of the gauge SLIGHTLY HIGHER than
+     * the taper current threshold of the charger. This ensures that the gauge
+     * detects the battery is fully charged BEFORE the charger cuts off
+     * charge." Their worked example is a 50 mA charger and a 70 mA gauge
+     * setting — a ratio of 1.4 — and the reason they give is that chargers
+     * carry about ±10% error on the threshold they cut off at.
+     *
+     * WHAT A WRONG CHOICE LOOKS LIKE ON THE DEVICE, so it is recognised
+     * rather than re-diagnosed a fourth time:
+     *
+     *   TOO LOW (at or below the charger's ITERM — TODAY'S STATE)
+     *     fc stays false through a charge the charger calls complete.
+     *     FullChargeCapacity stays at DesignCapacity, soc_percent reads a few
+     *     points short of 100 on a genuinely full cell, and vdq stays false.
+     *     The band is empty: above the ceiling the charger is still
+     *     delivering, below it the charger has stopped and the current is
+     *     zero. Nothing ever occupies it.
+     *
+     *   TOO HIGH (far above ITERM, into the constant-current phase)
+     *     fc sets EARLY, while the cell is still meaningfully charging. That
+     *     is worse than it looks, because it is silent: fc goes true, the
+     *     percentage snaps to 100, and everything reads healthy. The damage
+     *     is that FullChargeCapacity then learns SHORT — the gauge records a
+     *     smaller pack than exists and every later percentage is computed
+     *     against it. The symptom is a device that charges to 100% and then
+     *     runs longer than 100% should last, or an FCC that drifts downward
+     *     across cycles. Condition 3 bounds this: termination is only
+     *     attempted above ChargingVoltage - TaperVoltage, so the window is
+     *     inside the CV phase — but a taper current set high enough reaches
+     *     into the start of CV, where real charge is still going in.
+     *
+     * THE CONFLICT THAT IS NOT YET RESOLVED, and the reason no number is
+     * written here today: the same TI notes also advise keeping taper current
+     * below C/10, which for this 1300 mAh cell is 130 mA. This board's
+     * charger already terminates at 128 mA, so "above the charger's ITERM"
+     * and "below C/10" leave a window about two milliamps wide. One of the
+     * two has to give, and which one is a decision about the CHARGER as much
+     * as about the gauge. Deciding it from a charge profile nobody has
+     * watched yet would be the fourth confident guess on this ticket.
+     *
+     * So: this commit reads. Current() and AverageCurrent() are added for
+     * precisely this measurement. The next commit picks a number with a real
+     * taper in front of it.
+     */
     {BQ_DM_TAPER_CURRENT, 128, "TaperCurrent", "mA",
-     "THE FIX: the charger stops at 128 mA (REG05 ITERM) and the gauge was "
-     "watching for its 100 mA default, so it never saw a charge finish, never "
-     "set FC, and never learned FullChargeCapacity"},
+     "KNOWN WRONG, left unchanged pending a measured charge profile. It equals "
+     "the charger's ITERM (REG05), and TI SLUA777/903/917 say it must be set "
+     "SLIGHTLY HIGHER than the charger's threshold so the gauge sees full "
+     "before the charger cuts off. Equal means the gauge waits for a current "
+     "band the charger will not produce: above 128 mA the charger is still "
+     "charging, below it the charger has stopped. See charge_termination."},
     {BQ_DM_CHARGING_CURRENT, 512, "ChargingCurrent", "mA",
      "matches the charger's ICHG (REG04), so the gauge's idea of a charge in "
      "progress matches what the charger delivers"},
@@ -602,6 +964,16 @@ static const GaugeParam gauge_config[] = {
 };
 
 #define GAUGE_CONFIG_COUNT ((int)(sizeof(gauge_config) / sizeof(gauge_config[0])))
+
+/* The table entry at an address, or NULL. By address rather than by index,
+   because the comment above says the order here is explicitly free to change
+   and an index would quietly turn that freedom into a bug. */
+static const GaugeParam *gauge_param_at(uint16_t addr) {
+    for (int i = 0; i < GAUGE_CONFIG_COUNT; i++) {
+        if (gauge_config[i].addr == addr) return &gauge_config[i];
+    }
+    return NULL;
+}
 
 /*
  * Which parameters are not holding what the table says, as a bitmask over it.
@@ -756,6 +1128,41 @@ static bool bq27220_subcommand(uint8_t reg, uint16_t subcmd) {
 }
 
 /*
+ * One status word out of the MAC subcommand space. Read-only, guarded, and
+ * false unless the part answered the question that was asked.
+ *
+ * The guard is inside this function rather than at its call site for the same
+ * reason bq27220_dm_write()'s is: adding a call site must not be able to add a
+ * way around it. A refused subcommand returns false without opening a
+ * transaction.
+ *
+ * The frame is read from 0x3E rather than from MACData() at 0x40 because that
+ * is what TRM 2.2's worked example does, and because it is what makes the echo
+ * available — a read starting at 0x40 gets the value with no way to tell which
+ * subcommand produced it.
+ *
+ * BQ_DELAY_MAC_SELECT_MS between the write and the read is the same 15 ms
+ * bq27220_dm_read() waits for the address pointer to become valid. The TRM
+ * gives no figure for a subcommand; this is BQStudio's for the analogous step,
+ * and the echo check is what turns "not long enough" into a reported failure
+ * rather than into a decoded stale frame.
+ */
+static bool bq27220_mac_read16(uint16_t subcmd, uint16_t &val) {
+    if (!bq_mac_read_allowed(subcmd)) return false;
+
+    uint8_t sel[2] = {(uint8_t)(subcmd & 0xFFu), (uint8_t)((subcmd >> 8) & 0xFFu)};
+    if (!bq27220_write_bytes(BQ_REG_MAC, sel, 2)) return false;
+    delay(BQ_DELAY_MAC_SELECT_MS);
+
+    uint8_t frame[4];
+    if (!bq27220_read_bytes(BQ_REG_MAC, frame, 4)) return false;
+    if (!bq_mac_echo_ok(subcmd, frame)) return false;
+
+    val = bq_word(frame[2], frame[3]);
+    return true;
+}
+
+/*
  * ONE data-memory parameter, and the ONLY way a data-memory byte reaches this
  * part.
  *
@@ -830,11 +1237,22 @@ struct BatteryGauge {
     uint16_t design_mah;
     uint16_t op_status;
     uint16_t batt_status;
+    /* The two status words that are not standard commands, and the two signed
+       currents. `gauging_ok` false means the subcommand did not answer with its
+       own echo — not that every flag in it is clear. */
+    uint16_t gauging_status;
+    uint16_t control_status;
+    int16_t current_ma;
+    int16_t avg_current_ma;
     bool remaining_ok;
     bool full_ok;
     bool design_ok;
     bool op_ok;
     bool batt_ok;
+    bool gauging_ok;
+    bool control_ok;
+    bool current_ok;
+    bool avg_current_ok;
     /* The data-memory read-back, in table order, and what this pass concluded
        from it. Re-derived every pass rather than latched at boot, so a gauge
        that lost its RAM cannot go on being reported as configured. */
@@ -1131,6 +1549,28 @@ static void battery_read(bool at_boot) {
     g.op_ok        = bq27220_read16(BQ_CMD_OPERATION_STATUS, g.op_status);
     g.batt_ok      = bq27220_read16(BQ_CMD_BATTERY_STATUS, g.batt_status);
 
+    /* The two signed ones. Read through the same 16-bit path as everything
+       else and reinterpreted, because the wire format is identical and only the
+       meaning of the top bit differs. */
+    uint16_t raw = 0;
+    g.current_ok = bq27220_read16(BQ_CMD_CURRENT, raw);
+    if (g.current_ok) g.current_ma = bq_signed(raw);
+    g.avg_current_ok = bq27220_read16(BQ_CMD_AVERAGE_CURRENT, raw);
+    if (g.avg_current_ok) g.avg_current_ma = bq_signed(raw);
+
+    /* CONTROL_STATUS is a plain read of register 0x00 — nothing is written to
+       get it. GaugingStatus is a subcommand and cannot be had that way.
+
+       BOTH ARE READ BEFORE THE DATA-MEMORY READ-BACK BELOW, AND THAT ORDER IS
+       DELIBERATE. The subcommand write re-points the MAC register at 0x3E,
+       which is the same register bq27220_dm_read() points at an address. Each
+       re-points before it reads, so either order works today; doing the
+       subcommand first means the data-memory read-back — the thing this file
+       makes claims about — is never the one running on a pointer somebody else
+       set. */
+    g.control_ok = bq27220_read16(BQ_CMD_CONTROL, g.control_status);
+    g.gauging_ok = bq27220_mac_read16(BQ_MAC_GAUGING_STATUS, g.gauging_status);
+
     /*
      * The data-memory read-back, on the same pass and under the same rule as
      * everything else: this is the only task allowed on the bus.
@@ -1265,8 +1705,9 @@ static void battery_refresh() {
 /* --- Endpoints --- */
 
 static const SkillEndpoint battery_endpoints[] = {
-    {"GET", "/battery", "Fuel gauge registers raw and decoded, plus the six "
-                        "charge parameters written to its data memory at boot"},
+    {"GET", "/battery", "Fuel gauge registers and all four status words raw and "
+                        "decoded, the measured current, what charge termination "
+                        "requires, and the six parameters written at boot"},
     {NULL, NULL, NULL}
 };
 
@@ -1290,7 +1731,8 @@ static const char *battery_describe() {
            "### Endpoints\n\n"
            "| Method | Path | Description |\n"
            "|--------|------|-------------|\n"
-           "| GET | /battery | Every register read here raw and decoded, plus "
+           "| GET | /battery | Every register read here raw and decoded, all "
+           "four status words, the measured current, `charge_termination`, and "
            "`gauge_config`: what was written, read back, and whether it is "
            "still there |\n\n"
            "### Why the writes exist\n\n"
@@ -1304,12 +1746,33 @@ static const char *battery_describe() {
            "has never noticed a charge finish. It declares a pack full when the\n"
            "charge current tapers below **its own** taper threshold at **its\n"
            "own** termination voltage — both in data memory, both still at ROM\n"
-           "defaults, neither describing this board. The charger stops at\n"
-           "128 mA; the gauge was waiting for 100 mA. That condition never\n"
-           "arrives, so `fc` never sets and FullChargeCapacity never updates.\n\n"
+           "defaults, neither describing this board.\n\n"
            "The fix is not to write a capacity — that would be inventing the\n"
            "number the gauge is supposed to measure. It is to describe the\n"
            "charger to the gauge and let it find the capacity itself.\n\n"
+           "**That much still holds. The specific number did not.** This text\n"
+           "used to end: \"the charger stops at 128 mA, the gauge was waiting\n"
+           "for 100 mA, that condition never arrives\" — and concluded that\n"
+           "setting the gauge's taper current to the charger's 128 mA would\n"
+           "make `fc` set on the next completed charge. It was applied, it\n"
+           "verified, and the next completed charge ended at 1256 mAh, 4171 mV,\n"
+           "97%, with `fc` still **false**.\n\n"
+           "Why, from TRM 4.4.1 and served as `charge_termination` below: the\n"
+           "second condition requires accumulated capacity above 0.25 mAh per\n"
+           "40 s window, which is a **floor** on the current of 22 500 uA. So\n"
+           "the gauge waits for the current to sit *between* that floor and the\n"
+           "taper current for eighty seconds. Setting the taper current equal\n"
+           "to the charger's termination current makes that band exactly the\n"
+           "range the charger refuses to operate in: above 128 mA the charger\n"
+           "is still delivering, below it the charger has stopped and the\n"
+           "current is zero. The band is empty by construction, which is why\n"
+           "all three attempts on this device failed the same way.\n\n"
+           "**Nothing has been changed on the strength of that.** The six\n"
+           "values below are exactly what the previous version wrote. This\n"
+           "version adds the readings that would show a taper actually\n"
+           "happening — `current_ma`, `average_current_ma`, `gauging_status` —\n"
+           "because three theories have now been acted on before being\n"
+           "measured and the measurement is the thing that was missing.\n\n"
            "### What is written\n\n"
            "Six data-memory parameters, from TRM SLUUBD4A Table 3-2, matching\n"
            "LilyGO's own production firmware for this board.\n\n"
@@ -1380,7 +1843,7 @@ static const char *battery_describe() {
            "be locked out. It is left in FULL ACCESS rather than re-sealed: it\n"
            "arrived unsealed, and the 60 s read-back needs data-memory access.\n\n"
            "### What you get from the registers\n\n"
-           "Seven standard commands, each a two-byte little-endian read:\n\n"
+           "Ten standard commands, each a two-byte little-endian read:\n\n"
            "| Field | Command | Meaning |\n"
            "|-------|---------|---------|\n"
            "| `voltage_mv` | 0x08 | cell voltage, mV |\n"
@@ -1388,9 +1851,16 @@ static const char *battery_describe() {
            "| `remaining_mah` | 0x10 | RemainingCapacity |\n"
            "| `full_charge_mah` | 0x12 | FullChargeCapacity |\n"
            "| `design_mah` | 0x3C | DesignCapacity |\n"
+           "| `current_ma` | 0x0C | instantaneous current, **signed**, "
+           "positive into the cell |\n"
+           "| `average_current_ma` | 0x14 | the same filtered, ~14.5 s time "
+           "constant |\n"
            "| `operation_status` | 0x3A | security mode and gauging state |\n"
-           "| `battery_status` | 0x0A | charge/discharge flags |\n\n"
-           "The last five are objects: each carries `ok`, and a value only when\n"
+           "| `battery_status` | 0x0A | charge/discharge flags |\n"
+           "| `control_status` | 0x00 | calibration and profile bits |\n\n"
+           "`gauging_status` is **not** in that list because it is not a\n"
+           "register: it is MAC subcommand 0x0056. See below.\n\n"
+           "The last seven are objects: each carries `ok`, and a value only when\n"
            "`ok` is true, so a failed bus transaction never looks like a\n"
            "reading of zero. `voltage_mv` and `soc_percent` are plain numbers\n"
            "and are absent when there is nothing to report — an unreadable\n"
@@ -1405,16 +1875,71 @@ static const char *battery_describe() {
            "to report — when either capacity read failed, and when\n"
            "FullChargeCapacity is zero and the figure cannot be computed at\n"
            "all.\n\n"
-           "### The two status words\n\n"
-           "Both are reported as `raw` (hex) and as decoded flags. Decoded from\n"
+           "### The four status words\n\n"
+           "All four are reported as `raw` (hex) and as decoded flags. From\n"
            "`operation_status`: `sec` (`sealed` / `unsealed` / `full` /\n"
            "`unknown`, with `sec_bits` alongside it), `cfgupdate`, `vdq`,\n"
            "`initcomp`, `smth`, `edv2`, `btpint`, `calmd`. From\n"
            "`battery_status`: `fc` (full charge), `fd`, `dsg`, `battpres`,\n"
            "`auth_gd`, `ocvgd`, `ocvcomp`, `ocvfail`, `chginh`, `tca`, `tda`,\n"
-           "`sysdwn`, `otc`, `otd`, `sleep`.\n\n"
+           "`sysdwn`, `otc`, `otd`, `sleep`. From `control_status`: `cca`\n"
+           "(coulomb-counter calibration running), `bca`, `snooze`, `batt_id`.\n"
+           "From `gauging_status`: `fc`, `fd`, `tc`, `td`, `dsg`, `cf`, `edv`,\n"
+           "`edv1`, `edv2`, `vdq`, `fccx`.\n\n"
            "`sec` decides what is possible at all: a SEALED gauge accepts no\n"
            "configuration until it is unsealed with the right key.\n\n"
+           "### gauging_status is not a second opinion\n\n"
+           "It has its own `fc` and its own `tc`, and the obvious reading —\n"
+           "that the firmware was watching the wrong FC all along — is wrong.\n"
+           "TRM SLUUBD4A Table 2-4 says of each of these bits that it **\"is\n"
+           "identical to\"** its counterpart: `fc` to `battery_status.fc`, `tc`\n"
+           "to `tca`, `td` to `tda`, `fd` to `fd`, and `vdq` to\n"
+           "`operation_status.vdq`. Section 2.2.18 puts it the other way round:\n"
+           "the most-checked flags of this register are *copied* to the direct\n"
+           "read registers. One state, four windows. If a pair ever disagrees,\n"
+           "that is news about the silicon and not the answer to a percentage\n"
+           "question.\n\n"
+           "What is **only** here: `cf` (conditioning needed), `dsg` (set in\n"
+           "DISCHARGE or RELAXATION, clear in CHARGING — the state machine the\n"
+           "taper conditions run inside), `edv` and `edv1`.\n\n"
+           "Reaching it costs a subcommand rather than a register read: 0x0056\n"
+           "is written to 0x3E and a four-byte frame read back, of which the\n"
+           "first two bytes echo the subcommand. **If that echo does not match,\n"
+           "nothing is decoded** and `ok` is false with a `note` saying why —\n"
+           "a frame that cannot be shown to answer this question is not served\n"
+           "as sixteen plausible flags. Only status subcommands are reachable\n"
+           "by this path at all; the allowlist exists because `RESET` (0x0041)\n"
+           "lives in the same small space and would discard the configuration,\n"
+           "the learning and the access state in one acknowledged transaction.\n\n"
+           "`control_status` needs no subcommand: TRM 2.2 makes reading\n"
+           "register 0x00 sufficient, so nothing at all is written to get it.\n\n"
+           "### charge_termination — what FC is waiting for\n\n"
+           "TRM 4.4.1 gives three conditions, all required, and this object\n"
+           "substitutes this build's own numbers into them. **The second\n"
+           "condition is a floor on the current, not a footnote**, and that is\n"
+           "the whole reason the object exists: accumulated capacity must\n"
+           "exceed 0.25 mAh per 40 s window, which is `capacity_floor_ua` =\n"
+           "22 500 uA. So termination needs the current to stay *between*\n"
+           "`current_floor_ua` and `current_ceiling_ma` for `windows_required`\n"
+           "consecutive `window_s` periods, with the cell above\n"
+           "`min_voltage_mv`. It is a **band**, not a threshold. A charge that\n"
+           "leaves the ceiling and reaches zero without spending that time in\n"
+           "between passes through the band without ever being in it, and never\n"
+           "terminates.\n\n"
+           "**There are two floors and the higher one wins.** Below\n"
+           "`QuitCurrent` the gauge leaves CHARGE mode for RELAXATION after\n"
+           "`chg_relax_time_s` (TRM 4.9.60), and 60 s is *shorter* than the\n"
+           "80 s two windows take — so the qualification is abandoned before it\n"
+           "can finish. `relax_exit_pre_empts_taper` says whether that is true\n"
+           "for this build, `quit_current_floor_ua` is that floor,\n"
+           "`current_floor_ua` is the one that actually binds, and\n"
+           "`floor_set_by` names which rule produced it. On this device it is\n"
+           "QuitCurrent at 40 mA, not the capacity condition at 22.5 mA.\n\n"
+           "`ti_guidance` carries TI's own recommendation verbatim in summary,\n"
+           "including the part that conflicts with it on this board. Nothing in\n"
+           "this object is written to the gauge and nothing in it is applied.\n"
+           "It reports what the manual requires and what this firmware has\n"
+           "configured, so the two can be compared without a PDF.\n\n"
            "**There is no `itpor` flag, and its absence is deliberate.** ITPOR\n"
            "— \"the RAM configuration was reset to defaults\" — is named in the\n"
            "BQ27220 TRM's prose as `Flags()[ITPOR]`, but on this part `Flags()`\n"
@@ -1503,6 +2028,18 @@ static void battery_register_routes(AsyncWebServer &server) {
         design["ok"] = g.design_ok;
         if (g.design_ok) design["value"] = g.design_mah;
 
+        /* Signed, positive into the cell. These are the readings the taper
+           argument below is made of, and until this commit the firmware had
+           never looked at either — every claim about what current the gauge
+           does or does not see was inference from capacities. */
+        JsonObject cur = doc["current_ma"].to<JsonObject>();
+        cur["ok"] = g.current_ok;
+        if (g.current_ok) cur["value"] = g.current_ma;
+
+        JsonObject avg = doc["average_current_ma"].to<JsonObject>();
+        avg["ok"] = g.avg_current_ok;
+        if (g.avg_current_ok) avg["value"] = g.avg_current_ma;
+
         /* Derived, and only when both inputs are real. */
         if (g.remaining_ok && g.full_ok) {
             int derived = bq_soc_from_capacity(g.remaining_mah, g.full_mah);
@@ -1546,6 +2083,129 @@ static void battery_register_routes(AsyncWebServer &server) {
             bs["otd"]      = bq_flag(g.batt_status, BQ_BS_OTD);
             bs["sleep"]    = bq_flag(g.batt_status, BQ_BS_SLEEP);
         }
+
+        /*
+         * GaugingStatus, MAC subcommand 0x0056.
+         *
+         * `ok` false here means something specific and stronger than a failed
+         * bus transaction: the part did not echo the subcommand back, so
+         * whatever arrived is not known to be an answer to this question. No
+         * flag is decoded in that case. A word of sixteen plausible false
+         * flags, printed off a frame that belonged to something else, is the
+         * exact failure the ITPOR line further down refuses to commit.
+         */
+        JsonObject gs = doc["gauging_status"].to<JsonObject>();
+        gs["ok"] = g.gauging_ok;
+        if (g.gauging_ok) {
+            snprintf(hex, sizeof(hex), "0x%04X", g.gauging_status);
+            gs["raw"] = String(hex);
+            gs["fc"]   = bq_flag(g.gauging_status, BQ_GS_FC);
+            gs["fd"]   = bq_flag(g.gauging_status, BQ_GS_FD);
+            gs["tc"]   = bq_flag(g.gauging_status, BQ_GS_TC);
+            gs["td"]   = bq_flag(g.gauging_status, BQ_GS_TD);
+            gs["dsg"]  = bq_flag(g.gauging_status, BQ_GS_DSG);
+            gs["cf"]   = bq_flag(g.gauging_status, BQ_GS_CF);
+            gs["edv"]  = bq_flag(g.gauging_status, BQ_GS_EDV);
+            gs["edv1"] = bq_flag(g.gauging_status, BQ_GS_EDV1);
+            gs["edv2"] = bq_flag(g.gauging_status, BQ_GS_EDV2);
+            gs["vdq"]  = bq_flag(g.gauging_status, BQ_GS_VDQ);
+            gs["fccx"] = bq_flag(g.gauging_status, BQ_GS_FCCX);
+            /* Said next to the bits rather than only in describe(), because the
+               reader most likely to open this object is one who has just been
+               told there are two FC bits and is about to conclude something
+               from the pair. */
+            gs["note"] = "fc/tc/td/fd and vdq are the SAME state as "
+                         "battery_status.fc/tca/tda/fd and operation_status.vdq "
+                         "(TRM SLUUBD4A Table 2-4: each 'is identical to' its "
+                         "counterpart), not a second opinion on it. What is "
+                         "only here: cf, dsg, edv, edv1.";
+        } else {
+            gs["note"] = "the gauge did not echo subcommand 0x0056 back, so "
+                         "nothing is decoded; a frame that cannot be shown to "
+                         "answer this question is not reported as flags.";
+        }
+
+        /* CONTROL_STATUS, read straight off register 0x00 with nothing written
+           — TRM 2.2 makes the 0x0000 subcommand unnecessary. Three flags and a
+           three-bit field is the whole of it; the rest of the word is
+           reserved, and is in `raw`. */
+        JsonObject cs = doc["control_status"].to<JsonObject>();
+        cs["ok"] = g.control_ok;
+        if (g.control_ok) {
+            snprintf(hex, sizeof(hex), "0x%04X", g.control_status);
+            cs["raw"] = String(hex);
+            cs["cca"]     = bq_flag(g.control_status, BQ_CS_CCA);
+            cs["bca"]     = bq_flag(g.control_status, BQ_CS_BCA);
+            cs["snooze"]  = bq_flag(g.control_status, BQ_CS_SNOOZE);
+            cs["batt_id"] = bq_batt_id(g.control_status);
+        }
+
+        /*
+         * The three conditions FC actually waits on, with this build's own
+         * numbers substituted into them.
+         *
+         * Served because the two status words above answer "did it terminate"
+         * and this answers "what would have to be true for it to". Every figure
+         * comes from the shipping table or from TRM 4.4.1; nothing here is a
+         * recommendation and nothing here is written to the part.
+         */
+        JsonObject term = doc["charge_termination"].to<JsonObject>();
+        term["source"] = "TRM SLUUBD4A section 4.4.1, all three required";
+        term["window_s"] = BQ_TAPER_WINDOW_S;
+        term["windows_required"] = BQ_TAPER_WINDOWS;
+        term["min_capacity_per_window_uah"] = BQ_TAPER_MIN_CAP_UAH;
+        /* The floor condition 2 implies, on its own. In microamps: 22500 uA is
+           22.5 mA and does not round. */
+        term["capacity_floor_ua"] = bq_taper_floor_ua();
+
+        const GaugeParam *taper = gauge_param_at(BQ_DM_TAPER_CURRENT);
+        const GaugeParam *cvolt = gauge_param_at(BQ_DM_CHARGING_VOLTAGE);
+        const GaugeParam *tvolt = gauge_param_at(BQ_DM_CEDV_TAPER_VOLTAGE);
+        const GaugeParam *quit  = gauge_param_at(BQ_DM_QUIT_CURRENT);
+
+        /* And the OTHER floor, which is a different mechanism and on this
+           device is the one that actually binds: below Quit Current the gauge
+           leaves CHARGE mode after Chg Relax Time, and 60 s is less than the
+           80 s the qualification needs. Reported alongside rather than instead,
+           because a reader who only sees the larger number cannot tell which
+           of the two rules produced it. */
+        term["chg_relax_time_s"] = BQ_CHG_RELAX_TIME_S;
+        term["relax_exit_pre_empts_taper"] = bq_relax_pre_empts_taper();
+        if (quit) {
+            term["quit_current_floor_ua"] = (long)quit->value * 1000L;
+            term["current_floor_ua"] = bq_termination_floor_ua(quit->value);
+            term["floor_set_by"] =
+                bq_termination_floor_ua(quit->value) > bq_taper_floor_ua()
+                    ? "QuitCurrent: below it the gauge leaves CHARGE mode after "
+                      "chg_relax_time_s, which is shorter than the two windows "
+                      "the qualification needs"
+                    : "the 0.25 mAh per window capacity condition";
+        }
+
+        if (taper) term["current_ceiling_ma"] = taper->value;
+        if (cvolt && tvolt) term["min_voltage_mv"] = cvolt->value - tvolt->value;
+        term["condition"] = "the current must stay between current_floor_ua and "
+                            "current_ceiling_ma for windows_required consecutive "
+                            "window_s periods while voltage_mv exceeds "
+                            "min_voltage_mv. A charge that leaves the ceiling "
+                            "and reaches zero without spending that time in "
+                            "between passes through the band without ever being "
+                            "in it.";
+        /* The vendor guidance, cited rather than acted on. See the comment on
+           the TaperCurrent row of gauge_config[] for why this is not simply
+           applied here. */
+        term["ti_guidance"] = "TI SLUA777 3.2, SLUA903 2.2 and SLUA917, in "
+                              "identical words: set the gauge's taper current "
+                              "SLIGHTLY HIGHER than the charger's taper "
+                              "threshold, so the gauge sees full before the "
+                              "charger cuts off. Their worked example is 70 mA "
+                              "for a 50 mA charger, a ratio of 1.4. They also "
+                              "advise taper current below C/10, which for this "
+                              "1300 mAh cell is 130 mA — and this board's "
+                              "charger already terminates at 128 mA, so the two "
+                              "pieces of guidance leave almost no room between "
+                              "them. That conflict is unresolved and is why "
+                              "nothing here has been changed yet.";
 
         /* Said in the payload as well as in describe(): whoever is chasing the
            wrong percentage will read this response long before they read the
@@ -1617,10 +2277,11 @@ static void battery_register_routes(AsyncWebServer &server) {
 
 static const Skill battery_skill = {
     .name = "battery",
-    /* 0.2.0 rather than 0.1.1: this skill's contract changed. It used to write
-       nothing to the gauge and now writes six data-memory parameters at boot,
-       and `writes` in the response went from false to true with it. */
-    .version = "0.2.0",
+    /* 0.3.0 rather than 0.2.1: the response gained fields — two status words,
+       two currents and charge_termination — which is a contract change even
+       though nothing was removed and no behaviour changed. What is written to
+       the gauge is exactly what 0.2.0 wrote. */
+    .version = "0.3.0",
     .describe = battery_describe,
     .endpoints = battery_endpoints,
     .register_routes = battery_register_routes
