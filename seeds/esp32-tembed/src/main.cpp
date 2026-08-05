@@ -346,6 +346,16 @@ static void probe_cc1101() {
 static void battery_probe();
 static void battery_refresh();
 
+// The backlight is declared here for the same shape of reason, one step earlier
+// in the boot: display_init() has to light the panel the moment there is
+// something on it to light, and that is long before skills_init() runs. So the
+// bring-up — pin, stored level, first pulse train — is called from there and
+// only the skill's registration waits for the skill list. GPIO21 is the enable
+// pin of an AW9364 rather than a transistor's gate, which is why this is a
+// function at all instead of the two lines it replaces; the protocol and the
+// reason a level is not a PWM duty are at the head of skills/backlight.cpp.
+static void backlight_begin();
+
 // The charger shares that I2C bus and is a separate skill because it is a
 // separate part with a separate failure: charger_probe() sets four registers on
 // the BQ25896 — the termination current above all, which on the power-on value
@@ -722,9 +732,10 @@ static void display_init() {
     tft.init();
     tft.setRotation(3);  // 320x170 landscape, knob on the right
     tft.fillScreen(COL_BG);
-    // Backlight only after the panel is initialized — avoids a garbage flash
-    pinMode(PIN_TFT_BL, OUTPUT);
-    digitalWrite(PIN_TFT_BL, HIGH);
+    // Backlight only after the panel is initialized — avoids a garbage flash.
+    // GPIO21 is not a switch: it clocks an AW9364, and the level it comes up at
+    // is the stored one rather than full. See skills/backlight.cpp.
+    backlight_begin();
 
     clock_w = tft.textWidth("00:00", 8);
     sec_w = tft.textWidth("00", 4);
@@ -1592,11 +1603,13 @@ static void handle_skill(AsyncWebServerRequest *request) {
     s += "  `/ir/tvbgone/stop` and started a blast instead of aborting one\n";
     s += "- An OTA upload whose connection dies is torn down after 30s without data,\n";
     s += "  so a dropped transfer no longer blocks every later one until reboot\n";
-    s += "- The encoder button opens an on-device menu (messages, TV-B-Gone, setup AP,\n";
-    s += "  info). TV-B-Gone holds the three region blasts and a by-brand list of the\n";
-    s += "  nine named codes. It drives the same code paths as the API and has no\n";
-    s += "  endpoints of its own, so a job started here shows up in\n";
-    s += "  GET /ir/tvbgone/status like any other\n";
+    s += "- The encoder button opens an on-device menu (messages, quiet hours,\n";
+    s += "  backlight, TV-B-Gone, setup AP, info) — the rows in that order, and this\n";
+    s += "  list is the only place they are written down, so a row added to ui_items[]\n";
+    s += "  has to be added here too. TV-B-Gone holds the three region blasts and a\n";
+    s += "  by-brand list of the nine named codes. It drives the same code paths as\n";
+    s += "  the API and has no endpoints of its own, so a job started here shows up\n";
+    s += "  in GET /ir/tvbgone/status like any other\n";
     s += "- POST /notify makes this a pager: the message appears on the screen at once\n";
     s += "  if the device is idle, and the clock face carries an unread count until\n";
     s += "  somebody acknowledges it with the knob or POST /notify/ack\n";
@@ -1733,6 +1746,11 @@ static void handle_wifi_post(AsyncWebServerRequest *request) {
    publish into it and it publishes into nothing, which is the direction that
    lets a third supplier be added without touching this list. */
 #include "skills/progress.cpp"
+/* After notify.cpp, for the JSON response helpers its endpoints borrow, and
+   before ui.h, which draws its menu row. It reads no skill and no skill reads
+   it: it owns one pin and the part on the end of it. Its bring-up already ran,
+   from display_init(), for the reason given at the forward declaration. */
+#include "skills/backlight.cpp"
 /* After notify.cpp, which it reads for the unread level it breathes, and before
    ui.h, which hands it every encoder detent. */
 #include "skills/ring.cpp"
@@ -1766,9 +1784,13 @@ static void skills_init() {
        already zeroed. It is here rather than first only to match the include
        order above. */
     skill_progress_init();
+    /* A registration and nothing else: the pin was configured and the stored
+       level applied at display_init(), before the network existed. */
+    skill_backlight_init();
     /* Last, and after skill_ir_init() in particular: the two share the four RMT
        TX memory blocks this chip has, IR takes two of them, and whichever runs
-       first gets what it asks for. */
+       first gets what it asks for. The backlight above competes for none of
+       them — it clocks its own pin from the CPU, for want of a third channel. */
     skill_ring_init();
     /* No such contention here: the I2S channel comes from a different
        peripheral entirely, and the ESP32-S3 has two ports for one consumer. */
@@ -2026,6 +2048,17 @@ void loop() {
     // Composes a frame at most every 25ms, sends one only when it differs from
     // the last, and hands the bit stream to the RMT peripheral without waiting.
     ring_poll();
+
+    // The backlight, on the same terms: the endpoints and the menu record a
+    // wanted level and this is the only place the part is ever clocked, because
+    // its pulse train is relative to the step the part is already standing on
+    // and two of them interleaved would leave it on neither. Two comparisons
+    // when nothing has changed, which is almost every pass; a change costs one
+    // train of at most fifteen pulses — some tens of microseconds — with
+    // interrupts held off this core for the length of it so that no gap in the
+    // wave is stretched past the 500us the part allows. See
+    // skills/backlight.cpp.
+    backlight_poll();
 
     // The speaker, on the same terms again: loop() owns the I2S channel and any
     // open cue file, the endpoints only stage a request. Feeds the DMA with

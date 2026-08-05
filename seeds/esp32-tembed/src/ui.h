@@ -273,6 +273,7 @@ static_assert(sizeof(ui_titles) / sizeof(ui_titles[0]) == UI_REC + 1,
 enum {
     UI_ITEM_MSG = 0,
     UI_ITEM_QUIET,
+    UI_ITEM_BACKLIGHT,
     UI_ITEM_TVBGONE,
     UI_ITEM_AP,
     UI_ITEM_INFO,
@@ -284,10 +285,16 @@ enum {
    messages, and it is the row somebody reaches for at one in the morning
    without wanting to read a menu first. The row's name is here; the hours after
    it come from ring_quiet_hours(), because they are the skill's to say — the
-   same division as the Messages row and its unread count. */
+   same division as the Messages row and its unread count.
+
+   Backlight sits third, next to Quiet, because the two are the settings a hand
+   reaches for in the dark and both act in place rather than opening a screen.
+   Same division again: the name is here, the level's word comes from
+   bl_level_label(). */
 static const char *ui_items[UI_ITEM_COUNT] = {
     "Messages >",   /* ui_list_label() appends the unread count */
     "Quiet",        /* ui_list_label() appends the ring's window, or "off" */
+    "Backlight",    /* ui_list_label() appends the level's word, or its step */
     "TV-B-Gone >",
     "Setup AP",
     "Info",
@@ -797,6 +804,19 @@ static const char *ui_list_label(int i) {
                 char win[16];
                 ring_quiet_hours(ring_night_from, ring_night_to, win, sizeof(win));
                 snprintf(built, sizeof(built), "%s %s", ui_items[i], win);
+                return built;
+            }
+            if (i == UI_ITEM_BACKLIGHT) {
+                /* "Backlight day" for one of the four the menu offers, or
+                   "Backlight step 13" for a level only the endpoint can set —
+                   the row never rounds one into the other. The longest is the
+                   step form, 210px of font 4 with the row's marker against the
+                   296px ui_draw_row() has, measured against TFT_eSPI's own
+                   width table like every other column here and pinned by
+                   tools/test_backlight.sh at the label's end. */
+                char level[BL_LABEL_MAX];
+                bl_level_label(bl_wanted, level, sizeof(level));
+                snprintf(built, sizeof(built), "%s %s", ui_items[i], level);
                 return built;
             }
             return ui_items[i];
@@ -1438,6 +1458,20 @@ static void ui_activate(int item) {
                selection has not moved — and it has not: what changed is a
                string the cache still holds the old copy of. */
             ring_quiet_toggle();
+            display_force = true;
+            ui_draw();
+            break;
+        case UI_ITEM_BACKLIGHT:
+            /* Acts without leaving the menu, exactly as Quiet does, and for the
+               same reason: the answer is the row's own label, and a screen with
+               one line on it would be a worse way to say it. The level is only
+               recorded here — the pulse train that carries it out belongs to
+               backlight_poll() on the next pass, so the redraw below happens
+               while the panel is still at the old brightness and the new one
+               arrives a few milliseconds later. That is the right order:
+               brightness changing after the row that announced it reads as the
+               row causing it. */
+            backlight_menu_click();
             display_force = true;
             ui_draw();
             break;
