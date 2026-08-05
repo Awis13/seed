@@ -313,6 +313,24 @@ static bool ota_upload_ok = false;
 static bool ota_upload_error = false;
 static char ota_upload_error_msg[128] = "";
 static size_t ota_bytes_written = 0;
+// Per-request ownership of the in-flight OTA transfer. The flags above are
+// file-global with no identity, and before this the index==0 path wrote
+// ota_upload_error on auth-fail BEFORE checking whether another authenticated
+// upload already owned the slot. So while a token-holder was streaming an
+// image, any unauthenticated LAN peer POSTing to /firmware/upload set that
+// global, and the legit upload's remaining chunks then hit
+// `if (ota_upload_error) return;` and were silently dropped: Update.end() never
+// ran and ota_in_progress never cleared, DoSing the update channel until reboot.
+//
+// ota_session is the id of the transfer that owns the slot (0 = no owner). It
+// is a monotonic id, NOT the AsyncWebServerRequest pointer: the library
+// destroys the request object on client disconnect, so a later request landing
+// on the same freed address would pass a pointer-equality test and splice its
+// chunks into the abandoned transfer. The owner stamps its id into its own
+// request->_tempObject (a small heap tag), and a request that reused a freed
+// address starts with _tempObject NULL and cannot inherit the claim.
+static uint32_t ota_session = 0;
+static uint32_t ota_next_session = 1;  // monotonic; never hands out 0
 static volatile bool pending_restart = false;
 static volatile bool pending_rollback = false;
 
@@ -843,23 +861,39 @@ static void handle_firmware_version(AsyncWebServerRequest *request) {
 static void handle_firmware_upload_body(AsyncWebServerRequest *request, uint8_t *data,
                                          size_t len, size_t index, size_t total) {
     if (index == 0) {
-        if (!check_auth(request)) {
-            ota_upload_error = true;
-            snprintf(ota_upload_error_msg, sizeof(ota_upload_error_msg), "auth required");
-            return;
-        }
-        if (ota_in_progress) {
-            ota_upload_error = true;
-            snprintf(ota_upload_error_msg, sizeof(ota_upload_error_msg), "already in progress");
-            return;
-        }
-        // OTA app slots are 4MB each (partitions/ats-mini_16mb_ota.csv)
+        // A transfer already owns the slot: touch NOTHING, write no shared
+        // globals. This must be first — before this, an unauth POST would write
+        // ota_upload_error here and poison the live owner's stream.
+        if (ota_in_progress) return;
+        // No token: write NO shared globals and claim nothing. The 401 is
+        // emitted by the paired completion handler handle_firmware_upload(),
+        // which runs its own require_auth() and sends. Setting a global here
+        // would let an unauthenticated peer poison state.
+        if (!check_auth(request)) return;
+        // OTA app slots are 4MB each (partitions/ats-mini_16mb_ota.csv). No
+        // owner exists yet (guarded above), so recording the error here cannot
+        // poison anyone; the next claim resets it.
         if (total == 0 || total > 0x400000) {
             ota_upload_error = true;
             snprintf(ota_upload_error_msg, sizeof(ota_upload_error_msg),
                      "invalid size: %u", (unsigned)total);
             return;
         }
+
+        // Claim the slot. Stamp this request with a fresh session id, stored as
+        // the heap tag in its own _tempObject; a request that later reuses this
+        // freed address starts with _tempObject NULL and cannot inherit it.
+        uint32_t *tag = (uint32_t*)malloc(sizeof(uint32_t));
+        if (!tag) {
+            ota_upload_error = true;
+            snprintf(ota_upload_error_msg, sizeof(ota_upload_error_msg),
+                     "OOM claiming upload");
+            return;
+        }
+        ota_session = ota_next_session++;
+        if (ota_next_session == 0) ota_next_session = 1;  // never hand out 0
+        *tag = ota_session;
+        request->_tempObject = tag;
 
         ota_in_progress = true;
         ota_upload_started = false;
@@ -873,7 +907,8 @@ static void handle_firmware_upload_body(AsyncWebServerRequest *request, uint8_t 
         // Detach the encoder ISR for the whole OTA write: Update.write disables
         // the flash cache and the ISR reads flash (encoder.process()), so an edge
         // mid-write would crash. Re-attached in handle_firmware_upload(), which
-        // always runs once the stream finishes — every success and error path.
+        // resumes only for the owner (this request) on every path — success and
+        // error — so a non-owner completion cannot re-attach mid-flash.
         radio_encoder_pause();
 
         if (!Update.begin(total, U_FLASH)) {
@@ -881,10 +916,19 @@ static void handle_firmware_upload_body(AsyncWebServerRequest *request, uint8_t 
             snprintf(ota_upload_error_msg, sizeof(ota_upload_error_msg),
                      "Update.begin failed: %s", Update.errorString());
             ota_in_progress = false;
+            // Do NOT clear ota_session here: the completion handler identifies
+            // the owner by tag == ota_session to know it must resume the encoder
+            // this claim paused. Clearing it would strand the encoder detached.
             return;
         }
         ota_upload_started = true;
     }
+
+    // Chunks of a request that never claimed the slot (a non-owner, including
+    // the unauth attacker whose _tempObject is NULL) or whose session has been
+    // retired. Drop them before they can touch the owner's state.
+    uint32_t *tag = (uint32_t*)request->_tempObject;
+    if (!tag || *tag != ota_session) return;
 
     if (ota_upload_error) return;
 
@@ -914,11 +958,27 @@ static void handle_firmware_upload_body(AsyncWebServerRequest *request, uint8_t 
 }
 
 static void handle_firmware_upload(AsyncWebServerRequest *request) {
-    // The stream is done by the time this always-invoked completion handler runs,
-    // so re-attach the encoder ISR here — on every path, success or error —
-    // rather than in each body-handler branch. If no upload started (no body),
-    // radio_encoder_pause() never ran and this attach is a harmless idempotent.
-    radio_encoder_resume();
+    // Resume the encoder ISR ONLY for the request that actually paused it — the
+    // owner, identified by its heap tag matching the live session. A second POST
+    // to /firmware/upload (even the tiny unauth attacker, dropped at index==0
+    // with _tempObject NULL) must be a no-op here: resuming from a non-owner
+    // completion would re-attach the ISR while the owner is still mid-flash with
+    // the cache disabled, and the ISR's flash read would then fault. The owner's
+    // pause runs exactly once (at claim), so this resumes it exactly once, on
+    // every owner path — success, write-fail, begin-fail.
+    uint32_t *tag = (uint32_t*)request->_tempObject;
+    bool is_owner = (tag && *tag == ota_session);
+    if (is_owner) {
+        radio_encoder_resume();
+        ota_session = 0;
+        ota_in_progress = false;
+    }
+    // Free this request's tag if it claimed one (only the owner ever does). The
+    // library also frees _tempObject on request destroy; nulling it here makes
+    // that a no-op rather than a double free. Reached only for /firmware/upload,
+    // whose body callback never runs the shared body collector, so there is no
+    // collision with the _tempObject those other routes use.
+    if (tag) { free(tag); request->_tempObject = nullptr; }
 
     // The body handler authenticates the upload itself, but a POST with no body
     // never reaches it and would otherwise report the md5 and size of whatever
