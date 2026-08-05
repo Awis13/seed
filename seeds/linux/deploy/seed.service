@@ -1,0 +1,32 @@
+# seed.service — systemd unit for the Linux seed node.
+#
+# The unit name must be exactly "seed": the firmware-apply watchdog inside
+# seed.c calls `systemctl restart seed` / `systemctl start seed` by name.
+
+[Unit]
+Description=Seed node (AI-growable firmware, HTTP on :8080)
+# The seed binds 0.0.0.0:8080 and announces its LAN addresses at startup.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/opt/seed/seed 8080
+WorkingDirectory=/opt/seed
+# A crashed seed comes back on its own; apply-flow restarts are clean exits.
+Restart=on-failure
+RestartSec=2
+# The firmware-apply watchdog is a forked child of the service that itself
+# runs `systemctl restart seed`; kill only the main process so the watchdog
+# survives the restart it triggered and can health-check/roll back.
+KillMode=process
+# No setuid escalation for /exec children (sudo from /exec will not work).
+NoNewPrivileges=yes
+LimitNOFILE=4096
+
+# Deliberately NOT sandboxed further: /fs writes arbitrary paths, /exec runs
+# arbitrary shell, /gpio and /serial need /dev, sysmon reads /proc and the
+# journal, and the node recompiles itself. See deploy/README.md.
+
+[Install]
+WantedBy=multi-user.target
