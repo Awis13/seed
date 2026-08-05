@@ -330,7 +330,9 @@ int main(int argc, char **argv) {
         drop_reset();
         post("alice", "bob", 0, NULL, "first line");
         post("bob", "all", 1, "TICKET/7", "second line");
-        char board[4096];
+        drop_cursor_set("bob", 1);
+        drop_cursor_set("carol", 0);
+        static char board[3 * DROP_BOARD_LINE_MAX];  /* room for two lines + guard */
         int o = drop_board_render(board, sizeof(board));
         check(o > 0 && o < (int)sizeof(board), "renders within the buffer");
         check(strstr(board, "2 message(s)") != NULL, "with a count in the header");
@@ -340,6 +342,13 @@ int main(int argc, char **argv) {
         check(strstr(board,
               "- **bob→all** (#2 re #1, 13:45 UTC) — second line — TICKET/7") != NULL,
               "a reply with a link");
+        check(strstr(board, "## Cursors") != NULL, "and a cursors footer");
+        /* id 2 is bob's own broadcast, so it is not unread FOR bob */
+        check(strstr(board, "- bob @ 1 (0 unread)") != NULL,
+              "bob: own broadcast does not count as unread");
+        /* carol never read anything; the broadcast is hers to read */
+        check(strstr(board, "- carol @ 0 (1 unread)") != NULL,
+              "carol: one unread broadcast");
     }
 
     printf("board.md truncation guard\n");
@@ -456,6 +465,30 @@ int main(int argc, char **argv) {
         }
         check(quotes % 2 == 0, "every rendered quote is paired");
         free(buf);
+    }
+
+    printf("a max-size message survives the JSONL round trip\n");
+    {
+        /* Pins DROP_LINE_MAX to the derived message size: a hand-sized
+         * line buffer would silently truncate full-size text on reload. */
+        drop_reset();
+        drop_msg_t m, r;
+        static char line[DROP_LINE_MAX];
+        memset(&m, 0, sizeof(m));
+        m.id = 1;
+        m.ts = 100;
+        drop_str_copy(m.from, sizeof(m.from), "alice");
+        drop_str_copy(m.to, sizeof(m.to), "bob");
+        memset(m.text, 'x', DROP_TEXT_LEN);
+        m.text[DROP_TEXT_LEN] = '\0';
+        memset(m.link, 'y', DROP_LINK_LEN);
+        m.link[DROP_LINK_LEN] = '\0';
+        int n = drop_msg_format_jsonl(&m, line, sizeof(line));
+        check(n < (int)sizeof(line) - 1, "the line buffer holds a max-size message");
+        check(line[n - 1] == '\n', "with its newline intact");
+        check(drop_parse_line(line, &r), "and it parses back");
+        check((int)strlen(r.text) == DROP_TEXT_LEN, "with every text byte");
+        check((int)strlen(r.link) == DROP_LINK_LEN, "and every link byte");
     }
 
     printf("torn append is sealed, never merged\n");

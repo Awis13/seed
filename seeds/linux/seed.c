@@ -1334,6 +1334,9 @@ int main(int argc, char **argv) {
 
         struct timeval tv = { .tv_sec = SOCK_TIMEOUT };
         setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        /* Writes too: a client that stops reading a large response must
+         * not block the single-threaded loop indefinitely. */
+        setsockopt(client, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 
         handle(client, ip);
         close(client);

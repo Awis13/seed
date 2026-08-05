@@ -22,14 +22,18 @@
 /* host-test:begin drop — sliced out by tools/test_drop.sh */
 #define DROP_RING           256
 #define DROP_HANDLE_LEN     32
-#define DROP_LINK_LEN       128
-#define DROP_TEXT_LEN       1024
+#define DROP_LINK_LEN       256
+#define DROP_TEXT_LEN       8192
 #define DROP_CURSORS_MAX    32
-#define DROP_LINE_MAX       4096  /* one JSONL line, worst case ~2.5KB */
 /* Worst-case rendered sizes, derived from the field caps: json_escape can
- * at most double text/link; the +128 covers keys, ids and punctuation. */
+ * at most double text/link; the +128 covers keys, ids and punctuation.
+ * At 8192/256 that is ~17KB per message JSON and ~8.7KB per board line;
+ * the full-ring buffers below come to ~4.4MB (list) / ~2.2MB (board),
+ * and the ring itself ~2.2MB of BSS — home-rig-class budgets. */
 #define DROP_MSG_JSON_MAX   (2 * DROP_TEXT_LEN + 2 * DROP_LINK_LEN + 2 * DROP_HANDLE_LEN + 128)
 #define DROP_BOARD_LINE_MAX (DROP_TEXT_LEN + DROP_LINK_LEN + 2 * DROP_HANDLE_LEN + 128)
+#define DROP_LINE_MAX       (DROP_MSG_JSON_MAX + 16)  /* one JSONL line */
+#define DROP_BOARD_FOOT_MAX 96    /* one cursors-footer line, worst case */
 #define DROP_RESP_HEADROOM  128   /* inbox JSON wrapper around the array */
 
 typedef struct {
@@ -216,6 +220,13 @@ static void drop_cursor_set(const char *handle, int cursor) {
 
 /* --- Rendering --- */
 
+/* Is this message addressed to handle? Direct mail, or a broadcast that
+ * is not the reader's own — a sender knows what they posted to "all". */
+static int drop_msg_for(const drop_msg_t *m, const char *handle) {
+    if (strcmp(m->to, handle) == 0) return 1;
+    return strcmp(m->to, "all") == 0 && strcmp(m->from, handle) != 0;
+}
+
 /* One message as JSON. Never writes past cap; returns bytes written. */
 static int drop_msg_json(const drop_msg_t *m, char *buf, int cap) {
     char esc_link[DROP_LINK_LEN * 2 + 8];
@@ -241,14 +252,7 @@ static int drop_list_json(char *buf, int cap, int since, const char *to_handle,
     for (int i = 0; i < g_drop_count; i++) {
         const drop_msg_t *m = drop_ring_at(i);
         if (m->id <= since) continue;
-        if (to_handle) {
-            /* Direct mail, or a broadcast — but not the reader's own:
-             * a sender knows what they posted to "all". */
-            int direct = strcmp(m->to, to_handle) == 0;
-            int bcast  = strcmp(m->to, "all") == 0 &&
-                         strcmp(m->from, to_handle) != 0;
-            if (!direct && !bcast) continue;
-        }
+        if (to_handle && !drop_msg_for(m, to_handle)) continue;
         if (cap - o < DROP_MSG_JSON_MAX + 4) break;
         if (!first) buf[o++] = ',';
         o += drop_msg_json(m, buf + o, cap - o);
@@ -297,6 +301,23 @@ static int drop_board_render(char *buf, int cap) {
             "- **%s→%s** (#%d%s, %02d:%02d UTC) — %s%s%s\n",
             m->from, m->to, m->id, reply, tm.tm_hour, tm.tm_min,
             m->text, m->link[0] ? " — " : "", m->link);
+    }
+    /* Footer: who has read what — the question the human asks first
+     * when coordination stalls. */
+    drop_appendf(buf, cap, &o, "\n## Cursors\n\n");
+    for (int i = 0; i < g_drop_cursor_count; i++) {
+        if (cap - o < DROP_BOARD_FOOT_MAX) {
+            drop_appendf(buf, cap, &o, "(truncated)\n");
+            break;
+        }
+        const drop_cursor_t *c = &g_drop_cursors[i];
+        int unread = 0;
+        for (int j = 0; j < g_drop_count; j++) {
+            const drop_msg_t *m = drop_ring_at(j);
+            if (m->id > c->cursor && drop_msg_for(m, c->handle)) unread++;
+        }
+        drop_appendf(buf, cap, &o, "- %s @ %d (%d unread)\n",
+                     c->handle, c->cursor, unread);
     }
     return o;
 }
@@ -461,12 +482,16 @@ static int drop_send_json_checked(int fd, const char *body) {
     if (drop_write_all(fd, hdr, hl) != 0) return -1;
     if (drop_write_all(fd, body, blen) != 0) return -1;
     if (shutdown(fd, SHUT_WR) != 0) return -1;
+    int drained = 0;
     for (;;) {
         char tail[64];
         ssize_t n = read(fd, tail, sizeof(tail));
         if (n == 0) return 0;   /* orderly EOF: delivery confirmed */
         if (n < 0) return -1;   /* RST or timeout: unconfirmed */
-        /* stray bytes from the client are ignored */
+        /* Stray bytes are ignored, but bounded: a drip-feeding client
+         * must not hold the single-threaded server hostage. */
+        drained += (int)n;
+        if (drained > 4096) return -1;
     }
 }
 
@@ -658,6 +683,14 @@ static const char *drop_describe(void) {
            "Loopback is unauthenticated by server design (trusted box). "
            "Post under your session handle; poll your inbox between work "
            "steps.\n\n"
+           "Delivery is at-least-once, not exactly-once: an aborted read "
+           "redelivers the whole batch — make consumption idempotent.\n\n"
+           "`from` is an attribution convention under a shared token, NOT "
+           "identity — never build authorization on it.\n\n"
+           "The `cursor` response field is the post-batch cursor on a "
+           "consuming fetch, but the current (unmoved) cursor on peek.\n\n"
+           "POST bodies must be compact JSON: whitespace after a colon is "
+           "tolerated, whitespace before it is not.\n\n"
            "Limits: fetches serve from the in-memory ring (last 256) — "
            "older disk-only mail is skipped. Cursors track up to 32 "
            "handles; the least-advanced is evicted when full.\n";
