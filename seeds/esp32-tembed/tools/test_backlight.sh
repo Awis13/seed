@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 #
-# Host-side regression test for the backlight ladder in src/skills/backlight.cpp.
+# Host-side regression test for the backlight ladder and its idle policy in
+# src/skills/backlight.cpp.
 #
 # Why this exists: the AW9364 has no readback. Nothing can ask the part what
 # step it is standing on, so the firmware's idea of the level is a MODEL that is
@@ -36,6 +37,27 @@
 #   - the panel. Whether "night" is actually readable is a question for eyes in
 #     a room, and it is the reason the preset table is four numbers in one place
 #     rather than a curve.
+#
+# The idle policy is here for a different reason: not because it is delicate,
+# but because it is a decision with boundaries, and boundaries are exactly what
+# a person cannot check by watching a screen. "Does it dim at thirty seconds or
+# at thirty-one" is not a question anybody will ever answer with a stopwatch, so
+# it is answered here — both thresholds from both sides, the switch, each
+# exemption on its own, and the case that would otherwise be found by somebody
+# noticing their screen got BRIGHTER when they walked away.
+#
+# The wrap of millis() is covered too, in uint32_t rather than in the host's
+# wider unsigned long, because that is the arithmetic the device does. What the
+# policy sees is an elapsed time the caller already subtracted, which is the
+# whole defence: this file checks that the defence holds and that nothing in the
+# policy needs a second one.
+#
+# What it does NOT cover, again plainly: the wiring in ui.h and main.cpp. That
+# the policy is asked once a pass, that the answer reaches the pin, and that a
+# turn of the knob restores the level are properties of a running loop and are
+# checked by reading and by the device. The one wiring fact that IS enforced
+# mechanically is the compile-time assertion in ui.h that the dim threshold
+# outlasts the screen's own idle timeout — see ui_backlight_idle().
 #
 # The core is sliced straight out of the shipping source between its
 # `host-test:begin` markers, the same way tools/test_progress.sh and
@@ -73,6 +95,7 @@ slice() {
 PRELUDE
     slice "$src" bl_ladder
     slice "$src" bl_presets
+    slice "$src" bl_idle
     cat <<'MAIN'
 
 /* ---- test scaffolding ---- */
@@ -337,7 +360,14 @@ int main(void) {
         check(never_off, "and no level whatsoever clicks through to a dark screen");
     }
 
-    printf("the menu row's label, which is the only new string on the device\n");
+    /* Not "the only new string on the device" any more: the Auto-dim row's
+       "on"/"off" is one too, and it is the one string here that this section
+       does NOT reach. bl_idle_word() reads the live switch, which is a device
+       global with no meaning on a host, so it stays outside the sliced region —
+       and at two words neither of which is longer than a preset name, it cannot
+       be what makes a row run off the panel. Said here rather than left as a
+       heading that quietly stopped being true. */
+    printf("the menu row's label, which is where a level becomes a word\n");
     {
         /* The buffer the DEVICE uses, not a roomier one: a label that only fits
            because the test gave itself more space than ui.h has is a label that
@@ -395,6 +425,212 @@ int main(void) {
         bl_level_label(255, s, sizeof(s));
         check(strcmp(s, "step 255") == 0 && strlen(s) < BL_LABEL_MAX,
               "a level off the ladder entirely still prints whole");
+    }
+
+    printf("the idle policy, which is where the battery is actually won\n");
+    {
+        /* The shipped policy, and the same one switched off. Both built by the
+           shipping factory rather than assembled here, so that the wiring
+           between the macros and the fields is under test and not merely
+           copied — see the section after this one. */
+        const BacklightIdle live = bl_idle_policy(true);
+        const BacklightIdle off = bl_idle_policy(false);
+        /* Thresholds and a level the shipped policy does not use, so that a
+           version reading the macros instead of its argument is caught. */
+        const BacklightIdle other = {true, 1000, 5000, 7};
+
+        /* The panel's facts, one case per constant, in the struct's declared
+           order. Named rather than written as four booleans at each call site:
+           a row of bare true/false is where an exemption ends up tested as its
+           neighbour. */
+        const BacklightPanel bare  = {false, false, false, false};
+        const BacklightPanel blast = {true,  false, false, false};
+        const BacklightPanel rec   = {false, true,  false, false};
+        const BacklightPanel bar   = {false, false, true,  false};
+        const BacklightPanel crit  = {false, false, false, true};
+        const BacklightPanel live_out = {true, true, true, false};
+
+        check(bl_idle_level(live, BL_STEPS, 0, bare) == BL_STEPS,
+              "a device just touched is at the level its owner set");
+        check(bl_idle_level(live, BL_STEPS, BL_IDLE_DIM_MS - 1, bare) == BL_STEPS,
+              "and one millisecond before the dim threshold, still is");
+        check(bl_idle_level(live, BL_STEPS, BL_IDLE_DIM_MS, bare) == BL_IDLE_LEVEL,
+              "the dim threshold is the first millisecond of dim, not the last of full");
+        check(bl_idle_level(live, BL_STEPS, BL_IDLE_DIM_MS + 1, bare) == BL_IDLE_LEVEL,
+              "and it stays there through the middle of the window");
+        check(bl_idle_level(live, BL_STEPS, BL_IDLE_OFF_MS - 1, bare) == BL_IDLE_LEVEL,
+              "right up to one millisecond before the blank");
+        check(bl_idle_level(live, BL_STEPS, BL_IDLE_OFF_MS, bare) == 0,
+              "the blank threshold is inclusive in the same way");
+        check(bl_idle_level(live, BL_STEPS, 3600000UL, bare) == 0,
+              "and an hour later the panel is still dark");
+
+        /* The thresholds are the struct's, not the file's. */
+        check(bl_idle_level(other, BL_STEPS, 999, bare) == BL_STEPS,
+              "a policy with its own thresholds is obeyed below the first of them");
+        check(bl_idle_level(other, BL_STEPS, 1000, bare) == 7,
+              "dims at its own threshold, to its own level");
+        check(bl_idle_level(other, BL_STEPS, 5000, bare) == 0,
+              "and blanks at its own");
+
+        /* THE SWITCH. Off means the level set by hand is the level, full stop:
+           this is the whole of what the menu row promises. */
+        int handed_back = 1;
+        const unsigned long spread[] = {0, 1, BL_IDLE_DIM_MS - 1, BL_IDLE_DIM_MS,
+                                        BL_IDLE_OFF_MS, 3600000UL, 4294967295UL};
+        const int spread_n = (int)(sizeof(spread) / sizeof(spread[0]));
+        for (int i = 0; i < spread_n; i++)
+            for (int level = 0; level <= BL_STEPS; level++)
+                if (bl_idle_level(off, (uint8_t)level, spread[i], bare) != level)
+                    handed_back = 0;
+        check(handed_back,
+              "with the switch off the level set by hand is what the panel is at, "
+              "however long nobody comes");
+
+        /* THE EXEMPTIONS, one at a time. Live output on the panel is never
+           dimmed and never blanked, however long the last input was. */
+        int blast_safe = 1, rec_safe = 1, bar_safe = 1;
+        for (int i = 0; i < spread_n; i++) {
+            if (bl_idle_level(live, BL_STEPS, spread[i], blast) != BL_STEPS)
+                blast_safe = 0;
+            if (bl_idle_level(live, BL_STEPS, spread[i], rec) != BL_STEPS)
+                rec_safe = 0;
+            if (bl_idle_level(live, BL_STEPS, spread[i], bar) != BL_STEPS)
+                bar_safe = 0;
+        }
+        check(blast_safe, "a blast in flight is never dimmed out from under whoever started it");
+        check(rec_safe, "and neither is a recording, at any idle time whatsoever");
+        /* The one nothing on the device stamps input for: a job pushed over the
+           network draws its bar on a panel nobody has touched, so without this
+           the bar is drawn into the dark two minutes in. */
+        check(bar_safe, "and neither is a progress bar, which nobody had to touch the knob to start");
+        check(bl_idle_level(live, BL_STEPS, BL_IDLE_OFF_MS, live_out) == BL_STEPS,
+              "all three at once is still the level set by hand");
+
+        /* AN UNREAD CRITICAL STOPS THE BLANK. It never expires, and inside the
+           ring's night window the breathing rule on the clock face is the only
+           thing left saying it is there — so a blank would leave a critical with
+           no indication anywhere at all, in a state that stays that way until
+           somebody happens to look. It is a FLOOR: the panel still dims. */
+        check(bl_idle_level(live, BL_STEPS, BL_IDLE_OFF_MS, crit) == BL_IDLE_LEVEL,
+              "an unread critical holds the panel at the dim step instead of letting it blank");
+        check(bl_idle_level(live, BL_STEPS, 3600000UL, crit) == BL_IDLE_LEVEL,
+              "and still holds it there an hour later, because a critical never expires");
+        check(bl_idle_level(live, BL_STEPS, BL_IDLE_DIM_MS, crit) == BL_IDLE_LEVEL,
+              "it does not stop the DIM, which is the half that costs almost nothing");
+        check(bl_idle_level(live, BL_STEPS, BL_IDLE_DIM_MS - 1, crit) == BL_STEPS,
+              "and it is not a reason to hold a panel up that nothing was taking down");
+        /* Never a wake-up. Somebody sitting below the dim step, or with the
+           screen switched off outright, asked for that. */
+        check(bl_idle_level(live, 1, BL_IDLE_OFF_MS, crit) == 1,
+              "a panel already dimmer than the dim step is held there and not raised to meet it");
+        check(bl_idle_level(live, 0, BL_IDLE_OFF_MS, crit) == 0,
+              "and a screen switched off by hand stays off, critical or no critical");
+        int crit_off = 1;
+        for (int i = 0; i < spread_n; i++)
+            for (int level = 0; level <= BL_STEPS; level++)
+                if (bl_idle_level(off, (uint8_t)level, spread[i], crit) != level)
+                    crit_off = 0;
+        check(crit_off, "and with the auto-dim switched off it changes nothing at all");
+
+        /* NEVER BRIGHTER. Somebody sitting at "night" asked for less than the
+           dim step offers, and raising it because they stopped touching the
+           device would be the policy working against its own purpose. */
+        check(bl_idle_level(live, BL_IDLE_LEVEL, BL_IDLE_DIM_MS, bare) == BL_IDLE_LEVEL,
+              "a device already at the dim step is left exactly where it is");
+        check(bl_idle_level(live, 1, BL_IDLE_DIM_MS, bare) == 1,
+              "and one already dimmer than the dim step is not turned UP to meet it");
+        check(bl_idle_level(live, 1, BL_IDLE_OFF_MS, bare) == 0,
+              "though it still goes out at the blank, which is about power and not about level");
+
+        /* A screen the endpoint blanked deliberately stays blanked, and the
+           policy has nothing to add to it. */
+        int stays_dark = 1;
+        for (int i = 0; i < spread_n; i++)
+            if (bl_idle_level(live, 0, spread[i], bare) != 0) stays_dark = 0;
+        check(stays_dark, "a screen already switched off stays off rather than being dimmed to something");
+
+        /* Monotone in the idle time, at every level: waiting longer can only
+           ever take the panel DOWN. A threshold accidentally written the wrong
+           way round shows up here as well as at the boundaries. Run with a
+           critical outstanding too, because the floor is the one thing here
+           that could plausibly hand a panel back up. */
+        int monotone = 1;
+        for (int level = 0; level <= BL_STEPS; level++) {
+            for (int c = 0; c < 2; c++) {
+                const BacklightPanel &s = c ? crit : bare;
+                uint8_t prev = bl_idle_level(live, (uint8_t)level, 0, s);
+                for (unsigned long t = 0; t <= BL_IDLE_OFF_MS + 2000; t += 500) {
+                    uint8_t now = bl_idle_level(live, (uint8_t)level, t, s);
+                    if (now > prev) monotone = 0;
+                    prev = now;
+                }
+            }
+        }
+        check(monotone, "waiting longer only ever takes the panel down, never up");
+
+        /* THE WRAP. millis() is 32 bits and goes round every 49 days. The
+           caller subtracts, and the subtraction is unsigned, so the elapsed
+           time this function sees stays small across the wrap — modelled in
+           uint32_t here because a host's unsigned long is not the device's. */
+        {
+            uint32_t last = 0xFFFFF000UL;         /* 4096ms before the wrap */
+            uint32_t now = 4000UL;                /* 4000ms after it */
+            unsigned long since = (unsigned long)(uint32_t)(now - last);
+            check(since == 8096UL,
+                  "an unsigned subtraction across the wrap gives the real 8 seconds");
+            check(bl_idle_level(live, BL_STEPS, since, bare) == BL_STEPS,
+                  "so a panel in use when the clock wraps is not blanked by the wrap");
+
+            /* And the other direction: genuinely idle ACROSS the wrap still
+               goes dark, rather than having its clock reset by it. */
+            uint32_t later = last + 200000UL;     /* wraps on the way */
+            unsigned long idle = (unsigned long)(uint32_t)(later - last);
+            check(idle == 200000UL, "and a real wait across the wrap is still the real wait");
+            check(bl_idle_level(live, BL_STEPS, idle, bare) == 0,
+                  "so the wrap does not hand a forgotten device its backlight back");
+        }
+
+        /* The shipped numbers. They are meant to be edited after looking at a
+           screen; these are the properties that must survive the edit. */
+        check(BL_IDLE_DIM_MS < BL_IDLE_OFF_MS,
+              "the panel dims before it blanks, which is the order of the two names");
+        check(BL_IDLE_LEVEL > 0 && BL_IDLE_LEVEL <= BL_STEPS,
+              "the dim step is a level the part actually has");
+        check(bl_preset_name(BL_IDLE_LEVEL) != NULL,
+              "and it is one of the presets, not an arbitrary rung of a ladder "
+              "nobody has looked at");
+        /* The switch's default, which is the one number in this file that
+           silently reverses the whole commit. Flipped to false the policy never
+           runs, the panel sits at full around the clock exactly as it did
+           before, and nothing else in this file has anything to say about it —
+           bl_idle_level() is asked about a policy the test builds and never
+           about the one the device boots with. */
+        check(BL_IDLE_DEFAULT,
+              "the policy is ON out of the box, which is the whole of what this saves");
+    }
+
+    printf("the wiring between the numbers and the fields they fill\n");
+    {
+        /* bl_idle_policy() is the only place the macros meet the struct, and it
+           is here because it is the one place in this file where two fields of
+           the same type sit side by side. Swapped, the panel blanks at the dim
+           threshold and never dims at all — and every check above stays green,
+           because every one of them hands bl_idle_level() a policy built from
+           these same two macros in whatever order it was given them. Read back
+           by name, which is the only way that mistake has to show. */
+        const BacklightIdle p = bl_idle_policy(true);
+        check(p.dim_ms == BL_IDLE_DIM_MS, "the dim threshold reaches the field that dims");
+        check(p.off_ms == BL_IDLE_OFF_MS, "the blank threshold reaches the field that blanks");
+        check(p.dim_level == BL_IDLE_LEVEL, "and the dim step reaches the level");
+        check(p.on, "the switch is what it was handed");
+        check(!bl_idle_policy(false).on, "both ways round");
+        /* And the order the two thresholds have to be in, stated against the
+           built policy rather than against the macros, so that this section
+           says something even if the macros are read correctly and assigned to
+           each other's fields. */
+        check(p.dim_ms < p.off_ms,
+              "the built policy dims before it blanks, whatever the macros are edited to");
     }
 
     printf("\n%s\n", failures ? "FAILED" : "all checks passed");

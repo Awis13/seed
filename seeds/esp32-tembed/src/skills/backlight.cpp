@@ -8,9 +8,11 @@
  * last has to come here first, and until now there was nothing here to come to:
  * the pin was driven HIGH once at boot and never touched again.
  *
- * This file makes the level a number. What USES that number — going dim when
- * nobody is looking at the device — is not here, deliberately: this is the
- * primitive and the two ways a person sets it by hand.
+ * This file makes the level a number, and it holds the policy that takes that
+ * number down when nobody is looking at the device. The two are kept apart on
+ * purpose — bl_idle_level() is a pure function of a clock and cannot reach the
+ * pin, and the pin cannot be driven from anywhere but the loop task — so the
+ * decision can be argued with on a desk and the driving stays where it must.
  *
  *
  * The part, and why the pin is not a switch
@@ -125,6 +127,12 @@
  * magnitude short of the interrupt watchdog, with the exact figure being the
  * kind of thing a scope would settle and this comment should not pretend to.
  *
+ * That band is not a figure measured at one core clock, which is worth saying
+ * because this firmware sets the core clock and could set it again. What sizes
+ * a cell is the system timer delayMicroseconds() spins on, and that timer does
+ * not follow the core. Changing the core clock moves the register stores and
+ * the loop overhead around inside a cell; it does not move the cell.
+ *
  * What the critical section buys is that no interrupt on THIS core stretches a
  * T_LO past 500us; it is the same guard, for the same stated reason, that the
  * Rockchip driver puts a spinlock around ("the wave should not be intterupted",
@@ -162,15 +170,87 @@
  * reachable over HTTP so the table can be argued with from data.
  *
  * Off is deliberately not one of them. The menu must not be able to blank the
- * screen somebody is reading the menu on; the endpoint may, because the idle
- * policy that will eventually want it is not a person holding the device.
+ * screen somebody is reading the menu on; the endpoint may, and so may the idle
+ * policy below, because neither of those is a person holding the device.
+ *
+ *
+ * Dim after a while, dark after longer
+ * ------------------------------------
+ * A level nothing ever changes is a level that sits at full around the clock,
+ * which is 85mA spent lighting an empty room. So bl_idle_level() answers one
+ * question — given how long it has been since anybody touched the device, what
+ * should the panel be at — and it answers it as a pure function so that the
+ * boundaries can be pinned by tools/test_backlight.sh rather than by squinting
+ * at a screen and counting.
+ *
+ * Two thresholds and one level, all three meant to be edited:
+ *
+ *   - under BL_IDLE_DIM_MS, the level the person set. Nothing to do.
+ *   - past it, BL_IDLE_LEVEL — but never brighter than what they set. Somebody
+ *     sitting at "night" already asked for less than the dim step offers, and
+ *     turning their screen UP because they stopped touching it would be a
+ *     policy working against its own purpose.
+ *   - past BL_IDLE_OFF_MS, dark. This is where the battery is actually won:
+ *     the dim step is worth 60mA of the 85 and blanking is worth all of it.
+ *
+ * The thresholds are asked about as an ELAPSED time rather than as a timestamp.
+ * That is not a stylistic preference: millis() wraps every 49 days, and the
+ * only subtraction that survives the wrap is the unsigned one done at the call
+ * site. Handing this function two clocks to compare would move that trap in
+ * here, where it would be evaluated once every ten milliseconds forever.
+ *
+ * Everything the policy is allowed to know about the panel arrives in one
+ * BacklightPanel, filled in by ui.h because they are all facts about what is
+ * drawn and this file draws nothing.
+ *
+ * Three of the four are live output and hand the level straight back. Two of
+ * them — a running blast and a recording in progress — are the two the screen's
+ * own idle timeout in ui.h already exempts, taken from there rather than
+ * invented here. The third is the progress bar, and it is exempt HERE and not
+ * there on purpose: the screen timeout only returns to the clock face, which is
+ * where the bar is drawn, so it costs that output nothing. Blanking destroys
+ * it. A backup script pushing percentages at this device over POST /progress
+ * has nothing to do with the knob, so the bar would otherwise be drawn onto a
+ * dark panel two minutes in, and the person it is for would have no way to know
+ * that the job they are watching is still running. Bounded without any help
+ * from here, because a job carries a deadline: the bar goes away on its own and
+ * the panel resumes its clock with it.
+ *
+ * The fourth is not an exemption but a floor. An unread CRITICAL message never
+ * expires — skills/notify.cpp holds it until somebody acknowledges it — and the
+ * only thing this device does about one, once the ring's night window has
+ * silenced the ring, is breathe the hairline under the clock's header. Blanking
+ * the panel takes that away and leaves NO indication of an unread critical at
+ * all, in a state that is stable rather than passing. So a critical outstanding
+ * stops the blank at the dim step instead: the ring stays as quiet as its own
+ * rule says it must, and the one thing that was already saying so keeps saying
+ * it. It costs the dim step's current for as long as the message goes
+ * unacknowledged, which is what the device is for. It does NOT raise a panel
+ * somebody deliberately set to off, for the same reason nothing else here does.
+ *
+ * The message card is deliberately NOT a fifth entry, and that is a claim about
+ * arithmetic rather than a judgement: BL_IDLE_DIM_MS is longer than UI_IDLE_MS,
+ * so a card is always back to the clock face before the first threshold is
+ * reached and the case cannot arise. ui.h holds that as a static_assert next to
+ * the call, so the day somebody shortens the dim threshold below the screen's
+ * own timeout it stops compiling instead of quietly fading a message out from
+ * under somebody reading it.
+ *
+ * And the whole thing is one switch, off by hand from the menu row or the
+ * endpoint: with it off the level a person set is simply what the panel is at,
+ * for as long as they leave it. That is the point of the switch — either the
+ * policy owns the brightness or the person does, and there is no third party
+ * that owns it a little bit.
  */
 
 #include <soc/gpio_reg.h>
 
 /* Datasheet timings, in microseconds. The two cell halves are asked for as 1us
-   against a 0.5us minimum: the margin is free and the whole train still costs
-   about 30us. T_LO's 500us MAXIMUM is the one that matters and is nowhere near.
+   against a 0.5us minimum: the margin is free and the whole train is still tens
+   of microseconds, not hundreds. T_LO's 500us MAXIMUM is the one that matters
+   and is the wrong side of the cell entirely — it bounds a single low period,
+   which is one delayMicroseconds(1) plus a register store however fast the core
+   is running.
    BL_ON_US is the Rockchip driver's 30us rather than the datasheet's 20us
    floor, for the same reason it chose it — a floor wants headroom above it.
    BL_OFF_MS is Figure 7's 2.5ms shutdown threshold, rounded up.
@@ -356,6 +436,138 @@ static void bl_level_label(uint8_t level, char *out, size_t n) {
 }
 /* host-test:end */
 
+/* host-test:begin bl_idle — sliced out by tools/test_backlight.sh */
+/*
+ * THESE THREE NUMBERS ARE THE POLICY. Everything below is the machinery that
+ * carries them out, and it reads them from nowhere else.
+ *
+ * The two thresholds are written as SECONDS and multiplied up, so that the
+ * prose the device serves over /skill can be built from the same tokens the
+ * code compares against — see backlight_describe(). Every other place that
+ * quotes a threshold is either derived from these or points at them by name;
+ * the one thing here that is unavoidably prose is the dim step's WORD, and it
+ * is called out where it sits.
+ *
+ * The dim threshold: comfortably longer than the UI_IDLE_MS the screen already
+ * takes to fall back to the clock face, so the two never argue about the same
+ * moment, and long enough that setting something down mid-sentence does not
+ * darken the panel under a hand about to come back to it. ui.h asserts that
+ * relation at compile time.
+ *
+ * The blank threshold: long enough to walk away from and come back to, short
+ * enough that a device left on a shelf spends the day at the 65mA floor rather
+ * than at 150mA. It is the threshold the whole saving rests on — the dim step
+ * alone would leave a quarter of the backlight lit forever — and it is the one
+ * to lengthen first if the screen ever goes out while somebody is still
+ * reading it.
+ *
+ * The dim step is a PRESET and not an arbitrary rung. The ladder is linear in
+ * current while the eye is not, and the palette spends four fifths of its
+ * contrast before the backlight is touched at all, so a level picked for
+ * arithmetic rather than off the table would land somewhere nobody has looked
+ * at. It is the table's floor, chosen there for readability rather than because
+ * the part stops — see the preset table above. The host test holds it to being
+ * one of the presets, whatever the table is edited to say.
+ */
+#define BL_IDLE_DIM_S   30
+#define BL_IDLE_OFF_S   120
+#define BL_IDLE_DIM_MS  (BL_IDLE_DIM_S * 1000UL)
+#define BL_IDLE_OFF_MS  (BL_IDLE_OFF_S * 1000UL)
+
+/* The dimmest preset the table offers. EDITING THIS MEANS EDITING TWO THINGS:
+   the level here, and the word "night" in backlight_describe(), which is the
+   one number in this block the served text cannot derive — the word lives in
+   the preset table and a string literal cannot look it up. GET /backlight
+   reports the name alongside the level for exactly that reason, so a reader who
+   has the endpoint never has to trust the prose. */
+#define BL_IDLE_LEVEL   4
+
+/* On out of the box. A device that ships with this off ships with the defect
+   this policy exists to fix, and the switch is one click away on the menu.
+   Pinned by the host test: flipped to false, nothing else here changes and the
+   whole saving quietly goes away. */
+#define BL_IDLE_DEFAULT true
+
+/* The policy as data, so that the test can drive boundaries the shipped numbers
+   do not sit on and the shipped numbers stay one edit in one place. */
+struct BacklightIdle {
+    bool on;                 /* the menu's switch: false hands the level back */
+    unsigned long dim_ms;    /* no input for this long -> dim_level */
+    unsigned long off_ms;    /* no input for this long -> dark */
+    uint8_t dim_level;
+};
+
+/*
+ * The shipped policy, built in one place.
+ *
+ * This exists so that the wiring between the macros above and the fields they
+ * fill is inside the sliced region rather than in a struct literal further down
+ * the file. In a literal, dim_ms and off_ms are two unsigned longs side by side:
+ * swapping them compiles, ships, blanks the panel at the dim threshold and
+ * never dims it at all, and every check in the file stays green because each
+ * one hands bl_idle_level() a policy it built itself. Named assignments, and
+ * the test reads them back.
+ */
+static BacklightIdle bl_idle_policy(bool on) {
+    BacklightIdle p;
+    p.on = on;
+    p.dim_ms = BL_IDLE_DIM_MS;
+    p.off_ms = BL_IDLE_OFF_MS;
+    p.dim_level = BL_IDLE_LEVEL;
+    return p;
+}
+
+/*
+ * What is true of the panel at this instant, as its owner in ui.h sees it.
+ *
+ * Four facts and not four arguments: they all come from the same caller, they
+ * are all about what is drawn, and a call site with six bare booleans in a row
+ * is a call site somebody eventually fills in out of order. This file draws
+ * nothing and cannot answer any of them for itself.
+ */
+struct BacklightPanel {
+    bool blasting;      /* a TV-B-Gone run is on the panel */
+    bool recording;     /* the level meter is on the panel */
+    bool on_bar;        /* a progress bar is on the clock face */
+    bool crit_unread;   /* a critical message is waiting to be acknowledged */
+};
+
+/*
+ * What the panel should be at.
+ *
+ * `manual` is the level the person set and the level this hands back whenever
+ * the policy has nothing to say; `since_ms` is how long ago the last input was,
+ * already subtracted by the caller.
+ *
+ * The order of the guards is the order of the argument: the switch outranks
+ * everything, live output outranks the clock, and the later threshold is tested
+ * before the earlier one so that the two cannot both claim the same instant.
+ *
+ * Both comparisons are >=, so a threshold is the first millisecond of the state
+ * it names rather than the last millisecond of the one before it. Which way
+ * that goes matters to nobody in a room and matters a great deal to a test, so
+ * it is stated here and pinned there.
+ */
+static uint8_t bl_idle_level(const BacklightIdle &p, uint8_t manual,
+                             unsigned long since_ms, const BacklightPanel &s) {
+    if (!p.on) return manual;
+    /* Live output on the panel: dimming it out from under the person watching
+       it is the one failure this policy could produce that a person would call
+       a bug rather than a setting. */
+    if (s.blasting || s.recording || s.on_bar) return manual;
+    /* An unread critical stops the blank and nothing more. It falls through to
+       the dim rule below, which is what keeps it from ever RAISING a panel: a
+       device already dimmer than the dim step, or switched off by hand, is left
+       exactly where it is. See the head of this file for why the blank is the
+       one thing worth spending current on here. */
+    if (since_ms >= p.off_ms && !s.crit_unread) return 0;
+    /* Never brighter than what was asked for: this is a policy for spending
+       less, and a device already below the dim step is already there. */
+    if (since_ms >= p.dim_ms) return p.dim_level < manual ? p.dim_level : manual;
+    return manual;
+}
+/* host-test:end */
+
 /* --- State ---
  *
  * bl_wanted is written by the endpoint on the web-server task and by the menu
@@ -373,6 +585,34 @@ static void bl_level_label(uint8_t level, char *out, size_t n) {
 static volatile uint8_t bl_wanted = BL_DEFAULT;
 static uint8_t bl_applied = 0;          /* 0 = the part is shut down */
 static bool bl_ready = false;
+
+/* The switch. Written by the menu on the loop task and by the endpoint on the
+   web-server task, read by both — volatile on the same terms as bl_wanted. */
+static volatile bool bl_idle_on = BL_IDLE_DEFAULT;
+
+/*
+ * What the idle policy last decided, and the ONLY level backlight_poll() ever
+ * drives. bl_wanted is what a person asked for and is what the menu, the
+ * endpoint and the config file all mean by "the level"; this is what the panel
+ * is at this instant, which is the same thing whenever the policy has nothing
+ * to say and lower whenever it does.
+ *
+ * Keeping them apart is what makes the switch reversible: nothing here ever
+ * writes a policy decision back into the setting, so turning the policy off —
+ * or touching the knob — restores the level the person chose rather than
+ * whatever the policy had wound it down to.
+ *
+ * Volatile because GET /backlight reads it from the web-server task, and
+ * because ui.h reads it to decide whether a press is a person waking the panel
+ * or a person using it.
+ *
+ * Two writers, both on the loop task and no others: backlight_idle() every pass
+ * from then on, and backlight_begin() once before there is a loop to run the
+ * policy. Naming both matters because the single-writer claim is what makes the
+ * plain read in backlight_poll() safe, and a third writer on another task would
+ * quietly cost it.
+ */
+static volatile uint8_t bl_shown = BL_DEFAULT;
 
 /* When the line was last taken low, so that a level asked for immediately after
    an off waits for the part to have actually shut down. */
@@ -455,6 +695,7 @@ static bool bl_drive(uint8_t want) {
 static void bl_cfg_save() {
     JsonDocument doc;
     doc["level"] = bl_wanted;
+    doc["idle"] = bl_idle_on;
     String out;
     serializeJson(doc, out);
     write_spiffs_file_atomic(BL_CFG_FILE, BL_CFG_TMP, out);
@@ -484,7 +725,43 @@ static void bl_cfg_load() {
         int level = doc["level"].as<int>();
         if (bl_level_valid(level)) bl_wanted = (uint8_t)level;
     }
+    /* A file written before the switch existed has no such key, and the
+       compiled default standing is the right answer for it: the policy is what
+       this device should have been doing all along. */
+    if (doc["idle"].is<bool>()) bl_idle_on = doc["idle"].as<bool>();
 }
+
+/* --- The policy, as the loop runs it --- */
+
+/*
+ * Hand the policy the clock and let it decide. Loop task only, and it must run
+ * on EVERY pass — the level it records is the level the panel holds until the
+ * next call, so a pass that skips this is a pass that keeps whatever the last
+ * one concluded, including a dark screen under a hand that has just moved.
+ *
+ * The elapsed time is subtracted by the caller because the caller owns the
+ * timestamp; see the head of this file for why it is never handed over as one.
+ * The panel's four facts come from the caller for the same reason: they are
+ * facts about what is drawn, and this file draws nothing.
+ */
+static void backlight_idle(unsigned long since_input_ms,
+                           const BacklightPanel &panel) {
+    bl_shown = bl_idle_level(bl_idle_policy(bl_idle_on), bl_wanted,
+                             since_input_ms, panel);
+}
+
+/*
+ * Is the idle policy holding the panel dark right now? ui.h's, to decide
+ * whether a press is a person waking the screen or a person using it.
+ *
+ * The second half of the condition is what stops that decision locking the
+ * device out. A panel dark because somebody set the level to 0 by hand is a
+ * panel that stays dark through any number of presses, and swallowing those
+ * presses would leave the menu unreachable from the front. So this answers
+ * "dark BECAUSE of the policy", which a press can undo, and not "dark", which
+ * a press cannot.
+ */
+static bool backlight_blanked() { return bl_shown == 0 && bl_wanted != 0; }
 
 /* --- Poll --- */
 
@@ -493,7 +770,11 @@ static void bl_cfg_load() {
 static void backlight_poll() {
     if (!bl_ready) return;
 
-    if (bl_wanted != bl_applied) bl_drive(bl_wanted);
+    /* bl_shown and not bl_wanted: the level a person set reaches the part only
+       by way of the policy, which hands it straight back whenever it has
+       nothing to say. One writer of the pin, one decision behind it. */
+    uint8_t shown = bl_shown;
+    if (shown != bl_applied) bl_drive(shown);
 
     if (bl_cfg_dirty && (long)(millis() - bl_cfg_save_at) >= 0) {
         bl_cfg_dirty = false;
@@ -524,11 +805,47 @@ static void backlight_menu_click() {
               (unsigned)BL_STEPS, (unsigned long)(bl_total_ua(next) / 1000));
 }
 
+/* The word the Auto-dim row carries after its name. Here rather than in ui.h
+   for the same division the Quiet row and the Backlight row already draw: the
+   row's NAME belongs to the UI, what the setting currently says belongs to the
+   skill that owns it. The width it costs is ui.h's to account for, and it does,
+   at the call site. */
+static const char *bl_idle_word() {
+    return bl_idle_on ? "on" : "off";
+}
+
+/*
+ * Put the policy where it is asked for. Whichever way it goes the next
+ * backlight_idle() acts on it — off restores the level the person set within
+ * one pass, on lets the clock start taking it down again from wherever it
+ * stands.
+ *
+ * An ASSIGNMENT and not a flip, because one of the two callers below runs on
+ * the web-server task. A request carrying {"idle":false} asks for a state, not
+ * for a change of state, and a version that read the switch and negated it
+ * would give the opposite answer whenever a click on the menu row landed in
+ * between the read and the write — and would then log the state it did not
+ * reach. Written this way there is nothing to interleave: the request's value
+ * is the value, whatever else happens on the other task.
+ */
+static void backlight_idle_set(bool on) {
+    bl_idle_on = on;
+    bl_cfg_mark_dirty();
+    event_add("backlight: auto-dim %s (%lus, off %lus)", bl_idle_word(),
+              (unsigned long)BL_IDLE_DIM_S, (unsigned long)BL_IDLE_OFF_S);
+}
+
+/* Flip it from the front panel, which is the only route with no network in
+   reach. The menu row is a two-state row with no argument, so a click means
+   "the other one" — and this runs on the loop task, the only task that writes
+   the switch by reading it first. */
+static void backlight_idle_toggle() { backlight_idle_set(!bl_idle_on); }
+
 /* --- Endpoints --- */
 
 static const SkillEndpoint backlight_endpoints[] = {
-    {"GET",  "/backlight", "Backlight level, what it draws, and the presets the menu offers"},
-    {"POST", "/backlight", "Set {level} — 0 for off, 1 (dimmest) to 16 (brightest)"},
+    {"GET",  "/backlight", "Backlight level, what it draws, the presets, and the idle policy"},
+    {"POST", "/backlight", "Set {level} 0 (off) to 16 (brightest), and/or {idle} for the auto-dim"},
     {NULL, NULL, NULL}
 };
 
@@ -555,6 +872,27 @@ static void backlight_state_json(JsonDocument &doc) {
         p["name"] = bl_preset_table[i].name;
         p["level"] = bl_preset_table[i].level;
     }
+    /* What the panel is at RIGHT NOW, which differs from `level` exactly while
+       the idle policy is holding it down. Reported separately rather than
+       folded into `level` because a reading taken from a device nobody has
+       touched for five minutes would otherwise say the setting had changed. */
+    doc["shown"] = bl_shown;
+    /* `idle` is the bare switch and not an object, so that the key means the
+       same thing coming back out as it does going in: a client that reads this
+       response, changes one field and POSTs it is a client this endpoint should
+       understand rather than reject. The numbers behind the switch cannot be
+       set at all, so they are reported under their own name. */
+    doc["idle"] = bl_idle_on;
+    JsonObject policy = doc["idle_policy"].to<JsonObject>();
+    policy["dim_after_ms"] = BL_IDLE_DIM_MS;
+    policy["off_after_ms"] = BL_IDLE_OFF_MS;
+    policy["dim_level"] = BL_IDLE_LEVEL;
+    /* The dim step's WORD, looked up in the table rather than written down, so
+       that a reader of this response never has to trust the one spot in
+       backlight_describe() where the same word is prose. NULL — a dim step
+       edited off the table — simply leaves the key out. */
+    const char *dim_name = bl_preset_name(BL_IDLE_LEVEL);
+    if (dim_name) policy["dim_preset"] = dim_name;
 }
 
 /* notify_take_body() and notify_send_error() are notify.cpp's, borrowed the
@@ -591,17 +929,35 @@ static void backlight_register_routes(AsyncWebServer &server) {
             return;
         }
 
-        if (!input["level"].is<int>()) {
-            notify_send_error(req, 400, "level must be a number, 0 (off) to 16 (brightest)");
+        /* Two settings, either of which may be absent: a request that only
+           wants the auto-dim switched off should not have to restate a
+           brightness it is not changing. Both are CHECKED before either is
+           APPLIED, so a body carrying a good level and a bad switch leaves the
+           device exactly as it was rather than half-obeyed. */
+        bool has_level = !input["level"].isNull();
+        bool has_idle = !input["idle"].isNull();
+        if (!has_level && !has_idle) {
+            notify_send_error(req, 400, "body must carry a level, an idle switch, or both");
             return;
         }
-        int level = input["level"].as<int>();
-        if (!bl_level_valid(level)) {
-            notify_send_error(req, 400, "level must be 0 (off) to 16 (brightest)");
+        int level = 0;
+        if (has_level) {
+            if (!input["level"].is<int>()) {
+                notify_send_error(req, 400, "level must be a number, 0 (off) to 16 (brightest)");
+                return;
+            }
+            level = input["level"].as<int>();
+            if (!bl_level_valid(level)) {
+                notify_send_error(req, 400, "level must be 0 (off) to 16 (brightest)");
+                return;
+            }
+        }
+        if (has_idle && !input["idle"].is<bool>()) {
+            notify_send_error(req, 400, "idle must be true or false");
             return;
         }
 
-        if ((uint8_t)level != bl_wanted) {
+        if (has_level && (uint8_t)level != bl_wanted) {
             bl_wanted = (uint8_t)level;
             bl_cfg_mark_dirty();
             char label[BL_LABEL_MAX];
@@ -609,6 +965,15 @@ static void backlight_register_routes(AsyncWebServer &server) {
             event_add("backlight: %s (%u/%u, %lu mA)", label, (unsigned)level,
                       (unsigned)BL_STEPS,
                       (unsigned long)(bl_total_ua((uint8_t)level) / 1000));
+        }
+        /* The requested value, assigned. The comparison is only here to keep a
+           request that changes nothing from costing a flash write and a line in
+           the log — it is not what makes this correct, which is that
+           backlight_idle_set() stores what it was given. Reading the switch and
+           negating it from this task is the version that inverts itself when a
+           click on the menu row lands in the middle. */
+        if (has_idle && input["idle"].as<bool>() != bl_idle_on) {
+            backlight_idle_set(input["idle"].as<bool>());
         }
 
         JsonDocument doc;
@@ -619,6 +984,20 @@ static void backlight_register_routes(AsyncWebServer &server) {
         req->send(200, "application/json", out);
     }, NULL, handle_body_collect);
 }
+
+/*
+ * The policy's numbers, as text, for the markdown below.
+ *
+ * This exists because the markdown below is SERVED — GET /skill hands it to a
+ * person and to an agent — and a served number that disagrees with the compiled
+ * one is worse than no number at all: it reads as a specification and it is a
+ * memory. The thresholds are macros with bare integer tokens for exactly this,
+ * so the sentence a reader gets is built from the tokens the policy compares
+ * against and cannot drift from them. Two expansions, because the argument has
+ * to be macro-expanded before it is stringified.
+ */
+#define BL_STR_(x) #x
+#define BL_STR(x)  BL_STR_(x)
 
 static const char *backlight_describe() {
     return "## Skill: backlight\n\n"
@@ -634,13 +1013,71 @@ static const char *backlight_describe() {
            "### Endpoints\n\n"
            "| Method | Path | Description |\n"
            "|--------|------|-------------|\n"
-           "| GET | /backlight | `{\"ready\":true,\"pin\":21,\"level\":16,\"steps\":16,\"on\":true,\"chip_step\":1,\"preset\":\"full\",\"led_ma\":20,\"total_ma\":80,\"presets\":[...]}` |\n"
-           "| POST | /backlight | `{\"level\":11}` — 0 for off, 1 (dimmest) to 16 (brightest) |\n\n"
+           "| GET | /backlight | `{\"ready\":true,\"pin\":21,\"level\":16,\"steps\":16,\"on\":true,\"chip_step\":1,\"preset\":\"full\",\"led_ma\":20,\"total_ma\":80,\"presets\":[...],\"shown\":16,\"idle\":true,\"idle_policy\":{...}}` |\n"
+           "| POST | /backlight | `{\"level\":11}`, `{\"idle\":false}`, or both in one body |\n\n"
            "`level` counts the way a person expects: 16 is brightest and 1 is\n"
            "dimmest. `chip_step` is the same setting in the part's own\n"
            "numbering, where 1 is 20mA and 16 is 1.25mA, so a reading can be\n"
            "checked against the datasheet without arithmetic. The value\n"
            "survives a reboot, including a stored 0.\n\n"
+           "`shown` is what the panel is at this moment. It equals `level`\n"
+           "except while the idle policy below is holding it down, which is why\n"
+           "the two are reported separately: a device nobody has touched for\n"
+           "five minutes reports `\"level\":16,\"shown\":0`, and its setting has\n"
+           "not changed.\n\n"
+           "### Going dim when nobody is looking\n\n"
+           "The backlight is 85mA of a 150mA device, so a panel left lit at an\n"
+           "empty room is more than half the battery. With no input the level\n"
+           "drops to the dim step — level " BL_STR(BL_IDLE_LEVEL) ", **night** as\n"
+           "the preset table stands — after **" BL_STR(BL_IDLE_DIM_S) "s**, and to\n"
+           "**off** after **" BL_STR(BL_IDLE_OFF_S) "s**. Any turn of the knob or\n"
+           "press of either key puts it straight back, and so does a\n"
+           "notification: an arriving message takes the screen, which counts as\n"
+           "input. Every number in that sentence comes from the same macros the\n"
+           "policy compares against, so it cannot go stale; the WORD is the one\n"
+           "exception, and `idle_policy.dim_preset` below carries it from the\n"
+           "table itself.\n\n"
+           "It never goes UP. A device set below the dim step by hand stays\n"
+           "there rather than being raised to meet it.\n\n"
+           "Three things are exempt. A running TV-B-Gone blast and a recording\n"
+           "in progress are the two the screen's own idle timeout exempts: they\n"
+           "are live output, and dimming those out from under whoever is\n"
+           "watching them would be a bug rather than a saving. The third is a\n"
+           "progress bar, and it is exempt here and not there — the screen\n"
+           "timeout only returns to the clock face, which is where the bar is\n"
+           "drawn, while blanking takes the bar away outright. So a job pushed\n"
+           "with POST /progress keeps the panel readable for as long as its\n"
+           "`ttl_s` says the job is alive, whether or not anybody has touched\n"
+           "the knob.\n\n"
+           "One more thing stops the **blank**, without stopping the dim: an\n"
+           "unacknowledged **crit** message. Those never expire, and inside the\n"
+           "ring's night window the breathing hairline under the clock's header\n"
+           "is the only thing on this device still saying one is waiting — so\n"
+           "the panel holds at the dim step rather than going out from under it.\n"
+           "It is a floor and not a wake-up: a screen already dimmer, or set to\n"
+           "**off** by hand, is left where it is. Acknowledging the message lets\n"
+           "the panel blank on the usual schedule.\n\n"
+           "`{\"idle\":false}` hands the brightness back: the level set by hand\n"
+           "is then simply what the panel is at, indefinitely. The switch is\n"
+           "also the **Auto-dim** row on the menu, and it survives a reboot.\n\n"
+           "`idle_policy` reports the numbers behind all of that — the two\n"
+           "thresholds, which level the dim step lands on and what the table\n"
+           "calls it. They are compiled in and cannot be set from here; they are\n"
+           "reported so that what the device is doing can be checked against a\n"
+           "real screen and then changed in one place.\n\n"
+           "### Setting a level while the policy holds the panel down\n\n"
+           "`{\"level\":N}` sets the SETTING and does not wake the panel. On a\n"
+           "device nobody has touched for an hour it changes `level`, leaves\n"
+           "`shown` at 0, and nothing visible happens until somebody touches the\n"
+           "knob. `{\"idle\":false}` in the same endpoint lights the screen at\n"
+           "once, and the difference is deliberate rather than an oversight:\n"
+           "`idle` is the thing holding the panel down, so switching it off\n"
+           "releases it, while `level` is what the policy is currently\n"
+           "overriding. A request is not somebody standing in front of the\n"
+           "device, and treating one as input would let anything with the token\n"
+           "light this screen at three in the morning. To see a level applied\n"
+           "immediately, send `{\"level\":N,\"idle\":false}` — and note that the\n"
+           "panel then stays lit until the policy is switched back on.\n\n"
            "### When the level and the part disagree\n\n"
            "The AW9364 cannot be read back. Nothing can ask it which of the\n"
            "sixteen steps it is standing on, so the level above is a MODEL that\n"
@@ -717,6 +1154,11 @@ static void backlight_begin() {
 
     bl_cfg_load();
 
+    /* A boot is an input: the device came up because somebody pressed something
+       or plugged it in, and the panel has to be readable before there is a loop
+       to run the policy. backlight_idle() takes it over on the first pass. */
+    bl_shown = bl_wanted;
+
     /* Waited out here rather than left to the next poll, which is what every
        other deferral in this file does. loop() does not run until setup() has
        finished associating with the network, so a level handed to the poll
@@ -727,8 +1169,9 @@ static void backlight_begin() {
 
     char label[BL_LABEL_MAX];
     bl_level_label(bl_wanted, label, sizeof(label));
-    event_add("backlight: %s (%u/%u, %lu mA)", label, (unsigned)bl_wanted,
-              (unsigned)BL_STEPS, (unsigned long)(bl_total_ua(bl_wanted) / 1000));
+    event_add("backlight: %s (%u/%u, %lu mA), auto-dim %s", label,
+              (unsigned)bl_wanted, (unsigned)BL_STEPS,
+              (unsigned long)(bl_total_ua(bl_wanted) / 1000), bl_idle_word());
 }
 
 /* Nothing to bring up: the pin was configured and the stored level applied at

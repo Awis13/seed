@@ -24,10 +24,11 @@
  * TVMENU, TVMENU to MENU, MENU to CLOCK — whether it comes from the Back item
  * or the user key, so the knob alone is enough to get anywhere and out again.
  *
- * MENU also carries one row that opens nothing: Quiet switches the night window
- * on and off in place and rewrites its own label. It is a setting with two
- * states and no arguments, and a screen holding one line of that would be a
- * screen to get out of again.
+ * MENU also carries rows that open nothing. Quiet switches the night window on
+ * and off, Backlight steps through the levels, and Auto-dim switches the
+ * backlight's idle policy; each acts in place and rewrites its own label. They
+ * are settings with no arguments, and a screen holding one line of that would
+ * be a screen to get out of again.
  *
  * MSGCARD is the one screen where the click and the user key differ. A click
  * acknowledges the message and returns; the user key returns without
@@ -42,6 +43,16 @@
  * that does not time out — it is live output, and its click means "stop". An
  * idle timeout never acknowledges anything: a pager that clears itself because
  * nobody was standing there is not a pager.
+ *
+ * The same timestamp drives a second, slower thing. ui_backlight_idle() hands
+ * the elapsed time to skills/backlight.cpp, which takes the panel down to its
+ * dimmest preset after BL_IDLE_DIM_MS and out altogether after BL_IDLE_OFF_MS —
+ * the backlight is 85mA of a 150mA device, so this is most of what the battery
+ * is spent on. Both thresholds live there, next to the policy that compares
+ * against them, and are deliberately not repeated here. Any input puts the
+ * panel straight back, and the two screens the timeout above exempts are
+ * exempted from the dimming too, along with a third the timeout has no reason
+ * to care about — see ui_watching_progress().
  *
  * The pager face
  * --------------
@@ -274,6 +285,7 @@ enum {
     UI_ITEM_MSG = 0,
     UI_ITEM_QUIET,
     UI_ITEM_BACKLIGHT,
+    UI_ITEM_DIM,
     UI_ITEM_TVBGONE,
     UI_ITEM_AP,
     UI_ITEM_INFO,
@@ -290,11 +302,17 @@ enum {
    Backlight sits third, next to Quiet, because the two are the settings a hand
    reaches for in the dark and both act in place rather than opening a screen.
    Same division again: the name is here, the level's word comes from
-   bl_level_label(). */
+   bl_level_label().
+
+   Auto-dim sits directly under Backlight because it decides what happens to
+   the row above it: whether that level is what the panel holds, or only what
+   it holds while somebody is there. Reading the two in that order is the whole
+   explanation of the setting, which is why it is not filed under Info. */
 static const char *ui_items[UI_ITEM_COUNT] = {
     "Messages >",   /* ui_list_label() appends the unread count */
     "Quiet",        /* ui_list_label() appends the ring's window, or "off" */
     "Backlight",    /* ui_list_label() appends the level's word, or its step */
+    "Auto-dim",     /* ui_list_label() appends "on" or "off" */
     "TV-B-Gone >",
     "Setup AP",
     "Info",
@@ -327,6 +345,20 @@ static int ui_sel_drawn = -1;
 static int ui_first = 0;
 static unsigned long ui_last_input = 0;
 static unsigned long ui_last_draw = 0;
+
+/*
+ * Somebody is at the device. The one place ui_last_input is written, so that
+ * "what counts as input" is a question with a list of callers rather than an
+ * assignment scattered across two files.
+ *
+ * It matters more than it did before the panel could go dark. A screen timeout
+ * that fires wrongly costs a trip back into a menu; a blank that fires wrongly
+ * costs the owner the screen they are looking at, and every path that puts
+ * something on the panel without going through here is a path that draws it
+ * into the dark. main.cpp's ap_start() is one such path and calls this; that is
+ * the reason it is a named function and not an assignment.
+ */
+static void ui_note_input() { ui_last_input = millis(); }
 /* When the blast being watched stopped running, 0 while it still is. */
 static unsigned long ui_blast_done_at = 0;
 /* The same, for the recording screen: when the take ended, 0 while it runs. */
@@ -817,6 +849,17 @@ static const char *ui_list_label(int i) {
                 char level[BL_LABEL_MAX];
                 bl_level_label(bl_wanted, level, sizeof(level));
                 snprintf(built, sizeof(built), "%s %s", ui_items[i], level);
+                return built;
+            }
+            if (i == UI_ITEM_DIM) {
+                /* "Auto-dim on" or "Auto-dim off" — the row's name from the
+                   table above, the state from the skill that owns it, exactly
+                   as the two rows before it are built. "Auto-dim off" is the
+                   longer of the two states at twelve characters against the
+                   Backlight row's seventeen, so it needs no measurement of its
+                   own: the row it sits under already cleared the width with
+                   five characters to spare. */
+                snprintf(built, sizeof(built), "%s %s", ui_items[i], bl_idle_word());
                 return built;
             }
             return ui_items[i];
@@ -1311,7 +1354,10 @@ static void ui_draw() {
    outside display_status(). */
 static void ui_enter(uint8_t screen) {
     ui_screen = screen;
-    ui_last_input = millis();
+    /* A screen change is input, including the ones nobody pressed for: a card
+       arriving and a recording taking the panel both land here, and both put
+       something on a screen that has to be lit to be worth putting it on. */
+    ui_note_input();
     ui_last_draw = millis();
     ui_encoder_reset();
 
@@ -1475,6 +1521,19 @@ static void ui_activate(int item) {
             display_force = true;
             ui_draw();
             break;
+        case UI_ITEM_DIM:
+            /* The third row that acts in place, for the third time the same
+               reason: two states, no arguments, and the answer is the row's
+               own label — which is why display_force is needed here as it is
+               for Quiet, since ui_draw_list() returns early on a selection
+               that has not moved. The brightness itself does not change on
+               this pass: the click has just stamped ui_last_input, so the
+               policy is handing the level back either way, and the switch
+               only decides what happens once the dim threshold passes. */
+            backlight_idle_toggle();
+            display_force = true;
+            ui_draw();
+            break;
         case UI_ITEM_TVBGONE:
             ui_enter_list(UI_TVMENU, UI_TV_ALL);
             break;
@@ -1520,7 +1579,104 @@ static void ui_init() {
     ui_encoder.setFilter(1023);
     ui_encoder.clearCount();
     ui_encoder_reset();
-    ui_last_input = millis();
+    /* A boot is input: the device came up because somebody pressed something or
+       plugged it in, so the idle clock starts here rather than at zero. */
+    ui_note_input();
+}
+
+/*
+ * The two screens that must not be taken away from whoever is watching them.
+ *
+ * They are predicates rather than two locals inside ui_poll() because there is
+ * a second consumer: the backlight's idle policy exempts exactly these, and it
+ * has to exempt the SAME ones. A blast dimmed to nothing halfway through, or a
+ * level meter that fades while a finger is still on the key, would be the same
+ * defect the screen timeout was already written to avoid — and two copies of
+ * this pair, thirty lines apart, is how they would come to disagree.
+ *
+ * A blast counts only while it is on the panel: one started over HTTP while a
+ * menu is up is not live output the person in front of the device is watching,
+ * and there is nothing on screen for the exemption to protect.
+ */
+static bool ui_watching_blast() { return ui_screen == UI_BLAST && ir_busy(); }
+
+/* The recording screen is exempt outright rather than only while it records: a
+   hold can outlast fifteen seconds of "no input" — holding a key is not input
+   to the click state machine — and its own exit is deterministic, so neither
+   the timeout nor the dimming has anything to add and both could only fire
+   mid-sentence. */
+static bool ui_watching_rec() { return ui_screen == UI_REC; }
+
+/*
+ * The progress bar, which is live output too — but only to the backlight, and
+ * that asymmetry is the whole reason it is a third predicate rather than a
+ * third case in the pair above.
+ *
+ * The screen timeout may fire under a bar and cost nothing: what it does is
+ * return to the clock face, and the clock face is where the bar is drawn. Going
+ * dark is not the same act. A job pushed with POST /progress — a backup script,
+ * a long build, anything holding a percentage up on somebody's desk — has
+ * nothing to do with the knob, so nothing stamps ui_last_input for it and the
+ * panel it is drawn on would otherwise go out two minutes in.
+ *
+ * On the clock face only, for the same reason a blast counts only while it is
+ * on the panel: a bar nobody can see is not output being protected. And bounded
+ * without any help from here, because a job carries a deadline of its own — the
+ * bar clears itself and the panel goes back to blanking on schedule.
+ */
+static bool ui_watching_progress() {
+    return ui_screen == UI_CLOCK && progress_current(NULL);
+}
+
+/*
+ * Hand the backlight policy the idle clock. Called from loop(), once a pass,
+ * immediately above backlight_poll().
+ *
+ * NOT from inside ui_poll(), and the reason is worth stating because the
+ * opposite looks obviously right: ui_poll() returns early from most paths, and
+ * from the clock face it returns UNCONDITIONALLY — `case UI_CLOCK` has nothing
+ * to time out to, so it answers the click and leaves. The clock face is where
+ * this device spends its life, so a brightness decision made at the bottom of
+ * ui_poll() would be a brightness decision that almost never runs. What IS
+ * shared with the screen timeout is everything that matters: the one timestamp,
+ * and the two exemptions it also has.
+ *
+ * That unconditional return is also why the thresholds mean exactly what they
+ * say FROM THE CLOCK FACE. Elsewhere they are later, and by a knowable amount:
+ * ui_enter() stamps the timestamp, so the automatic return to the clock at
+ * UI_IDLE_MS restarts the dim clock once. Input on a menu therefore dims at
+ * UI_IDLE_MS + BL_IDLE_DIM_MS and blanks at UI_IDLE_MS + BL_IDLE_OFF_MS — one
+ * restart and not a repeating one, because from the clock face there is no
+ * further timeout to stamp anything. Worth knowing before timing the device
+ * with a stopwatch and concluding the thresholds are wrong.
+ *
+ * The subtraction is here, in the one place that owns ui_last_input, and it is
+ * the unsigned form that survives the 49-day wrap of millis(). bl_idle_level()
+ * is handed the elapsed time and no clocks at all.
+ */
+static void ui_backlight_idle() {
+    /* The message card needs no exemption of its own, and this is why. A card
+       is returned to the clock face after UI_IDLE_MS whether it was read or
+       not, so with the dim threshold strictly longer than that, a card is
+       never on the panel when the first dimming happens — there is no moment
+       at which a notification could fade out from under somebody reading it.
+       That is arithmetic between two constants in two files, so it is checked
+       here rather than trusted: shortening either one below the other stops
+       the build instead of quietly costing somebody a message. */
+    static_assert(BL_IDLE_DIM_MS > UI_IDLE_MS,
+                  "the backlight must not dim while a message card can still "
+                  "be on the panel: BL_IDLE_DIM_MS must exceed UI_IDLE_MS");
+    /* The fourth fact is not about a screen at all: an unread critical never
+       expires, and blanking the panel would take away the breathing hairline
+       that is the only sign of one left once the ring's night window has
+       silenced the ring. skills/backlight.cpp turns that into a floor, not a
+       wake-up. */
+    BacklightPanel panel;
+    panel.blasting = ui_watching_blast();
+    panel.recording = ui_watching_rec();
+    panel.on_bar = ui_watching_progress();
+    panel.crit_unread = notify_crit_unread();
+    backlight_idle(millis() - ui_last_input, panel);
 }
 
 /* Called every loop() pass. Nothing here blocks and nothing here draws unless
@@ -1540,11 +1696,44 @@ static void ui_poll() {
        only a short press counts as "back" here. */
     bool back = ui_user_key.click && ui_user_key.held_ms < AP_KEY_HOLD_MS;
 
-    if (steps != 0 || click || back) ui_last_input = millis();
+    /*
+     * A press on a panel the policy has blanked wakes it and does nothing else.
+     *
+     * Before there was a dark state every press was deliberate, because there
+     * was always something on the screen to press AT. Now the first press is
+     * usually somebody wanting to see the time — and on the clock face a click
+     * opens the menu, so without this they get the menu instead. That is how
+     * every phone and every watch behaves and the opposite is a surprise every
+     * single time.
+     *
+     * Only while it was BLANK. A press on a merely dimmed panel is a press on a
+     * screen its owner can read, and swallowing that would be taking away a
+     * click they meant. backlight_blanked() answers the narrow question — dark
+     * because of the policy, which a press undoes — and not "dark", which on a
+     * device somebody set to level 0 by hand a press does not.
+     *
+     * The two long-hold gestures are untouched and must stay so: a hold is not
+     * a glance. Both are polled off the pin elsewhere in loop(), and both are
+     * already excluded from `click` and `back` by the guards above, so a
+     * three-second hold on the user key still raises the setup AP from a dark
+     * panel and a hold on the encoder still starts a recording.
+     */
+    bool woke = backlight_blanked() && (steps != 0 || click || back);
+
+    if (steps != 0 || click || back) ui_note_input();
+
+    if (woke) {
+        steps = 0;
+        click = false;
+        back = false;
+    }
 
     /* The knob's own feedback on the ring, which outranks whatever the ring was
        saying by itself: a hand is on the control. The screen and the ring get
-       the same detents, and neither is told what the other did with them. */
+       the same detents, and neither is told what the other did with them.
+       Below the wake, deliberately: the detent that brings the panel back is
+       spent on bringing it back, and lighting an arc for a turn that moved
+       nothing would be the same surprise in a different colour. */
     ring_knob(steps);
 
     /*
@@ -1727,15 +1916,11 @@ static void ui_poll() {
             break;
     }
 
-    /* A running blast is live output and must not be timed out from under the
-       user; everything else falls back to the clock. The recording screen is
-       exempt outright rather than only while it records: a hold can outlast
-       fifteen seconds of "no input" — holding a key is not input to the click
-       state machine — and its own exit above is deterministic, so the idle
-       timer has nothing to add and could only fire mid-sentence. */
-    bool watching_blast = (ui_screen == UI_BLAST && ir_busy());
-    bool watching_rec = (ui_screen == UI_REC);
-    if (!watching_blast && !watching_rec && millis() - ui_last_input >= UI_IDLE_MS) {
+    /* Live output must not be timed out from under the user; everything else
+       falls back to the clock. Both exemptions are stated once, above, and the
+       backlight's idle policy reads the same two. */
+    if (!ui_watching_blast() && !ui_watching_rec() &&
+        millis() - ui_last_input >= UI_IDLE_MS) {
         ui_enter(UI_CLOCK);
         return;
     }

@@ -82,6 +82,35 @@
 // down. See the watchdog in loop() for why this number.
 #define OTA_STALL_TIMEOUT_MS 30000
 
+/*
+ * What the CPU runs at, all the time.
+ *
+ * The board definition says 240MHz and nothing ever changed it. This device is
+ * a pager: it waits. Its loop() ends in a delay of up to 10ms — one, while an
+ * IR blast wants the pass back sooner — so the idle task is in WAITI for the
+ * overwhelming majority of every second, and the S3 datasheet's own
+ * current table (Table 5-9, WAITI, Typ2 — modem sleep, which is the case here)
+ * puts 240MHz about 11.5mA above 80MHz. That is 18% of this device's 65mA
+ * floor, bought with one line and no behaviour to reason about.
+ *
+ * ALWAYS, not only while idle, for two reasons. The saving is a floor cost paid
+ * every second the device is awake, and the busiest thing this firmware does is
+ * clock bit streams out of the RMT and I2S peripherals — which run off APB and
+ * do not get faster with the core. And changing it at runtime would mean
+ * changing it underneath whatever is mid-flight; a setting that never moves has
+ * no such moment.
+ *
+ * 80 AND NOT LOWER, which is the part that would be a hardware claim if it were
+ * left implicit. APB_CLK is held at 80MHz whenever the CPU is fed from the PLL,
+ * which covers 240, 160 and 80 — every peripheral's timebase is unchanged
+ * across all three. At 40 and 20 the core switches to the crystal and APB
+ * FOLLOWS IT DOWN, which retimes the RMT: that is the IR transmitter and the
+ * LED ring, both of which would start producing waveforms nothing recognises.
+ * Checked against the SoC's own rtc_clk.c rather than assumed. Do not go below
+ * 80 without measuring what came out of GPIO2.
+ */
+#define CPU_MHZ 80
+
 // What a running IR blast calls itself on the progress bar, and how long that
 // job outlives its last update. The label is a key as well as a caption, so it
 // is a constant rather than a literal typed twice: publishing under one string
@@ -643,6 +672,13 @@ static bool notify_crit_unread();
 static bool ring_night_armed();
 static bool ring_night_now();
 
+// Defined in ui.h, which is included last of all: the idle clock the backlight
+// policy runs on. Declared up here because ap_start() below has to stamp it —
+// raising the setup AP is the offline recovery path, it puts a one-session
+// password on the screen and nowhere else, and a password drawn onto a panel
+// the policy has blanked is a password nobody can read.
+static void ui_note_input();
+
 static bool display_ready = false;
 // Set from the web server task, consumed by the clock tick in loop(): TFT_eSPI
 // owns the SPI bus and must only be driven from one task.
@@ -893,7 +929,16 @@ static void display_status() {
 // that the eye keeps re-detecting, which is right for an alarm demanding an
 // action in the next second and wrong for a device sitting on a shelf saying
 // "there is something here for you". The ramp reads as present rather than
-// urgent, and it never goes dark, so the rule never looks broken.
+// urgent, and its own colour never reaches black, so the rule never looks
+// broken.
+//
+// That is a statement about the ramp and not about the panel, which the idle
+// policy can take down under it — so it is worth being exact about what keeps
+// this visible. An unread critical never expires, and while one is outstanding
+// skills/backlight.cpp holds the panel at its dim step rather than blanking it.
+// Dim, not off: this line is still on the screen and still breathing, which is
+// the whole reason that floor is there. It is the only indication left inside
+// the ring's night window, where the ring is silent by a rule of its own.
 //
 // Cost is one drawFastHLine of 304 pixels per step — about 0.25ms of SPI at
 // 40MHz, twelve times a second, and nothing at all when no critical is
@@ -1081,6 +1126,15 @@ static void ap_start(bool temporary) {
     event_add("setup AP up: %s", ap_ssid.c_str());  // SSID only, never the password
     mdns_restart();
     display_force = true;  // the password is only readable off the screen
+    // ...and only if the panel is lit. The gesture that raises the AP is a
+    // three-second HOLD of the user key, which is deliberately NOT a click and
+    // so stamps nothing on its own: neither the hold nor the release reaches
+    // ui_poll()'s idea of input. On a panel the idle policy has blanked, an
+    // owner who has lost the network would hold the key, get the AP, and see
+    // nothing at all — including the fresh random password that exists nowhere
+    // but this screen. Raising the AP is somebody standing in front of the
+    // device by definition, so it counts as input like any other.
+    ui_note_input();
 }
 
 static void ap_stop() {
@@ -1604,12 +1658,12 @@ static void handle_skill(AsyncWebServerRequest *request) {
     s += "- An OTA upload whose connection dies is torn down after 30s without data,\n";
     s += "  so a dropped transfer no longer blocks every later one until reboot\n";
     s += "- The encoder button opens an on-device menu (messages, quiet hours,\n";
-    s += "  backlight, TV-B-Gone, setup AP, info) — the rows in that order, and this\n";
-    s += "  list is the only place they are written down, so a row added to ui_items[]\n";
-    s += "  has to be added here too. TV-B-Gone holds the three region blasts and a\n";
-    s += "  by-brand list of the nine named codes. It drives the same code paths as\n";
-    s += "  the API and has no endpoints of its own, so a job started here shows up\n";
-    s += "  in GET /ir/tvbgone/status like any other\n";
+    s += "  backlight, auto-dim, TV-B-Gone, setup AP, info) — the rows in that\n";
+    s += "  order, and this list is the only place they are written down, so a row\n";
+    s += "  added to ui_items[] has to be added here too. TV-B-Gone holds the three\n";
+    s += "  region blasts and a by-brand list of the nine named codes. It drives the\n";
+    s += "  same code paths as the API and has no endpoints of its own, so a job\n";
+    s += "  started here shows up in GET /ir/tvbgone/status like any other\n";
     s += "- POST /notify makes this a pager: the message appears on the screen at once\n";
     s += "  if the device is idle, and the clock face carries an unread count until\n";
     s += "  somebody acknowledges it with the knob or POST /notify/ack\n";
@@ -1858,6 +1912,12 @@ void setup() {
     pinMode(PIN_PWR_EN, OUTPUT);
     digitalWrite(PIN_PWR_EN, HIGH);
 
+    // Then the clock, before anything is brought up on it: the UART's divider,
+    // the radio and every peripheral configured below are set from whatever
+    // this is, so moving it afterwards would mean moving it under them. See
+    // CPU_MHZ for the 11.5mA and for why 80 is the floor.
+    setCpuFrequencyMhz(CPU_MHZ);
+
     // Park all chip-selects on the shared SPI bus before anyone talks on it
     pinMode(PIN_TFT_CS, OUTPUT);
     digitalWrite(PIN_TFT_CS, HIGH);
@@ -1898,7 +1958,10 @@ void setup() {
             WiFi.softAPIP().toString().c_str(), HTTP_PORT, ap_ssid.c_str());
     }
 
-    event_add("seed started v%s", SEED_VERSION);
+    // The clock is read back rather than reported from CPU_MHZ: this line is
+    // how a battery measurement is tied to what the chip actually settled on.
+    event_add("seed started v%s (cpu %u MHz)", SEED_VERSION,
+              (unsigned)getCpuFrequencyMhz());
 }
 
 void loop() {
@@ -2048,6 +2111,17 @@ void loop() {
     // Composes a frame at most every 25ms, sends one only when it differs from
     // the last, and hands the bit stream to the RMT peripheral without waiting.
     ring_poll();
+
+    // What the backlight SHOULD be at, which is a question about the idle clock
+    // and not about the part: ui.h owns the timestamp and knows which screens
+    // are live output, skills/backlight.cpp owns the thresholds and the switch.
+    //
+    // Here rather than inside ui_poll() because ui_poll() returns early from
+    // nearly every path — including unconditionally from the clock face, which
+    // is the screen this device wears all day. See ui_backlight_idle().
+    // Immediately above the poll that carries it out, so a level decided on this
+    // pass reaches the panel on this pass.
+    ui_backlight_idle();
 
     // The backlight, on the same terms: the endpoints and the menu record a
     // wanted level and this is the only place the part is ever clocked, because
