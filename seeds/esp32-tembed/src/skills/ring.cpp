@@ -122,7 +122,15 @@
  * a measurement.
  *
  * Night silence is absolute: inside the window the ring does not light, not
- * even for an unread critical, which already breathes on the (dim) screen.
+ * even for an unread critical. What carries that critical instead is the
+ * breathing hairline on the clock face — and it is worth naming the thing that
+ * keeps it carryable, because this rule leans on it. The panel goes DARK on its
+ * own after BL_IDLE_OFF_MS of nobody touching the device, an unread critical
+ * never expires, and the two together would leave a critical with no indication
+ * anywhere at all until morning. So skills/backlight.cpp holds the panel at its
+ * dim step for as long as one is outstanding. That is a floor on the screen and
+ * changes nothing here: the ring stays as silent as this paragraph says, and
+ * shortening the silence is not the answer to a dark panel.
  * Boundaries come from clock_local_time() and therefore from whatever POSIX TZ
  * string SPIFFS holds — this file knows no city and no offset, and must not
  * learn one. When the clock has never been set the ring stays lit: a node that

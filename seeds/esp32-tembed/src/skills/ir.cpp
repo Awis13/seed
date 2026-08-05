@@ -77,23 +77,26 @@
  *
  * Between two different codes, the receiver's AGC has to settle before it will
  * lock onto a frame it has never seen. Upstream nominally asks for 205ms, but
- * it asks with delay_ten_us() — an uncalibrated AVR NOP loop that ports carry
- * over verbatim and that lands nowhere near 205ms on a 240MHz part, so the
- * number is not evidence of a requirement. 100ms is a real number, chosen
- * here: it is long enough to be a gap and it keeps a region under 40 seconds,
- * which is the only budget that matters for something used while standing in
- * front of a television.
+ * it asks with delay_ten_us() — an uncalibrated AVR NOP loop, counted in
+ * instructions on a part whose instruction rate has nothing to do with this
+ * one, that ports carry over verbatim. Whatever it comes to here it is not
+ * 205ms, so the number is not evidence of a requirement. Nothing in this file
+ * executes it in any case: the gap is the constant below, in milliseconds off a
+ * real clock. 100ms is a real number, chosen here: it is long enough to be a
+ * gap and it keeps a region under 40 seconds, which is the only budget that
+ * matters for something used while standing in front of a television.
  *
  * This gap is not what makes a television toggle back on, and shortening it
  * would not help. A receiver ignores IR for something like 0.5-2s after
  * accepting a power command, but the duplicate commands that were causing
- * toggling sit seconds apart in the run — 3.9s and 38.0s for the Samsung pair
- * at this gap, and still 2.4s and 27.2s at the ~20ms a NOP loop really
- * produces — so no gap in this range hides them inside a lockout. The AVR
- * original settles it: its delay_ten_us(25000) is 250ms on the part it was
- * written for, slower than this, and it does not toggle, because within one
- * region it sends each command once. Duplicate suppression is the fix; see
- * ir_dup_groups below.
+ * toggling sit SECONDS apart in the run — 3.9s and 38.0s for the Samsung pair
+ * at this gap — with dozens of other codes between them, so no gap this file
+ * could plausibly be set to hides them inside a lockout. Shortening the gap
+ * moves them closer together and leaves them seconds apart; the separation is
+ * mostly the codes themselves. The AVR original settles it from the other
+ * direction: its delay_ten_us(25000) is 250ms on the part it was written for,
+ * slower than this, and it does not toggle, because within one region it sends
+ * each command once. Duplicate suppression is the fix; see ir_dup_groups below.
  */
 #define IR_CODE_GAP_MS    100
 #define IR_REPEAT_GAP_MS  45
