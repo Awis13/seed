@@ -31,6 +31,7 @@
 //   POST /firmware/confirm  — confirm (cancel rollback)
 //   POST /firmware/rollback — revert to previous
 //   GET  /skill             — AI agent skill file
+//   POST /auth/token/rotate — regenerate the node token (hardware RNG)
 //   GET  /                  — WiFi config page
 //   POST /wifi/config       — save WiFi credentials
 
@@ -355,6 +356,23 @@ static bool ota_encoder_paused = false;
 // fail the tag guard under the lock before any write. Mirrors eibi_mtx. Created
 // once in setup() before server.begin(); take/give are null-guarded defensively.
 static SemaphoreHandle_t ota_mtx = nullptr;
+// Serialises every SPIFFS write across tasks. write_spiffs_file() is the single
+// shared flash writer and is reached from two tasks that share a core: the
+// debounced radio.json persist runs on loopTask, while memory_store_save (POST
+// /radio/memory) and the config/tz/wifi handlers run on async_tcp (prio 10),
+// which preempts loopTask mid-instruction. Each write brackets itself with
+// radio_encoder_pause()/resume() (detach/attach the encoder ISR) around a
+// cache-disabling SPIFFS write. Without a lock, async_tcp can start its own
+// write and radio_encoder_resume() mid-way through a loopTask write still in
+// flight: the ISR re-attaches while the flash cache is off, an encoder edge
+// faults reading its Rotary table from flash. Holding this across the whole
+// pause+write+resume sequence makes it one atomic critical section, so the two
+// callers can neither interleave the detach/attach nor tear the flash write.
+// Mirrors ota_mtx (which only covers the OTA Update.write path, not this one).
+// Created once in setup() before server.begin(); take/give are null-guarded
+// defensively — a few callers (token_load, wifi restore) run single-threaded at
+// boot before setup() creates it, where a null mutex is safe.
+static SemaphoreHandle_t spiffs_mtx = nullptr;
 static volatile bool pending_restart = false;
 static volatile bool pending_rollback = false;
 
@@ -385,14 +403,24 @@ static String read_spiffs_file(const char *path) {
 }
 
 static bool write_spiffs_file(const char *path, const String &content) {
+    // Serialise all SPIFFS writes: the pause + open/print/close + resume below is
+    // one atomic critical section so a second writer on another task (async_tcp vs
+    // loopTask, same core) can't re-attach the encoder ISR while this write has the
+    // flash cache off, and two writes can't interleave. Given before every return.
+    if (spiffs_mtx) xSemaphoreTake(spiffs_mtx, portMAX_DELAY);
     // Pause the encoder ISR around the flash write: SPIFFS disables the cache and
     // encoder.process() reads flash, so an edge mid-write would crash the chip.
     radio_encoder_pause();
     File f = SPIFFS.open(path, FILE_WRITE);
-    if (!f) { radio_encoder_resume(); return false; }
+    if (!f) {
+        radio_encoder_resume();
+        if (spiffs_mtx) xSemaphoreGive(spiffs_mtx);
+        return false;
+    }
     f.print(content);
     f.close();
     radio_encoder_resume();
+    if (spiffs_mtx) xSemaphoreGive(spiffs_mtx);
     return true;
 }
 
@@ -474,6 +502,63 @@ static bool require_auth(AsyncWebServerRequest *request) {
     request->send(401, "application/json",
         "{\"error\":\"Authorization: Bearer <token> required\"}");
     return false;
+}
+
+// POST /auth/token/rotate — regenerate the node token with the hardware RNG.
+// The original token was minted by old firmware before RF was up (weak
+// esp_random entropy); rotating on current firmware yields a strong token
+// without a physical USB reflash. A current-token holder can already POST
+// arbitrary firmware, so gating this on require_auth() grants no new privilege.
+// Order matters to avoid lockout: persist to flash, read it back, and only
+// then swap the RAM copy. If flash write or readback fails, the old token
+// stays valid in both RAM and flash.
+static void handle_token_rotate(AsyncWebServerRequest *request) {
+    if (!require_auth(request)) return;
+
+    // Same generation loop as token_load(): 16 bytes -> 32 hex chars.
+    char buf[33];
+    for (int i = 0; i < 16; i++) {
+        snprintf(buf + i * 2, 3, "%02x", (uint8_t)esp_random());
+    }
+    buf[32] = '\0';
+    String new_token(buf);
+
+    // a. Persist first. Failure -> RAM untouched, old token still works.
+    if (!write_spiffs_file(TOKEN_FILE, new_token)) {
+        request->send(500, "application/json",
+            "{\"error\":\"flash write failed\"}");
+        return;
+    }
+
+    // b. Read back and verify. On mismatch, restore the old (still-valid RAM)
+    //    token to flash so flash and RAM agree, and leave RAM untouched.
+    String readback = read_spiffs_file(TOKEN_FILE);
+    readback.trim();
+    if (readback != new_token) {
+        // Restore the old token to flash. If that restore ALSO fails, flash now
+        // holds neither the confirmed-old nor the confirmed-new token; RAM still
+        // authenticates the current session, but the next reboot would reseed
+        // from the corrupted file and lock the operator out — so make that case
+        // explicit and demand a physical reflash before any reboot.
+        bool restored = write_spiffs_file(TOKEN_FILE, auth_token);
+        request->send(500, "application/json",
+            restored ? "{\"error\":\"token readback mismatch, old token kept\"}"
+                     : "{\"error\":\"token readback mismatch AND flash restore failed - reflash required before reboot\"}");
+        return;
+    }
+
+    // c. Flash is good — swap the RAM copy. The new token authenticates the
+    //    next request; the old one stops working immediately. Inherent
+    //    two-generals gap: if the device reboots between this confirmed
+    //    readback and the response completing, flash and post-reboot RAM both
+    //    hold the new token but the operator never received it (unavoidable for
+    //    any persist-then-notify design; not a regression).
+    auth_token = new_token;
+
+    // The caller authenticated with the OLD token; this response is the only
+    // channel that surfaces the NEW token on an STA node.
+    request->send(200, "application/json",
+        "{\"ok\":true,\"token\":\"" + new_token + "\"}");
 }
 
 // ===== WiFi =====
@@ -695,7 +780,7 @@ static void handle_capabilities(AsyncWebServerRequest *request) {
         "/clock", "/clock/tz",
         "/firmware/version", "/firmware/upload", "/firmware/apply",
         "/firmware/confirm", "/firmware/rollback",
-        "/skill", "/ui", NULL
+        "/skill", "/auth/token/rotate", "/ui", NULL
     };
     for (int i = 0; eps[i]; i++) ep.add(eps[i]);
 
@@ -1134,6 +1219,7 @@ static void handle_skill(AsyncWebServerRequest *request) {
     s += "| POST | /firmware/confirm | Confirm |\n";
     s += "| POST | /firmware/rollback | Rollback |\n";
     s += "| GET | /skill | This file |\n";
+    s += "| POST | /auth/token/rotate | Regenerate node token (hardware RNG) |\n";
 
     // Skill endpoints
     for (int i = 0; i < g_skill_count; i++) {
@@ -1443,6 +1529,7 @@ static void setup_routes() {
     server.on("/firmware/confirm", HTTP_POST, handle_firmware_confirm);
     server.on("/firmware/rollback", HTTP_POST, handle_firmware_rollback);
     server.on("/skill", HTTP_GET, handle_skill);
+    server.on("/auth/token/rotate", HTTP_POST, handle_token_rotate);
     server.on("/ui", HTTP_GET, handle_ui);
     server.on("/", HTTP_GET, handle_wifi_page);
     server.on("/wifi/config", HTTP_POST, handle_wifi_post);
@@ -1474,6 +1561,7 @@ void setup() {
     token_load();     // after wifi_setup(): needs RF up for a real hardware RNG
     skills_init();    // display can now show the token / AP password on screen
     if (!ota_mtx) ota_mtx = xSemaphoreCreateMutex();  // before any upload is possible
+    if (!spiffs_mtx) spiffs_mtx = xSemaphoreCreateMutex();  // before concurrent SPIFFS writers
     setup_routes();
     server.begin();
 
