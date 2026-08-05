@@ -224,8 +224,8 @@ struct ParamCase {
 };
 
 static const ParamCase trm_params[] = {
-    /* 0x01+0x92+0x00+0x80 = 0x113 -> 0x13; 0xFF-0x13 = 0xEC */
-    {"TaperCurrent",                 0x9201,  128, 0xEC},
+    /* 0x01+0x92+0x00+0x64 = 0xF7;         0xFF-0xF7 = 0x08 */
+    {"TaperCurrent",                 0x9201,  100, 0x08},
     /* 0xFB+0x91+0x02+0x00 = 0x18E -> 0x8E; 0xFF-0x8E = 0x71 */
     {"ChargingCurrent",              0x91FB,  512, 0x71},
     /* 0xFD+0x91+0x10+0x70 = 0x20E -> 0x0E; 0xFF-0x0E = 0xF1 */
@@ -505,12 +505,12 @@ int main(void) {
         eq_int(blk[3], 0x00, "and its low byte second — NOT the address order");
 
         /* A value whose two bytes are equal proves nothing about order, so the
-           table's own 128 is checked for what it does prove: the low byte is
-           where the magnitude went. 128 little-endian would be 0x80,0x00 and
-           the gauge would store 32768. */
-        bq_dm_block(0x9201, 128, blk);
-        eq_int(blk[2], 0x00, "128 = 0x0080: high byte is zero");
-        eq_int(blk[3], 0x80, "and the magnitude is in the low byte");
+           table's own taper current is checked for what it does prove: the low
+           byte is where the magnitude went. 100 little-endian would be
+           0x64,0x00 and the gauge would store 25600 instead. */
+        bq_dm_block(0x9201, 100, blk);
+        eq_int(blk[2], 0x00, "100 = 0x0064: high byte is zero");
+        eq_int(blk[3], 0x64, "and the magnitude is in the low byte");
 
         /* Every parameter in the shipping table encodes to what the TRM
            addresses say it should. */
@@ -686,7 +686,39 @@ int main(void) {
            writable on the part, and would corrupt the gauge silently. */
         check(!bq_dm_write_allowed(0x929F, 1300), "0x929F DesignCapacity is refused");
         check(!bq_dm_write_allowed(0x929D, 1300), "0x929D FullChargeCapacity is refused");
+        /* Both of these are now READ on every pass and served in the endpoint,
+           which makes them the two addresses most likely to be added to the
+           write table by somebody who sees them in the response and assumes
+           symmetry. bq27220_dm_read() is unguarded on purpose — reading is
+           harmless — and that asymmetry is the whole safety argument, so the
+           refusals are pinned by name rather than left to the sweep above. */
         check(!bq_dm_write_allowed(0x929B, 0),    "0x929B GaugingConfig is refused");
+        check(!bq_dm_write_allowed(0x927F, 0),    "0x927F SOCFlagConfigA is refused");
+        /* 0x102A is the default TRM Table 3-2 gives 0x929B, and the value that
+           would have CSYNC set. It is the one somebody chasing the percentage
+           is most likely to try to write, so the refusal is pinned at it. */
+        check(!bq_dm_write_allowed(0x929B, 0x102A),
+              "including at the value TRM Table 3-2 gives as its default");
+
+        /* And the structural version of the same statement, which does not
+           need updating when a diagnostic is added: NO address in the
+           read-only table is writable, and no address appears in both tables.
+           Two tables rather than one table with a `writable` flag is exactly
+           what makes this assertable — a flag would have to be trusted, a
+           separate table can be swept. */
+        int diag_writable = -1;
+        int diag_in_config = -1;
+        for (int d = 0; d < GAUGE_DIAG_COUNT; d++) {
+            if (bq_dm_write_allowed(gauge_diagnostics[d].addr, 0)) diag_writable = d;
+            for (int i = 0; i < GAUGE_CONFIG_COUNT; i++) {
+                if (gauge_config[i].addr == gauge_diagnostics[d].addr) diag_in_config = d;
+            }
+        }
+        check(diag_writable < 0,
+              "no address in the read-only diagnostic table is writable");
+        check(diag_in_config < 0,
+              "and none of them is also in the table this file writes");
+        check(GAUGE_DIAG_COUNT > 0, "there is at least one diagnostic to check");
         /* The address LilyGO's own header mislabels as EMF. Not a hypothetical
            keystroke — a real one, already made upstream. */
         check(!bq_dm_write_allowed(0x92A3, 3743), "0x92A3 Design Voltage is refused");
@@ -823,16 +855,91 @@ int main(void) {
             live[i] = was;
         }
 
-        /* Off by one in either direction, on the parameter that matters: 100 is
-           the ROM default this whole commit is about, and it must not read as
-           agreement. */
+        /*
+         * The stale value that matters, on the parameter that matters.
+         *
+         * THIS CHECK USED TO BE ABOUT 100 mA, the ROM default, back when the
+         * table wrote 128. It cannot be any more: the table now writes 100, so
+         * 100 IS the value, and asserting that it is flagged asserted a
+         * contradiction. That is not a weakened test, it is a fact about the
+         * number chosen — the BQ27220's ROM default for Taper Current is
+         * 100 mA, and the value this fix wants is also 100 mA.
+         *
+         * Which means the taper write is a no-op against a factory-default
+         * gauge, and the behaviour change in this commit lives entirely on the
+         * charger side. Writing it anyway is deliberate: it pins the value
+         * instead of inheriting it, so a part that arrives holding something
+         * else — LilyGO's own firmware writes 128 here — is corrected rather
+         * than trusted.
+         *
+         * So the stale reading with teeth is now 128: what the previous two
+         * versions of this firmware wrote, and what the vendor writes. A gauge
+         * still holding it is a gauge this fix has not reached, and that must
+         * not read as agreement.
+         */
         {
             int taper = param_index("TaperCurrent");
             check(taper >= 0, "TaperCurrent has an index");
-            live[taper] = 100;
+            live[taper] = 128;
             eq_int(gauge_verify_mask(live), 1 << taper,
-                   "a TaperCurrent still at its 100 mA ROM default is flagged");
+                   "a TaperCurrent still at the 128 mA this firmware used to "
+                   "write — and that LilyGO writes — is flagged");
             live[taper] = gauge_config[taper].value;
+        }
+
+        /*
+         * AND THE CONSEQUENCE OF THAT CHOICE, ASSERTED RATHER THAN ASSUMED.
+         *
+         * Four of the six parameters now equal their ROM defaults: Taper
+         * Current, Charge Detection Threshold, Quit Current and CEDV Charge
+         * Termination Voltage. The read-back is what tells this firmware that
+         * the gauge lost its RAM, and a table entirely equal to the ROM
+         * defaults would make a reset gauge indistinguishable from a
+         * configured one — the verdict would read `applied: true` on a part
+         * that had been wiped at 03:00.
+         *
+         * It does not, because Charging Current and Charging Voltage still
+         * differ. That is the property, so it is checked as one: at least one
+         * parameter must disagree with its ROM default. Anyone lowering
+         * Charging Current to the ROM 200 mA, or shifting the voltage, needs
+         * to see this go red rather than discover it on a device.
+         *
+         * The defaults are literals from TRM SLUUBD4A Table 3-2, in the same
+         * order as the address defines they annotate.
+         */
+        {
+            struct { uint16_t addr; int16_t rom; } rom_defaults[] = {
+                {0x91FB,  200},   /* Charging Current                */
+                {0x91FD, 4200},   /* Charging Voltage                */
+                {0x9201,  100},   /* Taper Current                   */
+                {0x922A,   75},   /* Charge Detection Threshold      */
+                {0x922C,   40},   /* Quit Current                    */
+                {0x92A5,  100},   /* CEDV Charge Termination Voltage */
+            };
+            int differ = 0;
+            for (int i = 0; i < GAUGE_CONFIG_COUNT; i++) {
+                for (int r = 0; r < COUNT(rom_defaults); r++) {
+                    if (gauge_config[i].addr != rom_defaults[r].addr) continue;
+                    if (gauge_config[i].value != rom_defaults[r].rom) differ++;
+                }
+            }
+            check(differ > 0,
+                  "at least one parameter differs from its ROM default, so a "
+                  "gauge that lost its RAM cannot read back as configured");
+
+            /* Named, because "at least one" is satisfied by whichever survives
+               a later edit and these two are the ones carrying it today. */
+            const GaugeParam *amps  = param_named("ChargingCurrent");
+            const GaugeParam *volts = param_named("ChargingVoltage");
+            if (amps)  check(amps->value  != 200,  "ChargingCurrent is not the ROM 200 mA");
+            if (volts) check(volts->value != 4200, "ChargingVoltage is not the ROM 4200 mV");
+
+            /* And the one that now IS its default, stated so nobody reads the
+               table as six corrections. */
+            const GaugeParam *taper_r = param_named("TaperCurrent");
+            if (taper_r) eq_int(taper_r->value, 100,
+                                "TaperCurrent equals its own ROM default, in mA — "
+                                "pinned rather than corrected");
         }
 
         for (int i = 0; i < GAUGE_CONFIG_COUNT; i++) live[i] = 0;
@@ -1030,7 +1137,8 @@ int main(void) {
     {
         eq_int(bq_signed(0x0000), 0, "zero is zero");
         eq_int(bq_signed(0x0200), 512, "512 mA into the cell");
-        eq_int(bq_signed(0x0080), 128, "128 mA, the charger's termination current");
+        eq_int(bq_signed(0x0064), 100, "100 mA, the gauge's taper ceiling");
+        eq_int(bq_signed(0x0040), 64,  "64 mA, the charger's termination current");
         eq_int(bq_signed(0xFFB0), -80, "an 80 mA discharge is negative");
         /* The small readings are the ones an unsigned mistake still flatters:
            65531 does not look like a current, but it does not look like -5
@@ -1043,9 +1151,17 @@ int main(void) {
     printf("the taper band, which is what FC is actually waiting for\n");
     {
         /* TRM 4.4.1 conditions 1 and 2 read together. The floor is the half of
-           it that reads like a footnote and is not one. */
-        eq_int((int)bq_taper_floor_ua(), 22500,
-               "0.25 mAh per 40 s window is a floor of 22500 uA");
+           it that reads like a footnote and is not one.
+
+           The 0.25 mAh accumulates "during the same two periods" — across the
+           whole qualification, not per window. Dividing by one window is the
+           easy misreading, it doubles the answer to 22500, and this file
+           shipped that number once. The assertion is here so it cannot come
+           back quietly. */
+        eq_int((int)bq_taper_floor_ua(), 11250,
+               "0.25 mAh across both 40 s windows is a floor of 11250 uA");
+        check(bq_taper_floor_ua() != 22500,
+              "and NOT 22500, which is the per-window misreading of TRM 4.4.1");
         eq_int(BQ_TAPER_WINDOW_S, 40, "the window is the TRM's 40 s");
         eq_int(BQ_TAPER_MIN_CAP_UAH, 250, "and the capacity is its 0.25 mAh");
 
@@ -1061,14 +1177,16 @@ int main(void) {
         eq_int(BQ_CHG_RELAX_TIME_S, 60, "Chg Relax Time is the TRM's 60 s");
         eq_int(BQ_TAPER_WINDOWS, 2, "and two windows are required");
 
-        /* QuitCurrent 40 mA is above the 22.5 mA capacity floor, so on THIS
-           device it is the binding one. */
+        /* QuitCurrent 40 mA is above the 11.25 mA capacity floor, so on THIS
+           device it is the binding one — as it would have been on the doubled
+           misreading too, which is why correcting that floor changes nothing
+           about what the device waits for. */
         eq_int((int)bq_termination_floor_ua(40), 40000,
                "QuitCurrent 40 mA binds over the capacity floor");
         /* And below it, the capacity condition takes over again. */
-        eq_int((int)bq_termination_floor_ua(10), 22500,
+        eq_int((int)bq_termination_floor_ua(10), 11250,
                "a QuitCurrent of 10 mA does not, so the capacity floor binds");
-        eq_int((int)bq_termination_floor_ua(0), 22500,
+        eq_int((int)bq_termination_floor_ua(0), 11250,
                "nor does a QuitCurrent of zero");
 
         /* The shipping QuitCurrent is the one the endpoint reports against. */
@@ -1080,29 +1198,145 @@ int main(void) {
         }
 
         /*
-         * THE CHECK THIS WHOLE COMMIT IS ABOUT, stated as a fact rather than
-         * as an assertion about what the values should be.
+         * THE CHECK THIS WHOLE COMMIT IS ABOUT, and it is now an assertion
+         * rather than a pinned observation.
          *
          * Termination needs the current between the floor and the ceiling for
          * two windows. The charger stops delivering at its termination
          * current. So the band is only reachable while charging if the gauge's
-         * ceiling is ABOVE the charger's cut-off — and today it is not, it is
-         * equal to it, which is why this reports rather than asserts.
+         * ceiling is ABOVE the charger's cut-off.
          *
-         * Deliberately NOT written as check(taper->value > iterm): that would
-         * be red on the shipping configuration, and this commit was asked to
-         * diagnose without changing behaviour. When the taper current is
-         * raised, this check is the one to invert.
+         * The previous version of this block carried a note saying it was
+         * "deliberately NOT written as check(taper->value > iterm)", because
+         * that would have been red on the shipping configuration, and ending
+         * with "when the taper current is raised, this check is the one to
+         * invert". The taper current has been raised. This is that inversion.
          */
         const GaugeParam *taper_p = param_named("TaperCurrent");
         check(taper_p != NULL, "TaperCurrent is in the table");
         if (taper_p) {
             check((long)taper_p->value * 1000L > bq_taper_floor_ua(),
                   "the taper ceiling is above the capacity floor at all");
-            eq_int(taper_p->value, charger_table_iterm_ma(),
-                   "TODAY the ceiling EQUALS the charger's cut-off, so the "
-                   "band the gauge watches is the range the charger will not "
-                   "operate in — this is the defect, pinned, not endorsed");
+            check(taper_p->value > charger_table_iterm_ma(),
+                  "the gauge's ceiling is ABOVE the charger's cut-off, so the "
+                  "band it watches is a range the charger actually produces");
+
+            /* The floor that binds is QuitCurrent's, not the capacity rule's,
+               and the ceiling has to clear THAT too or the band is empty from
+               the other end. */
+            const GaugeParam *quit_q = param_named("QuitCurrent");
+            if (quit_q) {
+                check((long)taper_p->value * 1000L >
+                          bq_termination_floor_ua(quit_q->value),
+                      "and above the floor that actually binds, which is "
+                      "QuitCurrent's rather than the capacity rule's");
+            }
+        }
+    }
+
+    printf("the taper current is inside every bound that applies to it at once\n");
+    {
+        /*
+         * Five rules constrain this one number, and it is the only number in
+         * either file with that many. Each is cheap, each is a pure comparison
+         * on shipping values, and each is a different way the choice could be
+         * wrong — so each gets its own check with its own message rather than
+         * one conjunction that says "the taper is bad" and nothing else.
+         *
+         * WHAT IS DELIBERATELY NOT HERE: the time-in-band arithmetic. Whether
+         * the current spends eighty seconds between the floor and the ceiling
+         * depends on the cell's decay rate — about 12 mA/min measured on this
+         * one — and on a charger termination accuracy the datasheet specifies
+         * only at 256 mA. Those are properties of hardware and temperature,
+         * not of this code. A check pinned to them would go red on a device
+         * that is working perfectly well. The arithmetic lives in the comment
+         * beside gauge_config[]'s TaperCurrent row, where a reader considering
+         * a change will be standing.
+         */
+        const GaugeParam *taper = param_named("TaperCurrent");
+        const GaugeParam *detect = param_named("ChargeDetectThreshold");
+        const GaugeParam *quit  = param_named("QuitCurrent");
+        check(taper && detect && quit,
+              "the three currents that have to be ordered are all in the table");
+        if (taper && detect && quit) {
+
+        const int design_mah = 1300;   /* the cell on this board, as a literal */
+        const int iterm = charger_table_iterm_ma();
+
+        /* 1. Above the charger's threshold. TI SLUA777/903/917: "slightly
+              higher", so that the gauge sees full BEFORE the charger cuts. */
+        check(taper->value > iterm,
+              "TaperCurrent is above the charger's termination current");
+
+        /* 2. And by a sane margin rather than by one milliamp. TI's own worked
+              example is 70 mA against a 50 mA charger, a ratio of 1.4, sized
+              for a charger held to about 10%. This charger's accuracy is
+              specified only at 256 mA and not at all at 64 mA, so the ratio
+              here is larger than theirs on purpose — but an unbounded ratio
+              would mean a ceiling up in the constant-current phase, where fc
+              sets early and FullChargeCapacity learns SHORT. Both ends. */
+        check(taper->value * 10 >= iterm * 14,
+              "the ratio to the charger's cut-off is at least TI's 1.4");
+        check(taper->value * 10 <= iterm * 25,
+              "and not more than 2.5x, which would reach into constant current");
+
+        /* 3. Below C/10. The same TI notes, and the rule that made this
+              impossible until the charger was lowered to 64 mA. */
+        eq_int(design_mah / 10, 130, "C/10 on this 1300 mAh cell is, in mA");
+        check(taper->value < design_mah / 10,
+              "TaperCurrent is below C/10");
+
+        /* 4. Above C/100. Below that the taper is inside what the 0.01R shunt
+              reads as noise at rest, and a threshold the gauge cannot resolve
+              is not a threshold. */
+        eq_int(design_mah / 100, 13, "C/100 is, in mA");
+        check(taper->value > design_mah / 100,
+              "and above C/100, so it is a current the shunt can resolve");
+
+        /* 5. The ordering. A ceiling at or below ChargeDetectThreshold means
+              the gauge stops calling it a charge before it can qualify one;
+              a ChargeDetectThreshold at or below QuitCurrent means it calls
+              the pack at rest and charging at the same current. */
+        check(taper->value > detect->value,
+              "Taper > ChargeDetect: the gauge still calls it a charge at the ceiling");
+        check(detect->value > quit->value,
+              "ChargeDetect > Quit: and does not call the same current both at rest and charging");
+
+        /* Stated as one line as well, because the ordering is the property and
+           the two checks above are how it is enforced. */
+        check(taper->value > detect->value && detect->value > quit->value,
+              "so the three hold the required order Taper > ChargeDetect > Quit");
+
+        /* 6. And QuitCurrent below C/20. This is the FLOOR of the band, and it
+              is the one that actually binds here — below it the gauge leaves
+              CHARGE mode after 60 s, which is shorter than the 80 s a
+              qualification takes, so the band is pre-empted from underneath.
+              Keeping it under C/20 keeps the band wide enough to cross at a
+              realistic taper rate. C/20 is also where the charger now
+              terminates, which is not a coincidence worth relying on but is
+              worth noticing: a QuitCurrent above the charger's cut-off would
+              close the band completely. */
+        eq_int(design_mah / 20, 65, "C/20 on this cell is, in mA");
+        check(quit->value < design_mah / 20,
+              "QuitCurrent is below C/20, so the band has room under the ceiling");
+        check(quit->value < iterm,
+              "and below the charger's termination current, or the band would "
+              "be closed from underneath before the charger ever stopped");
+
+        /* The charger cannot be walked below where it is. ITERM is
+           64 + 64*code on REG05[3:0], so 64 mA is code 0 and there is nothing
+           under it — which means the gap this fix depends on cannot be widened
+           from the charger's side, only narrowed. Anyone who needs more room
+           has to raise the taper, and rules 3 and 4 above bound that. */
+        eq_int(iterm, 64, "the charger terminates at the lowest current it can encode, in mA");
+        /* Which is C/20 on this cell — 65 mA exactly — to within a milliamp.
+           Written as a comparison against C/20 rather than as
+           eq_int(design_mah / iterm, 20): that quotient is 20.3 truncated to
+           20, so it reads as an exact ratio while not being one, and it would
+           go on passing for any termination current from 62 to 68 mA. */
+        check(iterm <= design_mah / 20,
+              "which is at or just under C/20 on this cell");
+
         }
     }
 
@@ -1110,11 +1344,19 @@ int main(void) {
     {
         /*
          * The one fact that spans two files, and the reason this whole commit
-         * works. charger.cpp sets the BQ25896 to terminate at 128 mA; the gauge
-         * declares a pack full when it sees the current taper below ITS taper
-         * threshold. If those two numbers ever stop being equal, the gauge goes
-         * back to never seeing a charge finish — silently, with every other
-         * check in both suites still green.
+         * works. charger.cpp sets the BQ25896 to terminate at 64 mA; the gauge
+         * declares a pack full only after the current spends two 40 s windows
+         * between a floor and ITS taper threshold. If those two numbers ever
+         * become equal — or cross — the gauge goes back to never seeing a
+         * charge finish, silently, with every other check in both suites still
+         * green.
+         *
+         * THE RELATIONSHIP INVERTED IN THIS COMMIT. It used to be equality,
+         * which is what the numbers were and what was wrong with them. It is
+         * now an inequality plus a ratio: the two mirrored parameters below
+         * (voltage and current) are still copies, because the gauge does have
+         * to recognise what the charger delivers, but the taper deliberately
+         * is not.
          *
          * Both sides are read out of the shipping tables, so a change to either
          * file alone fails here. Stated honestly, though: a change to either
@@ -1122,26 +1364,40 @@ int main(void) {
          * — editing charger.cpp's REG05 to 0x12 turns tools/test_charger.sh red
          * as well, so this check is not what catches that.
          *
-         * What it catches, and nothing else does, is the two moving APART while
-         * each file's own expectations are kept consistent. Verified: the
-         * gauge's TaperCurrent moved to 192 mA and the trm_params pin above
-         * moved with it, charger.cpp untouched. tools/test_charger.sh stays
-         * green, every other check in this file stays green, and the equality
-         * below goes red alone. Restored, green.
+         * What it catches, and nothing else does, is the two drifting into the
+         * wrong RELATIONSHIP while each file's own expectations are kept
+         * consistent. Verified: the gauge's TaperCurrent moved to 64 mA and the
+         * trm_params pin above moved with it, charger.cpp untouched.
+         * tools/test_charger.sh stays green, every other check in this file
+         * stays green, and the inequality below goes red alone. Restored,
+         * green.
          *
          * The other half of its value is the message. A pin failing says a
-         * number changed; this says the gauge and the charger no longer agree,
-         * which is the sentence somebody needs to read at that moment.
+         * number changed; this says the gauge and the charger no longer stand
+         * in the relationship the fix depends on, which is the sentence
+         * somebody needs to read at that moment.
          */
         const GaugeParam *taper = param_named("TaperCurrent");
         const GaugeParam *volts = param_named("ChargingVoltage");
         const GaugeParam *amps  = param_named("ChargingCurrent");
-        check(taper && volts && amps, "the three mirrored parameters are in the table");
+        check(taper && volts && amps, "the three related parameters are in the table");
 
-        eq_int(charger_table_iterm_ma(), 128, "the charger terminates at 128 mA");
+        eq_int(charger_table_iterm_ma(), 64, "the charger terminates at 64 mA");
         if (taper) {
-            eq_int(taper->value, charger_table_iterm_ma(),
-                   "and the gauge's TaperCurrent is that same number");
+            /* NOT equality. That is what shipped, and it is the defect: a
+               ceiling equal to the cut-off is a band the charger never
+               operates in. */
+            check(taper->value != charger_table_iterm_ma(),
+                  "the gauge's TaperCurrent is NOT the charger's cut-off — "
+                  "equal is the defect this branch fixed");
+            check(taper->value > charger_table_iterm_ma(),
+                  "it is ABOVE it, so the gauge sees full before the charger cuts off");
+            /* And by how much, because "above" alone is satisfied by one
+               milliamp and one milliamp is not a margin. TI size theirs at 1.4
+               against a charger held to 10%; this charger's termination
+               accuracy is unspecified at 64 mA, so the gap is wider. */
+            eq_int(taper->value * 100 / charger_table_iterm_ma(), 156,
+                   "the gauge's ceiling is this percent of the charger's cut-off");
         }
 
         eq_int(charger_table_vreg_mv(), 4208, "the charger regulates at 4208 mV");
@@ -1156,8 +1412,9 @@ int main(void) {
                    "and the gauge's ChargingCurrent is that same number");
         }
 
-        /* The gauge's ceiling and the charger's are one number, not two that
-           happen to agree today. */
+        /* The charge VOLTAGE, unlike the taper current, is one number and not
+           two that happen to agree today — the gauge may not be told to wait
+           for a voltage this board will not produce. */
         check(!bq_dm_write_allowed(0x91FD, (int16_t)(charger_table_vreg_mv() + 1)),
               "the gauge may not be told to expect more than the charger's ceiling");
     }

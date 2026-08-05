@@ -337,12 +337,12 @@ static void probe_cc1101() {
 // the panel would stay frozen at the boot-time snapshot.
 //
 // battery_probe() ALSO WRITES, and it did not use to. It applies six charge
-// parameters to the gauge's data memory — the taper current above all, which at
-// its ROM default never matches what the charger does, so the gauge never sees
-// a charge finish and a full cell reports 80%. Data memory here is RAM and is
-// lost on a power-on reset, which is why this is a boot-time apply and not a
-// one-off calibration. The addresses, the values and the guard that bounds them
-// are at the head of skills/battery.cpp.
+// parameters to the gauge's data memory, describing to the gauge what the
+// charger on the same bus actually does — without them the gauge never sees a
+// charge finish and a full cell reports a few points short of 100. Data memory
+// here is RAM and is lost on a power-on reset, which is why this is a boot-time
+// apply and not a one-off calibration. The addresses, the values and the guard
+// that bounds them are at the head of skills/battery.cpp.
 static void battery_probe();
 static void battery_refresh();
 
@@ -350,9 +350,12 @@ static void battery_refresh();
 // separate part with a separate failure: charger_probe() sets four registers on
 // the BQ25896 — the termination current above all, which on the power-on value
 // cuts charging at 77% of this cell. The two fixes are related and land in
-// order: the charger is made to terminate at 128 mA, and the gauge is told that
-// 128 mA is what termination looks like. The values, the order they go out in
-// and the guard that bounds them are at the head of skills/charger.cpp.
+// order: the charger is made to terminate at 64 mA, and the gauge's taper
+// current is set to 100 mA — deliberately ABOVE that figure rather than equal
+// to it, because the gauge waits for the current to sit inside a BAND, and a
+// ceiling equal to the charger's cut-off makes that band one the charger never
+// produces. The values, the order they go out in and the guard that bounds them
+// are at the head of skills/charger.cpp.
 //
 // Declared here, like the gauge's, because the probe has to run from hw_probe()
 // rather than from skills_init(): the charger should be off its power-on

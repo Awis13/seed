@@ -22,11 +22,17 @@
  * attention budget.
  *
  * The two fixes ARE related and land in order, which is worth knowing when
- * reading either: this file makes the charger terminate at 128 mA, and
- * battery.cpp then tells the gauge that 128 mA is what termination looks like.
- * Change REG05's ITERM here and the gauge's TaperCurrent has to move with it —
- * tools/test_battery.sh asserts that the two are equal, across both files, for
- * exactly that reason.
+ * reading either: this file makes the charger terminate at 64 mA, and
+ * battery.cpp sets the gauge's taper threshold to 100 mA — ABOVE it, not equal
+ * to it. Those two numbers being DIFFERENT is the point, and it took three
+ * failed attempts on this device to establish it. The gauge qualifies a
+ * termination by watching the current sit inside a band for eighty seconds; if
+ * its ceiling equals the charger's cut-off, the band is exactly the range the
+ * charger refuses to operate in and nothing ever occupies it.
+ *
+ * Change REG05's ITERM here and the gauge's TaperCurrent has to move with it,
+ * keeping the ordering and the gap — tools/test_battery.sh asserts the
+ * inequality and the ratio across both files, for exactly that reason.
  *
  * WHY A SEPARATE ENDPOINT RATHER THAN A SECTION OF /battery
  * --------------------------------------------------------
@@ -87,15 +93,26 @@
  * ----------------------------------
  *   REG07  0x8D   EN_TERM on, WATCHDOG DISABLED, safety timer on at 12 h
  *   REG04  0x08   ICHG 512 mA (0.39 C)
- *   REG05  0x11   IPRECHG 128 mA, ITERM 128 mA (C/10) — the actual fix
+ *   REG05  0x10   IPRECHG 128 mA, ITERM 64 mA (C/20) — the actual fix
  *   REG06  0x5E   VREG 4.208 V, BATLOWV 3.0 V, VRECHG 100 mV
  *
- * Every one of those four values is what LilyGO's own production firmware
- * writes to this board (examples/test_battery_bq27220_bq25896 and the shipped
- * examples/factory, which carry identical constants). This is not an
+ * THREE of those four are what LilyGO's own production firmware writes to this
+ * board (examples/test_battery_bq27220_bq25896 and the shipped examples/factory,
+ * which carry identical constants). For REG07, REG04 and REG06 this is not an
  * independent guess that happens to agree with them; it is the vendor's
  * configuration for the hardware they built, and the agreement is the reason to
  * be confident in it.
+ *
+ * REG05 IS THE ONE THAT NO LONGER MATCHES THE VENDOR, and that is deliberate
+ * rather than drift. LilyGO write 0x11 — ITERM 128 mA — and this file wrote the
+ * same for two commits. It is a defensible charger setting on its own; what it
+ * is not is a setting the GAUGE can see a charge finish under, because 128 mA
+ * is also where the gauge's taper threshold sat, and a gauge whose ceiling
+ * equals the charger's cut-off waits for a current band the charger never
+ * produces. Lowering the charger to 64 mA is what opens room for the gauge's
+ * threshold to sit above it. The vendor's firmware has the same latent defect;
+ * agreeing with it here would mean keeping the bug. See battery.cpp's
+ * gauge_config[] for the other half and for the ratio the two now hold.
  *
  * REG07 IS FIRST AND THAT IS NOT COSMETIC. It closes the watchdog window
  * before the others land, so that the writes that matter cannot be undone by
@@ -607,8 +624,10 @@ static const ChargerWrite charger_config[] = {
      "EN_TERM on, watchdog disabled, safety timer on at 12 h, JEITA 20%"},
     {BQ25896_REG04_ICHG,  0x08, "REG04",
      "ICHG 512 mA, 0.39 C on this cell and what the vendor firmware uses"},
-    {BQ25896_REG05_TERM,  0x11, "REG05",
-     "IPRECHG 128 mA and ITERM 128 mA, C/10 — the fix"},
+    {BQ25896_REG05_TERM,  0x10, "REG05",
+     "IPRECHG 128 mA and ITERM 64 mA, C/20 — low enough that the gauge's "
+     "100 mA taper threshold sits above it with margin, which is what lets a "
+     "charge finish in the gauge's eyes as well as the charger's"},
     {BQ25896_REG06_VREG,  0x5E, "REG06",
      "VREG 4.208 V, BATLOWV 3.0 V, VRECHG 100 mV — written so it is verified "
      "rather than assumed, since another host has demonstrably written this "
@@ -1138,11 +1157,22 @@ static const char *charger_describe() {
            "| REG07 | 0x8D | termination on, **watchdog disabled**, safety "
            "timer on at 12 h |\n"
            "| REG04 | 0x08 | charge current 512 mA (0.39 C) |\n"
-           "| REG05 | 0x11 | precharge 128 mA, **termination 128 mA (C/10)** — "
+           "| REG05 | 0x10 | precharge 128 mA, **termination 64 mA (C/20)** — "
            "the fix |\n"
            "| REG06 | 0x5E | charge voltage 4.208 V, BATLOWV 3.0 V, VRECHG "
            "100 mV |\n\n"
-           "All four match LilyGO's own production firmware for this board.\n\n"
+           "Three of the four match LilyGO's own production firmware for this\n"
+           "board. **REG05 deliberately does not.** The vendor writes 0x11,\n"
+           "terminating at 128 mA, and so did this firmware until the gauge\n"
+           "made the cost visible: the BQ27220 declares a pack full only after\n"
+           "the current spends eighty seconds *between* a floor and its own\n"
+           "taper threshold, and that threshold was also 128 mA. A gauge\n"
+           "ceiling equal to the charger's cut-off is a band the charger never\n"
+           "operates in — above it the charger is still delivering, below it it\n"
+           "has stopped. Terminating at 64 mA leaves room for the gauge's\n"
+           "threshold to sit above the cut-off, which is what `GET /battery`\n"
+           "now reports as a taper of 100 mA. Matching the vendor here would\n"
+           "mean keeping their latent bug.\n\n"
            "REG07 is first so that the watchdog window is closed before the\n"
            "rest land. The watchdog is **disabled rather than kicked**: its\n"
            "default is 40 s, on expiry the part resets its registers to\n"
@@ -1430,7 +1460,12 @@ static void charger_register_routes(AsyncWebServer &server) {
 
 static const Skill charger_skill = {
     .name = "charger",
-    .version = "0.1.0",
+    /* 0.2.0 rather than 0.1.1: the response is unchanged in shape, but the part
+       is charged differently. REG05 goes out as 0x10 instead of 0x11, so
+       termination_current_ma reads 64 where it read 128, and a caller pinned to
+       the old figure is looking at a real behaviour change rather than a
+       cosmetic one. */
+    .version = "0.2.0",
     .describe = charger_describe,
     .endpoints = charger_endpoints,
     .register_routes = charger_register_routes

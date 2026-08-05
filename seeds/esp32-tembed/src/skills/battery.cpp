@@ -63,13 +63,14 @@
  *
  * WHAT IS WRITTEN, AND WHERE THE VALUES CAME FROM
  * ----------------------------------------------
- * Six data-memory parameters. The first three are the charger's own settings,
- * repeated to the gauge so that the two parts agree about what a finished charge
- * looks like:
+ * Six data-memory parameters. Two of them are the charger's own settings,
+ * repeated to the gauge so that the two parts agree about what a charge in
+ * progress looks like. The third is the one that must NOT be a copy:
  *
  *   0x91FB  Charging Current       512 mA   = the charger's ICHG   (REG04)
  *   0x91FD  Charging Voltage      4208 mV   = the charger's VREG   (REG06)
- *   0x9201  Taper Current          128 mA   = the charger's ITERM  (REG05)
+ *   0x9201  Taper Current          100 mA   ABOVE the charger's ITERM (REG05,
+ *                                           64 mA) — the one that is NOT a copy
  *   0x92A5  CEDV Charge Termination Voltage  100 mV
  *   0x922A  Charge Detection Threshold        75 mA
  *   0x922C  Quit Current                      40 mA
@@ -81,16 +82,38 @@
  * 0x9201 = 128 applied and verified, the next completed charge still ended with
  * fc false.
  *
- * The correction is above, under WHY THE LAST FOUR WERE ADDED, and it is one
- * sentence: TRM 4.4.1 condition 2 is a floor on the current, so termination
- * needs the current INSIDE a band, and setting Taper Current equal to the
- * charger's termination current makes that band the one range the charger
- * refuses to operate in. The number that would satisfy the condition is a
- * number ABOVE the charger's ITERM, not equal to it.
+ * The correction is one sentence: TRM 4.4.1 condition 2 is a floor on the
+ * current, so termination needs the current INSIDE a band, and setting Taper
+ * Current equal to the charger's termination current makes that band the one
+ * range the charger refuses to operate in. The number that satisfies the
+ * condition is a number ABOVE the charger's ITERM, not equal to it.
  *
- * The table below is nevertheless UNCHANGED in this commit, deliberately. Three
- * plausible theories have already been acted on before being measured, and this
- * commit exists to measure. Every value here is still what 0.2.0 wrote.
+ * THAT IS WHAT THIS VERSION WRITES, and it is the first change to the table
+ * since 0.2.0. Three plausible theories were acted on before being measured;
+ * the version before this one added Current(), AverageCurrent() and
+ * GaugingStatus and changed nothing, so that a real charge profile could be
+ * watched. It was. Across one full cycle, sampled once a minute: ZERO samples
+ * between the floor and the ceiling, fc never set, 1259 mAh delivered into a
+ * cell that finished full and read 97%, and a CV-phase decay of about
+ * 12 mA/min. The band was empty exactly as predicted.
+ *
+ * So two numbers moved, in two files, and they moved APART:
+ *
+ *   charger.cpp REG05  0x11 -> 0x10   termination 128 mA -> 64 mA (C/20)
+ *   0x9201 Taper Current  128 -> 100  now 1.56x the charger's threshold
+ *
+ * The charger had to move first: while it terminated at 128 mA, "above the
+ * charger's ITERM" and TI's "below C/10" (130 mA on this cell) left a window
+ * two milliamps wide. Dropping the charger to 64 mA is what made room. The
+ * reasoning behind 100 rather than 90 is on the table entry itself, because
+ * that is where somebody will be standing when they consider changing it.
+ *
+ * SAID PLAINLY, BECAUSE THE TABLE BELOW FLATTERS THIS COMMIT OTHERWISE: 100 mA
+ * is also Taper Current's own ROM default. Against a factory-default gauge the
+ * 0x9201 write changes nothing, and the behaviour that actually changes is the
+ * charger's. The gauge write earns its place by PINNING the value rather than
+ * inheriting it — LilyGO's firmware writes 128 here, so a part holding the
+ * wrong number is the expected case — but it is not the half doing the work.
  *
  * 0x92A5 is not an absolute voltage despite its name — the TRM calls it the
  * taper voltage in prose, and it is a delta BELOW Charging Voltage: termination
@@ -100,10 +123,16 @@
  * Every address was read out of the TRM's own data memory table (SLUUBD4A
  * Table 3-2) and then found to agree, address for address, with LilyGO's
  * production firmware for this exact board — examples/test_battery_bq27220_
- * bq25896, whose verifyGaugeChargeParameters() writes these same six values.
- * The values are theirs; the addresses are checked against the primary source
- * rather than inherited, because a wrong data-memory address does not fail, it
- * writes a different parameter.
+ * bq25896, whose verifyGaugeChargeParameters() writes these same six
+ * parameters. The addresses are checked against the primary source rather than
+ * inherited, because a wrong data-memory address does not fail, it writes a
+ * different parameter.
+ *
+ * FIVE OF THE SIX VALUES ARE THEIRS. THE TAPER CURRENT IS NOT, and this is the
+ * one place the vendor is deliberately not followed: they write 128 mA there,
+ * equal to the 128 mA their charger configuration terminates at, and that
+ * equality is exactly the defect described above. Matching them on that row
+ * would mean keeping it.
  *
  * One address in LilyGO's table IS wrong, recorded here so nobody copies it in
  * later: their GasGaugingCEDVProfile1EMF is 0x92A3, which the TRM gives as
@@ -143,6 +172,15 @@
  * MACDataLen = 2 address + N value + 1 checksum + 1 length. The TRM's own
  * worked example is the proof and is a test case below: address 0x9221 with one
  * data byte 0x00 gives 0xFF - (0x21+0x92+0x00) = 0x4C and a length of 5.
+ *
+ * ⚠️ THAT EXAMPLE HAS A TYPO IN IT AND THE CODE IS RIGHT WHERE THEY DIFFER, so
+ * it is recorded here rather than left for somebody to "correct". TRM section
+ * 4.6 prints the pair as "Write (hex) 4C 05, starting at 0x61". The checksum
+ * 0x4C belongs to MACDataSum, and section 2.30 puts MACDataSum at 0x60 with
+ * MACDataLen at 0x61 (Table 2-1 lists both). Starting the pair at 0x61 would
+ * write the checksum into the length register and the length into 0x62. The
+ * arithmetic in that example is sound and is the oracle this file uses; only
+ * the start address is wrong, and this file writes the pair from 0x60.
  *
  * LilyGO's driver computes both correctly and then transfers the wrong number
  * of bytes: `i2cWriteBytes(CommandMACDataSum, buffer, size + 2)`, where the
@@ -233,10 +271,12 @@
  *
  * 2. "The gauge cannot see current at all." It can. The board schematic
  *    (T-Embed-CC1101 V1.0 24-07-29, page 1) fits R36 = 0.01R in series between
- *    the charger's BAT net and the cell, with SRP and SRN across it. 128 mA
- *    develops 1.28 mV, which is a measurement, not noise. Current() and
- *    AverageCurrent() are added so that the next charge produces a reading
- *    instead of another inference from capacities.
+ *    the charger's BAT net and the cell, with SRP and SRN across it. The band
+ *    that now matters runs from the charger's 64 mA termination up to the
+ *    gauge's 100 mA taper, which across 0.01R develops 0.64 to 1.00 mV — small,
+ *    but a measurement rather than noise, and the whole span is resolved.
+ *    Current() and AverageCurrent() report it directly, so a charge produces a
+ *    reading instead of another inference from capacities.
  *
  * What the arithmetic says instead is in bq_taper_floor_ua() and is served as
  * `charge_termination`. In one line: TRM 4.4.1's second condition is a FLOOR on
@@ -559,34 +599,58 @@ static int bq_soc_from_capacity(uint16_t remaining_mah, uint16_t full_mah) {
  * WHAT THE GAUGE IS WAITING FOR, as arithmetic rather than as prose
  *
  * TRM SLUUBD4A section 4.4.1 gives three conditions, ALL required, for the
- * primary charge termination that sets BatteryStatus[FC]:
+ * primary charge termination that sets BatteryStatus[FC], quoted rather than
+ * paraphrased because two of the three have been misread here before:
  *
- *   1. two consecutive 40 s windows with the current below Taper Current
- *   2. during those same windows, accumulated capacity > 0.25 mAh per window
- *   3. Voltage() > Charging Voltage - Taper Voltage
+ *   1. "During two consecutive periods of 40 seconds, the AverageCurrent() <
+ *      Taper Current."
+ *   2. "During the same two periods, the accumulated change in capacity must
+ *      be > 0.25 mAh."
+ *   3. "Voltage() > Charging Voltage - Taper Voltage."
+ *
+ * CONDITION 1 IS ON AverageCurrent(), NOT Current(). That is a filtered value
+ * and it LAGS a decaying taper, so the instantaneous reading served as
+ * `current_ma` can already be inside the band while the value the gauge is
+ * actually testing is still above the ceiling. Both are read for that reason.
  *
  * CONDITION 2 IS A FLOOR ON THE CURRENT AND READS LIKE A FOOTNOTE. That is the
  * reason it is computed here instead of being left in the manual: it turns the
  * termination test into a BAND rather than a threshold. The gauge is not
  * waiting for the current to fall below Taper Current; it is waiting for the
- * current to spend eighty seconds BETWEEN the capacity floor and Taper Current,
- * above the taper voltage. A charge that jumps from above the ceiling to zero
- * passes through the band without ever being in it, and never terminates.
+ * current to spend two whole windows BETWEEN the capacity floor and Taper
+ * Current, above the taper voltage. A charge that jumps from above the ceiling
+ * to zero passes through the band without ever being in it, and never
+ * terminates.
  *
- * The floor is 0.25 mAh in 40 s. In microamps, exactly and with no rounding to
- * argue about: 250 uAh * 3600 s/h / 40 s = 22500 uA.
+ * THE 0.25 mAh IS PER QUALIFICATION, NOT PER WINDOW — "during the same two
+ * periods", which is 80 s of accumulation and not 40. Reading it as per-window
+ * doubles the floor, and this file did read it that way. In microamps, exactly
+ * and with no rounding to argue about:
+ *
+ *   250 uAh * 3600 s/h / 80 s = 11250 uA
+ *
+ * It makes no difference to what the device waits for, because
+ * bq_termination_floor_ua() takes the maximum against QuitCurrent's 40 mA and
+ * that dominates either reading. It is corrected because the figure is SERVED
+ * to agents as fact, and a number published as the TRM's should be the TRM's.
  * ------------------------------------------------------------------------- */
 #define BQ_TAPER_WINDOW_S       40    /* TRM 4.4.1, not configurable on this
                                          part — there is no Current Taper
                                          Window row in Table 3-2             */
-#define BQ_TAPER_MIN_CAP_UAH   250    /* 0.25 mAh, likewise fixed            */
+#define BQ_TAPER_MIN_CAP_UAH   250    /* 0.25 mAh across BOTH windows, likewise
+                                         fixed — see the derivation above     */
 #define BQ_TAPER_WINDOWS       2      /* "two consecutive periods"           */
 
-/* Returned in microamps because 22.5 mA is not an integer and this figure is
+/* Returned in microamps because 11.25 mA is not an integer and this figure is
    the edge of a band somebody will compare a reading against. Rounding it
-   either way here would be inventing a bound the TRM does not state. */
+   either way here would be inventing a bound the TRM does not state.
+
+   The divisor is the WHOLE qualification, both windows, because that is the
+   span the TRM accumulates the 0.25 mAh over. Dividing by one window is the
+   easy misreading and it doubles the answer. */
 static long bq_taper_floor_ua(void) {
-    return (long)BQ_TAPER_MIN_CAP_UAH * 3600L / (long)BQ_TAPER_WINDOW_S;
+    return (long)BQ_TAPER_MIN_CAP_UAH * 3600L /
+           ((long)BQ_TAPER_WINDOW_S * (long)BQ_TAPER_WINDOWS);
 }
 
 /*
@@ -604,7 +668,9 @@ static long bq_taper_floor_ua(void) {
  * Below Quit Current the qualification therefore cannot complete no matter what
  * the capacity condition says. The real floor is whichever of the two is
  * higher, and on this device it is Quit Current at 40 mA rather than the
- * capacity condition's 22.5 mA.
+ * capacity condition's 11.25 mA — it would still be Quit Current even on the
+ * doubled misreading of that condition, which is why correcting the capacity
+ * floor changes nothing about what the device waits for.
  *
  * The comparison is written out rather than assumed because both figures are
  * ROM defaults that a later commit may move: raise Chg Relax Time above eighty
@@ -730,6 +796,88 @@ static bool bq_mac_echo_ok(uint16_t subcmd, const uint8_t *frame) {
 #define BQ_DM_CHARGE_DETECT       0x922A  /* mA  range 0..2000  default   75 */
 #define BQ_DM_QUIT_CURRENT        0x922C  /* mA  range 0..1000  default   40 */
 #define BQ_DM_CEDV_TAPER_VOLTAGE  0x92A5  /* mV  range 0..1000  default  100 */
+
+/*
+ * TWO MORE ADDRESSES THAT ARE READ AND NEVER WRITTEN, and the reason they are
+ * here at all.
+ *
+ * Setting BatteryStatus[FC] is what the taper change above is for, and it is
+ * the outcome to expect. What it does NOT promise is that FullChargeCapacity
+ * is learned down from the 1300 mAh design value — and the percentage a user
+ * looks at is computed against FullChargeCapacity, not against the flag. The
+ * gauge only updates FCC across a QUALIFIED DISCHARGE, which among other
+ * things needs the current at the end of the discharge to be at least
+ * 3C/32 = 122 mA on this cell. A pager that idles at single-digit milliamps
+ * will not produce one, possibly ever.
+ *
+ * What would make the display read 100% anyway is CSYNC: with it set, the
+ * gauge assigns RemainingCapacity = FullChargeCapacity at a valid charge
+ * termination, so the reported percentage snaps to 100 without any learning
+ * having happened.
+ *
+ * CSYNC IS IN GAUGING CONFIGURATION, 0x929B. NOT IN SOC FLAG CONFIG A. An
+ * earlier version of this comment had it the other way round, which is why the
+ * attribution is now written out with its proof — reading bit 1 of the wrong
+ * word yields a bit that means something else and answers this question
+ * confidently and wrongly, which is the failure mode the ITPOR paragraph above
+ * refuses for exactly the same reason.
+ *
+ *   TRM 4.4.1: "if the CEDV Configuration [CSYNC] bit is set, then
+ *   RemainingCapacity() is set equal to FullChargeCapacity()". Section 1.1
+ *   names it in full: "if [CSYNC] is set in CEDV Gauging Configuration".
+ *   Table 4-11 is titled "CEDV Gauging Configuration Register Bit Definitions"
+ *   and CSYNC is its low-byte bit 1. Table 3-2 gives 0x929B as Gauging
+ *   Configuration, in the Gas Gauging / CEDV Profile 1 class.
+ *
+ *   SOC Flag Config A has its own bit table, Table 4-9, and there is no CSYNC
+ *   anywhere in it: its bits are FCSETVCT, TCSETVCT, TCCLEARRSOC, TCSETRSOC,
+ *   TCCLEARV, TCSETV and the four TD equivalents.
+ *
+ *   The arithmetic settles it independently of any table title. Table 3-2
+ *   gives 0x927F a max of 0x0FFF, so 0x102A is not a legal value for it at
+ *   all, let alone its default.
+ *
+ * SO THE MANUAL'S SELF-CONTRADICTION IS ABOUT 0x929B, AND IT IS REAL. Table
+ * 3-2 gives Gauging Configuration a default of 0x102A. Table 4-11 prints that
+ * same register's per-bit defaults as all zeros. Both are in the same
+ * document, no amount of arguing settles it, and reading the part does — so
+ * the part is read.
+ *
+ * ⚠️ WHAT 0x102A WOULD MEAN, said plainly because it is the outcome actually
+ * being waited on and burying it would be the same failure as guessing it. Low
+ * byte 0x2A is bits 1, 3 and 5: CSYNC, EDV_CMP and FIXED_EDV0. So if Table 3-2
+ * is the correct reading, CSYNC IS ALREADY SET FROM THE FACTORY and this whole
+ * problem is smaller than it looks — the display would reach 100% the moment
+ * the full-charge flag sets, with no capacity learning needed at all, and the
+ * taper change above would be the entire fix. If Table 4-11 is correct, CSYNC
+ * is clear and the percentage stays short of 100 until an FCC learning cycle
+ * this device may never perform. That is a large difference and it is NOT
+ * asserted either way here. It is what the read is for.
+ *
+ * SOC Flag Config A is read alongside it, and not as an afterthought: FCSETVCT
+ * is the bit that enables BatteryStatus[FC] to be set on primary charge
+ * termination at all (TRM 4.4.1, "the [FC] and [TCA] bits are set depending on
+ * the SOC Flag Config A [FCSETVCT] and [TCSETVCT] options"). If that bit were
+ * clear, no taper current would ever produce the flag and every measurement in
+ * this file would be chasing the wrong register. Its default is 0x0C8C, which
+ * has FCSETVCT set — and unlike 0x929B there is no dispute about it, since
+ * Table 4-9's own per-bit defaults print 0x0C8C too, matching Table 3-2
+ * exactly. The read confirms it rather than resolving it.
+ *
+ * Both are served as raw hex rather than decoded. For 0x929B that is because
+ * the value is the open question; for 0x927F it is so the two are reported the
+ * same way and a reader can check either against the tables above.
+ *
+ * ⚠️ NEITHER IS WRITABLE AND NEITHER MAY BECOME SO. bq_dm_write_allowed()
+ * refuses 0x929B by name and tools/test_battery.sh asserts that refusal.
+ * bq27220_dm_read() is deliberately unguarded because reading an address is
+ * harmless; that asymmetry is the whole safety argument here, and adding
+ * either of these to the write allow-list would destroy it.
+ */
+#define BQ_DM_GAUGING_CONFIG      0x929B  /* H2  CSYNC and the CEDV mode bits;
+                                             default disputed, see above     */
+#define BQ_DM_SOC_FLAG_CONFIG_A   0x927F  /* H2  FCSETVCT and the flag-set
+                                             options; default 0x0C8C         */
 
 /* Every row in the table below is type I2 in TRM Table 3-2 — a signed 16-bit
    value — so the block is always the two address bytes plus two value bytes.
@@ -872,8 +1020,9 @@ static bool bq_dm_write_allowed(uint16_t addr, int16_t value) {
  * half-applied table. The order below is for a reader: the three that mirror
  * the charger, then the three that shape how the gauge interprets them.
  *
- * `why` is served in the endpoint, because a caller looking at 0x9201 = 128 has
- * no way to know from the number that it is the one that fixes the bug.
+ * `why` is served in the endpoint, because a caller looking at 0x9201 = 100 has
+ * no way to know from the number that it is the one that fixes the bug, still
+ * less that its distance from the charger's 64 mA is the whole point of it.
  */
 struct GaugeParam {
     uint16_t addr;
@@ -885,28 +1034,107 @@ struct GaugeParam {
 
 static const GaugeParam gauge_config[] = {
     /*
-     * ⚠️ THIS VALUE IS KNOWN WRONG AND IS DELIBERATELY LEFT ALONE. DO NOT
-     * "TIDY" IT INTO AGREEMENT WITH THE CHARGER. THAT AGREEMENT IS THE BUG.
+     * ⚠️ THIS VALUE MUST STAY ABOVE charger.cpp's ITERM. DO NOT "TIDY" IT INTO
+     * AGREEMENT WITH THE CHARGER. THAT AGREEMENT WAS THE BUG.
      *
-     * It reads like a matching pair with charger.cpp's ITERM and that is
-     * exactly the trap: 128 here equals 128 there, the two files look
-     * consistent, and the consistency is what stops FC ever setting. Every
-     * instinct a reader has on arriving at these two numbers is to preserve
-     * their equality. TI's guidance is the opposite of that instinct.
+     * WHAT WAS HERE, AND WHY IT NEVER WORKED
+     * --------------------------------------
+     * This entry read 128 for two commits, and charger.cpp's ITERM read 128
+     * with it. They looked like a matching pair, and that was exactly the
+     * trap: the two files were consistent, and the consistency is what stopped
+     * FC ever setting. Every instinct a reader has on arriving at these two
+     * numbers is to preserve their equality. TI's guidance is the opposite of
+     * that instinct, and so was the device.
+     *
+     * The gauge does not wait for the current to fall BELOW its taper
+     * threshold. TRM 4.4.1 condition 2 is a floor as well, so it waits for the
+     * current to sit INSIDE a band — see bq_termination_floor_ua() above — for
+     * two consecutive 40 s windows, above 4108 mV. With the ceiling equal to
+     * the charger's cut-off the band is empty by construction: above 128 mA
+     * the charger was still delivering, below it the charger had stopped and
+     * the current was zero.
+     *
+     * THE MEASUREMENT, which is why this commit is not a fourth guess. A full
+     * charge cycle sampled once a minute recorded ZERO samples inside the
+     * band. fc never set. 1259 mAh went in, the cell finished genuinely full,
+     * and it read 97% — because FullChargeCapacity is never learned down from
+     * the 1300 mAh design value while fc stays false. The observed CV-phase
+     * decay was about 12 mA per minute.
+     *
+     * WHY 100, AND NOT THE 90 THAT WAS PROPOSED FIRST
+     * ----------------------------------------------
+     * This is the part a later reader will otherwise undo, so it is the part
+     * written out. The charger now terminates at 64 mA (REG05 = 0x10), and
+     * 90 mA would satisfy every rule below just as 100 does. It was rejected
+     * on the charger's tolerance:
+     *
+     *   The BQ25896 datasheet specifies termination accuracy ONLY at
+     *   ITERM = 256 mA. Both of its rows are at that current and differ on
+     *   ICHG: ±12% for ICHG <= 1344 mA and ±20% above it. This board charges
+     *   at 512 mA, so ±12% is the applicable row and real termination lands
+     *   near 72 mA. At the 64 mA this actually programs there is no figure at
+     *   all, so a part cutting 20% high — worse than any published row — is
+     *   also carried below, at 77 mA.
+     *
+     *   HOW LONG THE QUALIFICATION REALLY NEEDS IS ~120 s, NOT 80. The two
+     *   40 s periods must be CONSECUTIVE, so entering the band part-way
+     *   through a period wastes the remainder of it and the clock starts at
+     *   the next boundary. Eighty seconds is the best case, 120 the worst, and
+     *   the worst case is the one a margin should be sized against.
+     *
+     *   The band is only occupied while the charger is still delivering, so
+     *   the travel that counts is from the taper ceiling down to wherever the
+     *   charger actually stops, at about 12 mA/min:
+     *
+     *     taper 100, termination 64 (nominal):       36 mA -> ~180 s  clears
+     *     taper 100, termination 72 (spec, ±12%):    28 mA -> ~140 s  clears
+     *     taper 100, termination 77 (20%, off-spec): 23 mA -> ~115 s  marginal
+     *     taper  90, termination 77 (20%, off-spec): 13 mA ->  ~65 s  FAILS
+     *
+     *   So the honest summary is that 100 clears the real 120 s requirement at
+     *   the specified tolerance with about 20 seconds to spare, and only goes
+     *   marginal on an assumption deliberately worse than anything TI
+     *   publishes. 90 fails on that same assumption by a wide margin, which is
+     *   what ruled it out.
+     *
+     *   TWO THINGS MAKE EVEN THE MARGINAL ROW LIKELY TO PASS, and they are
+     *   worth knowing before somebody reads ~115 against ~120 and panics. The
+     *   12 mA/min was measured near 128 mA; CV-phase current decays roughly
+     *   exponentially, so between 100 and 64 mA it is SLOWER than that, which
+     *   buys more time in the band rather than less. And 77 mA is off-spec
+     *   pessimism in the first place.
+     *
+     * That 12 mA/min is a measured property of this cell at this charge
+     * voltage, not a property of the code, which is why the arithmetic lives
+     * in this comment and NOT in an assertion. A colder cell, an older cell or
+     * a different VREG moves it, and a test pinned to it would go red on a
+     * device that is working perfectly well.
+     *
+     * 100 keeps margin under every rule that applies at once:
+     *
+     *   above the charger's threshold   100 / 64 = 1.56x. TI say "slightly
+     *     higher"; their worked example is 70 mA against a 50 mA charger, a
+     *     ratio of 1.4, chosen because chargers hold their threshold to about
+     *     ±10%. This charger's is unspecified at 64 mA, so the ratio is larger
+     *     than theirs on purpose.
+     *   below C/10                      130 mA on this 1300 mAh cell.
+     *   above C/100                     13 mA. Below that the taper is inside
+     *     the noise the shunt reads at rest.
+     *   ordering                        Taper > ChargeDetect > Quit, which is
+     *     100 > 75 > 40. A ceiling at or under ChargeDetectThreshold would
+     *     mean the gauge stops calling it a charge before it can qualify one.
      *
      * SLUA777 3.2, SLUA903 2.2 and SLUA917, in identical words across three
      * independent application reports: "It is very important to set the taper
      * current programmed in the data flash of the gauge SLIGHTLY HIGHER than
      * the taper current threshold of the charger. This ensures that the gauge
      * detects the battery is fully charged BEFORE the charger cuts off
-     * charge." Their worked example is a 50 mA charger and a 70 mA gauge
-     * setting — a ratio of 1.4 — and the reason they give is that chargers
-     * carry about ±10% error on the threshold they cut off at.
+     * charge."
      *
-     * WHAT A WRONG CHOICE LOOKS LIKE ON THE DEVICE, so it is recognised
-     * rather than re-diagnosed a fourth time:
+     * WHAT A WRONG CHOICE LOOKS LIKE ON THE DEVICE, kept so it is recognised
+     * rather than re-diagnosed a fifth time:
      *
-     *   TOO LOW (at or below the charger's ITERM — TODAY'S STATE)
+     *   TOO LOW (at or below the charger's ITERM — THE STATE THIS FIXES)
      *     fc stays false through a charge the charger calls complete.
      *     FullChargeCapacity stays at DesignCapacity, soc_percent reads a few
      *     points short of 100 on a genuinely full cell, and vdq stays false.
@@ -927,26 +1155,54 @@ static const GaugeParam gauge_config[] = {
      *     inside the CV phase — but a taper current set high enough reaches
      *     into the start of CV, where real charge is still going in.
      *
-     * THE CONFLICT THAT IS NOT YET RESOLVED, and the reason no number is
-     * written here today: the same TI notes also advise keeping taper current
-     * below C/10, which for this 1300 mAh cell is 130 mA. This board's
-     * charger already terminates at 128 mA, so "above the charger's ITERM"
-     * and "below C/10" leave a window about two milliamps wide. One of the
-     * two has to give, and which one is a decision about the CHARGER as much
-     * as about the gauge. Deciding it from a charge profile nobody has
-     * watched yet would be the fourth confident guess on this ticket.
+     * THE CONFLICT THAT USED TO BLOCK THIS, and how it was resolved: the same
+     * TI notes advise keeping taper current below C/10, which is 130 mA here.
+     * While the charger terminated at 128 mA, "above the charger's ITERM" and
+     * "below C/10" left a window two milliamps wide. One of the two had to
+     * give, and it was the CHARGER: REG05 moved from 0x11 to 0x10, dropping
+     * termination to 64 mA, which is C/20 and still inside the textbook C/10
+     * to C/20 range for a lithium polymer cell. That is what opened room
+     * between the two rules for a taper current to sit in.
      *
-     * So: this commit reads. Current() and AverageCurrent() are added for
-     * precisely this measurement. The next commit picks a number with a real
-     * taper in front of it.
+     * 100 IS ALSO THIS PARAMETER'S ROM DEFAULT, and that is worth saying out
+     * loud because it changes what this line does. Table 3-2 gives Taper
+     * Current a default of 100 mA — the same number now written. So against a
+     * factory-default gauge this write is a no-op, and the behaviour change in
+     * this commit lives entirely on the charger side, where termination moved
+     * from 128 mA to 64 mA.
+     *
+     * It is written anyway, and not dropped, for two reasons. It PINS the
+     * value instead of inheriting it: a part that arrives holding something
+     * else is corrected rather than trusted, and LilyGO's own firmware writes
+     * 128 here, so parts holding the wrong value are the expected case rather
+     * than a hypothetical. And it keeps the number visible in one table beside
+     * the charger's, which is where the relationship between the two is
+     * legible at all.
+     *
+     * The read-back consequence is real and is asserted in
+     * tools/test_battery.sh: four of these six now equal their ROM defaults,
+     * and what still makes a wiped gauge detectable is Charging Current
+     * (512 against the ROM's 200) and Charging Voltage (4208 against 4200).
+     * Move either of those to its default and `applied: true` would start
+     * being reported for a part that had lost everything.
+     *
+     * WHAT THIS DOES NOT PROMISE. Setting fc is the expected outcome. Learning
+     * FullChargeCapacity DOWN from 1300 mAh is not: the gauge only updates it
+     * across a qualified discharge, which needs the current at the end to be
+     * at least 3C/32 = 122 mA, and a pager idling at single-digit milliamps
+     * will never satisfy that. See the diagnostic read of Gauging
+     * Configuration below for CSYNC, the bit that would make the display read
+     * 100% regardless.
      */
-    {BQ_DM_TAPER_CURRENT, 128, "TaperCurrent", "mA",
-     "KNOWN WRONG, left unchanged pending a measured charge profile. It equals "
-     "the charger's ITERM (REG05), and TI SLUA777/903/917 say it must be set "
-     "SLIGHTLY HIGHER than the charger's threshold so the gauge sees full "
-     "before the charger cuts off. Equal means the gauge waits for a current "
-     "band the charger will not produce: above 128 mA the charger is still "
-     "charging, below it the charger has stopped. See charge_termination."},
+    {BQ_DM_TAPER_CURRENT, 100, "TaperCurrent", "mA",
+     "THE FIX. Deliberately ABOVE the charger's ITERM (REG05 = 0x10, 64 mA) "
+     "and not equal to it: TI SLUA777/903/917 say the gauge's taper must be "
+     "set SLIGHTLY HIGHER than the charger's threshold so the gauge sees full "
+     "before the charger cuts off. Equal — which is what shipped, at 128 mA on "
+     "both sides — means the gauge waits for a current band the charger will "
+     "not produce, and a full measured charge cycle recorded zero samples in "
+     "it. 100 mA is 1.56x the charger's 64 mA, below C/10 (130 mA), above "
+     "C/100, and above ChargeDetectThreshold. See charge_termination."},
     {BQ_DM_CHARGING_CURRENT, 512, "ChargingCurrent", "mA",
      "matches the charger's ICHG (REG04), so the gauge's idea of a charge in "
      "progress matches what the charger delivers"},
@@ -964,6 +1220,57 @@ static const GaugeParam gauge_config[] = {
 };
 
 #define GAUGE_CONFIG_COUNT ((int)(sizeof(gauge_config) / sizeof(gauge_config[0])))
+
+/*
+ * The read-only diagnostics, in a SEPARATE table from gauge_config[] and not
+ * merely flagged inside it.
+ *
+ * The separation is the safety property. gauge_write_table() walks
+ * gauge_config[] and writes every row; bq_dm_write_allowed() permits exactly
+ * the addresses in it, and tools/test_battery.sh sweeps all 65536 addresses to
+ * assert that the writable set and the table are the same set. Putting a
+ * read-only address in that table with a `writable: false` field beside it
+ * would make the guard depend on a boolean somebody has to remember to check.
+ * Two tables means the write path cannot reach these addresses at all — there
+ * is no flag to get wrong.
+ *
+ * No value and no `why` about what should be there, because nothing should be:
+ * these rows exist to report what IS there.
+ */
+struct GaugeDiagnostic {
+    uint16_t addr;
+    const char *name;
+    const char *question;
+};
+
+static const GaugeDiagnostic gauge_diagnostics[] = {
+    {BQ_DM_GAUGING_CONFIG, "GaugingConfiguration",
+     "CARRIES CSYNC — low byte bit 1, TRM SLUUBD4A Table 4-11, 'CEDV Gauging "
+     "Configuration Register Bit Definitions'. CSYNC assigns RemainingCapacity "
+     "= FullChargeCapacity at a valid charge termination (TRM 4.4.1), which is "
+     "what would make the percentage read 100 without FullChargeCapacity ever "
+     "being learned down — and learning it needs a qualified discharge "
+     "reaching 3C/32 = 122 mA at the end, which a pager idling in single "
+     "digits may never produce. THE TRM CONTRADICTS ITSELF ON THIS REGISTER'S "
+     "DEFAULT: Table 3-2 gives 0x102A, Table 4-11 prints its per-bit defaults "
+     "as all zeros. That is why it is read rather than assumed. If 0x102A is "
+     "right, low byte 0x2A is bits 1, 3 and 5 — CSYNC, EDV_CMP, FIXED_EDV0 — "
+     "so CSYNC is already set from the factory and the display should reach "
+     "100 as soon as the full-charge flag does. Not asserted; that is what "
+     "this read is for"},
+    {BQ_DM_SOC_FLAG_CONFIG_A, "SOCFlagConfigA",
+     "NO CSYNC HERE — its bit table is TRM Table 4-9 and CSYNC is not in it. "
+     "What this register decides is whether BatteryStatus[FC] gets set at all: "
+     "TRM 4.4.1 says [FC] and [TCA] are set on primary charge termination "
+     "'depending on the SOC Flag Config A [FCSETVCT] and [TCSETVCT] options'. "
+     "With FCSETVCT clear no taper current would ever produce the flag. Its "
+     "default is 0x0C8C, which has FCSETVCT set, and Table 3-2 and Table 4-9 "
+     "agree on that figure — so this read confirms rather than settles. Its "
+     "max is 0x0FFF, which is also the proof that the 0x102A the TRM disputes "
+     "belongs to GaugingConfiguration and not to this address"},
+};
+
+#define GAUGE_DIAG_COUNT ((int)(sizeof(gauge_diagnostics) / sizeof(gauge_diagnostics[0])))
 
 /* The table entry at an address, or NULL. By address rather than by index,
    because the comment above says the order here is explicitly free to change
@@ -1258,6 +1565,13 @@ struct BatteryGauge {
        that lost its RAM cannot go on being reported as configured. */
     int16_t dm_live[GAUGE_CONFIG_COUNT];
     bool dm_read_ok;
+    /* The read-only diagnostics, with a flag EACH rather than one flag for the
+       set. They answer independent questions — a Gauging Configuration that
+       reads and a SOC Flag Config A that does not is a useful half-answer, and
+       collapsing the two would throw it away. Nothing is derived from these and
+       no verdict depends on them; they are reported and nothing else. */
+    int16_t dm_diag[GAUGE_DIAG_COUNT];
+    bool dm_diag_ok[GAUGE_DIAG_COUNT];
     GaugeVerdict verdict;
     unsigned long read_ms;   /* millis() at the end of the pass; 0 = never */
 };
@@ -1392,6 +1706,17 @@ static bool gauge_read_dm(int16_t *out) {
         if (!bq27220_dm_read(gauge_config[i].addr, out[i])) ok = false;
     }
     return ok;
+}
+
+/* The read-only diagnostics, same pass, same bus rule, separate result per row.
+   Failure here is reported and acted on by nobody: these answer an open
+   question about the part's defaults, and a gauge that will not talk about them
+   still charges exactly as well. */
+static void gauge_read_diagnostics(int16_t *out, bool *ok) {
+    for (int i = 0; i < GAUGE_DIAG_COUNT; i++) {
+        out[i] = 0;
+        ok[i] = bq27220_dm_read(gauge_diagnostics[i].addr, out[i]);
+    }
 }
 
 /* The table, written out. One function so that "what we send" has exactly one
@@ -1589,6 +1914,16 @@ static void battery_read(bool at_boot) {
 
     g.dm_read_ok = access && gauge_read_dm(g.dm_live);
 
+    /* The two read-only diagnostics, on the same gate and for the same reason:
+       without FULL ACCESS they are two more transactions that cannot succeed,
+       once a minute for ever. They are read AFTER the configuration read-back
+       rather than before it, so that the parameters this file makes claims
+       about are never the ones running on an address pointer left by a read
+       that is only advisory. */
+    if (access) {
+        gauge_read_diagnostics(g.dm_diag, g.dm_diag_ok);
+    }
+
     /* One call, no field computed twice and none copied out and reassigned:
        the whole verdict comes back from the one function the host test drives.
        Deleting this line leaves the verdict zeroed by the memset above, which
@@ -1707,7 +2042,8 @@ static void battery_refresh() {
 static const SkillEndpoint battery_endpoints[] = {
     {"GET", "/battery", "Fuel gauge registers and all four status words raw and "
                         "decoded, the measured current, what charge termination "
-                        "requires, and the six parameters written at boot"},
+                        "requires, the six parameters written at boot, and two "
+                        "read-only data-memory diagnostics"},
     {NULL, NULL, NULL}
 };
 
@@ -1725,9 +2061,11 @@ static const char *battery_describe() {
            "are now, and this text says what is true instead.\n\n"
            "For charging — why a charge stopped, at what current it terminates,\n"
            "faults — see `GET /charger`. The BQ25896 charger shares this I2C\n"
-           "bus and is configured by its own skill; the three values above are\n"
-           "deliberately the same numbers, because the gauge's whole job is to\n"
-           "recognise what that charger does.\n\n"
+           "bus and is configured by its own skill. Two of the values above are\n"
+           "deliberately the same numbers as its own, because the gauge's job\n"
+           "is to recognise what that charger does. **The taper current is\n"
+           "deliberately NOT the same number**, and that difference is the\n"
+           "whole fix — see below.\n\n"
            "### Endpoints\n\n"
            "| Method | Path | Description |\n"
            "|--------|------|-------------|\n"
@@ -1758,28 +2096,87 @@ static const char *battery_describe() {
            "verified, and the next completed charge ended at 1256 mAh, 4171 mV,\n"
            "97%, with `fc` still **false**.\n\n"
            "Why, from TRM 4.4.1 and served as `charge_termination` below: the\n"
-           "second condition requires accumulated capacity above 0.25 mAh per\n"
-           "40 s window, which is a **floor** on the current of 22 500 uA. So\n"
-           "the gauge waits for the current to sit *between* that floor and the\n"
-           "taper current for eighty seconds. Setting the taper current equal\n"
+           "second condition requires accumulated capacity above 0.25 mAh\n"
+           "across the two 40 s periods, which is a **floor** on the current of\n"
+           "11 250 uA. So the gauge waits for `AverageCurrent()` to sit\n"
+           "*between* that floor and the taper current for two consecutive\n"
+           "windows — 80 s at best and 120 s if the band is entered part-way\n"
+           "through a window. Setting the taper current equal\n"
            "to the charger's termination current makes that band exactly the\n"
            "range the charger refuses to operate in: above 128 mA the charger\n"
            "is still delivering, below it the charger has stopped and the\n"
            "current is zero. The band is empty by construction, which is why\n"
            "all three attempts on this device failed the same way.\n\n"
-           "**Nothing has been changed on the strength of that.** The six\n"
-           "values below are exactly what the previous version wrote. This\n"
-           "version adds the readings that would show a taper actually\n"
-           "happening — `current_ma`, `average_current_ma`, `gauging_status` —\n"
-           "because three theories have now been acted on before being\n"
-           "measured and the measurement is the thing that was missing.\n\n"
+           "### What this version changes, and what measured it\n\n"
+           "The previous version changed nothing and added the readings that\n"
+           "would show a taper actually happening — `current_ma`,\n"
+           "`average_current_ma`, `gauging_status`. They did. Across one full\n"
+           "charge cycle, sampled once a minute: **zero samples inside the\n"
+           "band**, `fc` never set, 1259 mAh delivered into a cell that\n"
+           "finished genuinely full and reported 97%, and a CV-phase decay of\n"
+           "about 12 mA per minute. The band was empty exactly as predicted.\n\n"
+           "So two numbers moved, in two files, and they moved **apart**:\n\n"
+           "| | was | now |\n"
+           "|---|---|---|\n"
+           "| charger REG05 termination | 128 mA | **64 mA** (C/20) |\n"
+           "| gauge Taper Current 0x9201 | 128 mA | **100 mA** |\n\n"
+           "The charger had to move first. While it terminated at 128 mA, TI's\n"
+           "\"above the charger's threshold\" and their \"below C/10\" — 130 mA\n"
+           "on this 1300 mAh cell — left a window two milliamps wide.\n\n"
+           "100 rather than 90, which was the first proposal. The BQ25896's\n"
+           "termination accuracy is specified **only at ITERM = 256 mA**, in\n"
+           "two rows that differ on `ICHG`: ±12% for ICHG <= 1344 mA and ±20%\n"
+           "above it. This board charges at 512 mA, so **±12% is the applicable\n"
+           "row** and real termination lands near 72 mA. At the 64 mA actually\n"
+           "programmed there is no figure at all, so a part cutting 20% high —\n"
+           "worse than any published row — is carried as the pessimistic case\n"
+           "at 77 mA.\n\n"
+           "The travel that counts runs from the ceiling down to wherever the\n"
+           "charger really stops, and at the measured 12 mA/min it comes to\n"
+           "~140 s at the specified tolerance and ~115 s at the off-spec one.\n"
+           "Against a worst-case requirement of ~120 s, a taper of 100 clears\n"
+           "the specified case with margin and is marginal only on the\n"
+           "pessimistic one; a taper of 90 leaves ~65 s and fails it outright.\n"
+           "Two things push the marginal row the right way: 12 mA/min was\n"
+           "measured near 128 mA and CV decay is roughly exponential, so\n"
+           "between 100 and 64 mA it is *slower* — more time in the band, not\n"
+           "less — and 77 mA is beyond anything TI publishes to begin with.\n\n"
+           "100 also stays below C/10, above C/100, and above\n"
+           "`ChargeDetectThreshold`, keeping the required ordering\n"
+           "Taper > ChargeDetect > Quit at 100 > 75 > 40.\n\n"
+           "**Which half is doing the work.** 100 mA is also Taper Current's\n"
+           "own ROM default, so against a factory-default gauge the 0x9201\n"
+           "write changes nothing and the behaviour that actually moves is the\n"
+           "charger's termination. The gauge write earns its place by pinning\n"
+           "the value rather than inheriting it — LilyGO's firmware writes 128\n"
+           "there, so parts holding the wrong number are the expected case, not\n"
+           "a hypothetical.\n\n"
+           "One consequence, because it is the sort of thing that rots quietly:\n"
+           "four of the six parameters now equal their ROM defaults. What still\n"
+           "makes a gauge that lost its RAM detectable is Charging Current (512\n"
+           "against the ROM's 200) and Charging Voltage (4208 against 4200).\n\n"
+           "**What this promises and what it does not.** `fc` setting is the\n"
+           "expected outcome. `FullChargeCapacity` learning down from the\n"
+           "1300 mAh design value is **not promised**: the gauge only updates\n"
+           "it across a qualified discharge, which needs at least\n"
+           "3C/32 = 122 mA at the end, and this device idles at single-digit\n"
+           "milliamps. What would make the percentage read 100 regardless is\n"
+           "the `CSYNC` bit in **Gauging Configuration** (0x929B) — and TI's\n"
+           "own manual contradicts itself on that register's default, so this\n"
+           "version **reads** it rather than assuming it. See\n"
+           "`gauge_diagnostics`.\n\n"
            "### What is written\n\n"
-           "Six data-memory parameters, from TRM SLUUBD4A Table 3-2, matching\n"
-           "LilyGO's own production firmware for this board.\n\n"
+           "Six data-memory parameters, at the addresses TRM SLUUBD4A\n"
+           "Table 3-2 gives. Five carry the same values as LilyGO's own\n"
+           "production firmware for this board. **The taper current does\n"
+           "not** — the vendor writes 128 mA there, equal to the 128 mA their\n"
+           "charger configuration terminates at, and that equality is the\n"
+           "defect described above. Their firmware has it too; matching them\n"
+           "here would mean keeping it.\n\n"
            "| Address | Parameter | Value | Why |\n"
            "|---------|-----------|-------|-----|\n"
-           "| 0x9201 | Taper Current | 128 mA | **the fix** — equals the "
-           "charger's ITERM (REG05) |\n"
+           "| 0x9201 | Taper Current | 100 mA | **the fix** — deliberately "
+           "*above* the charger's 64 mA ITERM (REG05), at a ratio of 1.56 |\n"
            "| 0x91FB | Charging Current | 512 mA | equals the charger's ICHG "
            "(REG04) |\n"
            "| 0x91FD | Charging Voltage | 4208 mV | equals the charger's VREG "
@@ -1825,6 +2222,45 @@ static const char *battery_describe() {
            "suspended gauging, and a part that will not take the table must not\n"
            "turn that into a permanent once-a-minute stutter. A reboot is the\n"
            "escalation.\n\n"
+           "### `gauge_diagnostics` — read, never written\n\n"
+           "Two data-memory addresses are read on every pass and served as raw\n"
+           "hex. Nothing is written to either, and they are kept in a table of\n"
+           "their own so that the write path cannot reach them at all.\n\n"
+           "| Address | Parameter | Why it is read |\n"
+           "|---------|-----------|----------------|\n"
+           "| 0x929B | Gauging Configuration | **carries `CSYNC`** (low byte\n"
+           "bit 1, TRM Table 4-11), which assigns RemainingCapacity =\n"
+           "FullChargeCapacity at a valid termination |\n"
+           "| 0x927F | SOC Flag Config A | **no `CSYNC` in it** (its bit table\n"
+           "is Table 4-9); it holds `FCSETVCT`, which is what allows `fc` to be\n"
+           "set on primary termination at all |\n\n"
+           "`CSYNC` matters because `fc` setting does not by itself make the\n"
+           "percentage read 100 — that needs `FullChargeCapacity` to come down\n"
+           "from the design value, which needs a qualified discharge this\n"
+           "device may never perform. With `CSYNC` set the percentage snaps to\n"
+           "100 at termination regardless.\n\n"
+           "It is read rather than assumed because **TRM SLUUBD4A contradicts\n"
+           "itself on Gauging Configuration's ROM default**: Table 3-2 gives\n"
+           "0x102A, and Table 4-11 prints that same register's per-bit defaults\n"
+           "as all zeros. Both are in the same document.\n\n"
+           "**If 0x102A is the correct reading, `CSYNC` is already set from the\n"
+           "factory**: low byte 0x2A is bits 1, 3 and 5 — `CSYNC`, `EDV_CMP`,\n"
+           "`FIXED_EDV0`. That would mean the display reaches 100% as soon as\n"
+           "the full-charge flag sets, with no capacity learning involved, and\n"
+           "the taper change is the whole fix. It is **not asserted** — that is\n"
+           "what the read is for — but it is the outcome to look for first in\n"
+           "the value this endpoint returns.\n\n"
+           "SOC Flag Config A has no such dispute: Table 3-2 and Table 4-9 both\n"
+           "give 0x0C8C, which has `FCSETVCT` set. It is read to confirm that,\n"
+           "because with `FCSETVCT` clear no taper current would ever produce\n"
+           "the flag. Its documented max of 0x0FFF is also the plainest proof\n"
+           "that the disputed 0x102A belongs to 0x929B and not to it.\n\n"
+           "Both values are served undecoded — for 0x929B because the value is\n"
+           "the open question, and for 0x927F so that the two are reported the\n"
+           "same way and either can be checked against the tables above.\n\n"
+           "0x929B is on the write guard's **refused** list by name and stays\n"
+           "there. Reading any data-memory address is harmless; writing these\n"
+           "is not.\n\n"
            "### Safety\n\n"
            "Writes go through one guard: an allowlist of exactly those six\n"
            "addresses, each bounded by the TRM's own range, and everything else\n"
@@ -1918,14 +2354,24 @@ static const char *battery_describe() {
            "substitutes this build's own numbers into them. **The second\n"
            "condition is a floor on the current, not a footnote**, and that is\n"
            "the whole reason the object exists: accumulated capacity must\n"
-           "exceed 0.25 mAh per 40 s window, which is `capacity_floor_ua` =\n"
-           "22 500 uA. So termination needs the current to stay *between*\n"
-           "`current_floor_ua` and `current_ceiling_ma` for `windows_required`\n"
-           "consecutive `window_s` periods, with the cell above\n"
-           "`min_voltage_mv`. It is a **band**, not a threshold. A charge that\n"
-           "leaves the ceiling and reaches zero without spending that time in\n"
-           "between passes through the band without ever being in it, and never\n"
-           "terminates.\n\n"
+           "exceed 0.25 mAh **across the two periods together** — TRM 4.4.1\n"
+           "says \"during the same two periods\", not per window — which is\n"
+           "`capacity_floor_ua` = 11 250 uA. So termination needs the current\n"
+           "to stay *between* `current_floor_ua` and `current_ceiling_ma` for\n"
+           "`windows_required` consecutive `window_s` periods, with the cell\n"
+           "above `min_voltage_mv`. It is a **band**, not a threshold. A charge\n"
+           "that leaves the ceiling and reaches zero without spending that time\n"
+           "in between passes through the band without ever being in it, and\n"
+           "never terminates.\n\n"
+           "**Two details of condition 1 that the numbers here do not carry.**\n"
+           "The TRM tests `AverageCurrent()`, not `Current()` — a filtered\n"
+           "value that lags a decaying taper, so `current_ma` can be inside the\n"
+           "band while the value the gauge tests is not; both are served for\n"
+           "that reason. And the two periods must be *consecutive*, so entering\n"
+           "the band part-way through one wastes the remainder of it: 80 s is\n"
+           "the best case and **~120 s the worst**, which is the figure a\n"
+           "margin should be sized against. `measured_on`, `timing_note` and\n"
+           "`worst_case_seconds` carry both in the response.\n\n"
            "**There are two floors and the higher one wins.** Below\n"
            "`QuitCurrent` the gauge leaves CHARGE mode for RELAXATION after\n"
            "`chg_relax_time_s` (TRM 4.9.60), and 60 s is *shorter* than the\n"
@@ -1934,7 +2380,7 @@ static const char *battery_describe() {
            "for this build, `quit_current_floor_ua` is that floor,\n"
            "`current_floor_ua` is the one that actually binds, and\n"
            "`floor_set_by` names which rule produced it. On this device it is\n"
-           "QuitCurrent at 40 mA, not the capacity condition at 22.5 mA.\n\n"
+           "QuitCurrent at 40 mA, not the capacity condition at 11.25 mA.\n\n"
            "`ti_guidance` carries TI's own recommendation verbatim in summary,\n"
            "including the part that conflicts with it on this board. Nothing in\n"
            "this object is written to the gauge and nothing in it is applied.\n"
@@ -2153,10 +2599,25 @@ static void battery_register_routes(AsyncWebServer &server) {
         term["source"] = "TRM SLUUBD4A section 4.4.1, all three required";
         term["window_s"] = BQ_TAPER_WINDOW_S;
         term["windows_required"] = BQ_TAPER_WINDOWS;
-        term["min_capacity_per_window_uah"] = BQ_TAPER_MIN_CAP_UAH;
-        /* The floor condition 2 implies, on its own. In microamps: 22500 uA is
-           22.5 mA and does not round. */
+        /* Named for the whole qualification and not for one window, because
+           TRM 4.4.1 accumulates it "during the same two periods". The old key
+           said per_window and was wrong by a factor of two. */
+        term["min_capacity_per_qualification_uah"] = BQ_TAPER_MIN_CAP_UAH;
+        /* The floor condition 2 implies, on its own. In microamps: 11250 uA is
+           11.25 mA and does not round. */
         term["capacity_floor_ua"] = bq_taper_floor_ua();
+        /* Condition 1 names AverageCurrent(), which lags a decaying taper, and
+           the two periods must be consecutive — so entering the band part-way
+           through one costs the rest of it. Both are easy to lose when the
+           conditions are paraphrased, so both are stated rather than implied. */
+        term["measured_on"] = "AverageCurrent(), not Current(): TRM 4.4.1 "
+                              "condition 1 tests the filtered value, which "
+                              "lags the instantaneous one during a taper";
+        term["worst_case_seconds"] = BQ_TAPER_WINDOW_S * (BQ_TAPER_WINDOWS + 1);
+        term["timing_note"] = "the two periods must be CONSECUTIVE, so the "
+                              "best case is window_s * windows_required and "
+                              "the worst adds one more window for a band "
+                              "entered part-way through one";
 
         const GaugeParam *taper = gauge_param_at(BQ_DM_TAPER_CURRENT);
         const GaugeParam *cvolt = gauge_param_at(BQ_DM_CHARGING_VOLTAGE);
@@ -2184,16 +2645,16 @@ static void battery_register_routes(AsyncWebServer &server) {
 
         if (taper) term["current_ceiling_ma"] = taper->value;
         if (cvolt && tvolt) term["min_voltage_mv"] = cvolt->value - tvolt->value;
-        term["condition"] = "the current must stay between current_floor_ua and "
-                            "current_ceiling_ma for windows_required consecutive "
-                            "window_s periods while voltage_mv exceeds "
-                            "min_voltage_mv. A charge that leaves the ceiling "
-                            "and reaches zero without spending that time in "
-                            "between passes through the band without ever being "
-                            "in it.";
-        /* The vendor guidance, cited rather than acted on. See the comment on
-           the TaperCurrent row of gauge_config[] for why this is not simply
-           applied here. */
+        term["condition"] = "AverageCurrent() must stay between "
+                            "current_floor_ua and current_ceiling_ma for "
+                            "windows_required consecutive window_s periods "
+                            "while voltage_mv exceeds min_voltage_mv. A charge "
+                            "that leaves the ceiling and reaches zero without "
+                            "spending that time in between passes through the "
+                            "band without ever being in it.";
+        /* The vendor guidance, now acted on rather than merely cited. See the
+           comment on the TaperCurrent row of gauge_config[] for the tolerance
+           argument that picked 100 over the 90 first proposed. */
         term["ti_guidance"] = "TI SLUA777 3.2, SLUA903 2.2 and SLUA917, in "
                               "identical words: set the gauge's taper current "
                               "SLIGHTLY HIGHER than the charger's taper "
@@ -2201,11 +2662,27 @@ static void battery_register_routes(AsyncWebServer &server) {
                               "charger cuts off. Their worked example is 70 mA "
                               "for a 50 mA charger, a ratio of 1.4. They also "
                               "advise taper current below C/10, which for this "
-                              "1300 mAh cell is 130 mA — and this board's "
-                              "charger already terminates at 128 mA, so the two "
-                              "pieces of guidance leave almost no room between "
-                              "them. That conflict is unresolved and is why "
-                              "nothing here has been changed yet.";
+                              "1300 mAh cell is 130 mA. Both are satisfied "
+                              "here: the charger was lowered to terminate at "
+                              "64 mA and the gauge's taper is 100 mA, a ratio "
+                              "of 1.56 and comfortably under 130. The larger "
+                              "ratio is deliberate — TI size theirs against a "
+                              "charger held to about 10%, and the BQ25896's "
+                              "termination accuracy is specified only at "
+                              "256 mA, with no figure at all at 64 mA.";
+        /* Served because it is the question a reader asks next, and the honest
+           answer is not the reassuring one. */
+        term["fc_sets_but_fcc_may_not_learn"] =
+            "setting BatteryStatus[FC] is what this configuration is for and "
+            "is the expected outcome. It does NOT follow that "
+            "FullChargeCapacity is learned down from the design capacity: that "
+            "needs a qualified discharge, whose end-of-discharge current must "
+            "reach 3C/32 = 122 mA on this cell, and a device idling at "
+            "single-digit milliamps may never produce one. See "
+            "gauge_diagnostics for the CSYNC bit of GaugingConfiguration "
+            "(0x929B), which would set RemainingCapacity = FullChargeCapacity "
+            "at termination and make the percentage read 100 without any "
+            "learning.";
 
         /* Said in the payload as well as in describe(): whoever is chasing the
            wrong percentage will read this response long before they read the
@@ -2271,17 +2748,56 @@ static void battery_register_routes(AsyncWebServer &server) {
             p["why"] = gauge_config[i].why;
         }
 
+        /*
+         * The read-only diagnostics, as HEX and undecoded.
+         *
+         * Hex because the question these are here to answer is what the bits
+         * ARE. For GaugingConfiguration the VALUE is what TRM SLUUBD4A
+         * disagrees with itself about — Table 3-2 says 0x102A, Table 4-11
+         * prints its per-bit defaults as zero — and CSYNC is bit 1 of its low
+         * byte, so a decoded answer would look authoritative while resting on
+         * the half of the manual somebody picked. The raw word is checkable
+         * against either. SOCFlagConfigA is reported the same way for
+         * consistency rather than because its default is in doubt; it is not.
+         *
+         * Outside gauge_config so that nothing here can be mistaken for
+         * something this firmware wrote. Nothing is written to these addresses
+         * and 0x929B is refused by name in the write guard.
+         */
+        JsonObject diag = doc["gauge_diagnostics"].to<JsonObject>();
+        diag["written"] = false;
+        diag["encoding"] = "raw hex, not decoded: GaugingConfiguration's ROM "
+                           "default is the open question these reads exist to "
+                           "settle — TRM Table 3-2 says 0x102A, Table 4-11 "
+                           "prints zeros — and CSYNC is bit 1 of its low byte, "
+                           "so decoding it here would assume the answer";
+        JsonArray dregs = diag["registers"].to<JsonArray>();
+        for (int i = 0; i < GAUGE_DIAG_COUNT; i++) {
+            JsonObject d = dregs.add<JsonObject>();
+            d["name"] = gauge_diagnostics[i].name;
+            snprintf(hex, sizeof(hex), "0x%04X", gauge_diagnostics[i].addr);
+            d["address"] = String(hex);
+            d["read_ok"] = g.dm_diag_ok[i];
+            if (g.dm_diag_ok[i]) {
+                snprintf(hex, sizeof(hex), "0x%04X", (unsigned)(uint16_t)g.dm_diag[i]);
+                d["value"] = String(hex);
+            }
+            d["question"] = gauge_diagnostics[i].question;
+        }
+
         notify_send_json(req, 200, doc);
     });
 }
 
 static const Skill battery_skill = {
     .name = "battery",
-    /* 0.3.0 rather than 0.2.1: the response gained fields — two status words,
-       two currents and charge_termination — which is a contract change even
-       though nothing was removed and no behaviour changed. What is written to
-       the gauge is exactly what 0.2.0 wrote. */
-    .version = "0.3.0",
+    /* 0.4.0: this one changes what is WRITTEN, which 0.3.0 explicitly did not.
+       TaperCurrent goes out as 100 mA instead of 128, so the gauge's idea of a
+       finished charge is a different number than it was, and the response also
+       gains gauge_diagnostics. Either alone would earn the minor bump; a caller
+       pinned to `params[TaperCurrent].value == 128` is looking at a real
+       behaviour change and should see the version move. */
+    .version = "0.4.0",
     .describe = battery_describe,
     .endpoints = battery_endpoints,
     .register_routes = battery_register_routes

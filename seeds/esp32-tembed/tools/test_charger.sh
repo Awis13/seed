@@ -225,21 +225,48 @@ int main(void) {
         /* Bit 7 is EN_PUMPX and is not part of the number. */
         eq_int(bq25896_ichg_ma(0x88), 512,  "EN_PUMPX is masked out of the current");
 
-        /* REG05[3:0], offset 64 mA, step 64 mA. This is the defect and the fix,
-           and the two are one step apart. */
-        eq_int(bq25896_iterm_ma(0x13), 256, "REG05 0x13 terminates at 256 mA — the defect");
-        eq_int(bq25896_iterm_ma(0x11), 128, "REG05 0x11 terminates at 128 mA — the fix");
-        eq_int(bq25896_iterm_ma(0x10), 64,  "the offset is 64 mA, not 0");
+        /* REG05[3:0], offset 64 mA, step 64 mA. The original defect, the value
+           that shipped for two commits, and the value written now. */
+        eq_int(bq25896_iterm_ma(0x13), 256, "REG05 0x13 terminates at 256 mA — the original defect");
+        eq_int(bq25896_iterm_ma(0x11), 128, "REG05 0x11 terminates at 128 mA — what shipped before");
+        eq_int(bq25896_iterm_ma(0x10), 64,  "REG05 0x10 terminates at 64 mA — the fix");
         eq_int(bq25896_iterm_ma(0x1F), 1024, "and the field tops out at 1024 mA");
 
-        /* 128 mA on a 1300 mAh cell is C/10; 256 mA is C/5. The ratio is what
-           the whole argument rests on, so it is asserted rather than assumed. */
+        /* THE FLOOR OF THE FIELD, and the reason it is asserted rather than
+           noted. The whole argument for lowering termination is that it makes
+           room ABOVE it for the gauge's taper threshold. If code 0 were not the
+           bottom, a later reader chasing more room would go looking for a lower
+           one — so the offset is pinned in the direction somebody would push.
+           64 + 64*code, so code 0 is 64 mA and there is nothing under it. */
+        eq_int(bq25896_iterm_ma(0x10), 64, "the offset is 64 mA, not 0");
+        {
+            int lowest = bq25896_iterm_ma(0x10);
+            int any_lower = 0;
+            for (int code = 0; code <= 0x0F; code++)
+                if (bq25896_iterm_ma((uint8_t)(0x10 | code)) < lowest) any_lower = 1;
+            check(!any_lower,
+                  "no ITERM code in the whole field decodes below 64 mA, so the "
+                  "charger cannot be walked lower than it is written");
+        }
+
+        /* 64 mA on a 1300 mAh cell is C/20; 128 mA is C/10; 256 mA is C/5. The
+           ratio is what the whole argument rests on, so it is asserted rather
+           than assumed. C/20 is the low end of the textbook range and the end
+           this board now sits at. */
+        eq_int(1300 / bq25896_iterm_ma(0x10), 20, "64 mA against 1300 mAh is C/20");
         eq_int(1300 / bq25896_iterm_ma(0x11), 10, "128 mA against 1300 mAh is C/10");
         eq_int(1300 / bq25896_iterm_ma(0x13), 5,  "256 mA against 1300 mAh is C/5");
 
         /* REG05[7:4], same offset and step, and NOT the same nibble. Reading
-           the wrong nibble is the mistake this pair exists to catch: 0x11 has
-           the same value in both, so the values here deliberately differ. */
+           the wrong nibble is the mistake this pair exists to catch, and 0x10 —
+           the value now written — is the strongest case for it: its two nibbles
+           decode to 128 mA and 64 mA, so a swapped read is off by a factor of
+           two rather than invisible. 0x11 used to decode the same in both,
+           which is exactly why it made a poor test case. */
+        eq_int(bq25896_iprechg_ma(0x10), 128, "REG05 0x10 precharges at 128 mA");
+        eq_int(bq25896_iterm_ma(0x10),    64,  "but terminates at 64 mA — the same byte, the other nibble");
+        check(bq25896_iprechg_ma(0x10) != bq25896_iterm_ma(0x10),
+              "so the shipping byte itself distinguishes the two nibbles");
         eq_int(bq25896_iprechg_ma(0x11), 128, "REG05 0x11 precharges at 128 mA");
         eq_int(bq25896_iprechg_ma(0x13), 128, "and 0x13 does too — the default was never wrong");
         eq_int(bq25896_iprechg_ma(0x41), 320, "the high nibble is the precharge current");
@@ -263,7 +290,7 @@ int main(void) {
         /* The three registers this firmware writes, at the values it writes. */
         check(bq25896_write_allowed(0x07, 0x8D), "REG07 0x8D is allowed");
         check(bq25896_write_allowed(0x04, 0x08), "REG04 0x08 is allowed");
-        check(bq25896_write_allowed(0x05, 0x11), "REG05 0x11 is allowed");
+        check(bq25896_write_allowed(0x05, 0x10), "REG05 0x10 is allowed");
 
         /* ---- The overcharge ceiling. This is the check the commit is for. ----
          *
@@ -431,14 +458,24 @@ int main(void) {
         /* The values, by what they mean rather than by their bytes. */
         eq_int(charger_config[0].val, 0x8D, "REG07 is written 0x8D");
         eq_int(charger_config[1].val, 0x08, "REG04 is written 0x08");
-        eq_int(charger_config[2].val, 0x11, "REG05 is written 0x11");
+        eq_int(charger_config[2].val, 0x10, "REG05 is written 0x10");
 
         eq_int(bq25896_ichg_ma(charger_config[1].val), 512,
                "which charges the cell at, in mA");
-        eq_int(bq25896_iterm_ma(charger_config[2].val), 128,
+        eq_int(bq25896_iterm_ma(charger_config[2].val), 64,
                "and terminates at, in mA");
         eq_int(bq25896_iprechg_ma(charger_config[2].val), 128,
                "with a precharge current of, in mA");
+
+        /* The shipping byte sits at the bottom of the ITERM field. This is the
+           half of the fix that is about HEADROOM: the gauge's taper threshold
+           has to sit above this number with margin, so a later edit that walks
+           termination back up quietly closes the gap the gauge needs. There is
+           no lower code, which is asserted above. */
+        eq_int(charger_config[2].val & 0x0F, 0,
+               "REG05's ITERM field is at code 0, the lowest the part encodes");
+        eq_int(1300 / bq25896_iterm_ma(charger_config[2].val), 20,
+               "so the shipping termination is C/20 on this 1300 mAh cell");
 
         /* REG07 0x8D, field by field: EN_TERM on, watchdog off, safety timer on
            at 12 h. The watchdog bits are the ones that matter — 01 would be the
@@ -567,7 +604,7 @@ int main(void) {
 
         /* Everything as the table has it: the part is still holding what we
            wrote, and the mask is clean. */
-        charger_live_readback(0x08, 0x11, 0x5E, 0x8D, live);
+        charger_live_readback(0x08, 0x10, 0x5E, 0x8D, live);
         eq_int(charger_verify_mask(live), 0,
                "a part still holding all four written values compares clean");
 
@@ -577,7 +614,7 @@ int main(void) {
             uint8_t want = 0;
             switch (charger_config[i].reg) {
                 case 0x04: want = 0x08; break;
-                case 0x05: want = 0x11; break;
+                case 0x05: want = 0x10; break;
                 case 0x06: want = 0x5E; break;
                 case 0x07: want = 0x8D; break;
                 default:   want = 0xFF; break;
@@ -599,7 +636,7 @@ int main(void) {
 
         /* And the same for the register the old code trusted without ever
            verifying: a charge voltage moved to 4.32 V by anything at all. */
-        charger_live_readback(0x08, 0x11, 0x78, 0x8D, live);
+        charger_live_readback(0x08, 0x10, 0x78, 0x8D, live);
         check(charger_verify_mask(live) != 0,
               "REG06 moving to 0x78 — 4.32 V — shows up in the live comparison");
         eq_int(bq25896_vreg_mv(0x78), 4320, "because that byte regulates at, in mV");
@@ -674,7 +711,7 @@ int main(void) {
 
         /* The part is still holding all four. This is the only shape in which
            the endpoint may lead with `configured`. */
-        charger_derive(v, true, true, 0x08, 0x11, 0x5E, 0x8D);
+        charger_derive(v, true, true, 0x08, 0x10, 0x5E, 0x8D);
         eq_int(v.live_mask, 0, "a pass finding all four registers unchanged derives a clean mask");
         check(v.vreg_in_bounds, "with the charge voltage in bounds");
         check(v.config_still_live, "and the configuration still live");
@@ -695,13 +732,13 @@ int main(void) {
            a charge voltage another host moved to 4.32 V. Both vetoes fire here
            — it disagrees with the table AND it is out of bounds — and the
            bound is isolated from the drift by the property check above. */
-        charger_derive(v, true, true, 0x08, 0x11, 0x78, 0x8D);
+        charger_derive(v, true, true, 0x08, 0x10, 0x78, 0x8D);
         check(!v.vreg_in_bounds, "a charge voltage found at 4.32 V derives OUT of bounds");
         check(!v.configured, "and cannot derive configured true either");
 
         /* A pass that could not read the part concludes nothing, and nothing is
            not "fine". */
-        charger_derive(v, false, true, 0x08, 0x11, 0x5E, 0x8D);
+        charger_derive(v, false, true, 0x08, 0x10, 0x5E, 0x8D);
         eq_int(v.live_mask, CHARGER_MASK_ALL,
                "a pass that could not read derives every bit set, never a clean mask");
         check(!v.vreg_in_bounds, "and no claim about the charge voltage it did not see");
@@ -710,7 +747,7 @@ int main(void) {
 
         /* And the boot verdict still carries: agreement now does not
            retroactively land a write that never landed. */
-        charger_derive(v, true, false, 0x08, 0x11, 0x5E, 0x8D);
+        charger_derive(v, true, false, 0x08, 0x10, 0x5E, 0x8D);
         check(v.config_still_live,
               "a part holding the table is still live even when the boot write never verified");
         check(!v.configured,
@@ -727,7 +764,7 @@ int main(void) {
            derivation rather than through its ingredients: no register is
            exempt, whichever slot the table puts it in. */
         for (int i = 0; i < CHARGER_CONFIG_COUNT; i++) {
-            uint8_t r04 = 0x08, r05 = 0x11, r06 = 0x5E, r07 = 0x8D;
+            uint8_t r04 = 0x08, r05 = 0x10, r06 = 0x5E, r07 = 0x8D;
             switch (charger_config[i].reg) {
                 case 0x04: r04 = 0x20; break;   /* 2048 mA, the POR */
                 case 0x05: r05 = 0x13; break;   /* 256 mA, the defect */
