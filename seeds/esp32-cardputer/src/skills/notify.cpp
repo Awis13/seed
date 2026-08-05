@@ -178,16 +178,28 @@ static volatile unsigned long notify_save_at = 0;
    enough ago" and lets the first crit after boot go on the next pass. */
 static unsigned long notify_last_save_ms = 0;
 
-/* The T-Embed seed carries two more one-shot pairs beside these, one for its
+/* WHO CONSUMES AN ARRIVAL, which is the question this paragraph exists to
+   answer and which now has two answers rather than one.
+
+   The T-Embed seed carries two more one-shot pairs beside these, one for its
    LED ring and one for its speaker, because three consumers of a single flag
    would let whichever read it first swallow the arrival for the others. This
-   board drives neither, which is not the same as having neither: it has no LED
-   RING (only the single RGB LED on GPIO21, which this firmware never lights),
-   and its speaker path — ES8311 codec at I2C 0x18 into an NS4150B, I2S on
-   41/42/43/46 — is present and documented in main.cpp but never started here.
-   So the screen is the only consumer and the one pair above is the whole
-   handoff. Adding an output here means adding its own pair rather than sharing
-   this one. */
+   board has no LED ring, and its speaker path — ES8311 codec at I2C 0x18 into
+   an NS4150B, I2S on 41/42/43/46 — is present and documented in main.cpp but
+   never started here. So the flag pair above still has exactly one consumer:
+   the screen, which uses it to raise a message card.
+
+   The single RGB LED on GPIO21 is the second consumer of the STORE, and it is
+   deliberately not a consumer of the flag. It does not take a pair of its own
+   and it does not need one, because it is not driven by arrivals at all: it
+   polls notify_top_unread_level() on its own 40ms gate and shows a level, not
+   an event. A flag answers "something just came in", which is a one-shot and
+   has to be handed to each consumer exactly once; the LED asks "what is the
+   worst thing still outstanding", which is a level and is true continuously —
+   it has to survive a reboot with something unread, and it has to fall back to
+   `warn` when a `crit` is acknowledged, neither of which any arrival flag ever
+   says. So the rule for a NEW output is: a one-shot needs its own pair; a
+   level-driven indicator polls and needs nothing here. */
 
 /*
  * Ask for the flash mirror to be rewritten, no sooner than `delay_ms` from now.
@@ -421,18 +433,20 @@ static bool notify_crit_unread() {
     return found;
 }
 
-/* The most severe level still unacknowledged, or false if nothing is. The
-   question a severity-coloured badge would ask, and a different one from
-   notify_crit_unread()'s: that one asks whether UI_STATUS should stop looking
-   idle, this one asks which of three colours to draw. One pass under the lock
-   answers it, rather than a call per level.
+/* The most severe level still unacknowledged, or false if nothing is. A
+   different question from notify_crit_unread()'s: that one asks whether
+   UI_STATUS should stop looking idle, this one asks which of three colours to
+   drive. One pass under the lock answers it, rather than a call per level.
  *
- * STILL NO CALLER, and the header's badge is not one. That badge draws in the
- * accent colour whatever is sitting in the queue: colouring it by severity
- * changes what the screen means rather than where things are on it, and belongs
- * to a commit that can be judged on that alone. Left marked rather than given
- * an invented caller. */
-__attribute__((unused))
+ * Called by ui_led_tick() on the loop task, 25 times a second — its step gate's
+ * ceiling, and the reason that gate is tested before this is called rather than
+ * after, exactly as for notify_crit_unread() above.
+ *
+ * `out` IS LEFT UNTOUCHED ON A FALSE RETURN, and callers rely on it: there is
+ * no level that means "nothing", so the only safe reading of `out` is inside a
+ * branch that got a true. The header's unread badge is deliberately not a
+ * caller — it draws in the accent colour whatever is in the queue, because
+ * colouring it by severity would change what that corner of the screen means. */
 static bool notify_top_unread_level(uint8_t &out) {
     bool found = false;
     uint8_t top = NOTIFY_INFO;

@@ -14,7 +14,8 @@
 // exists to make the panel's state answerable over the network: which screen is
 // up, which fields it is showing and what they read, the backlight, and the last
 // key pressed. It is the only way this firmware's display can be verified at all
-// from off the device.
+// from off the device — and, since the RGB LED on the case is driven now, the
+// only way that is answerable either.
 //
 // Board specifics vs the other ESP32 seeds in this tree:
 //   - ADVANCE, not v1.1. Nothing from the v1.1 pinout transfers: the keyboard
@@ -187,14 +188,20 @@
 #define PIN_IR_TX       44
 #define PIN_VBAT_ADC    10  // battery divider; the ratio is unverified, so unread
 
-// RGB LED data line. M5Unified's board table maps board_M5CardputerADV to this
-// pin, and _setup_led() runs on every begin(), so the assignment is documented
-// rather than guessed. It only CONFIGURES the LED — it builds an RMT bus object
-// holding this pin number and drives nothing. The RMT peripheral is started by
-// M5.Led.begin(), which this firmware never calls, and cfg.led_brightness
-// defaults to 0, so the pin is idle at runtime. Idle, not free: the supply
-// behind it is gated by GPIO38 and anything that lights the LED takes the pin
-// back, which is why it is not on the safe list below.
+// RGB LED data line, and DRIVEN — one WS2812B-2020, GRB, through M5Unified's
+// M5.Led over RMT. M5Unified's board table maps board_M5CardputerADV to this
+// pin and _setup_led() runs on every begin(), so the assignment is the
+// library's rather than a guess; what M5.begin() builds is only the bus object,
+// and the RMT channel itself is created by the first mutator call, which is
+// ui_led_begin(). See "The body LED" in the UI section for what it shows and
+// what the GPIO38 coupling costs.
+//
+// FOR THE RECORD, BECAUSE IT WAS WRITTEN DOWN HERE AS FACT AND IS NOT ONE:
+// cfg.led_brightness has nothing to do with this LED. M5Unified declares it
+// "system LED brightness ... (not RGBcolorLED)" and uses it in exactly one
+// place, M5.Power.setLed(), which drives a monochrome power LED this board does
+// not have. When this pin was idle it was idle for one reason only — nothing
+// called an M5.Led mutator.
 //
 // The #undef is not tidying: the generic esp32s3 variant's pins_arduino.h, which
 // Arduino.h drags in above, already defines this name as 48 for a devkit's
@@ -306,10 +313,11 @@
 //                           and the recovery path with it.
 //   0,45,47,48              strapping pins and module-internal lines.
 //   26-32                   SPI flash. 22-25 do not exist on the ESP32-S3.
-//   21                      RGB LED data line — see PIN_RGB_LED above. A known
-//                           assignment from M5Unified's board table, not an
-//                           unknown one, and excluded because the LED owns the
-//                           pin even though nothing here starts the RMT.
+//   21                      RGB LED data line — see PIN_RGB_LED above. The
+//                           firmware drives it: M5.Led holds an RMT channel on
+//                           this pad for the life of the boot, so taking it is
+//                           taking the indicator. The gpio skill refuses it
+//                           outright rather than merely warning.
 //   16,17,18                UNCLASSIFIED — excluded because we do not know, not
 //                           because we know. M5Stack's published Cardputer-Adv
 //                           pinmap lists no assignment for these three, yet the
@@ -720,9 +728,16 @@ static volatile bool ui_force = false;
 // So network raises wait for the gate. They are folded into `force` inside
 // ui_tick() and appear nowhere in the expression that decides whether this
 // tick runs at all, which bounds the panel at one repaint per UI_TICK_MS no
-// matter what arrives. The cost is up to 200ms of latency on a message card,
-// on a node with no buzzer and no LED where the panel is not the thing that
-// makes an arrival urgent.
+// matter what arrives. The cost is up to 200ms of latency on a message card.
+//
+// That cost got CHEAPER, not dearer, when the body LED started being driven.
+// The argument used to rest on there being no other annunciator at all, which
+// is no longer true; but the LED runs on its own 40ms gate and polls the store
+// rather than waiting on this flag, so an arrival is already showing on the
+// outside of the case up to 160ms before the panel repaints. The panel is even
+// less the thing that makes an arrival urgent than it was. A buzzer, if one is
+// ever started here, would be a one-shot and would want its own flag pair —
+// see the note below notify_arrived in skills/notify.cpp.
 //
 // Raised only from skills/notify.cpp, and there only on the endpoint paths.
 // notify_poll() runs on the loop task and correctly uses ui_force.
@@ -2889,6 +2904,13 @@ static void ui_draw_frame(ui_screen_t screen) {
 // each time and it is the price of the gate being this simple. A forced repaint,
 // for scale, is a fillScreen and every field on top of it, ~13ms.
 #define UI_RULE_BREATHE_MS      80    // minimum interval between steps
+// SHARED WITH ui_led_tick(), WHICH IS WHY THE TWO BREATHS ARE IN PHASE. Both
+// derive their position from millis() % this, and neither keeps any state, so
+// one constant is the entire synchronising mechanism between them — there is no
+// handshake to notice if it goes. Re-tuning the hairline here silently re-times
+// the body LED on the outside of the case, which is a feature and not a hazard,
+// but only for somebody who knows it happens. The other two constants in this
+// group are the rule's alone; this one is not.
 #define UI_RULE_BREATHE_CYCLE 2000    // a full ramp up and back down
 #define UI_RULE_BREATHE_MAX    160    // ceiling on the blend of COL_CRIT over COL_RULE
 
@@ -3043,6 +3065,314 @@ static void ui_rule_tick() {
     ui_rule_alpha = alpha;
     ui_rule_steps++;
     ui_rule_breathing = true;
+}
+
+// ---- The body LED ----
+//
+// THE HAIRLINE ANSWERS "IS THIS SCREEN URGENT", THE LED ANSWERS "IS THERE
+// ANYTHING FOR ME", and the two are deliberately not the same signal. The rule
+// above is a screen element: it lives on UI_STATUS, it exists only while a
+// critical is unread, and it is gone the moment the panel shows anything else.
+// This one is on the body of the device. It is what answers the question from
+// across the room with the keyboard facing away, so it runs on every screen,
+// for every level, and it takes its colour from the most severe thing
+// outstanding.
+//
+// That colour is the whole reason notify_top_unread_level() finally has a
+// caller. Under a critical-only trigger it would return NOTIFY_CRIT every time
+// and the function would be an elaborate way of writing a constant.
+//
+// WHAT THE HARDWARE IS: one WS2812B-2020 on PIN_RGB_LED, GRB on the wire,
+// driven by M5Unified's M5.Led over RMT. M5.begin() already built the bus
+// object, and builds it even when panel autodetect fails, because
+// cfg.fallback_board names this board — but the RMT channel itself is created
+// lazily, by LED_Class::begin(), which every mutator calls for itself and which
+// nothing here had ever reached. ui_led_begin() below calls it outright.
+//
+// WHAT A STEP COSTS: 24 bits at 1.2us plus a 280us reset latch, about 309us on
+// the wire, transmitted by the peripheral rather than by the CPU.
+// LedBus_RMT::write() waits on the PREVIOUS frame before queueing the next, so
+// at UI_LED_BREATHE_MS apart that wait is long since satisfied and the call
+// costs only the queueing. Measured on this board: ten writes made to queue
+// behind one another take 3.28ms, i.e. 329us each — the 309us of wire time plus
+// the queueing, which is the shape the figure should have.
+//
+// WHAT IT TAKES AND DOES NOT GIVE BACK: rmt_new_tx_channel() is asked for 64
+// symbols against the ESP32-S3's 48 per block, so the channel occupies two of
+// the four RMT TX blocks for the life of the boot. A later IR skill on
+// PIN_IR_TX has two left, which is enough for it, but it is not four.
+//
+// THE SUPPLY IS THE BACKLIGHT'S, and no amount of care here works around it.
+// GPIO38 is one net doing two jobs: it enables the panel backlight and it gates
+// this LED's power. So at brightness 0 the LED is dark whatever the RMT is
+// transmitting, and brightness 0 is not an exotic state — the Backlight menu
+// row toggles straight to it, and `,` reaches it from the default 96 in three
+// presses. Below full brightness the rail is chopped by LEDC at 256Hz; at 96
+// the duty works out at 41.6%, a 2.28ms gap every 3.9ms. Only at 255 does the
+// duty go full-scale and the rail stop being chopped at all.
+//
+// WHETHER THE PART SURVIVES THE CHOPPED RAIL IS UNKNOWN AND IS NOT KNOWABLE
+// FROM IN HERE. It depends on bulk capacitance that no published schematic for
+// this board shows. The part's 280us figure is a data-line latch timeout and
+// not a supply-hold spec, so it does not answer the question either way. What
+// WAS established on this device is the firmware half: ten steady writes cost
+// 3.28ms at backlight 96, 3.29ms at 255 and 3.34ms at 0, so the RMT path
+// neither notices the rail nor stalls on it, and nothing hung, reset or
+// disturbed the panel at any of the three. Whether light comes out at 96 is a
+// question for somebody with eyes on the board.
+//
+// Hence: ui_led_supplied() qualifies every REPORT, and nothing gates the DRIVE.
+// A step transmitted into a dead rail costs 309us of a peripheral that is
+// otherwise idle, and it leaves the LED correct the instant the backlight comes
+// back — where a gated drive would owe the transition a repaint it has no other
+// reason to watch for.
+
+// The step gate, and deliberately NOT UI_RULE_BREATHE_MS. That number is the
+// panel's, chosen against a 240-pixel drawFastHLine and the notification
+// spinlock; this animation shares neither cost, and one name over two decisions
+// is how the next edit moves both by accident. 40ms is 25 steps a second, which
+// puts 50 samples in a cycle where the rule gets about 25, and holds the RMT
+// channel busy under 1% of the time. It also offers the notification store's
+// spinlock 25 takes a second against the ~90 passes loop() makes, which is the
+// same ratio argument ui_rule_tick() makes for its own gate.
+#define UI_LED_BREATHE_MS   40
+
+// The envelope's floor, in envelope units before gamma. Zero would take the LED
+// to black at the bottom of every cycle, and "there is something for you" must
+// not blink out of existence — the bottom of a breath is an ember, not a gap.
+// The sibling T-Embed firmware floors its ring at this same value for this same
+// reason. Through the curve below it comes out as 13/255 of drive.
+#define UI_LED_BREATHE_MIN  80
+
+static_assert(UI_LED_BREATHE_MIN < 255,
+              "the LED breath's floor is at or above its ceiling, so the envelope "
+              "would never move");
+
+// pow(i / 255, 2.6) * 255, rounded. A WS2812's output is close to linear in the
+// PWM value it is given and the eye is not, so a linear ramp reads as a snap to
+// full followed by a plateau. 2.6 is the exponent Adafruit's LED work settles
+// on and the one the sibling firmware's ring uses; this table was regenerated
+// rather than copied and comes out identical to it.
+//
+// Applied to the ENVELOPE and not to the product of envelope and channel, which
+// is where this differs from the sibling. Gamma-encoding the channels too would
+// pull the palette's own three colours about as it dimmed them; encoding only
+// the envelope scales all three channels by one factor, so the hue is exactly
+// the palette's at every point of the breath.
+//
+// The whole 256 entries are kept although only 80..255 are reachable while the
+// floor above stands. A table trimmed to the reachable range would have to be
+// indexed through that constant, and then moving the floor down would walk off
+// the front of it silently — 176 bytes is not worth buying that.
+static const uint8_t ui_led_gamma[256] = {
+      0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,
+      0,   0,   0,   0,   0,   0,   0,   0,   1,   1,   1,   1,   1,   1,   1,   1,
+      1,   1,   1,   1,   2,   2,   2,   2,   2,   2,   2,   2,   3,   3,   3,   3,
+      3,   3,   4,   4,   4,   4,   5,   5,   5,   5,   5,   6,   6,   6,   6,   7,
+      7,   7,   8,   8,   8,   9,   9,   9,  10,  10,  10,  11,  11,  11,  12,  12,
+     13,  13,  13,  14,  14,  15,  15,  16,  16,  17,  17,  18,  18,  19,  19,  20,
+     20,  21,  21,  22,  22,  23,  24,  24,  25,  25,  26,  27,  27,  28,  29,  29,
+     30,  31,  31,  32,  33,  34,  34,  35,  36,  37,  38,  38,  39,  40,  41,  42,
+     42,  43,  44,  45,  46,  47,  48,  49,  50,  51,  52,  53,  54,  55,  56,  57,
+     58,  59,  60,  61,  62,  63,  64,  65,  66,  68,  69,  70,  71,  72,  73,  75,
+     76,  77,  78,  80,  81,  82,  84,  85,  86,  88,  89,  90,  92,  93,  94,  96,
+     97,  99, 100, 102, 103, 105, 106, 108, 109, 111, 112, 114, 115, 117, 119, 120,
+    122, 124, 125, 127, 129, 130, 132, 134, 136, 137, 139, 141, 143, 145, 146, 148,
+    150, 152, 154, 156, 158, 160, 162, 164, 166, 168, 170, 172, 174, 176, 178, 180,
+    182, 184, 186, 188, 191, 193, 195, 197, 199, 202, 204, 206, 209, 211, 213, 215,
+    218, 220, 223, 225, 227, 230, 232, 235, 237, 240, 242, 245, 247, 250, 252, 255,
+};
+
+// Did the RMT channel come up. Written once at boot, read from AsyncTCP.
+static bool     ui_led_ready = false;
+// What the LED currently carries, and the falling-edge latch, one variable for
+// the same reason ui_rule_breathing is one: "does the part hold a colour?" is
+// both the latch's question and the endpoint's, and two variables holding one
+// fact is how a report starts drifting from the thing it reports.
+//
+// Written on the loop task and read from AsyncTCP, which preempts it — the same
+// arrangement as ui_rule_breathing and ui_clock_drawn, with the same ordering
+// at each write below and no new locking policy.
+static bool     ui_led_lit = false;
+static uint8_t  ui_led_level = NOTIFY_INFO;
+static uint8_t  ui_led_env = 0;
+static uint32_t ui_led_steps = 0;
+
+// Whether GPIO38 is actually holding the LED's supply up, which is the
+// qualification every report of this LED needs and the drive deliberately does
+// not take.
+//
+// ui_ready is in the test as well as the brightness, and it is not belt and
+// braces: when panel autodetect fails, M5GFX never attaches GPIO38 to an LEDC
+// channel at all and ui_begin() returns before it sets a brightness, so
+// ui_brightness is then a stored preference that nothing acted on. Reporting on
+// the number alone would claim a raised rail on a board whose backlight pin was
+// never driven.
+static bool ui_led_supplied() {
+    return ui_ready && ui_brightness > 0;
+}
+
+// The rail in words, and THREE STATES RATHER THAN TWO.
+//
+// ui_led_supplied() answers the question the drive path asks — is there any
+// supply at all — and that is a boolean. What a caller reading /capabilities
+// needs is finer than that, because the middle state is the one this firmware
+// cannot vouch for. Below full brightness LEDC chops the supply at 256Hz (41.6%
+// duty at the default 96, a 2.28ms gap every 3.9ms), and whether the part
+// survives that was never established — see "The body LED" for why it is not
+// establishable from in here. Only at 255 does the duty go full-scale and the
+// rail stop being chopped at all.
+//
+// Collapsing those two into "the LED can light" would report the one thing that
+// is genuinely open as though it were settled, on the endpoint whose whole job
+// is telling an agent what is true about hardware it cannot see. GET /ui can be
+// read alongside `brightness` and a caller there can work it out; /capabilities
+// carries no brightness at all, so it has to say this itself.
+static const char *ui_led_rail_state() {
+    if (!ui_led_supplied())
+        return "the LED is dark until the backlight comes up";
+    if (ui_brightness == 255)
+        return "the backlight is at full, so the supply is continuous and the "
+               "LED can light";
+    return "the backlight is dimmed, so the supply is chopped at 256Hz and "
+           "whether the LED lights through that is UNVERIFIED";
+}
+
+static void ui_led_begin() {
+    // begin() is what creates the RMT channel, and its return value is the only
+    // report of that anyone gets: every mutator calls it internally and then
+    // returns in silence when it fails. Calling it here rather than leaving the
+    // first step to do it lazily keeps channel allocation out of the animation's
+    // path and makes a failure answerable at boot instead of never.
+    ui_led_ready = M5.Led.begin();
+    if (!ui_led_ready) {
+        Serial.println("[led] RMT channel not created; the body LED is dead");
+        return;
+    }
+    // LED_Strip_Class starts at brightness 63 and its scaler is ((b+1)^2) >> 16,
+    // which at 63 is a divide by 16: the ramp would be four bits wide and would
+    // reach black well above the floor UI_LED_BREATHE_MIN sets, looking like an
+    // arithmetic error rather than a library default. 255 makes that scaler
+    // exactly 1 and is the only value that leaves an 8-bit channel 8 bits wide.
+    // THIS IS THE LIBRARY'S OWN SCALER AND NOT THE PANEL'S BRIGHTNESS — the two
+    // share a supply pin and nothing else.
+    //
+    // It also transmits a frame, because auto-display is on, and that is wanted
+    // here: LED_Strip_Class::begin() has just resized a zero-initialised colour
+    // buffer, so the frame is black and the first thing this pin carries after a
+    // boot is an explicit off rather than whatever the part powered up holding.
+    M5.Led.setBrightness(255);
+}
+
+static void ui_led_tick() {
+    static unsigned long last_step = 0;
+
+    // THE STEP GATE COMES FIRST AND THE STORE IS ASKED SECOND, for the reason
+    // ui_rule_tick() sets out above: notify_top_unread_level() walks the queue
+    // under portENTER_CRITICAL(&notify_mux), which disables interrupts on this
+    // core, and an ungated call would offer it every pass of loop() instead of
+    // roughly one pass in four — measured, 23.8 steps a second against the ~90
+    // passes delay(10) allows.
+    if (millis() - last_step < UI_LED_BREATHE_MS) return;
+    last_step = millis();
+
+    // The only guard, and the two that are absent are absent on purpose. NO
+    // ui_screen TEST: being independent of what the panel shows is the entire
+    // point of an indicator on the body. NO ui_ready TEST EITHER — that flag
+    // means the panel is drawable, and this shares no surface with the panel. It
+    // does share GPIO38, so a board whose panel never came up has a dark LED as
+    // well; that is a fact about the rail, ui_led_supplied() reports it, and
+    // gating the drive on it would buy nothing but a lag when it changed.
+    if (!ui_led_ready) return;
+
+    uint8_t top;
+    // Leaves `top` untouched on a false return, so it is read only inside the
+    // branch that got a true one.
+    if (!notify_top_unread_level(top)) {
+        // THE FALLING EDGE, AND HERE THE LATCH IS LOAD-BEARING RATHER THAN
+        // MERELY DETERMINISTIC. The rule's equivalent is a convenience: a forced
+        // repaint puts COL_RULE back anyway, so without it the rule would only
+        // be correct late. Nothing whatever clears this LED. It holds the last
+        // frame it accepted until something sends it another, and there is no
+        // fillScreen for a part on the outside of the case — so without this
+        // branch an acknowledged queue would leave the device lit until reboot.
+        if (ui_led_lit) {
+            // Cleared BEFORE the transmit, the way ui_rule_breathing is cleared
+            // before its draw and for the same reason: this flag promises the
+            // part is carrying a colour and must not be believed late.
+            ui_led_lit = false;
+            M5.Led.setAllColor(0, 0, 0);
+        }
+        return;
+    }
+
+    // THE SAME PHASE EXPRESSION AND THE SAME CYCLE CONSTANT AS ui_rule_tick(),
+    // which is the whole of what keeps the two in step. Both are pure functions
+    // of millis() and neither remembers anything across a step, so they need no
+    // shared state to stay in phase — including across the millis() rollover at
+    // 49.7 days, which they reach together and where both jump by the same
+    // 1296ms. Their step rates differ and their envelopes differ; the cycle they
+    // are sampling does not.
+    unsigned long pos  = millis() % UI_RULE_BREATHE_CYCLE;
+    unsigned long half = UI_RULE_BREATHE_CYCLE / 2;
+    unsigned long up   = (pos < half) ? pos : (UI_RULE_BREATHE_CYCLE - pos);
+    uint8_t tri = (uint8_t)(up * 255 / half);
+    uint8_t env = (uint8_t)(UI_LED_BREATHE_MIN +
+                            (255 - UI_LED_BREATHE_MIN) * (uint32_t)tri / 255);
+
+    // THE RAMP IS SCALED ON 8-BIT CHANNELS AND NOT BY BLENDING THE 565 VALUE,
+    // and that is the one place this departs from ui_rule_tick(). ui_blend()
+    // would have been one line, but what it scales is a 5/6/5 palette entry:
+    // COL_INFO's red is 10 of 31 against its blue's 28, so that channel would
+    // have had ten distinct levels across the whole ramp, and at the bottom of
+    // the breath the three round to (1,2,1) — an info notification that reads
+    // white at the ember instead of blue. Scaling the expanded channels keeps
+    // all three on the palette colour's own ray, to within the half-step per
+    // channel that 8 bits can represent at all; it is NOT exact below full
+    // envelope and nothing integer could be. m5gfx::convert_to_bgr888() is the
+    // library's own 565->888 expansion, i.e. the same three numbers
+    // setAllColor() derives from a packed value, so at env 255 this IS exact —
+    // bit-identical to handing it the uint16_t.
+    const RGBColor base = m5gfx::convert_to_bgr888(ui_level_color(top));
+    uint8_t scale = ui_led_gamma[env];
+
+    // ONE WRITE AND NOT THREE. Auto-display is on, so each setAllColor() call
+    // transmits a whole frame; the three channels have to go in one.
+    //
+    // + 127 BEFORE THE DIVIDE, which is ui_blend()'s own rounding convention and
+    // is here for its reason: truncation biases every channel up to a whole step
+    // dark, and it biases them by DIFFERENT fractions, so the ratios between
+    // them — the hue — drift as the envelope falls. COL_INFO at the floor is
+    // exactly (4.18, 7.65, 11.78); truncated that is (4, 7, 11) and rounded it
+    // is (4, 8, 12), which is the nearest representable colour on that ray. The
+    // rounding costs three additions a step and it is what lets the claim above
+    // be about the hue rather than about the arithmetic.
+    M5.Led.setAllColor((uint8_t)((base.R8() * scale + 127) / 255),
+                       (uint8_t)((base.G8() * scale + 127) / 255),
+                       (uint8_t)((base.B8() * scale + 127) / 255));
+
+    // Written after the transmit, and ui_led_lit written last of the four
+    // because that is the order a reader on the AsyncTCP task should see.
+    //
+    // NOTHING ENFORCES THAT ORDER AND THIS COMMENT USED TO CLAIM IT DID. These
+    // are four plain writes to non-volatile statics with no barrier between
+    // them; the compiler may retire them in any order it likes, and the store
+    // that publishes ui_led_lit may land before the level beside it. The bound
+    // is what makes that acceptable rather than a fence: the only pair a reader
+    // can catch mid-update is lit=true beside the previous step's level and
+    // envelope, i.e. a report at most one 40ms step stale, and only in the 40ms
+    // after a level actually changed. It is the same exposure ui_rule_breathing
+    // has and the same policy — see the UI section's one-writer rule for why the
+    // file buys this rather than locking. What must NOT be read from this is a
+    // guarantee, because there is not one.
+    //
+    // ui_led_steps is what separates a live ramp from a stuck one: the envelope
+    // revisits every value twice a cycle, so two polls that agree prove nothing
+    // on their own.
+    ui_led_level = top;
+    ui_led_env = env;
+    ui_led_steps++;
+    ui_led_lit = true;
 }
 
 // ---- The message list ----
@@ -4118,15 +4448,25 @@ static void handle_capabilities(AsyncWebServerRequest *request) {
     doc["flash_mhz"] = (unsigned long)(hw.flash_speed / 1000000);
     doc["has_psram"] = hw.psram_size > 0;
 
-    // Peripherals present but not driven by this firmware. Reported so an agent
-    // growing the node knows what is there and on which pins.
+    // The peripherals this board carries, and for each one whether this
+    // firmware drives it. Reported so an agent growing the node knows what is
+    // there and on which pins.
     //
     // Every pin number below is formatted from the #defines at the top of this
     // file rather than typed into the string. The pin map is meant to have one
     // source of truth; a hand-written "MOSI=35" in here is a second one that
     // goes stale in silence the day the define is corrected, and it goes stale
     // in the one endpoint an agent trusts to describe hardware it cannot see.
-    char peri[256];
+    //
+    // 384 AND NOT 256, AND THE HEADROOM IS THE POINT. snprintf() truncates
+    // without saying so, and a truncated string in this handler is a hardware
+    // description that stops mid-sentence in the one place nobody can check it
+    // against the board. `rgb_led` is the longest producer here at 305 bytes in
+    // its worst branch — it is the only entry with three substitutions, two of
+    // them whole clauses — and 256 would have cut it. The others are all under
+    // 200. Anything added below that can reach 384 needs this raised again,
+    // which is why the figure is written down rather than left to be measured.
+    char peri[384];
     snprintf(peri, sizeof(peri),
              "ST7789V2 240x135 IPS, driven via M5GFX (RST=%d,DC=%d,MOSI=%d,"
              "SCLK=%d,CS=%d,BL=%d PWM). %s; see GET /ui for what it is showing",
@@ -4157,6 +4497,20 @@ static void handle_capabilities(AsyncWebServerRequest *request) {
     doc["audio"] = peri;
     doc["ir_tx_pin"] = PIN_IR_TX;
     doc["battery_adc_pin"] = PIN_VBAT_ADC;
+    // The one peripheral in this list that IS driven, so it follows the
+    // `display` string's shape rather than ir_tx_pin's bare number: what it is
+    // and where, then whether it is actually up. Two separate conditions have to
+    // hold before this LED can be seen and an agent needs both — the RMT channel
+    // has to exist, and GPIO38 has to be holding the supply. Either one alone is
+    // a claim of light into a dark part.
+    snprintf(peri, sizeof(peri),
+             "WS2812B-2020 on GPIO%d (GRB), driven via M5.Led over RMT; %s. "
+             "GPIO%d gates its supply as well as the backlight — %s. Breathes "
+             "while anything is unread; see `led` in GET /ui",
+             PIN_RGB_LED,
+             ui_led_ready ? "RMT channel up" : "RMT channel NOT created",
+             PIN_TFT_BL, ui_led_rail_state());
+    doc["rgb_led"] = peri;
     // The EXT 2.54-14P header is on every ADVANCE; what is plugged into it is
     // not. Both halves of that are hardware facts an agent needs, and getting
     // either one wrong costs the same. Claiming a GNSS unconditionally puts
@@ -4433,6 +4787,35 @@ static void handle_ui(AsyncWebServerRequest *request) {
     doc["height"] = (int)M5.Display.height();
     doc["brightness"] = ui_brightness;
     doc["backlight"] = ui_brightness > 0;
+
+    // The body LED, reported beside the backlight because the backlight is what
+    // decides whether it can be seen, and reported OUTSIDE the per-screen switch
+    // below because it runs on all of them. That is the difference between it
+    // and `rule`, which is absent on every screen that does not drive it.
+    //
+    // `supplied` is the qualification the other keys need: GPIO38 gates this
+    // LED's power as well as the backlight, so `lit` says what the firmware last
+    // transmitted and `supplied` says whether that could have become light. The
+    // two are separate because the firmware can only ever know the first — see
+    // ui_led_supplied() for why the panel's readiness is in that test as well as
+    // the brightness.
+    //
+    // Written from the drive path, the way `rule` is, so these are what the LED
+    // IS rather than what an unread message implies it ought to be.
+    JsonObject led = doc["led"].to<JsonObject>();
+    led["ready"] = ui_led_ready;
+    led["supplied"] = ui_led_supplied();
+    led["lit"] = ui_led_lit;
+    if (ui_led_lit) {
+        // Omitted when it is not lit, the way `rule` omits its alpha and step
+        // count: all three describe a breath that is running and none of them
+        // means anything without one. `steps` is the proof that the ramp is
+        // live — `envelope` revisits its values twice a cycle, so two polls that
+        // agree establish nothing by themselves.
+        led["level"] = notify_level_name(ui_led_level);
+        led["envelope"] = ui_led_env;
+        led["steps"] = ui_led_steps;
+    }
 
     // WHICH KEY BELOW CARRIES THIS SCREEN'S CONTENT. Three screens fill
     // fields[]; status, the menu, the message list and the card have no
@@ -5053,13 +5436,21 @@ static void handle_skill(AsyncWebServerRequest *request) {
     s += "  labels G13 UART_RX and G15 UART_TX from the accessory's side, so reading it\n";
     s += "  as an ESP32-side name gives a UART wired backwards. M5Stack's own Cap\n";
     s += "  LoRa-1262 example opens it as `Serial1.begin(115200, SERIAL_8N1, 15, 13)`\n";
-    s += "- GPIO16,17,18,21 are not on the safe list either, and not because they are\n";
+    s += "- GPIO16,17,18 are not on the safe list either, and not because they are\n";
     s += "  known to be taken: M5Stack's pinmap simply does not mention them, while the\n";
     s += "  board has a microphone and an NS4150B amplifier documented on no pins at all\n";
+    s += "- GPIO21 is the on-body RGB LED (one WS2812B-2020, GRB) and this firmware\n";
+    s += "  DRIVES it, through M5Unified's M5.Led over RMT. It breathes while anything\n";
+    s += "  is unread, in the colour of the most severe unread level, on every screen —\n";
+    s += "  `led` in GET /ui reports what it is doing and `rgb_led` in /capabilities\n";
+    s += "  reports whether it is up. The channel holds two of the ESP32-S3's four RMT\n";
+    s += "  TX blocks for the life of the boot. POST /gpio/write refuses the pin\n";
     s += "- GPIO38 is the display backlight and also gates the RGB LED supply. It is\n";
     s += "  not a plain output here: M5GFX attaches it to an LEDC channel and dims it,\n";
     s += "  so the backlight is the brightness value in GET /ui rather than a pin\n";
-    s += "  level. A brightness of 0 also cuts the RGB LED's supply\n";
+    s += "  level. A brightness of 0 also cuts the RGB LED's supply, so a dark panel\n";
+    s += "  is a dark LED whatever the RMT is transmitting — which is why every report\n";
+    s += "  of the LED carries the state of the rail beside it\n";
     s += "- The mainboard I2C bus (SDA=8/SCL=9) carries exactly three devices: TCA8418\n";
     s += "  keyboard controller 0x34, ES8311 codec 0x18, BMI270 IMU 0x69. Anything else\n";
     s += "  in /capabilities' i2c_devices came from a cap or the Grove port. Entries\n";
@@ -5155,6 +5546,24 @@ static void handle_skill(AsyncWebServerRequest *request) {
     s += "It reports content, not pixels — it says nothing about layout or\n";
     s += "legibility, and the AP password is redacted there even though it is on\n";
     s += "the screen.\n\n";
+    s += "`led` is the one key there that is not about the panel at all: it is the\n";
+    s += "RGB LED on the body of the case, which breathes while anything is unread\n";
+    s += "in the colour of the most severe unread level, on EVERY screen. `lit` is\n";
+    s += "what the firmware last transmitted to it and `supplied` is whether GPIO38\n";
+    s += "was holding its power up at the time, which is the only honest way to\n";
+    s += "read `lit` — the two are separate because a dark backlight means a dark\n";
+    s += "LED and no code here can tell that a colour became light. `level`,\n";
+    s += "`envelope` and `steps` describe the breath and are absent when it is not\n";
+    s += "running. `envelope` is where the ramp is, 80 at the floor to 255 at the\n";
+    s += "top, BEFORE the gamma curve that turns it into drive. It is linear in the\n";
+    s += "same triangle the status screen's `rule.alpha` samples, but the two are\n";
+    s += "on different scales and different step gates, so they compare through a\n";
+    s += "formula rather than side by side: `rule.alpha`/160 and\n";
+    s += "(`led.envelope`-80)/175 are the same fraction of the same ramp, to within\n";
+    s += "the 80ms the slower gate can be stale by. `steps` only counts up, so it\n";
+    s += "is what\n";
+    s += "distinguishes a live ramp from one stuck at a value the envelope happens\n";
+    s += "to revisit twice a cycle.\n\n";
     s += "The display is written only from loop(). If you add a handler, it may READ\n";
     s += "UI state and must never draw: handlers run on the AsyncTCP task and will\n";
     s += "preempt a half-finished paint, corrupting M5GFX's font/datum/SPI state.\n\n";
@@ -5364,6 +5773,13 @@ void setup() {
     // and it is the seed's only I2C owner. See the ownership note above
     // hw_probe() for what happens to a second one.
     ui_begin();
+    // After ui_begin() because M5.begin() is what constructs the LED instance,
+    // and outside it because this is not the panel: ui_begin() returns early
+    // when autodetect leaves nothing to draw on, and the body LED's channel does
+    // not depend on there being a panel. It does depend on GPIO38, which the
+    // panel raises — but that decides whether the LED lights, not whether the
+    // RMT channel can be created, and the two are reported separately.
+    ui_led_begin();
     hw_probe();       // I2C scan, through M5's bus
     tz_load();        // before wifi_setup(): configTzTime() needs the TZ string
     wifi_setup();     // RF up first; also raises the setup AP if STA fails
@@ -5569,6 +5985,17 @@ void loop() {
     // strftime, getFreeHeap and the notification spinlock two and a half times
     // more often on every screen, for one line on one of them.
     ui_rule_tick();
+    // AFTER ui_rule_tick(), and adjacent to it rather than anywhere else in this
+    // function, so that both takes of the notification store's spinlock sit in
+    // one place and can be reasoned about together.
+    //
+    // It inherits NONE of the ordering constraint above. That one is about the
+    // framebuffer — a forced repaint painting over a step — and this drives a
+    // part on the outside of the case that shares no surface with the panel. It
+    // would be correct first, or between the two; it is here because the two
+    // ticks answer the same question of the same store and reading them apart
+    // would be worse than reading them together.
+    ui_led_tick();
 
     delay(10);
 }
