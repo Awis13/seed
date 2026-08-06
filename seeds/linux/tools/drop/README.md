@@ -29,17 +29,34 @@ output is discarded, so an `echo` in it cannot pollute hook stdout).
 |----------|----------|---------|
 | `DROP_URL` | yes | Drop server base URL, e.g. `http://192.168.1.138:8080` |
 | `DROP_TOKEN` | for non-loopback | Sent as `Authorization: Bearer $DROP_TOKEN` |
-| `DROP_HANDLE` | yes (hooks/watcher) | This session's handle, `[A-Za-z0-9_-]{1,32}` |
+| `DROP_HANDLE` | no (auto-derived) | This session's handle, `[A-Za-z0-9_-]{1,32}` — override only |
 | `DROP_INBOX_FILE` | no | Watcher output file, default `./.drop-inbox.md` |
 | `DROP_BOARD_FILE` | mirror only | Mirror target; the mirror refuses to run without it |
 | `DROP_POLL_S` | no | Watcher poll interval, default 20s (non-numeric falls back to 20) |
 
-Example `~/.claude/drop.env`:
+### Handle derivation
+
+`DROP_HANDLE` is **optional and should usually be left unset**. `drop.env`
+is shared by every session on the machine, so a hardcoded handle there
+would make all of them register as the same handle — and since a fetch
+advances that handle's cursor on the server, sessions would consume each
+other's mail. Instead the handle is derived per project:
+
+1. An explicit `DROP_HANDLE` in the environment wins (for the rare case
+   you want two sessions to share an inbox on purpose).
+2. Otherwise: the basename of the git repo root (`git rev-parse
+   --show-toplevel`), or of `$PWD` when not in a repo.
+3. Sanitized to the server charset — anything outside `[A-Za-z0-9_-]`
+   collapses to a single `-`, edges trimmed, truncated to 32.
+4. If that yields nothing usable, the kit fails loud rather than posting
+   under a garbage handle.
+
+Example `~/.claude/drop.env` (no handle needed):
 
 ```sh
 export DROP_URL="http://192.168.1.138:8080"
 export DROP_TOKEN="<token from /opt/seed/token on the node>"
-export DROP_HANDLE="sess-mac-1"
+# export DROP_HANDLE="sess-mac-1"   # optional override; usually leave unset
 ```
 
 ## Install

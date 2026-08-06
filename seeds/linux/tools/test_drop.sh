@@ -469,8 +469,11 @@ int main(int argc, char **argv) {
 
     printf("a max-size message survives the JSONL round trip\n");
     {
-        /* Pins DROP_LINE_MAX to the derived message size: a hand-sized
-         * line buffer would silently truncate full-size text on reload. */
+        /* Pins DROP_LINE_MAX to the derived message size. Every byte is a
+         * quote or backslash, so json_escape DOUBLES the field: this is the
+         * ~17KB escaped worst case DROP_MSG_JSON_MAX actually protects, not
+         * the ~8.6KB an un-escaped fill would pin (which a hand-sized 12KB
+         * buffer would pass while still truncating real quoted mail). */
         drop_reset();
         drop_msg_t m, r;
         static char line[DROP_LINE_MAX];
@@ -479,16 +482,18 @@ int main(int argc, char **argv) {
         m.ts = 100;
         drop_str_copy(m.from, sizeof(m.from), "alice");
         drop_str_copy(m.to, sizeof(m.to), "bob");
-        memset(m.text, 'x', DROP_TEXT_LEN);
+        for (int k = 0; k < DROP_TEXT_LEN; k++) m.text[k] = (k & 1) ? '\\' : '"';
         m.text[DROP_TEXT_LEN] = '\0';
-        memset(m.link, 'y', DROP_LINK_LEN);
+        for (int k = 0; k < DROP_LINK_LEN; k++) m.link[k] = (k & 1) ? '"' : '\\';
         m.link[DROP_LINK_LEN] = '\0';
         int n = drop_msg_format_jsonl(&m, line, sizeof(line));
-        check(n < (int)sizeof(line) - 1, "the line buffer holds a max-size message");
+        check(n < (int)sizeof(line) - 1, "the line buffer holds the escaped worst case");
         check(line[n - 1] == '\n', "with its newline intact");
         check(drop_parse_line(line, &r), "and it parses back");
         check((int)strlen(r.text) == DROP_TEXT_LEN, "with every text byte");
         check((int)strlen(r.link) == DROP_LINK_LEN, "and every link byte");
+        check(memcmp(r.text, m.text, DROP_TEXT_LEN) == 0,
+              "and every quote/backslash round-trips unaltered");
     }
 
     printf("torn append is sealed, never merged\n");

@@ -326,6 +326,64 @@ echo "drop-mirror.sh"
     if [ "$leftovers" = "0" ]; then ok "no tmp files left behind"; else bad "no tmp files left behind"; fi
 }
 
+echo "handle derivation (drop_resolve_handle)"
+{
+    # Resolve in a clean subshell: unset DROP_HANDLE, cd somewhere, source
+    # the common file, ask it for a handle. DROP_URL is exported so the
+    # env-file fallback stays inert.
+    resolve() {  # resolve <dir> [explicit]; echoes the handle or nothing
+        (
+            cd "$1" || exit 1
+            if [ -n "${2:-}" ]; then export DROP_HANDLE="$2"; else unset DROP_HANDLE; fi
+            # shellcheck source=drop-common.sh
+            # shellcheck disable=SC1091
+            . "$here/drop-common.sh"
+            drop_resolve_handle && printf '%s' "$DROP_HANDLE"
+        )
+    }
+
+    git init -q "$work/cleanrepo"
+    mkdir -p "$work/cleanrepo/sub/dir"
+    got="$(resolve "$work/cleanrepo/sub/dir")"
+    if [ "$got" = "cleanrepo" ]; then ok "in a repo: derives the repo-root basename"; else bad "in a repo: derives the repo-root basename (got '$got')"; fi
+
+    got="$(resolve "$work/cleanrepo/sub/dir" "my-override")"
+    if [ "$got" = "my-override" ]; then ok "explicit DROP_HANDLE wins over derivation"; else bad "explicit DROP_HANDLE wins (got '$got')"; fi
+
+    # A non-repo dir: /tmp workdir is not under git, so it falls to PWD.
+    mkdir -p "$work/plaindir"
+    got="$(resolve "$work/plaindir")"
+    if [ "$got" = "plaindir" ]; then ok "outside a repo: derives the PWD basename"; else bad "outside a repo: derives the PWD basename (got '$got')"; fi
+
+    # Spaces, dots and punctuation collapse to the server charset.
+    mkdir -p "$work/My.Weird Repo!!"
+    got="$(resolve "$work/My.Weird Repo!!")"
+    if [ "$got" = "My-Weird-Repo" ]; then ok "a messy dir name sanitizes to the charset"; else bad "a messy dir name sanitizes to the charset (got '$got')"; fi
+
+    # Over-long names truncate to 32.
+    mkdir -p "$work/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaBBBB"
+    got="$(resolve "$work/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaBBBB")"
+    if [ "${#got}" -le 32 ] && [ -n "$got" ]; then ok "an over-long name truncates to <=32 ($got)"; else bad "an over-long name truncates to <=32 (got '$got' len ${#got})"; fi
+
+    # A name that is nothing but punctuation yields no handle -> fail loud.
+    mkdir -p "$work/@@@"
+    got="$(resolve "$work/@@@")"
+    if [ -z "$got" ]; then ok "an all-punctuation name derives nothing (fails loud, no garbage handle)"; else bad "an all-punctuation name should derive nothing (got '$got')"; fi
+
+    # And a hook run from a repo with no DROP_HANDLE actually fetches under
+    # the derived handle: the mock logs the URL it was given.
+    rm -f "$work/curl.log"
+    (
+        cd "$work/cleanrepo" || exit 1
+        unset DROP_HANDLE
+        MOCK_FETCH="$work/fix/inbox_empty.json" MOCK_CURL_LOG="$work/curl.log" \
+            bash "$here/hooks/prompt-inject.sh"
+    ) >/dev/null 2>&1
+    if grep -q "handle=cleanrepo" "$work/curl.log" 2>/dev/null; then
+        ok "a hook with no DROP_HANDLE fetches under the derived handle"
+    else bad "a hook with no DROP_HANDLE fetches under the derived handle"; fi
+}
+
 printf '\n%d checks, %d failed — %s\n' "$((pass + fail))" "$fail" \
     "$([ "$fail" -eq 0 ] && echo "all passed" || echo FAILED)"
 [ "$fail" -eq 0 ]
