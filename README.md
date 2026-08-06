@@ -155,6 +155,12 @@ cd seeds/esp32
 pio run -t upload
 ```
 
+The T-Embed seed exposes `GET /panel` and `POST /panel` for eight transient
+home pages. A panel can be plain `text`, a `kv` table, `bars`, a `sparkline`,
+or a large `status` value. Omitting `kind` preserves the original
+`{key,title,body,ttl_s,pos}` text contract; the device's `/skill` response
+documents the bounded fields for every structured kind.
+
 **PDP-11 (2.11BSD):**
 ```
 cc -o seed seed.c

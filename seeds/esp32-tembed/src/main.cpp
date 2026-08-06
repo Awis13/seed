@@ -82,6 +82,35 @@
 // down. See the watchdog in loop() for why this number.
 #define OTA_STALL_TIMEOUT_MS 30000
 
+/*
+ * What the CPU runs at, all the time.
+ *
+ * The board definition says 240MHz and nothing ever changed it. This device is
+ * a pager: it waits. Its loop() ends in a delay of up to 10ms — one, while an
+ * IR blast wants the pass back sooner — so the idle task is in WAITI for the
+ * overwhelming majority of every second, and the S3 datasheet's own
+ * current table (Table 5-9, WAITI, Typ2 — modem sleep, which is the case here)
+ * puts 240MHz about 11.5mA above 80MHz. That is 18% of this device's 65mA
+ * floor, bought with one line and no behaviour to reason about.
+ *
+ * ALWAYS, not only while idle, for two reasons. The saving is a floor cost paid
+ * every second the device is awake, and the busiest thing this firmware does is
+ * clock bit streams out of the RMT and I2S peripherals — which run off APB and
+ * do not get faster with the core. And changing it at runtime would mean
+ * changing it underneath whatever is mid-flight; a setting that never moves has
+ * no such moment.
+ *
+ * 80 AND NOT LOWER, which is the part that would be a hardware claim if it were
+ * left implicit. APB_CLK is held at 80MHz whenever the CPU is fed from the PLL,
+ * which covers 240, 160 and 80 — every peripheral's timebase is unchanged
+ * across all three. At 40 and 20 the core switches to the crystal and APB
+ * FOLLOWS IT DOWN, which retimes the RMT: that is the IR transmitter and the
+ * LED ring, both of which would start producing waveforms nothing recognises.
+ * Checked against the SoC's own rtc_clk.c rather than assumed. Do not go below
+ * 80 without measuring what came out of GPIO2.
+ */
+#define CPU_MHZ 80
+
 // What a running IR blast calls itself on the progress bar, and how long that
 // job outlives its last update. The label is a key as well as a caption, so it
 // is a constant rather than a literal typed twice: publishing under one string
@@ -346,6 +375,16 @@ static void probe_cc1101() {
 static void battery_probe();
 static void battery_refresh();
 
+// The backlight is declared here for the same shape of reason, one step earlier
+// in the boot: display_init() has to light the panel the moment there is
+// something on it to light, and that is long before skills_init() runs. So the
+// bring-up — pin, stored level, first pulse train — is called from there and
+// only the skill's registration waits for the skill list. GPIO21 is the enable
+// pin of an AW9364 rather than a transistor's gate, which is why this is a
+// function at all instead of the two lines it replaces; the protocol and the
+// reason a level is not a PWM duty are at the head of skills/backlight.cpp.
+static void backlight_begin();
+
 // The charger shares that I2C bus and is a separate skill because it is a
 // separate part with a separate failure: charger_probe() sets four registers on
 // the BQ25896 — the termination current above all, which on the power-on value
@@ -418,9 +457,10 @@ static unsigned long boot_time = 0;
 // password is rolled on every raise and exists only in this variable and on the
 // screen — never persisted, never sent anywhere.
 //
-// A gesture-raised session is time-boxed: someone may have leaned on the key,
-// and the radio must not then stay up forever. The boot-time session does not
-// expire, because with no working credentials the AP is the only way in.
+// A session raised from the menu is time-boxed: somebody opens it, walks away
+// and forgets, and the radio must not then stay up forever. The boot-time
+// session does not expire, because with no working credentials the AP is the
+// only way in.
 #define AP_SESSION_MS (10UL * 60UL * 1000UL)
 static bool ap_active = false;
 static String ap_password = "";
@@ -546,7 +586,7 @@ static bool clock_local_time(struct tm &out) {
 //
 // The last two rows switch with the connectivity mode: on the network they
 // carry RSSI and the mDNS name, in setup mode the AP name, its one-shot
-// password and the auth token, and offline the gesture that raises the AP.
+// password and the auth token, and offline the way back to the setup AP.
 //
 // Three colours only: warm white for the digits, slate for everything
 // secondary, one amber accent (seconds, and the AP password in setup mode).
@@ -632,6 +672,13 @@ static bool notify_crit_unread();
 // inside it right now.
 static bool ring_night_armed();
 static bool ring_night_now();
+
+// Defined in ui.h, which is included last of all: the idle clock the backlight
+// policy runs on. Declared up here because ap_start() below has to stamp it —
+// raising the setup AP is the offline recovery path, it puts a one-session
+// password on the screen and nowhere else, and a password drawn onto a panel
+// the policy has blanked is a password nobody can read.
+static void ui_note_input();
 
 static bool display_ready = false;
 // Set from the web server task, consumed by the clock tick in loop(): TFT_eSPI
@@ -722,9 +769,10 @@ static void display_init() {
     tft.init();
     tft.setRotation(3);  // 320x170 landscape, knob on the right
     tft.fillScreen(COL_BG);
-    // Backlight only after the panel is initialized — avoids a garbage flash
-    pinMode(PIN_TFT_BL, OUTPUT);
-    digitalWrite(PIN_TFT_BL, HIGH);
+    // Backlight only after the panel is initialized — avoids a garbage flash.
+    // GPIO21 is not a switch: it clocks an AW9364, and the level it comes up at
+    // is the stored one rather than full. See skills/backlight.cpp.
+    backlight_begin();
 
     clock_w = tft.textWidth("00:00", 8);
     sec_w = tft.textWidth("00", 4);
@@ -817,7 +865,7 @@ static void display_tick() {
     // screen is their only channel, so nothing else has to carry them.
     char row1l[32], row1r[32], row2[48];
     if (ap_active) {
-        // A gesture-raised AP is time-boxed, so say how long it has left.
+        // An AP raised from the menu is time-boxed, so say how long it has left.
         unsigned long mins = ap_minutes_left();
         if (mins > 0) {
             snprintf(row1l, sizeof(row1l), "AP %s  %lum", ap_ssid.c_str(), mins);
@@ -833,13 +881,17 @@ static void display_tick() {
     } else {
         snprintf(row1l, sizeof(row1l), "WiFi offline");
         row1r[0] = '\0';
-        snprintf(row2, sizeof(row2), "hold KEY 3s for setup AP");
+        // The route in, said on the one screen somebody standing in front of
+        // an offline device is looking at. It names the menu row rather than a
+        // key to hold: the AP is raised from Setup AP in the menu, and from
+        // nowhere else on the device.
+        snprintf(row2, sizeof(row2), "click for menu > Setup AP");
     }
     // A running job borrows the note row for its label and the band under it
     // for its bar, but only when the row is otherwise empty: the token and the
-    // setup gesture have nowhere else to be displayed. Whose job it is has
-    // already been decided by then — this reads the winner, it does not choose
-    // between suppliers.
+    // way back to the setup AP have nowhere else to be displayed. Whose job it
+    // is has already been decided by then — this reads the winner, it does not
+    // choose between suppliers.
     int bar_pct = -1;
     if (row2[0] == '\0') progress_status_line(row2, sizeof(row2), &bar_pct);
 
@@ -882,7 +934,16 @@ static void display_status() {
 // that the eye keeps re-detecting, which is right for an alarm demanding an
 // action in the next second and wrong for a device sitting on a shelf saying
 // "there is something here for you". The ramp reads as present rather than
-// urgent, and it never goes dark, so the rule never looks broken.
+// urgent, and its own colour never reaches black, so the rule never looks
+// broken.
+//
+// That is a statement about the ramp and not about the panel, which the idle
+// policy can take down under it — so it is worth being exact about what keeps
+// this visible. An unread critical never expires, and while one is outstanding
+// skills/backlight.cpp holds the panel at its dim step rather than blanking it.
+// Dim, not off: this line is still on the screen and still breathing, which is
+// the whole reason that floor is there. It is the only indication left inside
+// the ring's night window, where the ring is silent by a rule of its own.
 //
 // Cost is one drawFastHLine of 304 pixels per step — about 0.25ms of SPI at
 // 40MHz, twelve times a second, and nothing at all when no critical is
@@ -999,9 +1060,6 @@ static bool wifi_save_config(const String &ssid, const String &pass) {
 // POST /firmware/upload, i.e. arbitrary code on a box behind the firewall.
 // The other seeds still ship that pattern and need the same treatment.
 
-// How long the user key must be held to raise the AP.
-#define AP_KEY_HOLD_MS 3000
-
 // The AP subnet is pinned rather than left on the ESP-IDF default of
 // 192.168.4.1/24. from_setup_ap() decides "this client came in over the setup
 // AP" by matching the first three octets, so an AP subnet that a STA network
@@ -1070,6 +1128,16 @@ static void ap_start(bool temporary) {
     event_add("setup AP up: %s", ap_ssid.c_str());  // SSID only, never the password
     mdns_restart();
     display_force = true;  // the password is only readable off the screen
+    // ...and only if the panel is lit, which is why this stamps the idle clock
+    // rather than trusting whatever led here to have stamped it. The menu row
+    // is the caller that already did — a click is input — but wifi_setup() is
+    // the other one, and it raises the AP from boot with nobody having touched
+    // the device at all. What goes on the panel either way is a fresh random
+    // password that exists nowhere else, so the stamp belongs with the act that
+    // creates it and not with the routes into it. Raising the AP is somebody
+    // standing in front of the device by definition, or is the moment the
+    // device has most to say to whoever walks up to it next.
+    ui_note_input();
 }
 
 static void ap_stop() {
@@ -1096,31 +1164,12 @@ static void ap_poll() {
         ap_stop();
         return;
     }
-    // Nobody reprovisioned in time: close the window the gesture opened. The
+    // Nobody reprovisioned in time: close the window the menu opened. The
     // subtraction is rollover-safe as long as it stays in signed arithmetic.
     if (ap_temporary && (long)(millis() - ap_expires_at) >= 0) {
         event_add("setup AP expired");
         ap_stop();
     }
-}
-
-// The only way to raise the AP after boot: hold the user key for three seconds.
-// Physical presence, not network reachability, is what authorises provisioning,
-// so nothing remote can ask for the AP back. Contact bounce reads as a release
-// and restarts the timer, which is debounce enough for a hold this long.
-static void ap_key_poll() {
-    static unsigned long held_since = 0;
-    static bool fired = false;
-
-    if (digitalRead(PIN_USER_KEY) != LOW) {  // active low
-        held_since = 0;
-        fired = false;
-        return;
-    }
-    if (held_since == 0) held_since = millis();
-    if (fired || millis() - held_since < AP_KEY_HOLD_MS) return;
-    fired = true;
-    if (!ap_active) ap_start(true);  // time-boxed: see AP_SESSION_MS
 }
 
 static void wifi_setup() {
@@ -1582,9 +1631,9 @@ static void handle_skill(AsyncWebServerRequest *request) {
     s += "- Battery telemetry: BQ27220 fuel gauge at I2C 0x55 (SDA=8, SCL=18), not an ADC\n";
     s += "- Flashing over USB-Serial/JTAG needs `--after watchdog_reset`\n";
     s += "- The clock runs on UTC until POST /clock/tz stores a POSIX TZ string in SPIFFS\n";
-    s += "- The setup AP is only up during provisioning: hold the user key (GPIO6) 3s to\n";
-    s += "  raise it, with a fresh random password shown on the device screen. A\n";
-    s += "  gesture-raised AP closes itself after 10 minutes if nothing reprovisions\n";
+    s += "- The setup AP is only up during provisioning: raise it from Setup AP in the\n";
+    s += "  on-device menu, with a fresh random password shown on the device screen. An\n";
+    s += "  AP raised that way closes itself after 10 minutes if nothing reprovisions\n";
     s += "- POST /wifi/config needs the token unless the request comes over that AP\n";
     s += "- Paths match exactly: `/health/` is not `/health` and returns 404. Nothing\n";
     s += "  here generates a trailing slash, but a client that appends one will break.\n";
@@ -1592,11 +1641,13 @@ static void handle_skill(AsyncWebServerRequest *request) {
     s += "  `/ir/tvbgone/stop` and started a blast instead of aborting one\n";
     s += "- An OTA upload whose connection dies is torn down after 30s without data,\n";
     s += "  so a dropped transfer no longer blocks every later one until reboot\n";
-    s += "- The encoder button opens an on-device menu (messages, TV-B-Gone, setup AP,\n";
-    s += "  info). TV-B-Gone holds the three region blasts and a by-brand list of the\n";
-    s += "  nine named codes. It drives the same code paths as the API and has no\n";
-    s += "  endpoints of its own, so a job started here shows up in\n";
-    s += "  GET /ir/tvbgone/status like any other\n";
+    s += "- The encoder button opens an on-device menu (messages, quiet hours,\n";
+    s += "  backlight, auto-dim, TV-B-Gone, setup AP, info) — the rows in that\n";
+    s += "  order, and this list is the only place they are written down, so a row\n";
+    s += "  added to ui_items[] has to be added here too. TV-B-Gone holds the three\n";
+    s += "  region blasts and a by-brand list of the nine named codes. It drives the\n";
+    s += "  same code paths as the API and has no endpoints of its own, so a job\n";
+    s += "  started here shows up in GET /ir/tvbgone/status like any other\n";
     s += "- POST /notify makes this a pager: the message appears on the screen at once\n";
     s += "  if the device is idle, and the clock face carries an unread count until\n";
     s += "  somebody acknowledges it with the knob or POST /notify/ack\n";
@@ -1717,6 +1768,7 @@ static void handle_wifi_post(AsyncWebServerRequest *request) {
 #include "skills/serial.cpp"
 #include "skills/ir.cpp"
 #include "skills/notify.cpp"
+#include "skills/panel.cpp"
 /* After notify.cpp, for the JSON response helpers, and after nothing else: the
    fuel gauge is its own hardware and no skill reads it. Its probe runs earlier
    than this, from hw_probe(), through the two forward declarations above it —
@@ -1733,6 +1785,11 @@ static void handle_wifi_post(AsyncWebServerRequest *request) {
    publish into it and it publishes into nothing, which is the direction that
    lets a third supplier be added without touching this list. */
 #include "skills/progress.cpp"
+/* After notify.cpp, for the JSON response helpers its endpoints borrow, and
+   before ui.h, which draws its menu row. It reads no skill and no skill reads
+   it: it owns one pin and the part on the end of it. Its bring-up already ran,
+   from display_init(), for the reason given at the forward declaration. */
+#include "skills/backlight.cpp"
 /* After notify.cpp, which it reads for the unread level it breathes, and before
    ui.h, which hands it every encoder detent. */
 #include "skills/ring.cpp"
@@ -1756,6 +1813,7 @@ static void skills_init() {
     skill_serial_init();
     skill_ir_init();
     skill_notify_init();
+    skill_panel_init();
     /* Only a registration: the gauge was read at boot by hw_probe() and the
        cache behind GET /battery was filled there. */
     skill_battery_init();
@@ -1766,9 +1824,13 @@ static void skills_init() {
        already zeroed. It is here rather than first only to match the include
        order above. */
     skill_progress_init();
+    /* A registration and nothing else: the pin was configured and the stored
+       level applied at display_init(), before the network existed. */
+    skill_backlight_init();
     /* Last, and after skill_ir_init() in particular: the two share the four RMT
        TX memory blocks this chip has, IR takes two of them, and whichever runs
-       first gets what it asks for. */
+       first gets what it asks for. The backlight above competes for none of
+       them — it clocks its own pin from the CPU, for want of a third channel. */
     skill_ring_init();
     /* No such contention here: the I2S channel comes from a different
        peripheral entirely, and the ESP32-S3 has two ports for one consumer. */
@@ -1836,6 +1898,12 @@ void setup() {
     pinMode(PIN_PWR_EN, OUTPUT);
     digitalWrite(PIN_PWR_EN, HIGH);
 
+    // Then the clock, before anything is brought up on it: the UART's divider,
+    // the radio and every peripheral configured below are set from whatever
+    // this is, so moving it afterwards would mean moving it under them. See
+    // CPU_MHZ for the 11.5mA and for why 80 is the floor.
+    setCpuFrequencyMhz(CPU_MHZ);
+
     // Park all chip-selects on the shared SPI bus before anyone talks on it
     pinMode(PIN_TFT_CS, OUTPUT);
     digitalWrite(PIN_TFT_CS, HIGH);
@@ -1844,7 +1912,7 @@ void setup() {
     pinMode(PIN_SD_CS, OUTPUT);
     digitalWrite(PIN_SD_CS, HIGH);
 
-    // Read-only: the hold-to-raise-AP gesture is the only user of this pin.
+    // Read-only: ui_button_poll() is the only user of this pin.
     pinMode(PIN_USER_KEY, INPUT_PULLUP);
 
     Serial.begin(115200);
@@ -1876,7 +1944,10 @@ void setup() {
             WiFi.softAPIP().toString().c_str(), HTTP_PORT, ap_ssid.c_str());
     }
 
-    event_add("seed started v%s", SEED_VERSION);
+    // The clock is read back rather than reported from CPU_MHZ: this line is
+    // how a battery measurement is tied to what the chip actually settled on.
+    event_add("seed started v%s (cpu %u MHz)", SEED_VERSION,
+              (unsigned)getCpuFrequencyMhz());
 }
 
 void loop() {
@@ -1945,10 +2016,8 @@ void loop() {
         last_wifi = millis();
     }
 
-    // Retire the provisioning AP once it has done its job, and watch the user
-    // key for the gesture that brings it back. Both polls are non-blocking.
+    // Retire the provisioning AP once it has done its job. Non-blocking.
     ap_poll();
-    ap_key_poll();
 
     // Starts frames and collects completions; the transmission itself runs in
     // the RMT peripheral. Advances as far as it can each pass and never blocks.
@@ -1980,12 +2049,16 @@ void loop() {
     // one task that is allowed to spend milliseconds.
     notify_poll();
 
+    // Retire expired home-page data. This only invalidates the clock cache;
+    // panel.cpp owns no drawing, wake, input, or backlight behaviour.
+    panel_poll();
+
     // The microphone: the hold-to-record gesture on the encoder key, and the
     // drain of whatever the I2S receive DMA has collected. Before ui_poll() so
     // that a recording started on this pass puts its screen up on this pass —
     // and it is here rather than inside ui_poll() because the gesture reads the
-    // pin level directly, the way ap_key_poll() does, and shares nothing with
-    // the click state machine but the pin itself. Idle cost is a digitalRead.
+    // pin level directly rather than through the click state machine, and
+    // shares nothing with it but the pin itself. Idle cost is a digitalRead.
     mic_poll();
 
     // The uploader's loop-task half, and only that half: the transfer itself
@@ -2026,6 +2099,28 @@ void loop() {
     // Composes a frame at most every 25ms, sends one only when it differs from
     // the last, and hands the bit stream to the RMT peripheral without waiting.
     ring_poll();
+
+    // What the backlight SHOULD be at, which is a question about the idle clock
+    // and not about the part: ui.h owns the timestamp and knows which screens
+    // are live output, skills/backlight.cpp owns the thresholds and the switch.
+    //
+    // Here rather than inside ui_poll() because ui_poll() returns early from
+    // nearly every path — including unconditionally from the clock face, which
+    // is the screen this device wears all day. See ui_backlight_idle().
+    // Immediately above the poll that carries it out, so a level decided on this
+    // pass reaches the panel on this pass.
+    ui_backlight_idle();
+
+    // The backlight, on the same terms: the endpoints and the menu record a
+    // wanted level and this is the only place the part is ever clocked, because
+    // its pulse train is relative to the step the part is already standing on
+    // and two of them interleaved would leave it on neither. Two comparisons
+    // when nothing has changed, which is almost every pass; a change costs one
+    // train of at most fifteen pulses — some tens of microseconds — with
+    // interrupts held off this core for the length of it so that no gap in the
+    // wave is stretched past the 500us the part allows. See
+    // skills/backlight.cpp.
+    backlight_poll();
 
     // The speaker, on the same terms again: loop() owns the I2S channel and any
     // open cue file, the endpoints only stage a request. Feeds the DMA with

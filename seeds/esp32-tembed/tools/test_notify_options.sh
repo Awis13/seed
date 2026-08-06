@@ -125,6 +125,67 @@ fi
 printf '  ok:   %s refusal path(s), each clearing the id it had read\n' \
     "$(printf '%s\n' "$body" | grep -c 'return false')"
 
+# --- The other rule the C tests below cannot reach at all ---
+#
+# notify_describe() is the only account of these field widths anybody outside
+# the firmware ever gets: it is what the skill catalogue serves and what the
+# person writing the curl reads. It is a string constant, it sits outside every
+# host-test region, and nothing below compiles it — so the widths it states can
+# drift from the widths the fields have while every test here stays green. That
+# was checked rather than assumed: putting the old "title 40, body 96" back
+# leaves all ten scripts in this directory and `pio run -e tembed` clean.
+#
+# So it is read as text, and read against the constants rather than against a
+# number written out a second time here. Every "<field> N" it states has to
+# match that field's #define less its terminator. Asking only that the right
+# numbers are present would not be a gate at all: a stale line sitting beside a
+# correct one contains both, and a containment check sees only the one it was
+# told to look for. Each stated number is checked on its own, and a field that
+# stopped being described is a failure too — a gate that passes because the
+# sentence went away is not a gate.
+desc="$(awk '
+    /^static const char \*notify_describe\(\)/ { inf = 1 }
+    inf                                        { print }
+    inf && /^}/                                { exit }
+' "$src")"
+
+[ -n "$desc" ] || { echo "cannot find notify_describe() in $src"; exit 1; }
+
+echo "the widths described to callers are the widths the fields have"
+field_chars() {   # the #define, less the byte the terminator takes
+    grep -E "^#define $1[[:space:]]" "$src" | awk '{print $3 - 1}'
+}
+stated="$(printf '%s\n' "$desc" | grep -oE '(title|body|source|id) [0-9]+' || true)"
+drift=""
+seen=""
+while read -r field n; do
+    [ -n "$field" ] || continue
+    case "$field" in
+        title)  want="$(field_chars NOTIFY_TITLE_LEN)"  ;;
+        body)   want="$(field_chars NOTIFY_BODY_LEN)"   ;;
+        source) want="$(field_chars NOTIFY_SOURCE_LEN)" ;;
+        id)     want="$(field_chars NOTIFY_KEY_LEN)"    ;;
+    esac
+    [ -n "$want" ] || { echo "cannot read the constant behind '$field' in $src"; exit 1; }
+    seen="$seen $field"
+    [ "$n" = "$want" ] ||
+        drift="$drift          $field: described as $n, the field holds $want"$'\n'
+done <<< "$stated"
+for field in title body source id; do
+    case " $seen " in
+        *" $field "*) ;;
+        *) drift="$drift          $field: no width described for it any more"$'\n' ;;
+    esac
+done
+if [ -n "$drift" ]; then
+    printf '  FAIL: notify_describe() and the field it describes disagree, so a\n'
+    printf '        caller is being told a length that is not enforced:\n'
+    printf '%s' "$drift"
+    exit 1
+fi
+printf '  ok:   %s width(s) described, each matching its constant\n' \
+    "$(printf '%s\n' "$stated" | grep -c .)"
+
 json="${ARDUINOJSON_DIR:-$here/../.pio/libdeps/tembed/ArduinoJson/src}"
 if [ ! -f "$json/ArduinoJson.h" ]; then
     echo "cannot find ArduinoJson.h under $json"
@@ -513,6 +574,130 @@ int main(void) {
         check_str(dst, "aaaaaaa", "and pure ASCII fills the field to the last byte");
         notify_copy_text(dst, sizeof(dst), "");
         check_str(dst, "", "an empty string copies to an empty field");
+    }
+
+    printf("the constants, the struct and the queue entry agree on the widths\n");
+    {
+        /* The constants and the struct are checked separately on purpose. A
+           field widened in one place and not the other is a queue that accepts
+           what it cannot hold, and neither half says so on its own. */
+        check(NOTIFY_TITLE_LEN == 65, "a title field holds 64 characters and a terminator");
+        check(NOTIFY_BODY_LEN == 257, "a body field holds 256 characters and a terminator");
+
+        /* The device pins this with a static_assert, which cannot live here:
+           the number is a statement about the device's RAM and a host laid out
+           differently would refuse to compile rather than report. So it is
+           checked at run time, where the number it got can be printed. It does
+           hold on an ordinary 64-bit host — the padding the device spends after
+           its 32-bit `unsigned long` is what that host spends on a wider one. */
+        if (sizeof(Notification) != 392) {
+            printf("  FAIL: a queue entry is %u bytes here, not 392\n",
+                   (unsigned)sizeof(Notification));
+            failures++;
+        } else {
+            printf("  ok:   a queue entry is 392 bytes\n");
+        }
+
+        /* Through the real fields rather than through a local sized from the
+           constant, so that a struct whose members drifted from the constants
+           above cannot pass this. */
+        Notification e;
+        memset(&e, 0, sizeof(e));
+        char long_title[200], long_body[600];
+        memset(long_title, 'T', sizeof(long_title) - 1);
+        long_title[sizeof(long_title) - 1] = '\0';
+        memset(long_body, 'B', sizeof(long_body) - 1);
+        long_body[sizeof(long_body) - 1] = '\0';
+        notify_copy_text(e.title, sizeof(e.title), long_title);
+        notify_copy_text(e.body, sizeof(e.body), long_body);
+        check(strlen(e.title) == 64, "a title longer than the field is cut to 64 bytes");
+        check(strlen(e.body) == 256, "and a body to 256");
+    }
+
+    printf("the cut still lands on a character at the new width\n");
+    {
+        /* The width the cut runs at changed, so the boundary case is re-asked
+           at the width the fields actually have rather than only at the small
+           one above: 63 ASCII and then a two-byte character has exactly one
+           byte of room left, which is half a character and must go. */
+        Notification e;
+        memset(&e, 0, sizeof(e));
+        char s[NOTIFY_TITLE_LEN + 8];
+        memset(s, 'a', 63);
+        s[63] = '\0';
+        strcat(s, "\xc3\xa9\xc3\xa8");
+        notify_copy_text(e.title, sizeof(e.title), s);
+        check(strlen(e.title) == 63, "a character straddling the end of a title is dropped whole");
+        check(strncmp(e.title, s, 63) == 0, "and the 63 bytes before it are what was sent");
+
+        /* One byte earlier the same character fits exactly, so the field ends
+           on the last byte it has room for and nothing is given back. */
+        memset(s, 'a', 62);
+        s[62] = '\0';
+        strcat(s, "\xc3\xa9\xc3\xa8");
+        notify_copy_text(e.title, sizeof(e.title), s);
+        check(strlen(e.title) == 64, "one that ends exactly on the last byte is kept");
+        check((unsigned char)e.title[63] == 0xa9, "with its second byte still there");
+    }
+
+    printf("a control byte arrives as a space\n");
+    {
+        /* JSON escapes seven sequences and writes every other byte below 0x20
+           out raw, so one of these stored is a document GET /notify serves that
+           a strict reader may reject — and the same bytes go into the snapshot
+           file. A pager replaces them rather than refusing the message. */
+        Notification e;
+        memset(&e, 0, sizeof(e));
+        int bad = 0;
+        for (int c = 0x01; c <= 0x1F; c++) {
+            char s[4] = { 'a', (char)c, 'b', '\0' };
+            notify_copy_text(e.title, sizeof(e.title), s);
+            if (strcmp(e.title, "a b") != 0) { bad++; printf("  ..   0x%02X came back as \"%s\"\n", c, e.title); }
+        }
+        check(bad == 0, "every byte from 0x01 to 0x1F becomes one space");
+        {
+            char s[4] = { 'a', (char)0x7F, 'b', '\0' };
+            notify_copy_text(e.title, sizeof(e.title), s);
+            check_str(e.title, "a b", "and so does 0x7F");
+        }
+
+        /* The printable range is the one thing a filter like this can quietly
+           take away, so it is asked for byte by byte rather than sampled. */
+        bad = 0;
+        for (int c = 0x20; c <= 0x7E; c++) {
+            char s[4] = { 'a', (char)c, 'b', '\0' };
+            notify_copy_text(e.title, sizeof(e.title), s);
+            if ((unsigned char)e.title[1] != (unsigned char)c || strlen(e.title) != 3) {
+                bad++;
+                printf("  ..   0x%02X came back as 0x%02X\n", c, (unsigned char)e.title[1]);
+            }
+        }
+        check(bad == 0, "and everything from 0x20 to 0x7E passes through unchanged");
+
+        /* The rule stops at 0x80. Above it the bytes are the tail of a UTF-8
+           character the cut has already kept whole, the serialiser hands them
+           back as they are, and blanking them would damage text the API is
+           contracted to return intact. */
+        notify_copy_text(e.title, sizeof(e.title), "\xc3\xa9\xc3\xa8 \xe2\x9c\x93 \xf0\x9f\x94\x94");
+        check_str(e.title, "\xc3\xa9\xc3\xa8 \xe2\x9c\x93 \xf0\x9f\x94\x94",
+                  "a two-, three- and four-byte character all pass through untouched");
+
+        /* A run stays a run. Collapsing one would move every byte after it and
+           make the cut above and this share an offset they do not share. */
+        notify_copy_text(e.title, sizeof(e.title), "a\r\n\tb");
+        check_str(e.title, "a   b", "a run of them becomes the same number of spaces");
+        check(strlen(e.title) == 5, "so the length is the length that arrived");
+
+        /* Both rules on the same copy: the tab is replaced, and the character
+           that straddles the end of the field is still dropped whole. */
+        char s[NOTIFY_TITLE_LEN + 8];
+        s[0] = 'a'; s[1] = '\t';
+        memset(s + 2, 'a', 61);
+        s[63] = '\0';
+        strcat(s, "\xc3\xa9");
+        notify_copy_text(e.title, sizeof(e.title), s);
+        check(strlen(e.title) == 63, "a field that is both filtered and cut is still cut on a character");
+        check(e.title[1] == ' ', "and still filtered");
     }
 
     printf("a snapshot written by this firmware, read back by it\n");
@@ -1002,6 +1187,16 @@ int main(void) {
         check(restore_text("{\"id\":5,\"ti\":\"q\",\"sr\":\"\xd0\xb4\xd0\xb0\xd0\xb4\xd0\xb0\"}",
                            out, out_op, now), "a source of multi-byte characters");
         check(strlen(out.source) < NOTIFY_SOURCE_LEN, "is cut to the field");
+
+        /* The cut is not the only thing the restore path owes the file. A
+           control byte in a stored title has to be blanked here too — a file
+           written by an older firmware carries them, and GET /notify serves
+           what was restored. Nothing but this notices an snprintf() inlined on
+           that path: the entry would restore, read correctly, and put the byte
+           straight back on the wire. */
+        check(restore_text("{\"id\":5,\"ti\":\"a\\u0001b\"}", out, out_op, now),
+              "a stored title carrying a control byte");
+        check_str(out.title, "a b", "comes back filtered, like one that was posted");
     }
 
     printf("an older file, and a newer one\n");

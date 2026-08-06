@@ -11,12 +11,14 @@
  * T-Embed CC1101 pin notes:
  *   GPIO15 — power hold: REFUSED for write/mode, LOW powers the board off
  *   GPIO33-37 — octal PSRAM bus: REFUSED, driving one crashes the board
+ *   GPIO21 — AW9364 backlight clock: REFUSED, an edge moves the brightness and
+ *     the skill that owns the level cannot see that it did
  *   USB: 19(D-), 20(D+) — the USB-CDC console, warn
  *   Strapping: 0, 3, 45, 46 — warn but allow
  *   Not available: 26-32 (no GPIO on ESP32-S3)
  *   I2C: 8(SDA), 18(SCL) — fuel gauge + charger, warn
  *   Shared SPI bus + chip selects (display/CC1101/SD): 9,10,11,12,13,41 — warn
- *   Display control: 16(TFT DC), 21(backlight) — warn
+ *   Display control: 16(TFT DC) — warn
  *   CC1101 GDO lines: 3(GDO0), 38(GDO2) — warn
  *   Onboard: encoder 4/5/0/6, WS2812 14, IR 2/1, mic 42/39 — warn
  *   ADC1: 1-10; ADC2: 11-20 (ADC2 unavailable with WiFi)
@@ -121,7 +123,17 @@ static const char *gpio_warning(int pin) {
     if (gpio_is_usb(pin)) return "USB D-/D+ — kills the USB console";
     if (gpio_is_i2c(pin)) return "I2C pin (fuel gauge/charger)";
     if (gpio_is_spi(pin)) return "shared SPI bus/chip select (display/CC1101/SD)";
-    if (gpio_is_display(pin)) return "display control pin (ST7789 DC/backlight)";
+    // Ahead of the shared display line, because writing this one is not a
+    // switch: it clocks the AW9364's 16-step dimming ladder, so a write here
+    // moves the brightness one step and leaves the backlight skill's idea of
+    // the level wrong. Refused rather than warned about, for the reason
+    // gpio_refuse_reason() gives; the level has an endpoint of its own, see
+    // skills/backlight.cpp. This line is what /gpio/list says about the pin.
+    if (pin == PIN_TFT_BL) return "backlight driver clock — refused; set the level with POST /backlight";
+    // The backlight is the other half of gpio_is_display() and the line above
+    // has already taken it, so what reaches here is the DC line and nothing
+    // else. Named for the one pin it can still answer for.
+    if (gpio_is_display(pin)) return "display control pin (ST7789 DC)";
     if (gpio_is_radio(pin)) return "CC1101 GDO line (radio status/interrupt)";
     if (gpio_is_onboard(pin)) return "onboard peripheral pin (encoder/LED/IR/mic)";
     if (gpio_is_strapping(pin)) return "strapping pin — may affect boot";
@@ -142,13 +154,29 @@ static const char *gpio_class(int pin) {
     return "free";
 }
 
-// Pins the seed refuses to drive over HTTP: both take the node down in a way
-// nobody can undo remotely. Returns the refusal message, or NULL if allowed.
+// Pins the seed refuses to drive over HTTP: each one takes the node down, or
+// part of it, in a way nobody can undo remotely. Returns the refusal message,
+// or NULL if allowed.
+//
+// The backlight pin is here rather than in gpio_warning() alone because a
+// warning rides on the 200 that is sent AFTER the write has already happened,
+// which makes it a post-mortem and not a guard. What it would be a post-mortem
+// for: the AW9364 has no readback, so skills/backlight.cpp's count of where the
+// part's counter stands is the only record of it that exists. A write here
+// clocks that counter and the firmware's model does not move, after which every
+// level it sets is wrong by the same amount with nothing to reveal it. Setting
+// the pin back to an input is worse — the part's internal pull-down then takes
+// EN low, the panel shuts down, and the skill still believes it is lit, so
+// nothing drives the line again. Both are impossible to reach if the pin is
+// refused before the write, which is what this does.
 static const char *gpio_refuse_reason(int pin) {
     if (gpio_is_power(pin))
         return "GPIO15 is the power hold pin — driving it powers the board off";
     if (gpio_is_psram(pin))
         return "GPIO33-37 carry the octal PSRAM bus — driving them crashes the board";
+    if (pin == PIN_TFT_BL)
+        return "GPIO21 clocks the AW9364 backlight driver, which has no readback — "
+               "set the brightness with POST /backlight instead";
     return NULL;
 }
 
@@ -179,12 +207,17 @@ static const char *gpio_describe() {
            "have nothing wired to them (43/44 = UART0, console runs over USB-CDC).\n\n"
            "Refused with 403 on write/mode:\n\n"
            "- GPIO15 (power hold): LOW powers the board off\n"
-           "- GPIO33-37 (octal PSRAM bus): driving one crashes the running app\n\n"
+           "- GPIO33-37 (octal PSRAM bus): driving one crashes the running app\n"
+           "- GPIO21 (backlight): not a switch — it clocks an AW9364's 16-step\n"
+           "  dimming ladder, which cannot be read back. A write moves the\n"
+           "  brightness and leaves the backlight skill's model of it wrong;\n"
+           "  setting the pin to an input blanks the panel with nothing left to\n"
+           "  notice. Use POST /backlight, which owns the level.\n\n"
            "Allowed but warned, with `class` in /gpio/list:\n\n"
            "- `usb` (19,20): USB D-/D+ — the console and the only recovery path\n"
            "- `i2c` (8,18): fuel gauge + charger\n"
            "- `spi` (9,10,11,12,13,41): shared bus + chip selects, display is active\n"
-           "- `display` (16,21): ST7789 DC and backlight enable\n"
+           "- `display` (16): ST7789 DC — 21 has the same `class` and is refused above\n"
            "- `radio` (3,38): CC1101 GDO0/GDO2\n"
            "- `onboard` (0,1,2,4,5,6,14,39,42): encoder, WS2812, IR, mic\n"
            "- `strapping` (0,3,45,46): may affect boot\n\n"
