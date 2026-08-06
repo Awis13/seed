@@ -446,6 +446,7 @@ static char ui_panel_key[PANEL_KEY_LEN] = "";
 static bool ui_panel_draw_valid = false;
 static bool ui_panel_draw_live = false;
 static uint8_t ui_panel_draw_font = 0;
+static PanelKind ui_panel_draw_kind = PANEL_KIND_TEXT;
 static char ui_panel_draw_key[PANEL_KEY_LEN] = "";
 /* Fade frames already drawn for the card in front, MSG_FADE_STEPS once done. */
 static uint8_t ui_card_fade = 0;
@@ -690,6 +691,19 @@ static_assert(MSG_LINE_LEN > UI_ROW_LEN,
 #define PANEL_EMPTY_TITLE_H     26
 #define PANEL_EMPTY_HINT_Y     102
 #define PANEL_EMPTY_HINT_H      16
+#define PANEL_GRAPH_X           12
+#define PANEL_GRAPH_Y           78
+#define PANEL_GRAPH_W          296
+#define PANEL_GRAPH_H           88
+#define PANEL_BAR_H              7
+#define PANEL_STATUS_DETAIL_Y   96
+#define PANEL_STATUS_FONT2_ROWS  4
+#define PANEL_STATUS_FONT1_ROWS  8
+#define PANEL_STATUS_FONT2_MAX_LINES \
+    (2 * (PANEL_DETAIL_LEN / PANEL_FONT2_FIT_MIN + 1) + 1)
+#define PANEL_STATUS_FONT1_MAX_LINES \
+    (2 * (PANEL_DETAIL_LEN / PANEL_FONT1_FIT_MIN + 1) + 1)
+#define PANEL_STATUS_WRAP_MAX_LINES PANEL_STATUS_FONT2_MAX_LINES
 
 struct UiPanelLayout {
     uint8_t font;
@@ -701,6 +715,12 @@ static UiPanelLayout ui_panel_layout(int font2_lines) {
     if (font2_lines <= PANEL_FONT2_ROWS)
         return {PANEL_FONT2, PANEL_FONT2_ROWS, PANEL_FONT2_PITCH};
     return {PANEL_FONT1, PANEL_FONT1_ROWS, PANEL_FONT1_PITCH};
+}
+
+static UiPanelLayout ui_panel_status_layout(int font2_lines) {
+    if (font2_lines <= PANEL_STATUS_FONT2_ROWS)
+        return {PANEL_FONT2, PANEL_STATUS_FONT2_ROWS, PANEL_FONT2_PITCH};
+    return {PANEL_FONT1, PANEL_STATUS_FONT1_ROWS, PANEL_FONT1_PITCH};
 }
 
 enum {
@@ -715,14 +735,47 @@ enum {
    content update can stay field-differential unless its font changes. */
 static uint8_t ui_panel_clear_plan(bool prior_valid, bool prior_live,
                                    bool next_live, bool same_page,
-                                   uint8_t prior_font, uint8_t next_font) {
+                                   uint8_t prior_font, uint8_t next_font,
+                                   PanelKind prior_kind, PanelKind next_kind) {
     if (!prior_valid || prior_live != next_live || !same_page ||
-        (next_live && prior_font != next_font)) return UI_PANEL_CLEAR_ALL;
+        (next_live && (prior_font != next_font || prior_kind != next_kind)))
+        return UI_PANEL_CLEAR_ALL;
     return 0;
 }
 
 static bool ui_panel_line_changed(const char *cache, const char *line) {
     return strncmp(cache, line, PANEL_BODY_LINE_LEN - 1) != 0;
+}
+
+static int ui_panel_bar_width(float value, float maximum, int width) {
+    if (!isfinite(value) || !isfinite(maximum) || maximum <= 0.0f || width <= 0)
+        return 0;
+    double pixels = (double)value * (double)width / (double)maximum;
+    if (pixels <= 0.0) return 0;
+    if (pixels >= width) return width;
+    return (int)pixels;
+}
+
+static int ui_panel_graph_x(uint8_t index, uint8_t count) {
+    if (count < 2) return PANEL_GRAPH_X;
+    return PANEL_GRAPH_X + ((int)index * (PANEL_GRAPH_W - 1)) / (count - 1);
+}
+
+static int ui_panel_graph_y(float value, float minimum, float maximum) {
+    if (!isfinite(value) || !isfinite(minimum) || !isfinite(maximum))
+        return PANEL_GRAPH_Y + PANEL_GRAPH_H / 2;
+    if (maximum <= minimum) return PANEL_GRAPH_Y + PANEL_GRAPH_H / 2;
+    double ratio = ((double)value - minimum) / ((double)maximum - minimum);
+    if (ratio < 0.0) ratio = 0.0;
+    if (ratio > 1.0) ratio = 1.0;
+    return PANEL_GRAPH_Y + PANEL_GRAPH_H - 1 -
+           (int)(ratio * (PANEL_GRAPH_H - 1));
+}
+
+static bool ui_panel_structured_repaint(bool force, uint8_t clear,
+                                        bool same_page, PanelKind prior_kind,
+                                        PanelKind next_kind) {
+    return force || clear != 0 || !same_page || prior_kind != next_kind;
 }
 /* host-test:end */
 
@@ -739,6 +792,16 @@ static_assert(PANEL_BODY_Y + (PANEL_FONT1_ROWS - 1) * PANEL_FONT1_PITCH +
               "font 1 panel rows cross the display bottom");
 static_assert(PANEL_FONT1_MAX_LINES <= PANEL_FONT1_ROWS,
               "font 1 cannot expose the complete maximum panel body");
+static_assert(PANEL_STATUS_DETAIL_Y +
+                  (PANEL_STATUS_FONT2_ROWS - 1) * PANEL_FONT2_PITCH +
+                  PANEL_FONT2_H - 1 <= PANEL_BODY_BOTTOM,
+              "font 2 status detail crosses the display bottom");
+static_assert(PANEL_STATUS_DETAIL_Y +
+                  (PANEL_STATUS_FONT1_ROWS - 1) * PANEL_FONT1_PITCH +
+                  PANEL_FONT1_H - 1 <= PANEL_BODY_BOTTOM,
+              "font 1 status detail crosses the display bottom");
+static_assert(PANEL_STATUS_FONT1_MAX_LINES <= PANEL_STATUS_FONT1_ROWS,
+              "font 1 cannot expose the complete maximum status detail");
 
 /* The body itself is not cached as text: it is wrapped once into byte offsets
    into the message, and copied out one line at a time as it is drawn. Offsets
@@ -1987,11 +2050,116 @@ static void ui_panel_clear(uint8_t plan) {
     }
 }
 
-static void ui_panel_draw_state(bool live, const char *key, uint8_t font) {
+static void ui_panel_draw_state(bool live, const char *key, uint8_t font,
+                                PanelKind kind) {
     ui_panel_draw_valid = true;
     ui_panel_draw_live = live;
     ui_panel_draw_font = font;
+    ui_panel_draw_kind = kind;
     snprintf(ui_panel_draw_key, sizeof(ui_panel_draw_key), "%s", key ? key : "");
+}
+
+static void ui_panel_direct_text(const char *text, int x, int y, uint8_t font,
+                                 uint16_t color, uint8_t datum) {
+    tft.setTextDatum(datum);
+    tft.setTextColor(color, COL_BG);
+    tft.drawString(text, x, y, font);
+}
+
+static void ui_panel_draw_kv(const PanelKvPayload &kv) {
+    for (uint8_t i = 0; i < kv.count && i < PANEL_KV_MAX; i++) {
+        char label[PANEL_LABEL_LEN + 4];
+        char value[PANEL_VALUE_LEN + 4];
+        ui_ellipsis(label, sizeof(label), kv.items[i].label, 2, 126);
+        ui_ellipsis(value, sizeof(value), kv.items[i].value, 2, 154);
+        int y = PANEL_BODY_Y + i * 22;
+        ui_panel_direct_text(label, PANEL_TEXT_X, y, 2, COL_DIM, TL_DATUM);
+        ui_panel_direct_text(value, PANEL_TEXT_X + PANEL_BODY_W, y, 2,
+                             COL_TIME, TR_DATUM);
+    }
+}
+
+static void ui_panel_draw_bars(const PanelBarsPayload &bars) {
+    for (uint8_t i = 0; i < bars.count && i < PANEL_BAR_MAX; i++) {
+        const PanelBarItem &bar = bars.items[i];
+        char label[PANEL_LABEL_LEN + 4];
+        char amount[32];
+        ui_ellipsis(label, sizeof(label), bar.label, 2, 150);
+        snprintf(amount, sizeof(amount), "%.5g%s", (double)bar.value, bar.unit);
+        int text_y = PANEL_BODY_Y + i * 28;
+        int bar_y = text_y + 18;
+        ui_panel_direct_text(label, PANEL_TEXT_X, text_y, 2, COL_DIM, TL_DATUM);
+        ui_panel_direct_text(amount, PANEL_TEXT_X + PANEL_BODY_W, text_y, 2,
+                             COL_TIME, TR_DATUM);
+        tft.fillRect(PANEL_TEXT_X, bar_y, PANEL_BODY_W, PANEL_BAR_H, COL_RULE);
+        int filled = ui_panel_bar_width(bar.value, bar.max, PANEL_BODY_W);
+        if (filled > 0)
+            tft.fillRect(PANEL_TEXT_X, bar_y, filled, PANEL_BAR_H, COL_ACCENT);
+    }
+}
+
+static void ui_panel_draw_sparkline(const PanelSparkPayload &sparkline) {
+    if (sparkline.count < 2 || sparkline.count > PANEL_SPARK_MAX) return;
+    float minimum = sparkline.values[0];
+    float maximum = sparkline.values[0];
+    for (uint8_t i = 1; i < sparkline.count; i++) {
+        if (sparkline.values[i] < minimum) minimum = sparkline.values[i];
+        if (sparkline.values[i] > maximum) maximum = sparkline.values[i];
+    }
+    char current[40];
+    snprintf(current, sizeof(current), "%.7g%s", (double)sparkline.values[sparkline.count - 1],
+             sparkline.unit);
+    ui_panel_direct_text(current, PANEL_TEXT_X, PANEL_BODY_Y, 2, COL_TIME, TL_DATUM);
+    int prior_x = ui_panel_graph_x(0, sparkline.count);
+    int prior_y = ui_panel_graph_y(sparkline.values[0], minimum, maximum);
+    for (uint8_t i = 1; i < sparkline.count; i++) {
+        int x = ui_panel_graph_x(i, sparkline.count);
+        int y = ui_panel_graph_y(sparkline.values[i], minimum, maximum);
+        tft.drawLine(prior_x, prior_y, x, y, COL_ACCENT);
+        prior_x = x;
+        prior_y = y;
+    }
+}
+
+static void ui_panel_draw_status(const PanelStatusPayload &status) {
+    char headline[PANEL_STATUS_LEN + PANEL_UNIT_LEN + 2];
+    snprintf(headline, sizeof(headline), "%s%s%s", status.value,
+             status.unit[0] ? " " : "", status.unit);
+    char fitted[sizeof(headline) + 4];
+    ui_ellipsis(fitted, sizeof(fitted), headline, 4, PANEL_BODY_W);
+    ui_panel_direct_text(fitted, PANEL_TEXT_X + PANEL_BODY_W / 2, PANEL_BODY_Y + 4,
+                         4, COL_TIME, TC_DATUM);
+
+    UiLine lines[PANEL_STATUS_WRAP_MAX_LINES];
+    int count = ui_wrap_lines(status.detail, lines, PANEL_STATUS_WRAP_MAX_LINES,
+                              PANEL_FONT2, PANEL_BODY_W);
+    UiPanelLayout layout = ui_panel_status_layout(count);
+    if (layout.font == PANEL_FONT1) {
+        count = ui_wrap_lines(status.detail, lines, PANEL_STATUS_WRAP_MAX_LINES,
+                              PANEL_FONT1, PANEL_BODY_W);
+    }
+    for (int i = 0; i < count; i++) {
+        char line[PANEL_BODY_LINE_LEN];
+        ui_line_text(line, sizeof(line), status.detail, lines[i]);
+        ui_panel_direct_text(line, PANEL_TEXT_X,
+                             PANEL_STATUS_DETAIL_Y + i * layout.pitch,
+                             layout.font, COL_DIM, TL_DATUM);
+    }
+}
+
+static void ui_panel_draw_structured(const Panel &panel) {
+    tft.fillRect(PANEL_TEXT_X, PANEL_BODY_Y, PANEL_BODY_W,
+                 PANEL_BODY_BOTTOM - PANEL_BODY_Y + 1, COL_BG);
+    switch (panel.kind) {
+        case PANEL_KIND_KV:        ui_panel_draw_kv(panel.payload.kv); break;
+        case PANEL_KIND_BARS:      ui_panel_draw_bars(panel.payload.bars); break;
+        case PANEL_KIND_SPARKLINE: ui_panel_draw_sparkline(panel.payload.sparkline); break;
+        case PANEL_KIND_STATUS:    ui_panel_draw_status(panel.payload.status); break;
+        default:
+            ui_panel_direct_text("INVALID PANEL", PANEL_TEXT_X + PANEL_BODY_W / 2,
+                                 96, 4, COL_CRIT, MC_DATUM);
+            break;
+    }
 }
 
 static void ui_draw_panel() {
@@ -2004,30 +2172,35 @@ static void ui_draw_panel() {
         bool same_page = ui_panel_draw_valid && !ui_panel_draw_live;
         uint8_t clear = ui_panel_clear_plan(
             ui_panel_draw_valid, ui_panel_draw_live, false, same_page,
-            ui_panel_draw_font, 0);
+            ui_panel_draw_font, 0, ui_panel_draw_kind, PANEL_KIND_TEXT);
         ui_panel_clear(clear);
         ui_draw_row(0, "NO PANELS", PANEL_EMPTY_TITLE_Y, 4, COL_TIME);
         ui_draw_row(1, "POST /panel to add one", PANEL_EMPTY_HINT_Y, 2, COL_DIM);
-        ui_panel_draw_state(false, "", 0);
+        ui_panel_draw_state(false, "", 0, PANEL_KIND_TEXT);
         display_force = false;
         return;
     }
 
     const Panel &panel = panels[selected];
-    UiLine lines[PANEL_WRAP_MAX_LINES];
-    int line_count = ui_wrap_lines(panel.body, lines, PANEL_WRAP_MAX_LINES,
+    UiLine lines[PANEL_WRAP_MAX_LINES] = {};
+    int line_count = 0;
+    UiPanelLayout layout = {0, 0, 0};
+    if (panel.kind == PANEL_KIND_TEXT) {
+        line_count = ui_wrap_lines(panel.payload.body, lines, PANEL_WRAP_MAX_LINES,
                                    PANEL_FONT2, PANEL_BODY_W);
-    UiPanelLayout layout = ui_panel_layout(line_count);
-    if (layout.font == PANEL_FONT1) {
-        line_count = ui_wrap_lines(panel.body, lines, PANEL_WRAP_MAX_LINES,
-                                   PANEL_FONT1, PANEL_BODY_W);
+        layout = ui_panel_layout(line_count);
+        if (layout.font == PANEL_FONT1) {
+            line_count = ui_wrap_lines(panel.payload.body, lines,
+                                       PANEL_WRAP_MAX_LINES, PANEL_FONT1,
+                                       PANEL_BODY_W);
+        }
     }
 
     bool same_page = ui_panel_draw_valid && ui_panel_draw_live &&
                      strcmp(ui_panel_draw_key, panel.key) == 0;
     uint8_t clear = ui_panel_clear_plan(
         ui_panel_draw_valid, ui_panel_draw_live, true, same_page,
-        ui_panel_draw_font, layout.font);
+        ui_panel_draw_font, layout.font, ui_panel_draw_kind, panel.kind);
     ui_panel_clear(clear);
 
     char title[UI_ROW_LEN];
@@ -2053,17 +2226,23 @@ static void ui_draw_panel() {
     draw_field(ui_row[2], sizeof(ui_row[2]), counter, tft.width() - 10, HDR_Y,
                2, COL_BG, TR_DATUM, 48, COL_ACCENT);
 
-    for (int r = 0; r < layout.rows; r++) {
-        char line[PANEL_BODY_LINE_LEN];
-        if (r < line_count) ui_line_text(line, sizeof(line), panel.body, lines[r]);
-        else line[0] = '\0';
-        if (display_force || ui_panel_line_changed(ui_panel_body[r], line)) {
-            draw_field(ui_panel_body[r], sizeof(ui_panel_body[r]), line,
-                       PANEL_TEXT_X, PANEL_BODY_Y + r * layout.pitch, layout.font,
-                       COL_TIME, TL_DATUM, PANEL_BODY_W);
+    if (panel.kind == PANEL_KIND_TEXT) {
+        for (int r = 0; r < layout.rows; r++) {
+            char line[PANEL_BODY_LINE_LEN];
+            if (r < line_count)
+                ui_line_text(line, sizeof(line), panel.payload.body, lines[r]);
+            else line[0] = '\0';
+            if (display_force || ui_panel_line_changed(ui_panel_body[r], line)) {
+                draw_field(ui_panel_body[r], sizeof(ui_panel_body[r]), line,
+                           PANEL_TEXT_X, PANEL_BODY_Y + r * layout.pitch, layout.font,
+                           COL_TIME, TL_DATUM, PANEL_BODY_W);
+            }
         }
+    } else if (ui_panel_structured_repaint(display_force, clear, same_page,
+                                           ui_panel_draw_kind, panel.kind)) {
+        ui_panel_draw_structured(panel);
     }
-    ui_panel_draw_state(true, panel.key, layout.font);
+    ui_panel_draw_state(true, panel.key, layout.font, panel.kind);
     display_force = false;
 }
 
