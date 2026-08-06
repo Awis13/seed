@@ -285,18 +285,63 @@ enum {
        silently shifts every title after it onto the wrong screen. The assert
        below catches a missing entry; nothing can catch a reordering, which is
        why the rule is "append". */
-    UI_REC
+    UI_REC,
+    UI_PANEL
 };
 
 /* Capitals: this is the service text of the header bar, not prose. One entry
    per screen above, in the same order. */
 static const char *ui_titles[] = {
     "", "MENU", "MESSAGES", "MESSAGES", "TV-B-GONE", "BY BRAND", "TV-B-GONE",
-    "SETUP AP", "INFO", "RECORDING"
+    "SETUP AP", "INFO", "RECORDING", "PANEL"
 };
 
-static_assert(sizeof(ui_titles) / sizeof(ui_titles[0]) == UI_REC + 1,
+static_assert(sizeof(ui_titles) / sizeof(ui_titles[0]) == UI_PANEL + 1,
               "ui_titles[] must have one entry per screen, in enum order");
+
+/* host-test:begin panelui — sliced out by tools/test_panel_ui.sh */
+#define UI_PANEL_NONE UINT8_MAX
+
+/* Move over a bounded circular set. `steps` stays signed all the way through:
+   reducing it modulo the number of live entries before walking avoids both an
+   unbounded loop and negating INT_MIN. An invalid current position enters at
+   the first item in the requested direction, then spends any remaining
+   detents. Zero is useful for recovering a selection whose key disappeared. */
+static int ui_panel_next(const bool *enabled, uint8_t count, int current,
+                         int steps) {
+    if (!enabled || count == 0) return -1;
+
+    int live = 0;
+    for (uint8_t i = 0; i < count; i++) if (enabled[i]) live++;
+    if (live == 0) return -1;
+
+    bool current_live = current >= 0 && current < count && enabled[current];
+    int at = current;
+    int remaining = steps % live;
+    if (!current_live) {
+        at = steps < 0 ? count - 1 : 0;
+        while (!enabled[at]) {
+            at += steps < 0 ? -1 : 1;
+            if (at < 0) at = count - 1;
+            if (at >= count) at = 0;
+        }
+        if (steps > 0) remaining = (steps - 1) % live;
+        else if (steps < 0) remaining = (steps + 1) % live;
+        else remaining = 0;
+    }
+
+    while (remaining != 0) {
+        int direction = remaining > 0 ? 1 : -1;
+        do {
+            at += direction;
+            if (at < 0) at = count - 1;
+            if (at >= count) at = 0;
+        } while (!enabled[at]);
+        remaining -= direction;
+    }
+    return at;
+}
+/* host-test:end */
 
 /* Top level. The marker on a selected row is also ">", so a submenu is spelled
    out with a trailing one rather than by a different marker. Messages leads
@@ -393,6 +438,15 @@ static int ui_blast_back_sel = 0;
 /* Which notification the card is showing. An id, not an index: the list can
    shift underneath it when something expires or a new message arrives. */
 static uint32_t ui_msg_id = 0;
+/* A panel is identified by its API key, never by its current sorted row. The
+   row is only a recovery hint when that key expires or is deleted; 255 is the
+   explicit no-selection state and cannot collide with PANEL_MAX. */
+static uint8_t ui_panel_sel = UI_PANEL_NONE;
+static char ui_panel_key[PANEL_KEY_LEN] = "";
+static bool ui_panel_draw_valid = false;
+static bool ui_panel_draw_live = false;
+static uint8_t ui_panel_draw_font = 0;
+static char ui_panel_draw_key[PANEL_KEY_LEN] = "";
 /* Fade frames already drawn for the card in front, MSG_FADE_STEPS once done. */
 static uint8_t ui_card_fade = 0;
 /* Which reply chip the knob is on, for the card in front. Its own variable and
@@ -606,6 +660,85 @@ static_assert(MSG_LINE_LEN > MSG_BODY_W / MSG_GLYPH_W_MIN,
 static_assert(MSG_LINE_LEN > UI_ROW_LEN,
               "a body line is no wider than a row line — check MSG_BODY_W and "
               "the font table before making them share a cache");
+
+/* Home-page panels use the full content width below their title. Short bodies
+   keep font 2. A body that needs more rows switches to the fixed 6x8 font 1:
+   thirteen 9px-pitch rows fit through the last display pixel and the wrapper's
+   worst-case bound is thirteen, so every byte of the 256-byte body remains on
+   screen without taking the wheel away from page navigation. */
+/* host-test:begin panelrender — sliced out by tools/test_panel_ui.sh */
+#define PANEL_TEXT_X             12
+#define PANEL_BODY_Y             54
+#define PANEL_BODY_BOTTOM       169
+#define PANEL_BODY_W            296
+#define PANEL_FONT2             2
+#define PANEL_FONT2_H          16
+#define PANEL_FONT2_PITCH      18
+#define PANEL_FONT2_ROWS        6
+#define PANEL_FONT1             1
+#define PANEL_FONT1_W           6
+#define PANEL_FONT1_H           8
+#define PANEL_FONT1_PITCH       9
+#define PANEL_FONT1_ROWS       13
+#define PANEL_BODY_LINE_LEN    (PANEL_BODY_W / MSG_GLYPH_W_MIN + 1)
+#define PANEL_FONT2_FIT_MIN    (PANEL_BODY_W / MSG_GLYPH_W_MAX)
+#define PANEL_FONT2_MAX_LINES  (2 * (PANEL_BODY_LEN / PANEL_FONT2_FIT_MIN + 1) + 1)
+#define PANEL_FONT1_FIT_MIN    (PANEL_BODY_W / PANEL_FONT1_W)
+#define PANEL_FONT1_MAX_LINES  (2 * (PANEL_BODY_LEN / PANEL_FONT1_FIT_MIN + 1) + 1)
+#define PANEL_WRAP_MAX_LINES   PANEL_FONT2_MAX_LINES
+#define PANEL_EMPTY_TITLE_Y     58
+#define PANEL_EMPTY_TITLE_H     26
+#define PANEL_EMPTY_HINT_Y     102
+#define PANEL_EMPTY_HINT_H      16
+
+struct UiPanelLayout {
+    uint8_t font;
+    uint8_t rows;
+    uint8_t pitch;
+};
+
+static UiPanelLayout ui_panel_layout(int font2_lines) {
+    if (font2_lines <= PANEL_FONT2_ROWS)
+        return {PANEL_FONT2, PANEL_FONT2_ROWS, PANEL_FONT2_PITCH};
+    return {PANEL_FONT1, PANEL_FONT1_ROWS, PANEL_FONT1_PITCH};
+}
+
+enum {
+    UI_PANEL_CLEAR_TITLE_AGE = 1,
+    UI_PANEL_CLEAR_BODY = 2,
+    UI_PANEL_CLEAR_COUNTER = 4,
+    UI_PANEL_CLEAR_CACHES = 8,
+    UI_PANEL_CLEAR_ALL = 15
+};
+
+/* A transition invalidates every part of the old panel frame. A same-page
+   content update can stay field-differential unless its font changes. */
+static uint8_t ui_panel_clear_plan(bool prior_valid, bool prior_live,
+                                   bool next_live, bool same_page,
+                                   uint8_t prior_font, uint8_t next_font) {
+    if (!prior_valid || prior_live != next_live || !same_page ||
+        (next_live && prior_font != next_font)) return UI_PANEL_CLEAR_ALL;
+    return 0;
+}
+
+static bool ui_panel_line_changed(const char *cache, const char *line) {
+    return strncmp(cache, line, PANEL_BODY_LINE_LEN - 1) != 0;
+}
+/* host-test:end */
+
+static char ui_panel_body[PANEL_FONT1_ROWS][PANEL_BODY_LINE_LEN];
+static_assert(sizeof(ui_panel_body[0]) == PANEL_BODY_LINE_LEN,
+              "panel body render and cache capacities must stay equal");
+static_assert(PANEL_BODY_LINE_LEN > PANEL_BODY_W / MSG_GLYPH_W_MIN,
+              "a panel body cache cannot hold the narrowest full line");
+static_assert(PANEL_BODY_Y + (PANEL_FONT2_ROWS - 1) * PANEL_FONT2_PITCH +
+                  PANEL_FONT2_H - 1 <= PANEL_BODY_BOTTOM,
+              "font 2 panel rows cross the display bottom");
+static_assert(PANEL_BODY_Y + (PANEL_FONT1_ROWS - 1) * PANEL_FONT1_PITCH +
+                  PANEL_FONT1_H - 1 <= PANEL_BODY_BOTTOM,
+              "font 1 panel rows cross the display bottom");
+static_assert(PANEL_FONT1_MAX_LINES <= PANEL_FONT1_ROWS,
+              "font 1 cannot expose the complete maximum panel body");
 
 /* The body itself is not cached as text: it is wrapped once into byte offsets
    into the message, and copied out one line at a time as it is drawn. Offsets
@@ -1793,6 +1926,147 @@ static void ui_draw_rec() {
     display_force = false;
 }
 
+/* Resolve the selected key in a coherent sorted snapshot, then apply the
+   detents. If the key disappeared, its last row is the recovery point: the
+   item that shifted into that row remains selected, while deletion of the last
+   row falls back to the new last row. Reordering alone never changes pages. */
+static int ui_panel_select(const Panel *panels, int count, int steps) {
+    if (!panels || count <= 0) {
+        ui_panel_sel = UI_PANEL_NONE;
+        ui_panel_key[0] = '\0';
+        return -1;
+    }
+
+    int current = -1;
+    if (ui_panel_key[0]) {
+        for (int i = 0; i < count; i++) {
+            if (strcmp(panels[i].key, ui_panel_key) == 0) {
+                current = i;
+                break;
+            }
+        }
+    }
+    if (current < 0 && ui_panel_sel != UI_PANEL_NONE) {
+        current = ui_panel_sel < count ? ui_panel_sel : count - 1;
+    }
+
+    bool enabled[PANEL_MAX] = {};
+    for (int i = 0; i < count; i++) enabled[i] = true;
+    int selected = ui_panel_next(enabled, (uint8_t)count, current, steps);
+    if (selected < 0) {
+        ui_panel_sel = UI_PANEL_NONE;
+        ui_panel_key[0] = '\0';
+        return -1;
+    }
+
+    ui_panel_sel = (uint8_t)selected;
+    snprintf(ui_panel_key, sizeof(ui_panel_key), "%s", panels[selected].key);
+    return selected;
+}
+
+static void ui_panel_move(int steps) {
+    Panel panels[PANEL_MAX];
+    uint64_t sampled_ms;
+    int count = panel_live_snapshot(panels, &sampled_ms);
+    (void)sampled_ms;
+    ui_panel_select(panels, count, steps);
+}
+
+static void ui_panel_clear(uint8_t plan) {
+    if (plan & (UI_PANEL_CLEAR_TITLE_AGE | UI_PANEL_CLEAR_BODY)) {
+        tft.fillRect(0, HDR_BAR_H, tft.width(), tft.height() - HDR_BAR_H, COL_BG);
+    }
+    if (plan & UI_PANEL_CLEAR_COUNTER) {
+        tft.fillRect(tft.width() - 64, 0, 64, HDR_BAR_H, COL_ACCENT);
+    }
+    if (plan & UI_PANEL_CLEAR_CACHES) {
+        ui_cache_drop(ui_row[0]);
+        ui_cache_drop(ui_row[1]);
+        ui_cache_drop(ui_row[2]);
+        for (int r = 0; r < PANEL_FONT1_ROWS; r++) ui_cache_drop(ui_panel_body[r]);
+    }
+}
+
+static void ui_panel_draw_state(bool live, const char *key, uint8_t font) {
+    ui_panel_draw_valid = true;
+    ui_panel_draw_live = live;
+    ui_panel_draw_font = font;
+    snprintf(ui_panel_draw_key, sizeof(ui_panel_draw_key), "%s", key ? key : "");
+}
+
+static void ui_draw_panel() {
+    Panel panels[PANEL_MAX];
+    uint64_t sampled_ms;
+    int count = panel_live_snapshot(panels, &sampled_ms);
+    int selected = ui_panel_select(panels, count, 0);
+
+    if (selected < 0) {
+        bool same_page = ui_panel_draw_valid && !ui_panel_draw_live;
+        uint8_t clear = ui_panel_clear_plan(
+            ui_panel_draw_valid, ui_panel_draw_live, false, same_page,
+            ui_panel_draw_font, 0);
+        ui_panel_clear(clear);
+        ui_draw_row(0, "NO PANELS", PANEL_EMPTY_TITLE_Y, 4, COL_TIME);
+        ui_draw_row(1, "POST /panel to add one", PANEL_EMPTY_HINT_Y, 2, COL_DIM);
+        ui_panel_draw_state(false, "", 0);
+        display_force = false;
+        return;
+    }
+
+    const Panel &panel = panels[selected];
+    UiLine lines[PANEL_WRAP_MAX_LINES];
+    int line_count = ui_wrap_lines(panel.body, lines, PANEL_WRAP_MAX_LINES,
+                                   PANEL_FONT2, PANEL_BODY_W);
+    UiPanelLayout layout = ui_panel_layout(line_count);
+    if (layout.font == PANEL_FONT1) {
+        line_count = ui_wrap_lines(panel.body, lines, PANEL_WRAP_MAX_LINES,
+                                   PANEL_FONT1, PANEL_BODY_W);
+    }
+
+    bool same_page = ui_panel_draw_valid && ui_panel_draw_live &&
+                     strcmp(ui_panel_draw_key, panel.key) == 0;
+    uint8_t clear = ui_panel_clear_plan(
+        ui_panel_draw_valid, ui_panel_draw_live, true, same_page,
+        ui_panel_draw_font, layout.font);
+    ui_panel_clear(clear);
+
+    char title[UI_ROW_LEN];
+    ui_ellipsis(title, sizeof(title), panel.title[0] ? panel.title : panel.key,
+                4, 238);
+    draw_field(ui_row[0], sizeof(ui_row[0]), title, PANEL_TEXT_X, 24, 4,
+               COL_TIME, TL_DATUM, 238);
+
+    uint64_t age_ms = panel_age(panel, sampled_ms);
+    uint64_t age_seconds = age_ms / 1000ULL;
+    unsigned long age_s = age_seconds > UINT32_MAX
+                              ? (unsigned long)UINT32_MAX
+                              : (unsigned long)age_seconds;
+    char age[8];
+    notify_age_str(age_s, age, sizeof(age));
+    draw_field(ui_row[1], sizeof(ui_row[1]), age, tft.width() - 10, 29, 2,
+               COL_DIM, TR_DATUM, 48);
+
+    char counter[8];
+    uint8_t total = (uint8_t)count;
+    snprintf(counter, sizeof(counter), "%u/%u", (unsigned)ui_panel_sel + 1U,
+             (unsigned)total);
+    draw_field(ui_row[2], sizeof(ui_row[2]), counter, tft.width() - 10, HDR_Y,
+               2, COL_BG, TR_DATUM, 48, COL_ACCENT);
+
+    for (int r = 0; r < layout.rows; r++) {
+        char line[PANEL_BODY_LINE_LEN];
+        if (r < line_count) ui_line_text(line, sizeof(line), panel.body, lines[r]);
+        else line[0] = '\0';
+        if (display_force || ui_panel_line_changed(ui_panel_body[r], line)) {
+            draw_field(ui_panel_body[r], sizeof(ui_panel_body[r]), line,
+                       PANEL_TEXT_X, PANEL_BODY_Y + r * layout.pitch, layout.font,
+                       COL_TIME, TL_DATUM, PANEL_BODY_W);
+        }
+    }
+    ui_panel_draw_state(true, panel.key, layout.font);
+    display_force = false;
+}
+
 /* Screens whose content can only change when the knob moves, and which
    therefore have nothing to gain from the periodic repaint. The message list
    is deliberately not one of them: its age column advances on its own. */
@@ -1811,6 +2085,7 @@ static void ui_draw() {
         case UI_AP:      ui_draw_ap();      break;
         case UI_INFO:    ui_draw_info();    break;
         case UI_REC:     ui_draw_rec();     break;
+        case UI_PANEL:   ui_draw_panel();   break;
         default: break;
     }
 }
@@ -2374,8 +2649,26 @@ static void ui_poll() {
 
     switch (ui_screen) {
         case UI_CLOCK:
-            if (click) ui_enter_list(UI_MENU, 0);
+            if (click) {
+                ui_enter_list(UI_MENU, 0);
+            } else if (steps != 0) {
+                ui_panel_sel = UI_PANEL_NONE;
+                ui_panel_key[0] = '\0';
+                ui_panel_move(steps);
+                ui_enter(UI_PANEL);
+            }
             return;
+
+        case UI_PANEL:
+            if (click || back) {
+                ui_enter(UI_CLOCK);
+                return;
+            }
+            if (steps != 0) {
+                ui_panel_move(steps);
+                ui_draw();
+            }
+            break;
 
         case UI_MENU:
         case UI_TVMENU:
@@ -2544,8 +2837,10 @@ static void ui_poll() {
     }
 
     /* Live output must not be timed out from under the user; everything else
-       falls back to the clock. Both exemptions are stated once, above, and the
-       backlight's idle policy reads the same two.
+       falls back to the clock except a panel page, whose explicit way home is
+       either button. Unlike the two live-output exemptions above, UI_PANEL is
+       intentionally absent from ui_backlight_idle(): its page stays selected
+       while the ordinary policy is free to dim or blank the display.
 
        The card is the other screen where holding a key is normal, and it gets
        no exemption on purpose — it is where an unread message sits, and a card
@@ -2555,7 +2850,7 @@ static void ui_poll() {
        UI_IDLE_MS let this fire mid-gesture: the card went back to the clock,
        and the release then arrived there as a plain `back` on a screen that
        ignores it, so the whole gesture was swallowed. */
-    if (!ui_watching_blast() && !ui_watching_rec() &&
+    if (!ui_watching_blast() && !ui_watching_rec() && ui_screen != UI_PANEL &&
         millis() - ui_last_input >= UI_IDLE_MS) {
         ui_enter(UI_CLOCK);
         return;

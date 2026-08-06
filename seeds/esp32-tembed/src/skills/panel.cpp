@@ -184,6 +184,21 @@ static uint64_t panel_now_ms() {
     return (uint64_t)esp_timer_get_time() / 1000ULL;
 }
 
+/* One coherent view for the local UI. The timestamp is sampled once while the
+   store is locked, so every age drawn in one frame has the same origin. Sorting
+   under the same lock also makes this accessor a complete snapshot operation:
+   callers never observe or depend on panel_slot[] after the lock is released. */
+static int panel_live_snapshot(Panel *snapshot, uint64_t *sampled_ms) {
+    if (!snapshot || !sampled_ms) return 0;
+
+    portENTER_CRITICAL(&panel_mux);
+    *sampled_ms = panel_now_ms();
+    int count = panel_snapshot(snapshot, *sampled_ms);
+    panel_sort(snapshot, count);
+    portEXIT_CRITICAL(&panel_mux);
+    return count;
+}
+
 static const char *panel_describe() {
     return "## panel\n\n"
            "A fixed store of eight transient panels for agent-owned home pages.\n\n"
