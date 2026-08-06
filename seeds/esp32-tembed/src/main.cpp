@@ -1768,6 +1768,7 @@ static void handle_wifi_post(AsyncWebServerRequest *request) {
 #include "skills/serial.cpp"
 #include "skills/ir.cpp"
 #include "skills/notify.cpp"
+#include "skills/panel.cpp"
 /* After notify.cpp, for the JSON response helpers, and after nothing else: the
    fuel gauge is its own hardware and no skill reads it. Its probe runs earlier
    than this, from hw_probe(), through the two forward declarations above it —
@@ -1812,6 +1813,7 @@ static void skills_init() {
     skill_serial_init();
     skill_ir_init();
     skill_notify_init();
+    skill_panel_init();
     /* Only a registration: the gauge was read at boot by hw_probe() and the
        cache behind GET /battery was filled there. */
     skill_battery_init();
@@ -2046,6 +2048,10 @@ void loop() {
     // SPIFFS. The endpoints only ever touch RAM; the flash write is here, on the
     // one task that is allowed to spend milliseconds.
     notify_poll();
+
+    // Retire expired home-page data. This only invalidates the clock cache;
+    // panel.cpp owns no drawing, wake, input, or backlight behaviour.
+    panel_poll();
 
     // The microphone: the hold-to-record gesture on the encoder key, and the
     // drain of whatever the I2S receive DMA has collected. Before ui_poll() so
