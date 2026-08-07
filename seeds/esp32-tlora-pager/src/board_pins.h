@@ -9,6 +9,9 @@
 #define PIN_I2C_SDA         3
 #define PIN_I2C_SCL         2
 
+// Fuel gauge (same part as T-Embed; LilyGo 1500 mAh pack)
+#define BQ27220_ADDR        0x55
+
 // Shared SPI (display, LoRa, SD, NFC) — park every CS HIGH before first byte
 #define PIN_SPI_MOSI        34
 #define PIN_SPI_MISO        33

@@ -869,29 +869,33 @@ static bool notify_take_ring_ack() {
    I2S channel any more than they touch the panel. The flag is set last, so a
    consumer that sees it raised sees a complete source string behind it. */
 static void notify_request_sound(uint8_t level, const char *source) {
-    /* Formatted outside the lock, copied inside it: the critical section is
-       one memcpy of a fixed size, like every other one here. */
+    /* Flag + payload under the same critical section so the loop-core cannot
+       observe a raised flag with stale level/source (dual-core ESP32-S3). */
     char staged[NOTIFY_SOURCE_LEN];
     snprintf(staged, sizeof(staged), "%s", source ? source : "");
 
     portENTER_CRITICAL(&notify_mux);
     notify_snd_level = level;
     memcpy(notify_snd_source, staged, sizeof(notify_snd_source));
-    portEXIT_CRITICAL(&notify_mux);
     notify_snd_arrived = true;
+    portEXIT_CRITICAL(&notify_mux);
 }
 
 static bool notify_take_sound_arrival(uint8_t *level, char *source, size_t n) {
-    if (!notify_snd_arrived) return false;
-    notify_snd_arrived = false;
-
     char staged[NOTIFY_SOURCE_LEN];
-    uint8_t lv;
+    uint8_t lv = 0;
+    bool got = false;
+
     portENTER_CRITICAL(&notify_mux);
-    lv = notify_snd_level;
-    memcpy(staged, notify_snd_source, sizeof(staged));
+    if (notify_snd_arrived) {
+        notify_snd_arrived = false;
+        lv = notify_snd_level;
+        memcpy(staged, notify_snd_source, sizeof(staged));
+        got = true;
+    }
     portEXIT_CRITICAL(&notify_mux);
 
+    if (!got) return false;
     if (level) *level = lv;
     if (source && n) snprintf(source, n, "%s", staged);
     return true;
