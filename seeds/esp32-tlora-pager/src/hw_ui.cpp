@@ -478,6 +478,8 @@ static char fld_left[36]  = "";
 static char fld_right[36] = "";
 static char fld_note[56]  = "";
 static int  clock_badge   = -1;
+static int  clock_mesh_ui = -1;
+static int  clock_mesh_age_bucket = -2;  // -2 dirty; -1 never; else minutes (or hours*1000)
 static bool clock_dirty   = true;
 
 // Selection caches for partial repaint (menu / msglist / card_act / agents).
@@ -487,6 +489,7 @@ static int agents_sel_drawn = -1;
 static int agent_act_sel_drawn = -1;
 static int layout_sel_drawn = -1;
 static int layout_cur_drawn = -1;
+static int mesh_sel_drawn = -1;
 static int msglist_sel_drawn = -1;
 static int msglist_top_drawn = -1;
 static int msglist_count_drawn = -1;
@@ -532,6 +535,8 @@ static void draw_field(char *cache, size_t n, const char *text,
 }
 
 // ---- public ----------------------------------------------------------------
+SPIClass *hw_ui_spi() { return disp_spi; }
+
 bool hw_ui_begin() {
     Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL);
     Wire.setClock(400000);
@@ -565,6 +570,8 @@ void hw_ui_invalidate_clock() {
     fld_ver[0] = fld_addr[0] = fld_time[0] = fld_sec[0] = '\0';
     fld_date[0] = fld_left[0] = fld_right[0] = fld_note[0] = '\0';
     clock_badge = -1;
+    clock_mesh_ui = -1;
+    clock_mesh_age_bucket = -2;
     clock_bar_drawn = -1;
 }
 
@@ -578,6 +585,7 @@ void hw_ui_show_clock() {
     agent_act_sel_drawn = -1;
     layout_sel_drawn = -1;
     layout_cur_drawn = -1;
+    mesh_sel_drawn = -1;
     msglist_sel_drawn = -1;
     msglist_top_drawn = -1;
     msglist_count_drawn = -1;
@@ -598,11 +606,13 @@ void hw_ui_clock_tick(const char *version,
                       bool time_ok,
                       int hour, int minute, int second,
                       const char *date_str,
-                      bool crit_unread) {
+                      bool crit_unread,
+                      int mesh_ui,
+                      int mesh_age_s) {
     if (!panel_ok || screen != HW_UI_CLOCK) return;
     (void)crit_unread;
 
-    // Header: version | badge | BAT | IP  (same three-slot idea as tembed)
+    // Header: version | badge | M+age | BAT | IP
     draw_field(fld_ver, sizeof(fld_ver), version ? version : "",
                MARGIN, HDR_Y, 2, COL_DIM, 'L', 80);
     draw_field(fld_batt, sizeof(fld_batt), batt ? batt : "",
@@ -622,6 +632,46 @@ void hw_ui_clock_tick(const char *version,
             if (badge > 9) snprintf(b, sizeof(b), "9+");
             else snprintf(b, sizeof(b), "%d", badge);
             tft_draw_text(bx + 8, HDR_Y, b, COL_ACCENT, COL_BG, 2);
+        }
+    }
+
+    // MeshCore "M" + alive age since last private-path success (ACK / inbound).
+    // Age bucket: minutes 0..59, then hours as 1000+h so we repaint once per
+    // minute (or hour) without redrawing every second.
+    int age_bucket = -1;
+    if (mesh_age_s >= 0) {
+        if (mesh_age_s < 3600) age_bucket = mesh_age_s / 60;           // 0..59 min
+        else if (mesh_age_s < 86400) age_bucket = 1000 + mesh_age_s / 3600;  // hours
+        else age_bucket = 2000 + mesh_age_s / 86400;                  // days
+    }
+    if (clock_dirty || mesh_ui != clock_mesh_ui ||
+        age_bucket != clock_mesh_age_bucket) {
+        clock_mesh_ui = mesh_ui;
+        clock_mesh_age_bucket = age_bucket;
+        // Left of BAT; wider slot for "M12m" / "M2h"
+        const int mx = PANEL_W / 2 - 108;
+        tft_fill_rect(mx - 2, HDR_Y, 56, 16, COL_BG);
+        if (mesh_ui > MESH_UI_OFF) {
+            uint16_t col = COL_DIM;
+            if (mesh_ui == MESH_UI_OK) col = COL_INFO;
+            else if (mesh_ui == MESH_UI_STALE) col = COL_WARN;
+            else if (mesh_ui == MESH_UI_DOWN) col = COL_CRIT;
+            char label[10];
+            if (mesh_age_s < 0) {
+                snprintf(label, sizeof(label), "M--");
+            } else if (mesh_age_s < 60) {
+                snprintf(label, sizeof(label), "M0m");
+            } else if (mesh_age_s < 3600) {
+                snprintf(label, sizeof(label), "M%um",
+                         (unsigned)(mesh_age_s / 60));
+            } else if (mesh_age_s < 86400) {
+                snprintf(label, sizeof(label), "M%uh",
+                         (unsigned)(mesh_age_s / 3600));
+            } else {
+                snprintf(label, sizeof(label), "M%ud",
+                         (unsigned)(mesh_age_s / 86400));
+            }
+            tft_draw_text((uint16_t)mx, HDR_Y, label, col, COL_BG, 2);
         }
     }
 
@@ -820,12 +870,21 @@ void hw_ui_show_agent_invite(const char *agent_name,
 }
 
 // Menu row geometry — fixed so selection can repaint one bar without a wipe.
-static const int MENU_N = 5;
-static const int MENU_ROW0_Y = 36;
-static const int MENU_ROW_H = 30;
-static const int MENU_BAR_H = 26;
+static const int MENU_N = 6;
+static const int MENU_ROW0_Y = 32;
+static const int MENU_ROW_H = 28;
+static const int MENU_BAR_H = 24;
 static const char *const MENU_ITEMS[MENU_N] = {
-    "MESSAGES", "AGENTS", "SETTINGS", "INFO", "BACK"
+    "MESSAGES", "AGENTS", "MESHCORE", "SETTINGS", "INFO", "BACK"
+};
+
+// MeshCore submenu
+static const int MESH_N = 3;
+static const int MESH_ROW0_Y = 48;
+static const int MESH_ROW_H = 32;
+static const int MESH_BAR_H = 28;
+static const char *const MESH_ITEMS[MESH_N] = {
+    "STATUS", "PING GATEWAY", "BACK"
 };
 
 // Layout picker (SETTINGS → LAYOUT)
@@ -981,6 +1040,75 @@ void hw_ui_show_layout(int selected, int current_layout) {
         layout_draw_row(i, i == selected, current_layout);
     layout_sel_drawn = selected;
     layout_cur_drawn = current_layout;
+}
+
+static void mesh_draw_row(int i, bool on) {
+    uint16_t y = (uint16_t)(MESH_ROW0_Y + i * MESH_ROW_H);
+    uint16_t bar_y = y - 4;
+    uint16_t bar_w = PANEL_W - 2 * MARGIN;
+    if (on) {
+        tft_fill_rect(MARGIN, bar_y, bar_w, MESH_BAR_H, COL_ACCENT);
+        tft_draw_text(MARGIN + 12, y, MESH_ITEMS[i], COL_BG, COL_ACCENT, 2);
+    } else {
+        tft_fill_rect(MARGIN, bar_y, bar_w, MESH_BAR_H, COL_BG);
+        tft_draw_text(MARGIN + 12, y, MESH_ITEMS[i], COL_TIME, COL_BG, 2);
+    }
+}
+
+void hw_ui_show_meshcore(int selected) {
+    if (!panel_ok) return;
+    if (selected < 0) selected = 0;
+    if (selected >= MESH_N) selected = MESH_N - 1;
+
+    if (screen == HW_UI_MESHCORE && mesh_sel_drawn >= 0 &&
+        mesh_sel_drawn != selected) {
+        mesh_draw_row(mesh_sel_drawn, false);
+        mesh_draw_row(selected, true);
+        mesh_sel_drawn = selected;
+        return;
+    }
+    if (screen == HW_UI_MESHCORE && mesh_sel_drawn == selected) return;
+
+    screen = HW_UI_MESHCORE;
+    tft_fill(COL_BG);
+    tft_fill_rect(0, 0, PANEL_W, 22, COL_ACCENT);
+    tft_draw_text(MARGIN, 4, "MESHCORE", COL_BG, COL_ACCENT, 2);
+    tft_draw_text_r(PANEL_W - MARGIN, 6, "GW", COL_BG, COL_ACCENT, 1);
+    tft_draw_text(MARGIN, 32, "home radio gateway", COL_DIM, COL_BG, 1);
+    for (int i = 0; i < MESH_N; i++) mesh_draw_row(i, i == selected);
+    mesh_sel_drawn = selected;
+}
+
+void hw_ui_show_mesh_ping(const char *phase,
+                          const char *const *lines,
+                          int n_lines) {
+    if (!panel_ok) return;
+    screen = HW_UI_MESH_PING;
+    if (n_lines < 0) n_lines = 0;
+    if (n_lines > HW_UI_MESH_PING_LINES) n_lines = HW_UI_MESH_PING_LINES;
+
+    tft_fill(COL_BG);
+    // Phase colour: OK=info teal, FAIL=crit, else amber
+    uint16_t accent = COL_ACCENT;
+    if (phase && (strcmp(phase, "OK") == 0 || strcmp(phase, "DONE") == 0))
+        accent = COL_INFO;
+    else if (phase && (strcmp(phase, "FAIL") == 0 || strcmp(phase, "ERR") == 0))
+        accent = COL_CRIT;
+
+    tft_fill_rect(0, 0, PANEL_W, 22, accent);
+    tft_draw_text(MARGIN, 4, "MESH PING", COL_BG, accent, 2);
+    tft_draw_text_r(PANEL_W - MARGIN, 4,
+                    phase && phase[0] ? phase : "…",
+                    COL_BG, accent, 2);
+
+    uint16_t y = 32;
+    for (int i = 0; i < n_lines; i++) {
+        const char *ln = (lines && lines[i]) ? lines[i] : "";
+        tft_draw_text(MARGIN, y, ln, COL_TIME, COL_BG, 1);
+        y = (uint16_t)(y + 16);
+        if (y > PANEL_H - 24) break;
+    }
+    tft_draw_text(MARGIN, PANEL_H - 16, "click = back", COL_DIM, COL_BG, 1);
 }
 
 static void agents_list_draw_row(int i, bool on) {

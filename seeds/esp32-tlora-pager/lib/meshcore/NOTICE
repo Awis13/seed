@@ -1,0 +1,4 @@
+Vendored MeshCore subset for seed T-Lora Pager private-link transport.
+Source tree mirrored from the MeshCore library used by the Heltec companion
+(home gateway). Only files required to compile the seed SX1262 client are
+included. Upstream project: MeshCore (ripplebiz/MeshCore and derivatives).

@@ -12,6 +12,11 @@ bool hw_ui_begin();
 bool hw_ui_ready();
 bool hw_ui_expand_ok();
 
+// Shared SPI bus (FSPI) used by the ST7796. MeshCore SX1262 must use THIS
+// instance — a second SPIClass on the same pins hangs radio init.
+class SPIClass;
+SPIClass *hw_ui_spi();
+
 // Drive one XL9555 pin (e.g. EXP_AMP_EN). No-op if expander missing.
 void hw_xl_pin(uint8_t exp_pin, bool high);
 
@@ -31,6 +36,8 @@ enum HwUiScreen : uint8_t {
     HW_UI_INFO,
     HW_UI_REPLY,
     HW_UI_LAYOUT,      // keyboard layout picker (SETTINGS)
+    HW_UI_MESHCORE,    // MeshCore menu (PING / …)
+    HW_UI_MESH_PING,   // live gateway ping / path probe
 };
 
 HwUiScreen hw_ui_screen();
@@ -38,8 +45,25 @@ HwUiScreen hw_ui_screen();
 // Full home paint (chrome). Call after WiFi/token settle, then clock_tick.
 void hw_ui_show_clock();
 
+// Mesh link chrome on the clock header (small "M" glyph).
+//   MESH_UI_OFF     — hide (no identity)
+//   MESH_UI_WAIT    — keys present, radio/stack not ready yet (dim)
+//   MESH_UI_OK      — recent private-path ACK / inbound from gateway (teal)
+//   MESH_UI_STALE   — was OK, overdue for sparse probe (amber)
+//   MESH_UI_DOWN    — probe failed or silence too long (red)
+enum HwMeshUi : int8_t {
+    MESH_UI_OFF = 0,
+    MESH_UI_WAIT = 1,
+    MESH_UI_OK = 2,
+    MESH_UI_STALE = 3,
+    MESH_UI_DOWN = 4,
+};
+
 // One-second field update on the clock face. No-op if another screen is up.
 // batt is "BAT 87%" / "BAT --" / empty (no gauge). Drawn centered in the header.
+// mesh_ui: sparse MeshCore reachability chrome (see HwMeshUi).
+// mesh_age_s: seconds since last private-path alive (ACK / inbound DM);
+//             <0 = never — drawn as M-- next to the glyph.
 void hw_ui_clock_tick(const char *version,
                       const char *batt,
                       const char *ip_or_status,
@@ -50,7 +74,9 @@ void hw_ui_clock_tick(const char *version,
                       bool time_ok,
                       int hour, int minute, int second,
                       const char *date_str,
-                      bool crit_unread);
+                      bool crit_unread,
+                      int mesh_ui,
+                      int mesh_age_s);
 
 // 80ms breathing hairline under the header when crit is unread. Clock only.
 void hw_ui_clock_rule_tick(bool crit_unread);
@@ -80,6 +106,17 @@ void hw_ui_show_menu(int selected);
 // Keyboard layout picker: ABC / RU PHON / RU / BACK.
 // current_layout is 0=ABC, 1=PHON, 2=RU (marks with *).
 void hw_ui_show_layout(int selected, int current_layout);
+
+// MeshCore menu: STATUS / PING GW / BACK. selected 0..2
+void hw_ui_show_meshcore(int selected);
+
+// Gateway ping / path probe. lines[] are already short ASCII/UTF-8 rows.
+// phase: "PING…" / "WIFI" / "MESH" / "OK" / "FAIL"
+// n_lines up to HW_UI_MESH_PING_LINES.
+#define HW_UI_MESH_PING_LINES 10
+void hw_ui_show_mesh_ping(const char *phase,
+                          const char *const *lines,
+                          int n_lines);
 
 // Agents list: GROK / CLAUDE / HERMES / BACK. selected is 0..3.
 void hw_ui_show_agents(int selected, bool bridge_ok);

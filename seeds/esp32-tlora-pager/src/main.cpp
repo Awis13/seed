@@ -7,7 +7,7 @@
 //   - I2C on SDA=3/SCL=2 + scan (XL9555, BQ*, TCA8418, …)
 //   - XL9555 power rails, ST7796 480x222 + AW9364, notify beeper,
 //     encoder UI, haptic, sound, keyboard reply, BQ27220 fuel gauge
-// Not driven yet: SX1262, GNSS, NFC, BQ25896 as skills.
+// Not driven yet: SX1262 MeshCore RX stack (keys+P1 path ready), GNSS, NFC, BQ25896.
 // SPIFFS still ships WiFi + token so a dark-panel brick cannot lock us out.
 // Endpoints:
 //   GET  /health            — alive check (no auth)
@@ -28,6 +28,7 @@
 
 #include <Arduino.h>
 #include <stdlib.h>
+#include <stdarg.h>
 #include <time.h>
 #include <WiFi.h>
 #include <ESPmDNS.h>
@@ -46,7 +47,7 @@
 #include "hw_kb.h"
 
 // ===== Configuration =====
-#define SEED_VERSION        "0.9.15"
+#define SEED_VERSION        "0.9.25"
 #define HTTP_PORT           8080
 #define TOKEN_FILE          "/auth_token.txt"
 #define WIFI_CONFIG_FILE    "/wifi.json"
@@ -959,7 +960,7 @@ static void handle_skill(AsyncWebServerRequest *request) {
     s += "7. POST /firmware/confirm (or auto after 60s)\n\n";
     s += "## Board gotchas\n\n";
     s += "- Driven: I2C scan, XL9555, ST7796 + AW9364, notify, progress, haptic, sound, keyboard, BQ27220\n";
-    s += "- Not yet: SX1262/LoRa (MeshCore), GNSS, NFC, BQ25896 charger skill\n";
+    s += "- MeshCore: pair keys + P1→notify path (RX radio stack next); not yet: GNSS, NFC, BQ25896\n";
     s += "- Battery: BQ27220 at 0x55 — Voltage 0x08, SoC 0x2C; BAT % on clock header; /capabilities battery_v/soc\n";
     s += "- Beeper model: any LAN service POSTs /notify; MeshCore/Telegram are later transports into the same inbox\n";
     s += "- Four devices share SPI (display, SX1262, SD, NFC): park every CS HIGH\n";
@@ -1055,14 +1056,16 @@ static void handle_wifi_post(AsyncWebServerRequest *request) {
 // Included into this TU so they share auth, SPIFFS, event_add, display_force.
 // build_src_filter excludes skills/ from separate compilation (same as tembed).
 #include "skills/notify.cpp"
-// After notify: reuses notify_send_json / notify_send_error.
+// After notify: reuses notify_send_json / notify_send_error / notify_ingest_p1.
 #include "skills/progress.cpp"
 #include "skills/agents.cpp"
+#include "skills/meshcore.cpp"
 
 static void skills_init() {
     skill_notify_init();
     skill_progress_init();
     skill_agents_init();
+    skill_meshcore_init();
 }
 
 // Build one second of the home clock face (tembed look, 480x222).
@@ -1121,7 +1124,9 @@ static void ui_clock_paint(const char *note) {
     hw_ui_clock_tick(ver, batt, addr, row1l, row1r, row2,
                      notify_unread_count(),
                      ok, hh, mm, ss, date,
-                     notify_crit_unread());
+                     notify_crit_unread(),
+                     mesh_ui_state(),
+                     mesh_alive_age_s());
     hw_ui_clock_bar(bar_pct);
 }
 
@@ -1132,7 +1137,15 @@ static void ui_go_clock(const char *note) {
 
 // --- Front-panel state (encoder) --------------------------------------------
 // MENU items
-enum { MENU_MESSAGES = 0, MENU_AGENTS, MENU_SETTINGS, MENU_INFO, MENU_BACK, MENU_COUNT };
+enum {
+    MENU_MESSAGES = 0,
+    MENU_AGENTS,
+    MENU_MESHCORE,
+    MENU_SETTINGS,
+    MENU_INFO,
+    MENU_BACK,
+    MENU_COUNT
+};
 // Card action sheet (click / Enter on a notification)
 enum { CARD_ACT_ACK = 0, CARD_ACT_REPLY, CARD_ACT_BACK, CARD_ACT_COUNT };
 // Agents list: 0..2 = agents, 3 = BACK
@@ -1141,11 +1154,19 @@ enum { AGENTS_BACK = 3, AGENTS_LIST_COUNT = 4 };
 enum { AGENT_ACT_CLEAR = 0, AGENT_ACT_BACK, AGENT_ACT_COUNT };
 // Layout picker: 0=ABC 1=PHON 2=RU 3=BACK
 enum { LAYOUT_BACK = 3, LAYOUT_LIST_COUNT = 4 };
+// MeshCore menu: 0=STATUS 1=PING 2=BACK
+enum { MESH_ACT_STATUS = 0, MESH_ACT_PING = 1, MESH_ACT_BACK = 2, MESH_LIST_COUNT = 3 };
 static int menu_sel = 0;
 static int card_act_sel = 0;
 static int agents_sel = 0;
 static int agent_act_sel = 0;
 static int layout_sel = 0;
+static int mesh_sel = 0;
+
+// Home MeshCore gateway (Heltec daemon). Overridable via SPIFFS /mesh_gw.txt
+#define MESH_GW_PATH "/mesh_gw.txt"
+#define MESH_GW_DEFAULT "http://192.168.1.138:8325"
+static char mesh_gw_url[96] = MESH_GW_DEFAULT;
 static int agent_focus = 0;   // which agent chat is open (0..AGENTS_N-1)
 static bool agent_compose = false;  // REPLY screen is for agent, not notify
 static int agent_scroll = -1;       // visual row; -1 = pin to latest
@@ -1182,6 +1203,188 @@ static void kb_layout_load() {
         hw_kb_set_layout(lay);
         hw_kb_take_layout_changed();  // don't flash badge on boot
     }
+}
+
+static void mesh_gw_load() {
+    snprintf(mesh_gw_url, sizeof(mesh_gw_url), "%s", MESH_GW_DEFAULT);
+    if (!SPIFFS.exists(MESH_GW_PATH)) return;
+    File f = SPIFFS.open(MESH_GW_PATH, "r");
+    if (!f) return;
+    String s = f.readString();
+    f.close();
+    s.trim();
+    if (s.startsWith("http://") && s.length() < (int)sizeof(mesh_gw_url))
+        snprintf(mesh_gw_url, sizeof(mesh_gw_url), "%s", s.c_str());
+}
+
+// Pull one JSON string field "key":"value" into out (best-effort, no nested).
+static bool json_str_field(const char *js, const char *key, char *out, size_t out_n) {
+    if (!js || !key || !out || out_n == 0) return false;
+    out[0] = '\0';
+    char pat[48];
+    snprintf(pat, sizeof(pat), "\"%s\"", key);
+    const char *p = strstr(js, pat);
+    if (!p) return false;
+    p = strchr(p + strlen(pat), ':');
+    if (!p) return false;
+    p++;
+    while (*p == ' ' || *p == '\t') p++;
+    if (*p != '"') return false;
+    p++;
+    size_t i = 0;
+    while (*p && *p != '"' && i + 1 < out_n) {
+        if (*p == '\\' && p[1]) { p++; }  // skip escape
+        out[i++] = *p++;
+    }
+    out[i] = '\0';
+    return i > 0;
+}
+
+static bool json_num_field(const char *js, const char *key, long *out) {
+    if (!js || !key || !out) return false;
+    char pat[48];
+    snprintf(pat, sizeof(pat), "\"%s\"", key);
+    const char *p = strstr(js, pat);
+    if (!p) return false;
+    p = strchr(p + strlen(pat), ':');
+    if (!p) return false;
+    p++;
+    while (*p == ' ' || *p == '\t') p++;
+    char *end = NULL;
+    long v = strtol(p, &end, 10);
+    if (end == p) return false;
+    *out = v;
+    return true;
+}
+
+static void ui_open_meshcore() {
+    mesh_sel = 0;
+    hw_ui_show_meshcore(mesh_sel);
+    ui_note_input();
+}
+
+// MESHCORE → STATUS: pair keys + RF policy (from SPIFFS /mesh_*).
+static void ui_mesh_show_status() {
+    static char lines[HW_UI_MESH_PING_LINES][40];
+    static const char *ptrs[HW_UI_MESH_PING_LINES];
+    char raw[HW_UI_MESH_PING_LINES][40];
+    int n = mesh_status_lines(raw, HW_UI_MESH_PING_LINES);
+    for (int i = 0; i < n; i++) {
+        snprintf(lines[i], sizeof(lines[i]), "%s", raw[i]);
+        ptrs[i] = lines[i];
+    }
+    const char *phase = g_mesh.has_identity ? "PAIR" : "NOKEY";
+    hw_ui_show_mesh_ping(phase, ptrs, n);
+    ui_note_input();
+}
+
+// MESHCORE → PING GATEWAY: probe home Heltec daemon, show full path info.
+// Today: WiFi RTT to gateway /ping (mesh LoRa RTT when pager RX is ready).
+static void ui_mesh_ping_gateway() {
+    static char lines[HW_UI_MESH_PING_LINES][48];
+    static const char *ptrs[HW_UI_MESH_PING_LINES];
+    int n = 0;
+    auto push = [&](const char *fmt, ...) {
+        if (n >= HW_UI_MESH_PING_LINES) return;
+        va_list ap;
+        va_start(ap, fmt);
+        vsnprintf(lines[n], sizeof(lines[0]), fmt, ap);
+        va_end(ap);
+        ptrs[n] = lines[n];
+        n++;
+    };
+
+    // --- phase: start ---
+    n = 0;
+    push("path: WIFI (mesh RTT later)");
+    push("gw: %s", mesh_gw_url);
+    push("wifi: %s",
+         WiFi.status() == WL_CONNECTED
+             ? WiFi.localIP().toString().c_str()
+             : "OFFLINE");
+    push("sending GET /ping …");
+    hw_ui_show_mesh_ping("PING…", ptrs, n);
+    ui_note_input();
+    yield();
+
+    if (WiFi.status() != WL_CONNECTED) {
+        n = 0;
+        push("wifi: OFFLINE");
+        push("cannot reach home gateway");
+        push("join LAN or wait for mesh RX");
+        hw_ui_show_mesh_ping("FAIL", ptrs, n);
+        ui_note_input();
+        return;
+    }
+
+    char url[128];
+    unsigned long t0 = millis();
+    snprintf(url, sizeof(url), "%s/ping?t=%lu", mesh_gw_url, t0);
+
+    n = 0;
+    push("wifi: %s", WiFi.localIP().toString().c_str());
+    push("GET %s", mesh_gw_url);
+    push("waiting…");
+    hw_ui_show_mesh_ping("WIFI", ptrs, n);
+    yield();
+
+    HTTPClient http;
+    http.setTimeout(4000);
+    if (!http.begin(url)) {
+        n = 0;
+        push("http.begin failed");
+        push("%s", mesh_gw_url);
+        hw_ui_show_mesh_ping("FAIL", ptrs, n);
+        ui_note_input();
+        return;
+    }
+    int code = http.GET();
+    unsigned long rtt = millis() - t0;
+    String body = (code > 0) ? http.getString() : String("");
+    http.end();
+
+    n = 0;
+    if (code <= 0) {
+        push("http error %d", code);
+        push("rtt %lu ms (fail)", rtt);
+        push("gw %s", mesh_gw_url);
+        push("is meshcore-daemon up?");
+        hw_ui_show_mesh_ping("FAIL", ptrs, n);
+        ui_note_input();
+        return;
+    }
+
+    // Parse rich /ping JSON (best-effort flat key scan)
+    char name[24] = "", pk[20] = "", mode[16] = "", ch_n[24] = "";
+    long freq = 0, sf = 0, tx = 0, up_s = 0;
+    if (!json_str_field(body.c_str(), "pk16", pk, sizeof(pk)))
+        json_str_field(body.c_str(), "pk8", pk, sizeof(pk));
+    json_num_field(body.c_str(), "freq", &freq);  // 869.618 -> 869
+    json_num_field(body.c_str(), "sf", &sf);
+    json_num_field(body.c_str(), "tx_power", &tx);
+    json_num_field(body.c_str(), "daemon_uptime_s", &up_s);
+    json_str_field(body.c_str(), "notify_mode", mode, sizeof(mode));
+    const char *c0 = strstr(body.c_str(), "channel0");
+    if (c0) json_str_field(c0, "name", ch_n, sizeof(ch_n));
+    const char *rad = strstr(body.c_str(), "\"radio\"");
+    if (rad) json_str_field(rad, "name", name, sizeof(name));
+
+    n = 0;
+    push("RTT  %lu ms   HTTP %d", rtt, code);
+    push("path WIFI->gateway (LAN)");
+    push("mesh: private DM only (no Public)");
+    if (name[0]) push("node %s", name);
+    if (pk[0])   push("pk   %s...", pk);
+    if (freq)    push("RF   %ld MHz  SF%ld  TX%ld", freq, sf, tx);
+    if (ch_n[0]) push("ch0  %s", ch_n);
+    else         push("pair: set pager_pubkey on GW");
+    if (mode[0]) push("egress %s", mode);
+    if (up_s)    push("daemon up %ldh%ldm", up_s / 3600, (up_s / 60) % 60);
+    push("me   %s", WiFi.localIP().toString().c_str());
+
+    hw_ui_show_mesh_ping("OK", ptrs, n);
+    hw_haptic_notify(0);
+    ui_note_input();
 }
 
 static void kb_layout_save() {
@@ -1620,6 +1823,8 @@ static void ui_on_click() {
             ui_open_msglist();
         } else if (menu_sel == MENU_AGENTS) {
             ui_open_agents();
+        } else if (menu_sel == MENU_MESHCORE) {
+            ui_open_meshcore();
         } else if (menu_sel == MENU_SETTINGS) {
             layout_sel = (int)hw_kb_layout();
             hw_ui_show_layout(layout_sel, (int)hw_kb_layout());
@@ -1629,6 +1834,19 @@ static void ui_on_click() {
         } else {
             ui_go_clock(NULL);
         }
+        break;
+    case HW_UI_MESHCORE:
+        if (mesh_sel == MESH_ACT_BACK) {
+            ui_open_menu();
+        } else if (mesh_sel == MESH_ACT_STATUS) {
+            ui_mesh_show_status();
+        } else {
+            ui_mesh_ping_gateway();
+        }
+        break;
+    case HW_UI_MESH_PING:
+        // any click leaves the result
+        ui_open_meshcore();
         break;
     case HW_UI_LAYOUT:
         if (layout_sel == LAYOUT_BACK) {
@@ -1738,6 +1956,13 @@ static void ui_on_steps(int steps) {
         hw_ui_show_layout(layout_sel, (int)hw_kb_layout());
         break;
     }
+    case HW_UI_MESHCORE: {
+        mesh_sel += steps;
+        while (mesh_sel < 0) mesh_sel += MESH_LIST_COUNT;
+        while (mesh_sel >= MESH_LIST_COUNT) mesh_sel -= MESH_LIST_COUNT;
+        hw_ui_show_meshcore(mesh_sel);
+        break;
+    }
     case HW_UI_MSGLIST:
         if (msglist_count <= 0) break;
         msglist_sel += steps;
@@ -1822,6 +2047,7 @@ void setup() {
     hw_sound_begin();
     hw_kb_begin();
     kb_layout_load(); // SPIFFS /kb_layout.txt → EN / RU PHON / RU
+    mesh_gw_load();   // SPIFFS /mesh_gw.txt → home Heltec daemon URL
     hw_probe();
     tz_load();        // before wifi_setup(): configTzTime() needs the TZ string
     wifi_setup();     // RF up; raises the setup AP if STA fails

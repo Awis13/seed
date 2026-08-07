@@ -118,11 +118,14 @@
  * keep every comment inside fully closed: the slicer copies from the marker
  * without understanding what it copies. */
 /* host-test:begin types — sliced out by tools/test_notify_options.sh */
-#define NOTIFY_MAX          20
-#define NOTIFY_PERSIST       6
+/* Queue depth / string widths — bumped 0.9.22 for mesh multi-part + long chat
+ * spill. Screen still ellipsises; SPIFFS/API keep the full field.
+ * RAM: ~40 * sizeof(Notification) + options table; PSRAM not required. */
+#define NOTIFY_MAX          40
+#define NOTIFY_PERSIST      12
 #define NOTIFY_SOURCE_LEN   17   /* 16 chars, e.g. "home-rig", "k1c" */
-#define NOTIFY_TITLE_LEN    41   /* 40 chars */
-#define NOTIFY_BODY_LEN     97   /* 96 chars, two ellipsised lines on screen */
+#define NOTIFY_TITLE_LEN    61   /* 60 chars */
+#define NOTIFY_BODY_LEN    241   /* 240 chars — multi-line / mesh reassembly */
 #define NOTIFY_KEY_LEN      25   /* 24 chars of client-supplied dedup key */
 /* The range an id may take is 1..NOTIFY_ID_MAX, and both ends are excluded for
    the same reason. 0 marks a free slot. 0xFFFFFFFF is the id whose successor is
@@ -211,7 +214,10 @@ struct NotifyView {
    tail padding the struct was already paying for, and this is what says so.
    Outside the sliced region deliberately — the host's `unsigned long` and
    `time_t` are wider than the device's and the number would not hold there. */
-static_assert(sizeof(Notification) == 208,
+/* 0.9.22: title 61 + body 241 (was 41+97) → larger fixed slot; pin so host
+ * tests and future field adds stay honest. */
+/* 0.9.22: title 61 + body 241 (was 41+97). */
+static_assert(sizeof(Notification) == 376,
               "Notification changed size: the queue costs NOTIFY_MAX times this");
 
 /* The store itself is sliced onto the host too, because the restore loop under
@@ -1195,6 +1201,83 @@ static void notify_poll() {
         notify_dirty = false;
         notify_save();
     }
+}
+
+/* Ingest without HTTP — same card path as POST /notify.
+ * Used by MeshCore private DM (P1|…) and any future transport. */
+static uint32_t notify_ingest(const char *level_s,
+                              const char *source,
+                              const char *title,
+                              const char *body,
+                              const char *key) {
+    Notification e;
+    memset(&e, 0, sizeof(e));
+    e.level = NOTIFY_INFO;
+    if (level_s) {
+        if (!strcmp(level_s, "warn") || !strcmp(level_s, "warning")) e.level = NOTIFY_WARN;
+        else if (!strcmp(level_s, "crit") || !strcmp(level_s, "critical")) e.level = NOTIFY_CRIT;
+    }
+    e.unread = true;
+    e.chosen = -1;
+    e.opt_count = 0;
+    e.ttl_s = 0;
+    notify_copy_text(e.source, sizeof(e.source), source ? source : "mesh");
+    notify_copy_text(e.title, sizeof(e.title), title ? title : "notify");
+    notify_copy_text(e.body, sizeof(e.body), body ? body : "");
+    if (key && key[0]) notify_copy_text(e.key, sizeof(e.key), key);
+
+    time_t now = time(NULL);
+    e.created_epoch = (now > TIME_VALID_EPOCH) ? now : 0;
+    e.created_ms = millis();
+
+    uint32_t replaced = 0;
+    uint32_t id = notify_push(e, NULL, &replaced);
+    if (id == 0) return 0;
+
+    notify_arrived_id = id;
+    notify_arrived = true;
+    notify_ring_level = e.level;
+    notify_ring_arrived = true;
+    notify_request_sound(e.level, e.source);
+    notify_mark_dirty(e.level == NOTIFY_CRIT ? 0 : NOTIFY_COALESCE_MS);
+    display_force = true;
+    event_add("notify %s: %s%s%s", notify_level_name(e.level),
+              e.source[0] ? e.source : "", e.source[0] ? ": " : "", e.title);
+    return id;
+}
+
+/* Wire format from home-rig MeshCore gateway:
+ *   P1|<info|warn|crit>|<source>|<title>|<body>
+ * body may contain '|'. Returns notify id or 0. */
+static uint32_t notify_ingest_p1(const char *wire) {
+    if (!wire || strncmp(wire, "P1|", 3) != 0) return 0;
+    const char *p = wire + 3;
+    char level[8] = {0}, source[NOTIFY_SOURCE_LEN] = {0};
+    char title[NOTIFY_TITLE_LEN] = {0};
+    const char *body = "";
+
+    const char *a = strchr(p, '|');
+    if (!a) return 0;
+    size_t n = (size_t)(a - p);
+    if (n >= sizeof(level)) n = sizeof(level) - 1;
+    memcpy(level, p, n);
+    p = a + 1;
+
+    a = strchr(p, '|');
+    if (!a) return 0;
+    n = (size_t)(a - p);
+    if (n >= sizeof(source)) n = sizeof(source) - 1;
+    memcpy(source, p, n);
+    p = a + 1;
+
+    a = strchr(p, '|');
+    if (!a) return 0;
+    n = (size_t)(a - p);
+    if (n >= sizeof(title)) n = sizeof(title) - 1;
+    memcpy(title, p, n);
+    body = a + 1;
+
+    return notify_ingest(level, source, title, body, NULL);
 }
 
 /* --- Endpoints --- */
