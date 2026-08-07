@@ -43,10 +43,10 @@ PAGER_TOKEN = os.environ.get("PAGER_TOKEN", "")
 
 # Long replies are fine — the pager scrolls. Still ASCII-only for the panel font.
 SYSTEM = (
-    "You are Hermes talking to Nikolaj on a pocket pager (480x222 screen, ASCII only). "
-    "Reply in English. You may write several short paragraphs; he can scroll. "
-    "Prefer clear prose under ~1500 characters when possible. "
-    "No markdown fences, no emoji, no Cyrillic (panel cannot render it)."
+    "You are Hermes talking to Nikolaj on a pocket pager (480x222 screen). "
+    "He types in English or Russian (phonetic / JCUKEN). Reply in the language he uses. "
+    "ASCII + Cyrillic only — no emoji, no markdown fences. "
+    "Prefer clear prose under ~1500 characters; he can scroll."
 )
 
 
@@ -110,11 +110,17 @@ def hermes_chat(session: str, text: str) -> str:
         return f"(hermes bad response: {data!s})"[:200]
     if not isinstance(content, str):
         content = str(content)
-    # ASCII-safe for panel; keep length for scrolling chat (body collect max 4KB)
-    cleaned = "".join(
-        (ch if 32 <= ord(ch) <= 126 else " ") for ch in content
-    )
-    cleaned = " ".join(cleaned.split())
+    # Panel is UTF-8 (ASCII + Cyrillic). Drop control chars; keep letters.
+    cleaned_chars = []
+    for ch in content:
+        o = ord(ch)
+        if ch in "\n\r\t":
+            cleaned_chars.append(" ")
+        elif 32 <= o <= 126 or o >= 160:
+            cleaned_chars.append(ch)
+        else:
+            cleaned_chars.append(" ")
+    cleaned = " ".join("".join(cleaned_chars).split())
     if len(cleaned) > 3500:
         cleaned = cleaned[:3497] + "..."
     return cleaned or "(empty reply)"
@@ -126,10 +132,12 @@ def pager_push(agent: str, text: str) -> None:
         return
     auth = {"Authorization": f"Bearer {PAGER_TOKEN}"}
     # 1) Full reply → chat room (may be long; pager splits + scrolls).
+    # Slice by characters (not bytes) so UTF-8 Cyrillic stays intact.
+    inbound = text[:3500]
     _http_json(
         "POST",
         f"{PAGER_URL}/agents/inbound",
-        body={"agent": agent, "text": text[:3500]},
+        body={"agent": agent, "text": inbound},
         headers=auth,
         timeout=12.0,
     )
