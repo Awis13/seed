@@ -66,14 +66,25 @@ static void agents_push_one(int idx, bool from_me, const char *chunk) {
     if (a.n < AGENT_THREAD_MAX) a.n++;
 }
 
+/* UTF-8 lead length (1..4). Invalid lead → 1 so we never stall. */
+static int agents_utf8_len(const char *s) {
+    if (!s || !s[0]) return 0;
+    unsigned char c = (unsigned char)s[0];
+    if (c < 0x80) return 1;
+    if ((c & 0xE0) == 0xC0) return 2;
+    if ((c & 0xF0) == 0xE0) return 3;
+    if ((c & 0xF8) == 0xF0) return 4;
+    return 1;
+}
+
 /* Push arbitrary-length text: split on word boundaries into ring slots.
-   Long bot walls become several sequential lines, same speaker. */
+   Long bot walls become several sequential lines, same speaker.
+   Never cuts mid-UTF-8 sequence (Cyrillic is 2 bytes). */
 static void agents_push_line(int idx, bool from_me, const char *text) {
     if (idx < 0 || idx >= AGENTS_N || !text || !text[0]) return;
 
     const char *p = text;
     while (*p) {
-        // Skip leading spaces between chunks
         while (*p == ' ') p++;
         if (!*p) break;
 
@@ -81,18 +92,24 @@ static void agents_push_line(int idx, bool from_me, const char *text) {
         int n = 0;
         int last_sp = -1;
         while (p[n] && n < cap) {
-            if (p[n] == ' ') last_sp = n;
-            n++;
+            int k = agents_utf8_len(p + n);
+            if (k <= 0) break;
+            if (n + k > cap) break;  // don't start a char we can't finish
+            if (k == 1 && p[n] == ' ') last_sp = n;
+            n += k;
         }
-        // If we didn't finish the string, break at last space when possible
         if (p[n] && last_sp > 8) n = last_sp;
-        if (n <= 0) n = 1;  // single overlong token: hard cut
+        if (n <= 0) {
+            // hard cut one codepoint (or byte if garbage)
+            n = agents_utf8_len(p);
+            if (n <= 0) n = 1;
+            if (n > cap) n = cap;
+        }
 
         char chunk[AGENT_TEXT_LEN];
         if (n >= (int)sizeof(chunk)) n = (int)sizeof(chunk) - 1;
         memcpy(chunk, p, n);
         chunk[n] = '\0';
-        // trim trailing space
         while (n > 0 && chunk[n - 1] == ' ') chunk[--n] = '\0';
         if (n > 0) agents_push_one(idx, from_me, chunk);
         p += n;
@@ -182,20 +199,37 @@ static bool agents_bridge_post(const char *agent_id, const char *text) {
     return code >= 200 && code < 300;
 }
 
-/* Strip to printable ASCII into a heap-friendly stack buffer for long inbound. */
-static void agents_clean_ascii(const char *in, char *out, size_t out_n) {
+/* Keep printable ASCII + valid UTF-8 (Cyrillic). Tabs/newlines → space. */
+static void agents_clean_text(const char *in, char *out, size_t out_n) {
     if (!out || out_n == 0) return;
     size_t j = 0;
     if (in) {
-        for (size_t i = 0; in[i] && j + 1 < out_n; i++) {
+        for (size_t i = 0; in[i] && j + 1 < out_n; ) {
             unsigned char c = (unsigned char)in[i];
             if (c == '\n' || c == '\r' || c == '\t') {
-                // Keep structure as spaces so wrap still works
                 if (j == 0 || out[j - 1] != ' ') out[j++] = ' ';
+                i++;
                 continue;
             }
-            if (c < 0x20 || c > 0x7E) continue;
-            out[j++] = (char)c;
+            if (c < 0x20) { i++; continue; }
+            if (c < 0x80) {
+                out[j++] = (char)c;
+                i++;
+                continue;
+            }
+            int need = 0;
+            if ((c & 0xE0) == 0xC0) need = 2;
+            else if ((c & 0xF0) == 0xE0) need = 3;
+            else if ((c & 0xF8) == 0xF0) need = 4;
+            else { i++; continue; }
+            bool ok = true;
+            for (int k = 1; k < need; k++) {
+                if (((unsigned char)in[i + k] & 0xC0) != 0x80) { ok = false; break; }
+            }
+            if (!ok) { i++; continue; }
+            if (j + (size_t)need >= out_n) break;
+            for (int k = 0; k < need; k++) out[j++] = in[i + k];
+            i += (size_t)need;
         }
     }
     out[j] = '\0';
@@ -206,9 +240,8 @@ static bool agents_send(const char *agent_id, const char *text) {
     int idx = agents_find(agent_id);
     if (idx < 0 || !text || !text[0]) return false;
 
-    // User compose is short (reply buffer); still clean ASCII.
     char cleaned[AGENT_TEXT_LEN];
-    agents_clean_ascii(text, cleaned, sizeof(cleaned));
+    agents_clean_text(text, cleaned, sizeof(cleaned));
     if (!cleaned[0]) return false;
 
     portENTER_CRITICAL(&agents_mux);
@@ -234,7 +267,7 @@ static void agents_on_inbound(const char *agent_id, const char *text) {
     if (idx < 0 || !text || !text[0]) return;
     // Allow up to ~2KB inbound wall of text (split into ring slots).
     char cleaned[2048];
-    agents_clean_ascii(text, cleaned, sizeof(cleaned));
+    agents_clean_text(text, cleaned, sizeof(cleaned));
     if (!cleaned[0]) return;
     portENTER_CRITICAL(&agents_mux);
     agents_push_line(idx, false, cleaned);

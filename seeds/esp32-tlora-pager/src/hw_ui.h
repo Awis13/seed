@@ -30,6 +30,7 @@ enum HwUiScreen : uint8_t {
     HW_UI_MSGLIST,
     HW_UI_INFO,
     HW_UI_REPLY,
+    HW_UI_LAYOUT,      // keyboard layout picker (SETTINGS)
 };
 
 HwUiScreen hw_ui_screen();
@@ -73,8 +74,12 @@ void hw_ui_show_agent_invite(const char *agent_name,
 // title is a short dim subtitle (message title).
 void hw_ui_show_card_act(int selected, const char *title);
 
-// Menu: MESSAGES / AGENTS / INFO / BACK. selected is 0..3.
+// Menu: MESSAGES / AGENTS / SETTINGS / INFO / BACK. selected is 0..4.
 void hw_ui_show_menu(int selected);
+
+// Keyboard layout picker: ABC / RU PHON / RU / BACK.
+// current_layout is 0=ABC, 1=PHON, 2=RU (marks with *).
+void hw_ui_show_layout(int selected, int current_layout);
 
 // Agents list: GROK / CLAUDE / HERMES / BACK. selected is 0..3.
 void hw_ui_show_agents(int selected, bool bridge_ok);
@@ -114,9 +119,10 @@ void hw_ui_show_info(const char *version,
 
 void hw_ui_invalidate_clock();
 
-// Free-text reply composer. buffer is the live draft (ASCII).
-// caps/sym badges reflect keyboard modifiers.
+// Free-text reply composer. buffer is UTF-8 draft.
+// caps/sym badges + layout_name ("ABC"/"PHON"/"RU") in header.
 void hw_ui_show_reply(const char *title,
                       const char *buffer,
                       bool caps,
-                      bool symbol);
+                      bool symbol,
+                      const char *layout_name);

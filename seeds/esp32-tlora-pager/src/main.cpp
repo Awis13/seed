@@ -46,7 +46,7 @@
 #include "hw_kb.h"
 
 // ===== Configuration =====
-#define SEED_VERSION        "0.9.8"
+#define SEED_VERSION        "0.9.15"
 #define HTTP_PORT           8080
 #define TOKEN_FILE          "/auth_token.txt"
 #define WIFI_CONFIG_FILE    "/wifi.json"
@@ -1132,17 +1132,20 @@ static void ui_go_clock(const char *note) {
 
 // --- Front-panel state (encoder) --------------------------------------------
 // MENU items
-enum { MENU_MESSAGES = 0, MENU_AGENTS, MENU_INFO, MENU_BACK, MENU_COUNT };
+enum { MENU_MESSAGES = 0, MENU_AGENTS, MENU_SETTINGS, MENU_INFO, MENU_BACK, MENU_COUNT };
 // Card action sheet (click / Enter on a notification)
 enum { CARD_ACT_ACK = 0, CARD_ACT_REPLY, CARD_ACT_BACK, CARD_ACT_COUNT };
 // Agents list: 0..2 = agents, 3 = BACK
 enum { AGENTS_BACK = 3, AGENTS_LIST_COUNT = 4 };
 // In-chat menu (click while in agent chat room)
 enum { AGENT_ACT_CLEAR = 0, AGENT_ACT_BACK, AGENT_ACT_COUNT };
+// Layout picker: 0=ABC 1=PHON 2=RU 3=BACK
+enum { LAYOUT_BACK = 3, LAYOUT_LIST_COUNT = 4 };
 static int menu_sel = 0;
 static int card_act_sel = 0;
 static int agents_sel = 0;
 static int agent_act_sel = 0;
+static int layout_sel = 0;
 static int agent_focus = 0;   // which agent chat is open (0..AGENTS_N-1)
 static bool agent_compose = false;  // REPLY screen is for agent, not notify
 static int agent_scroll = -1;       // visual row; -1 = pin to latest
@@ -1154,13 +1157,78 @@ static int msglist_count = 0;
 // Notify card currently shown (for ack-on-click / reply).
 static uint32_t notify_card_id = 0;
 static char reply_title[NOTIFY_TITLE_LEN];
-static char reply_buf[NOTIFY_REPLY_LEN];
+// UTF-8 draft: keep room for ~40 Cyrillic codepoints (2–3 bytes each).
+static char reply_buf[192];
 // Idle return to clock (Advisor: shelf is a clock). Longer while typing.
 static unsigned long ui_last_input_ms = 0;
 #define UI_IDLE_MS        15000
 #define UI_IDLE_REPLY_MS  60000
+#define KB_LAYOUT_PATH    "/kb_layout.txt"
 
 static void ui_note_input() { ui_last_input_ms = millis(); }
+
+// ---- keyboard layout persist ----------------------------------------------
+static void kb_layout_load() {
+    if (!SPIFFS.exists(KB_LAYOUT_PATH)) return;
+    File f = SPIFFS.open(KB_LAYOUT_PATH, "r");
+    if (!f) return;
+    char id[16] = {0};
+    size_t n = f.readBytes(id, sizeof(id) - 1);
+    f.close();
+    while (n > 0 && (id[n - 1] == '\n' || id[n - 1] == '\r' || id[n - 1] == ' '))
+        id[--n] = '\0';
+    HwKbLayout lay;
+    if (hw_kb_layout_from_id(id, &lay)) {
+        hw_kb_set_layout(lay);
+        hw_kb_take_layout_changed();  // don't flash badge on boot
+    }
+}
+
+static void kb_layout_save() {
+    File f = SPIFFS.open(KB_LAYOUT_PATH, "w");
+    if (!f) return;
+    f.print(hw_kb_layout_id());
+    f.close();
+}
+
+// UTF-8 helpers for the reply draft
+static int utf8_cp_len(const char *s) {
+    if (!s || !s[0]) return 0;
+    unsigned char c = (unsigned char)s[0];
+    if (c < 0x80) return 1;
+    if ((c & 0xE0) == 0xC0) return 2;
+    if ((c & 0xF0) == 0xE0) return 3;
+    if ((c & 0xF8) == 0xF0) return 4;
+    return 1;
+}
+
+static void reply_buf_backspace() {
+    size_t n = strlen(reply_buf);
+    if (n == 0) return;
+    // Walk codepoints; drop the last one.
+    size_t i = 0, prev = 0;
+    while (i < n) {
+        prev = i;
+        int k = utf8_cp_len(reply_buf + i);
+        if (k <= 0) break;
+        i += (size_t)k;
+    }
+    reply_buf[prev] = '\0';
+}
+
+static bool reply_buf_append(const char *utf8) {
+    if (!utf8 || !utf8[0]) return false;
+    size_t n = strlen(reply_buf);
+    size_t add = strlen(utf8);
+    if (n + add + 1 > sizeof(reply_buf)) return false;
+    memcpy(reply_buf + n, utf8, add + 1);
+    return true;
+}
+
+static void ui_reply_paint() {
+    hw_ui_show_reply(reply_title, reply_buf, hw_kb_caps(), hw_kb_symbol(),
+                     hw_kb_layout_name());
+}
 
 // Keyboard shortcut HOME: leave any face, drop drafts, show clock.
 static void ui_go_home() {
@@ -1186,38 +1254,48 @@ static int agents_index_from_door(const NotifyView &v);
 static void ui_show_agent_invite_from_view(const NotifyView &v, uint32_t id);
 static void ui_enter_agent_from_notify(uint32_t id, const NotifyView &v);
 
-static void ui_open_reply(uint32_t id, const char *title, char first) {
+// first_utf8: optional first character (UTF-8); NULL/empty = empty draft.
+static void ui_open_reply(uint32_t id, const char *title, const char *first_utf8) {
     agent_compose = false;
     notify_card_id = id;
     snprintf(reply_title, sizeof(reply_title), "%s", title ? title : "");
     reply_buf[0] = '\0';
-    // Always start ABC — never inherit a stuck SYM latch from earlier typing.
+    // Clear CAPS/SYM latch; layout stays (user's Settings choice).
     hw_kb_reset_mods();
-    if (first && first != '\b' && first != '\n') {
-        reply_buf[0] = first;
-        reply_buf[1] = '\0';
+    if (first_utf8 && first_utf8[0] &&
+        first_utf8[0] != '\b' && first_utf8[0] != '\n' && first_utf8[0] != '\x1b') {
+        reply_buf_append(first_utf8);
     }
-    hw_ui_show_reply(reply_title, reply_buf, hw_kb_caps(), hw_kb_symbol());
+    ui_reply_paint();
     ui_note_input();
 }
 
-static void ui_open_agent_compose(char first) {
+static void ui_open_agent_compose(const char *first_utf8) {
     agent_compose = true;
     notify_card_id = 0;
     snprintf(reply_title, sizeof(reply_title), "-> %s", agents_name(agent_focus));
     reply_buf[0] = '\0';
     hw_kb_reset_mods();
-    if (first && first != '\b' && first != '\n') {
-        reply_buf[0] = first;
-        reply_buf[1] = '\0';
+    if (first_utf8 && first_utf8[0] &&
+        first_utf8[0] != '\b' && first_utf8[0] != '\n' && first_utf8[0] != '\x1b') {
+        reply_buf_append(first_utf8);
     }
-    hw_ui_show_reply(reply_title, reply_buf, hw_kb_caps(), hw_kb_symbol());
+    ui_reply_paint();
     ui_note_input();
 }
 
 static void ui_reply_redraw() {
-    hw_ui_show_reply(reply_title, reply_buf, hw_kb_caps(), hw_kb_symbol());
+    ui_reply_paint();
     ui_note_input();
+}
+
+static bool utf8_is_printable(const char *u) {
+    if (!u || !u[0]) return false;
+    unsigned char c = (unsigned char)u[0];
+    if (c == '\b' || c == '\n' || c == '\x1b') return false;
+    if (c >= 0x20 && c < 0x7F) return true;   // ASCII printable
+    if (c >= 0xC0) return true;                 // UTF-8 lead (Cyrillic etc.)
+    return false;
 }
 
 static void ui_reply_submit() {
@@ -1244,22 +1322,24 @@ static void ui_reply_submit() {
     ui_go_clock("sent");
 }
 
-static void ui_on_key(char c) {
+static void ui_on_key(const char *u) {
+    if (!u || !u[0]) return;
     ui_note_input();
     HwUiScreen scr = hw_ui_screen();
+    char c0 = u[0];
 
     // ALT (orange) + Backspace → home clock from any screen.
-    if (c == '\x1b') {
+    if (c0 == '\x1b') {
         ui_go_home();
-        hw_haptic_notify(0);  // soft click so the shortcut is felt
+        hw_haptic_notify(0);
         return;
     }
 
-    // From a card: typing jumps straight into reply (keep that).
-    // Enter / encoder: agent door → open chat; else Ack·Reply sheet.
+    // From a card: typing jumps straight into reply.
+    // Enter: agent door → open chat; else Ack·Reply sheet.
     if (scr == HW_UI_NOTIFY && notify_card_id) {
-        if (c == '\b') return;
-        if (c == '\n') {
+        if (c0 == '\b') return;
+        if (c0 == '\n') {
             NotifyView v;
             if (notify_view_by_id(notify_card_id, v, NULL, NULL) &&
                 notify_is_chat_door(v)) {
@@ -1269,17 +1349,16 @@ static void ui_on_key(char c) {
             }
             return;
         }
-        // Typing on a chat door → open room + compose. On a real page → reply.
         NotifyView v;
         if (notify_view_by_id(notify_card_id, v, NULL, NULL)) {
             if (notify_is_chat_door(v)) {
                 ui_enter_agent_from_notify(notify_card_id, v);
-                if (c >= 0x20 && c <= 0x7E) ui_open_agent_compose(c);
+                if (utf8_is_printable(u)) ui_open_agent_compose(u);
                 return;
             }
         }
-        if (c >= 0x20 && c <= 0x7E) {
-            ui_open_reply(notify_card_id, reply_title[0] ? reply_title : NULL, c);
+        if (utf8_is_printable(u)) {
+            ui_open_reply(notify_card_id, reply_title[0] ? reply_title : NULL, u);
             if (!reply_title[0]) {
                 NotifyView vv;
                 if (notify_view_by_id(notify_card_id, vv, NULL, NULL))
@@ -1292,52 +1371,46 @@ static void ui_on_key(char c) {
 
     // On Ack/Reply sheet: Enter confirms; typing still starts a reply.
     if (scr == HW_UI_CARD_ACT && notify_card_id) {
-        if (c == '\n') {
+        if (c0 == '\n') {
             ui_card_act_confirm();
             return;
         }
-        if (c >= 0x20 && c <= 0x7E) {
-            ui_open_reply(notify_card_id, reply_title[0] ? reply_title : NULL, c);
+        if (utf8_is_printable(u)) {
+            ui_open_reply(notify_card_id, reply_title[0] ? reply_title : NULL, u);
             return;
         }
     }
 
     if (scr == HW_UI_REPLY) {
-        if (c == '\n') {
+        if (c0 == '\n') {
             ui_reply_submit();
             return;
         }
-        if (c == '\b') {
-            size_t n = strlen(reply_buf);
-            if (n > 0) reply_buf[n - 1] = '\0';
+        if (c0 == '\b') {
+            reply_buf_backspace();
             ui_reply_redraw();
             return;
         }
-        if (c >= 0x20 && c <= 0x7E) {
-            size_t n = strlen(reply_buf);
-            if (n + 1 < sizeof(reply_buf)) {
-                reply_buf[n] = c;
-                reply_buf[n + 1] = '\0';
-                ui_reply_redraw();
-            }
+        if (utf8_is_printable(u)) {
+            if (reply_buf_append(u)) ui_reply_redraw();
             return;
         }
     }
 
     // Agent chat: type = compose to that agent; Enter = empty compose
     if (scr == HW_UI_AGENT_CHAT) {
-        if (c == '\n') {
-            ui_open_agent_compose(0);
+        if (c0 == '\n') {
+            ui_open_agent_compose(NULL);
             return;
         }
-        if (c >= 0x20 && c <= 0x7E) {
-            ui_open_agent_compose(c);
+        if (utf8_is_printable(u)) {
+            ui_open_agent_compose(u);
             return;
         }
     }
 
     // Clock / menu: 'm' opens messages, bare keys ignored
-    if (scr == HW_UI_CLOCK && (c == 'm' || c == 'M')) {
+    if (scr == HW_UI_CLOCK && (c0 == 'm' || c0 == 'M')) {
         msglist_sel = 0;
         ui_open_msglist();
     }
@@ -1527,7 +1600,7 @@ static void ui_card_act_confirm() {
         else ui_go_clock("acked");
     } else if (card_act_sel == CARD_ACT_REPLY) {
         ui_open_reply(notify_card_id,
-                      reply_title[0] ? reply_title : NULL, 0);
+                      reply_title[0] ? reply_title : NULL, NULL);
     } else {
         // BACK → re-show the card
         ui_open_notify_id(notify_card_id);
@@ -1547,10 +1620,26 @@ static void ui_on_click() {
             ui_open_msglist();
         } else if (menu_sel == MENU_AGENTS) {
             ui_open_agents();
+        } else if (menu_sel == MENU_SETTINGS) {
+            layout_sel = (int)hw_kb_layout();
+            hw_ui_show_layout(layout_sel, (int)hw_kb_layout());
+            ui_note_input();
         } else if (menu_sel == MENU_INFO) {
             ui_open_info();
         } else {
             ui_go_clock(NULL);
+        }
+        break;
+    case HW_UI_LAYOUT:
+        if (layout_sel == LAYOUT_BACK) {
+            ui_open_menu();
+        } else {
+            hw_kb_set_layout((HwKbLayout)layout_sel);
+            kb_layout_save();
+            hw_kb_take_layout_changed();
+            hw_haptic_notify(0);
+            // Re-draw so the * marker jumps to the new default.
+            hw_ui_show_layout(layout_sel, (int)hw_kb_layout());
         }
         break;
     case HW_UI_AGENTS:
@@ -1642,6 +1731,13 @@ static void ui_on_steps(int steps) {
         hw_ui_show_agent_act(agent_act_sel, agents_name(agent_focus));
         break;
     }
+    case HW_UI_LAYOUT: {
+        layout_sel += steps;
+        while (layout_sel < 0) layout_sel += LAYOUT_LIST_COUNT;
+        while (layout_sel >= LAYOUT_LIST_COUNT) layout_sel -= LAYOUT_LIST_COUNT;
+        hw_ui_show_layout(layout_sel, (int)hw_kb_layout());
+        break;
+    }
     case HW_UI_MSGLIST:
         if (msglist_count <= 0) break;
         msglist_sel += steps;
@@ -1725,6 +1821,7 @@ void setup() {
     hw_haptic_begin();  // after Wire is up (hw_ui_begin)
     hw_sound_begin();
     hw_kb_begin();
+    kb_layout_load(); // SPIFFS /kb_layout.txt → EN / RU PHON / RU
     hw_probe();
     tz_load();        // before wifi_setup(): configTzTime() needs the TZ string
     wifi_setup();     // RF up; raises the setup AP if STA fails
@@ -1787,10 +1884,18 @@ void loop() {
     if (steps) ui_on_steps(steps);
     if (click) ui_on_click();
 
-    // Keyboard → chars into reply / open compose from card.
+    // Keyboard → UTF-8 into reply / open compose from card.
+    // ALT+CAPS cycles layout; refresh reply badge if it changed.
     {
-        char kc = 0;
-        while (hw_kb_read(&kc)) ui_on_key(kc);
+        char u8[5];
+        while (hw_kb_read(u8, sizeof(u8))) ui_on_key(u8);
+        if (hw_kb_take_layout_changed()) {
+            kb_layout_save();
+            hw_haptic_notify(0);
+            if (hw_ui_screen() == HW_UI_REPLY) ui_reply_paint();
+            else if (hw_ui_screen() == HW_UI_LAYOUT)
+                hw_ui_show_layout(layout_sel, (int)hw_kb_layout());
+        }
     }
 
     // Idle → clock (longer while typing a reply).

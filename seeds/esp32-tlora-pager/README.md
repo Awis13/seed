@@ -53,11 +53,17 @@ Auth: `Authorization: Bearer <token>` on everything except `/health`.
 ## On-device UI
 
 - **Clock** — home (warm HH:MM, amber seconds, BAT %, unread badge, breathing rule on crit)
-- **Encoder click** → MENU → MESSAGES / **AGENTS** / INFO / BACK
+- **Encoder click** → MENU → MESSAGES / **AGENTS** / **SETTINGS** / INFO / BACK
 - **Inbox list** — Nokia/pager style: `*` + bright title = NEW, dim = read; `I`/`W`/`C` severity chip; header `*NN NEW`
 - **Card (severity)** — real pages from any service: `info` (teal) / `warn` (amber) / `crit` (red); click/Enter = ACKNOWLEDGE · REPLY · BACK; type = free-text REPLY
 - **Chat door** — only when client `id` ends with `-chat` (e.g. bridge posts `hermes-chat`): pretty CHAT invite → opens AGENTS room. Not a severity page.
 - **AGENTS** — Grok / Claude / Hermes chat threads (bridge optional via `/agent_bridge.txt`)
+- **Keyboard layouts** (SETTINGS → LAYOUT, persist `/kb_layout.txt`):
+  - **ABC** — Latin
+  - **RU PHON** — Apple `Russian - Phonetic` (Mac muscle memory: `privet` → привет)
+  - **RU** — standard ЙЦУКЕН
+  - Live cycle: **ALT+CAPS**; badge on REPLY shows `ABC`/`PHON`/`RU`
+  - Panel font is UTF-8 (ASCII + Cyrillic). Backspace deletes one codepoint.
 - **Enter** on reply = send (`reply` field or agent thread)
 
 **Two inboxes, one queue API:** `POST /notify` always lands in MESSAGES. Routing on device: `id: "*-chat"` → chat door UI; anything else (any `source`, any agent/service) → coloured severity card + reply.

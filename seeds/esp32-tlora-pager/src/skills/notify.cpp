@@ -188,7 +188,7 @@ struct Notification {
    under a lock and the panel takes milliseconds to draw. */
 /* Free-text reply from the device keyboard. Parallel to the slot, not inside
    Notification: keeps the host-tested sizeof(Notification) pin intact. */
-#define NOTIFY_REPLY_LEN    65   /* 64 printable ASCII + NUL */
+#define NOTIFY_REPLY_LEN    129  /* UTF-8 reply (~40 Cyrillic or 128 ASCII) + NUL */
 
 struct NotifyView {
     uint32_t id;
@@ -772,18 +772,42 @@ static bool notify_choose_id(uint32_t id, uint8_t index) {
 
 /*
  * Free-text reply typed on the device keyboard. Same ack semantics as
- * notify_choose_id: answering marks the entry read. Only printable ASCII is
- * stored (panel + wire). Empty text is refused.
+ * notify_choose_id: answering marks the entry read. Accepts printable ASCII
+ * and UTF-8 multi-byte (Cyrillic). Control bytes are dropped. Empty refused.
  */
 static bool notify_set_reply(uint32_t id, const char *text) {
     if (!text || !text[0]) return false;
 
     char cleaned[NOTIFY_REPLY_LEN];
     size_t j = 0;
-    for (size_t i = 0; text[i] && j + 1 < sizeof(cleaned); i++) {
+    for (size_t i = 0; text[i] && j + 1 < sizeof(cleaned); ) {
         unsigned char c = (unsigned char)text[i];
-        if (c < 0x20 || c > 0x7E) continue;  // drop control / non-ASCII
-        cleaned[j++] = (char)c;
+        if (c == '\n' || c == '\r' || c == '\t') {
+            if (j == 0 || cleaned[j - 1] != ' ') cleaned[j++] = ' ';
+            i++;
+            continue;
+        }
+        if (c < 0x20) { i++; continue; }           // other controls
+        if (c < 0x80) {                             // ASCII printable
+            cleaned[j++] = (char)c;
+            i++;
+            continue;
+        }
+        // UTF-8 multi-byte sequence — copy whole character if it fits
+        int need = 0;
+        if ((c & 0xE0) == 0xC0) need = 2;
+        else if ((c & 0xF0) == 0xE0) need = 3;
+        else if ((c & 0xF8) == 0xF0) need = 4;
+        else { i++; continue; }  // invalid lead
+        bool ok = true;
+        for (int k = 1; k < need; k++) {
+            unsigned char cc = (unsigned char)text[i + k];
+            if ((cc & 0xC0) != 0x80) { ok = false; break; }
+        }
+        if (!ok) { i++; continue; }
+        if (j + (size_t)need >= sizeof(cleaned)) break;
+        for (int k = 0; k < need; k++) cleaned[j++] = text[i + k];
+        i += (size_t)need;
     }
     cleaned[j] = '\0';
     if (j == 0) return false;

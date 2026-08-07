@@ -242,19 +242,135 @@ static const uint8_t FONT5X7[] PROGMEM = {
     0x00,0x41,0x36,0x08,0x00,0x08,0x04,0x08,0x10,0x08,
 };
 
+// ---- Cyrillic 5x7 (hand pixel art, same weight as FONT5X7 Latin) -----------
+// Column-major, bit0 = top. Where the letter is a Latin twin, use the exact
+// FONT5X7 glyph (А=A, В=B, Е=E, …) so stroke weight matches the panel.
+// Unique letters (Д д Л л …) redrawn as classic 5×7 matrix forms.
+static const uint8_t FONT_CYR_YO_UP[5] PROGMEM = { 0x7C,0x55,0x54,0x55,0x44 }; // Ё
+static const uint8_t FONT_CYR_YO_LO[5] PROGMEM = { 0x38,0x55,0x54,0x55,0x18 }; // ё
+static const uint8_t FONT_CYR_UP[32 * 5] PROGMEM = { // А-Я
+    0x7E,0x11,0x11,0x11,0x7E, // А (=A)
+    0x7F,0x49,0x49,0x49,0x31, // Б
+    0x7F,0x49,0x49,0x49,0x36, // В (=B)
+    0x7F,0x01,0x01,0x01,0x01, // Г
+    0x60,0x3E,0x21,0x3F,0x60, // Д  ..##. / .#.#. ×4 / ##### / #...#
+    0x7F,0x49,0x49,0x49,0x41, // Е (=E)
+    0x63,0x1C,0x77,0x1C,0x63, // Ж
+    0x41,0x49,0x49,0x49,0x36, // З
+    0x7F,0x10,0x08,0x04,0x7F, // И
+    0x7C,0x21,0x12,0x09,0x7C, // Й
+    0x7F,0x08,0x14,0x22,0x41, // К (=K)
+    0x40,0x3E,0x01,0x01,0x7F, // Л
+    0x7F,0x02,0x0C,0x02,0x7F, // М (=M)
+    0x7F,0x08,0x08,0x08,0x7F, // Н (=H)
+    0x3E,0x41,0x41,0x41,0x3E, // О (=O)
+    0x7F,0x01,0x01,0x01,0x7F, // П
+    0x7F,0x09,0x09,0x09,0x06, // Р (=P)
+    0x3E,0x41,0x41,0x41,0x22, // С (=C)
+    0x01,0x01,0x7F,0x01,0x01, // Т (=T)
+    // У — not Latin Y: V arms + stem with left hook (γ), classic matrix form
+    0x43,0x24,0x18,0x04,0x03, // У
+    0x0C,0x12,0x7F,0x12,0x0C, // Ф
+    0x63,0x14,0x08,0x14,0x63, // Х (=X)
+    0x3F,0x20,0x20,0x3F,0x60, // Ц
+    0x07,0x08,0x08,0x08,0x7F, // Ч
+    0x7F,0x40,0x7C,0x40,0x7F, // Ш
+    0x3F,0x20,0x3F,0x20,0x7F, // Щ
+    0x01,0x7F,0x48,0x48,0x30, // Ъ
+    0x7F,0x48,0x48,0x30,0x7F, // Ы
+    0x7F,0x48,0x48,0x48,0x30, // Ь
+    0x41,0x49,0x49,0x49,0x36, // Э
+    0x7F,0x08,0x3E,0x41,0x3E, // Ю
+    0x46,0x29,0x19,0x09,0x7F, // Я
+};
+static const uint8_t FONT_CYR_LO[32 * 5] PROGMEM = { // а-я
+    0x20,0x54,0x54,0x54,0x78, // а (=a)
+    0x7E,0x49,0x49,0x49,0x30, // б
+    0x7C,0x54,0x54,0x54,0x28, // в
+    0x7C,0x04,0x04,0x04,0x04, // г
+    0x60,0x3C,0x22,0x3E,0x60, // д  same skeleton as Д, x-height
+    0x38,0x54,0x54,0x54,0x18, // е (=e)
+    0x6C,0x10,0x7C,0x10,0x6C, // ж
+    0x44,0x54,0x54,0x54,0x28, // з
+    0x7C,0x20,0x10,0x08,0x7C, // и
+    0x7C,0x21,0x12,0x09,0x7C, // й
+    0x7C,0x10,0x28,0x44,0x00, // к
+    0x40,0x38,0x04,0x04,0x7C, // л
+    0x7C,0x08,0x10,0x08,0x7C, // м
+    0x7C,0x10,0x10,0x10,0x7C, // н
+    0x38,0x44,0x44,0x44,0x38, // о (=o)
+    0x7C,0x04,0x04,0x04,0x7C, // п
+    0x7C,0x14,0x14,0x14,0x08, // р (~p)
+    0x38,0x44,0x44,0x44,0x20, // с (~c)
+    0x04,0x04,0x7C,0x04,0x04, // т
+    // у — same γ-hook as У, not Latin y
+    0x0C,0x50,0x20,0x10,0x0C, // у
+    0x18,0x24,0x7E,0x24,0x18, // ф
+    0x44,0x28,0x10,0x28,0x44, // х (=x)
+    0x3C,0x20,0x20,0x3C,0x60, // ц
+    0x0C,0x10,0x10,0x10,0x7C, // ч
+    0x7C,0x40,0x78,0x40,0x7C, // ш
+    0x3C,0x20,0x3C,0x20,0x7C, // щ
+    0x04,0x7C,0x50,0x50,0x20, // ъ
+    0x7C,0x50,0x50,0x20,0x7C, // ы
+    0x7C,0x50,0x50,0x50,0x20, // ь
+    0x44,0x54,0x54,0x54,0x28, // э
+    0x7C,0x10,0x38,0x44,0x38, // ю
+    0x48,0x54,0x34,0x14,0x7C, // я
+};
+
+// Decode one UTF-8 codepoint; returns bytes consumed (0 on empty/invalid).
+static int utf8_next(const char *s, uint32_t *cp) {
+    if (!s || !s[0]) return 0;
+    const unsigned char *p = (const unsigned char *)s;
+    if (p[0] < 0x80) {
+        if (cp) *cp = p[0];
+        return 1;
+    }
+    if ((p[0] & 0xE0) == 0xC0 && (p[1] & 0xC0) == 0x80) {
+        if (cp) *cp = ((uint32_t)(p[0] & 0x1F) << 6) | (p[1] & 0x3F);
+        return 2;
+    }
+    if ((p[0] & 0xF0) == 0xE0 && (p[1] & 0xC0) == 0x80 && (p[2] & 0xC0) == 0x80) {
+        if (cp) *cp = ((uint32_t)(p[0] & 0x0F) << 12) |
+                      ((uint32_t)(p[1] & 0x3F) << 6) | (p[2] & 0x3F);
+        return 3;
+    }
+    if ((p[0] & 0xF8) == 0xF0 && (p[1] & 0xC0) == 0x80 &&
+        (p[2] & 0xC0) == 0x80 && (p[3] & 0xC0) == 0x80) {
+        if (cp) *cp = ((uint32_t)(p[0] & 0x07) << 18) |
+                      ((uint32_t)(p[1] & 0x3F) << 12) |
+                      ((uint32_t)(p[2] & 0x3F) << 6) | (p[3] & 0x3F);
+        return 4;
+    }
+    // Invalid lead — skip one byte as '?'
+    if (cp) *cp = (uint32_t)'?';
+    return 1;
+}
+
+// Resolve glyph pointer for a Unicode codepoint (5 bytes each).
+static const uint8_t *font_glyph(uint32_t cp) {
+    if (cp >= 0x20 && cp <= 0x7E)
+        return &FONT5X7[(cp - 0x20) * 5];
+    if (cp == 0x0401) return FONT_CYR_YO_UP;
+    if (cp == 0x0451) return FONT_CYR_YO_LO;
+    if (cp >= 0x0410 && cp <= 0x042F)
+        return &FONT_CYR_UP[(cp - 0x0410) * 5];
+    if (cp >= 0x0430 && cp <= 0x044F)
+        return &FONT_CYR_LO[(cp - 0x0430) * 5];
+    return &FONT5X7[('?' - 0x20) * 5];
+}
+
 // Draw one glyph by pushing a pre-scaled bitmap window (fast path).
-static void tft_draw_char(uint16_t x, uint16_t y, char c, uint16_t fg, uint16_t bg, uint8_t scale) {
-    if (c < 0x20 || c > 0x7E) c = '?';
+static void tft_draw_glyph(uint16_t x, uint16_t y, uint32_t cp,
+                           uint16_t fg, uint16_t bg, uint8_t scale) {
     if (scale < 1) scale = 1;
-    const uint8_t *g = &FONT5X7[(c - 0x20) * 5];
+    const uint8_t *g = font_glyph(cp);
     const uint16_t gw = 6 * scale;   // 5 cols + 1 gap
     const uint16_t gh = 7 * scale;
     if (x >= PANEL_W || y >= PANEL_H) return;
 
-    // Build line buffer for one scaled column-row scan in row-major order
-    // Max scale we use is 8 → 48x56 = 2688 pixels → ~5.4KB. Stack-allocate
-    // per row of scaled height instead.
-    uint8_t rowbuf[6 * 8 * 2];  // max gw at scale 8
+    uint8_t rowbuf[6 * 8 * 2];
     if (gw * 2 > sizeof(rowbuf)) return;
 
     tft_window(x, y, x + gw - 1, y + gh - 1);
@@ -262,7 +378,6 @@ static void tft_draw_char(uint16_t x, uint16_t y, char c, uint16_t fg, uint16_t 
     disp_spi->beginTransaction(SPISettings(DISP_SPI_HZ, MSBFIRST, SPI_MODE0));
 
     for (uint8_t row = 0; row < 7; row++) {
-        // Build one logical font row, scaled horizontally into rowbuf
         for (uint8_t col = 0; col < 5; col++) {
             uint8_t bits = pgm_read_byte(&g[col]);
             uint16_t color = (bits & (1u << row)) ? fg : bg;
@@ -272,13 +387,11 @@ static void tft_draw_char(uint16_t x, uint16_t y, char c, uint16_t fg, uint16_t 
                 rowbuf[i] = hi; rowbuf[i + 1] = lo;
             }
         }
-        // gap column = bg
         uint8_t bhi = (uint8_t)(bg >> 8), blo = (uint8_t)bg;
         for (uint8_t sx = 0; sx < scale; sx++) {
             size_t i = (5 * scale + sx) * 2;
             rowbuf[i] = bhi; rowbuf[i + 1] = blo;
         }
-        // repeat vertical scale
         for (uint8_t sy = 0; sy < scale; sy++) {
             disp_spi->writeBytes(rowbuf, gw * 2);
         }
@@ -287,20 +400,38 @@ static void tft_draw_char(uint16_t x, uint16_t y, char c, uint16_t fg, uint16_t 
     digitalWrite(PIN_DISP_CS, HIGH);
 }
 
+static void tft_draw_char(uint16_t x, uint16_t y, char c, uint16_t fg, uint16_t bg, uint8_t scale) {
+    tft_draw_glyph(x, y, (unsigned char)c, fg, bg, scale);
+}
+
+// UTF-8 text. Each codepoint advances one cell (6*scale px).
 static void tft_draw_text(uint16_t x, uint16_t y, const char *s, uint16_t fg, uint16_t bg, uint8_t scale) {
     if (!s) return;
     uint16_t adv = 6 * scale;
     while (*s) {
         if (x + adv > PANEL_W) break;
-        tft_draw_char(x, y, *s++, fg, bg, scale);
+        uint32_t cp = 0;
+        int n = utf8_next(s, &cp);
+        if (n <= 0) break;
+        tft_draw_glyph(x, y, cp, fg, bg, scale);
         x += adv;
+        s += n;
     }
 }
 
-// Text width helper
+
+// Text width helper — one cell per UTF-8 codepoint (not per byte).
 static uint16_t text_width(const char *s, uint8_t scale) {
     if (!s) return 0;
-    return (uint16_t)(strlen(s) * 6 * scale);
+    int n = 0;
+    while (*s) {
+        uint32_t cp;
+        int k = utf8_next(s, &cp);
+        if (k <= 0) break;
+        s += k;
+        n++;
+    }
+    return (uint16_t)(n * 6 * scale);
 }
 
 // Centered text
@@ -354,6 +485,8 @@ static int menu_sel_drawn = -1;
 static int card_act_sel_drawn = -1;
 static int agents_sel_drawn = -1;
 static int agent_act_sel_drawn = -1;
+static int layout_sel_drawn = -1;
+static int layout_cur_drawn = -1;
 static int msglist_sel_drawn = -1;
 static int msglist_top_drawn = -1;
 static int msglist_count_drawn = -1;
@@ -443,6 +576,8 @@ void hw_ui_show_clock() {
     card_act_sel_drawn = -1;
     agents_sel_drawn = -1;
     agent_act_sel_drawn = -1;
+    layout_sel_drawn = -1;
+    layout_cur_drawn = -1;
     msglist_sel_drawn = -1;
     msglist_top_drawn = -1;
     msglist_count_drawn = -1;
@@ -685,12 +820,21 @@ void hw_ui_show_agent_invite(const char *agent_name,
 }
 
 // Menu row geometry — fixed so selection can repaint one bar without a wipe.
-static const int MENU_N = 4;
-static const int MENU_ROW0_Y = 40;
-static const int MENU_ROW_H = 34;
-static const int MENU_BAR_H = 28;
+static const int MENU_N = 5;
+static const int MENU_ROW0_Y = 36;
+static const int MENU_ROW_H = 30;
+static const int MENU_BAR_H = 26;
 static const char *const MENU_ITEMS[MENU_N] = {
-    "MESSAGES", "AGENTS", "INFO", "BACK"
+    "MESSAGES", "AGENTS", "SETTINGS", "INFO", "BACK"
+};
+
+// Layout picker (SETTINGS → LAYOUT)
+static const int LAYOUT_N = 4;  // 3 layouts + BACK
+static const int LAYOUT_ROW0_Y = 48;
+static const int LAYOUT_ROW_H = 34;
+static const int LAYOUT_BAR_H = 28;
+static const char *const LAYOUT_ITEMS[LAYOUT_N] = {
+    "ABC", "RU PHON", "RU", "BACK"
 };
 
 // Agents list (same geometry language as menu).
@@ -785,6 +929,60 @@ void hw_ui_show_menu(int selected) {
     menu_sel_drawn = selected;
 }
 
+static void layout_draw_row(int i, bool on, int current_layout) {
+    uint16_t y = (uint16_t)(LAYOUT_ROW0_Y + i * LAYOUT_ROW_H);
+    uint16_t bar_y = y - 4;
+    uint16_t bar_w = PANEL_W - 2 * MARGIN;
+    char label[24];
+    if (i < 3) {
+        // Active layout marked like Nokia "* Item"
+        snprintf(label, sizeof(label), "%s %s",
+                 (i == current_layout) ? "*" : " ",
+                 LAYOUT_ITEMS[i]);
+    } else {
+        snprintf(label, sizeof(label), "  %s", LAYOUT_ITEMS[i]);
+    }
+    if (on) {
+        tft_fill_rect(MARGIN, bar_y, bar_w, LAYOUT_BAR_H, COL_ACCENT);
+        tft_draw_text(MARGIN + 8, y, label, COL_BG, COL_ACCENT, 2);
+    } else {
+        tft_fill_rect(MARGIN, bar_y, bar_w, LAYOUT_BAR_H, COL_BG);
+        uint16_t fg = (i < 3 && i == current_layout) ? COL_ACCENT : COL_TIME;
+        tft_draw_text(MARGIN + 8, y, label, fg, COL_BG, 2);
+    }
+}
+
+void hw_ui_show_layout(int selected, int current_layout) {
+    if (!panel_ok) return;
+    if (selected < 0) selected = 0;
+    if (selected >= LAYOUT_N) selected = LAYOUT_N - 1;
+    if (current_layout < 0) current_layout = 0;
+    if (current_layout > 2) current_layout = 2;
+
+    if (screen == HW_UI_LAYOUT && layout_sel_drawn >= 0 &&
+        layout_sel_drawn != selected &&
+        layout_cur_drawn == current_layout) {
+        layout_draw_row(layout_sel_drawn, false, current_layout);
+        layout_draw_row(selected, true, current_layout);
+        layout_sel_drawn = selected;
+        return;
+    }
+    if (screen == HW_UI_LAYOUT && layout_sel_drawn == selected &&
+        layout_cur_drawn == current_layout) {
+        return;
+    }
+
+    screen = HW_UI_LAYOUT;
+    tft_fill(COL_BG);
+    tft_fill_rect(0, 0, PANEL_W, 22, COL_ACCENT);
+    tft_draw_text(MARGIN, 4, "LAYOUT", COL_BG, COL_ACCENT, 2);
+    tft_draw_text_r(PANEL_W - MARGIN, 6, "ALT+CAPS", COL_BG, COL_ACCENT, 1);
+    for (int i = 0; i < LAYOUT_N; i++)
+        layout_draw_row(i, i == selected, current_layout);
+    layout_sel_drawn = selected;
+    layout_cur_drawn = current_layout;
+}
+
 static void agents_list_draw_row(int i, bool on) {
     uint16_t y = (uint16_t)(AGENTS_ROW0_Y + i * AGENTS_ROW_H);
     uint16_t bar_y = y - 4;
@@ -824,17 +1022,27 @@ void hw_ui_show_agents(int selected, bool bridge_ok) {
     agents_sel_drawn = selected;
 }
 
-// Advance one wrap step of *p; return bytes consumed, write painted text to line[].
+// Row line buffer: max_cols glyphs × 4 UTF-8 bytes + "> " + NUL.
+// Old 48-byte stack buffer silently truncated Cyrillic mid-line and then
+// advanced past the unpainted tail ("Готов" → "Гот" / drop "ов ").
+#define AGENT_CHAT_LINE_MAX  168
+
+// Advance one wrap step of *p; return *bytes* consumed (always == painted body).
 // first=true → prepend "> " or "< ".
+// max_cols is in *codepoints* (glyphs). line_n must hold max_cols*4 + 3.
 static int agent_chat_next_row(const char **pp, bool mine, bool first,
                                int max_cols, char *line, size_t line_n) {
-    if (!pp || !*pp || !line || line_n < 4) return 0;
+    if (!pp || !*pp || !line || line_n < 8) return 0;
     const char *p = *pp;
+
+    const int off = first ? 2 : 0;
+    int max_body = (int)line_n - 1 - off;  // bytes available for message text
+    if (max_body < 4) max_body = 4;
+
     int budget = max_cols - (first ? 2 : 0);
     if (budget < 4) budget = 4;
 
     if (!*p) {
-        // empty message: one row with prefix only
         if (first) {
             snprintf(line, line_n, "%s", mine ? "> " : "< ");
             return 0;
@@ -843,31 +1051,47 @@ static int agent_chat_next_row(const char **pp, bool mine, bool first,
         return 0;
     }
 
-    int n = 0, last_sp = -1;
-    while (p[n] && n < budget) {
-        if (p[n] == ' ') last_sp = n;
-        n++;
+    int chars = 0;
+    int bytes = 0;
+    int last_sp_bytes = -1;
+    // Stop on glyph budget OR when the next UTF-8 char would not fit in line[].
+    while (p[bytes] && chars < budget) {
+        uint32_t cp = 0;
+        int k = utf8_next(p + bytes, &cp);
+        if (k <= 0) break;
+        if (bytes + k > max_body) break;
+        if (cp == (uint32_t)' ') last_sp_bytes = bytes;
+        bytes += k;
+        chars++;
     }
-    if (p[n] && last_sp > 0) n = last_sp + 1;
-    if (n <= 0) n = 1;
+    // Prefer break at last space when more text remains (word wrap).
+    if (p[bytes] && last_sp_bytes > 0) {
+        bytes = last_sp_bytes + 1;  // consume the space
+    }
+    if (bytes <= 0) {
+        // Force one codepoint so we never stall (fits: max_body >= 4).
+        uint32_t cp = 0;
+        int k = utf8_next(p, &cp);
+        if (k <= 0) k = 1;
+        if (k > max_body) k = max_body;
+        bytes = k;
+    }
 
-    int take = n;
+    // Paint length: drop trailing space (still consumed in advance below).
+    int take = bytes;
     while (take > 0 && p[take - 1] == ' ') take--;
 
-    int off = 0;
     if (first) {
         line[0] = mine ? '>' : '<';
         line[1] = ' ';
-        off = 2;
     }
-    if (take + off >= (int)line_n) take = (int)line_n - 1 - off;
-    if (take < 0) take = 0;
-    memcpy(line + off, p, take);
+    memcpy(line + off, p, (size_t)take);
     line[off + take] = '\0';
 
-    *pp = p + n;
+    // Advance exactly what this row committed — never past unpainted body.
+    *pp = p + bytes;
     while (**pp == ' ') (*pp)++;
-    return n;
+    return bytes;
 }
 
 static int agent_chat_wrap_rows(const char *raw, bool mine, int max_cols) {
@@ -875,7 +1099,7 @@ static int agent_chat_wrap_rows(const char *raw, bool mine, int max_cols) {
     const char *p = raw;
     bool first = true;
     int rows = 0;
-    char discard[48];
+    char discard[AGENT_CHAT_LINE_MAX];
     if (!*raw) return 1;
     while (*p) {
         agent_chat_next_row(&p, mine, first, max_cols, discard, sizeof(discard));
@@ -977,7 +1201,7 @@ int hw_ui_show_agent_chat(const char *agent_name,
             continue;
         }
         while (*p) {
-            char line[48];
+            char line[AGENT_CHAT_LINE_MAX];
             agent_chat_next_row(&p, mine, first, max_cols, line, sizeof(line));
             if (row_i >= scroll && y + row_h <= y_max) {
                 tft_draw_text(MARGIN, y, line,
@@ -1235,17 +1459,21 @@ void hw_ui_show_msglist(const char *const *titles,
 void hw_ui_show_reply(const char *title,
                       const char *buffer,
                       bool caps,
-                      bool symbol) {
+                      bool symbol,
+                      const char *layout_name) {
     if (!panel_ok) return;
     screen = HW_UI_REPLY;
 
     tft_fill(COL_BG);
     tft_fill_rect(0, 0, PANEL_W, 22, COL_ACCENT);
     tft_draw_text(MARGIN, 4, "REPLY", COL_BG, COL_ACCENT, 2);
-    // Layer badge: hold orange ALT for 123, CAPS toggles case.
-    char mods[20];
-    if (symbol) snprintf(mods, sizeof(mods), "%s123", caps ? "CAPS " : "");
-    else        snprintf(mods, sizeof(mods), "%sABC",  caps ? "CAPS " : "");
+    // Badge: layout (ABC/PHON/RU) + CAPS + 123 while ALT held.
+    char mods[28];
+    const char *lay = (layout_name && layout_name[0]) ? layout_name : "ABC";
+    if (symbol)
+        snprintf(mods, sizeof(mods), "%s%s 123", caps ? "CAPS " : "", lay);
+    else
+        snprintf(mods, sizeof(mods), "%s%s", caps ? "CAPS " : "", lay);
     tft_draw_text_r(PANEL_W - MARGIN, 4, mods, COL_BG, COL_ACCENT, 1);
 
     // Original title, dim
@@ -1256,49 +1484,67 @@ void hw_ui_show_reply(const char *title,
     tft_fill_rect(MARGIN + 2, 58, PANEL_W - 2 * MARGIN - 4, 96, COL_BG);
 
     const char *buf = buffer ? buffer : "";
-    // Scale-2 glyphs are 12px wide (6*2). Old code used max_cols=70 as if
-    // scale-1 → draft ran off the right edge of the box.
     const uint8_t draft_scale = 2;
     const uint16_t draft_x = MARGIN + 8;
-    const uint16_t box_inner_r = PANEL_W - MARGIN - 4;  // inner fill edge
+    const uint16_t box_inner_r = PANEL_W - MARGIN - 4;
     const uint16_t draft_w = (box_inner_r > draft_x + 4)
                                  ? (uint16_t)(box_inner_r - draft_x - 4) : 40;
     int max_cols = (int)(draft_w / (6 * draft_scale));
     if (max_cols < 8) max_cols = 8;
     if (max_cols > 60) max_cols = 60;
 
-    char line[64];
+    char line[96];
     const char *p = buf;
     uint16_t y = 64;
     int rows = 0;
     const int max_rows = 5;
     while ((*p || rows == 0) && rows < max_rows && y + 14 < 150) {
-        int n = 0;
-        // Prefer break at last space within the column budget.
-        int last_sp = -1;
-        while (p[n] && p[n] != '\n' && n < max_cols) {
-            if (p[n] == ' ') last_sp = n;
-            n++;
+        // Wrap by codepoints, not bytes (UTF-8 Cyrillic is 2 bytes/glyph).
+        int chars = 0;
+        int last_sp_chars = -1;
+        int last_sp_bytes = -1;
+        int bytes = 0;
+        while (p[bytes] && p[bytes] != '\n' && chars < max_cols) {
+            uint32_t cp = 0;
+            int k = utf8_next(p + bytes, &cp);
+            if (k <= 0) break;
+            if (cp == (uint32_t)' ') {
+                last_sp_chars = chars;
+                last_sp_bytes = bytes;
+            }
+            bytes += k;
+            chars++;
         }
-        if (p[n] && p[n] != '\n' && last_sp > 0) n = last_sp + 1;  // keep space on this line end / next start clean
-        if (n == 0 && !*p) {
+        if (p[bytes] && p[bytes] != '\n' && last_sp_chars > 0) {
+            // Break after last space
+            bytes = last_sp_bytes + 1;  // include space in this line's advance
+            // trim painted space below
+        }
+        if (bytes == 0 && !*p) {
             tft_draw_text(draft_x, y, "_", COL_ACCENT, COL_BG, draft_scale);
             break;
         }
-        if (n == 0 && *p) { n = 1; }  // single overlong glyph: force progress
-        int take = n;
-        // Drop trailing space from the painted line (it was a wrap break).
-        while (take > 0 && p[take - 1] == ' ') take--;
+        if (bytes == 0 && *p) {
+            uint32_t cp;
+            int k = utf8_next(p, &cp);
+            bytes = k > 0 ? k : 1;
+        }
+        bool last = (p[bytes] == '\0');
+        int take = bytes;
+        // Soft-wrap mid-text: hide the break-space at EOL.
+        // Last line (with the caret): KEEP trailing spaces so "_" advances.
+        if (!last) {
+            while (take > 0 && p[take - 1] == ' ') take--;
+        }
         if (take >= (int)sizeof(line)) take = (int)sizeof(line) - 1;
         memcpy(line, p, take);
         line[take] = '\0';
-        bool last = (p[n] == '\0');
         if (last && take + 1 < (int)sizeof(line)) {
             line[take] = '_';
             line[take + 1] = '\0';
         }
         tft_draw_text(draft_x, y, line, COL_TIME, COL_BG, draft_scale);
-        p += n;
+        p += bytes;
         if (*p == '\n') p++;
         y += (uint16_t)(7 * draft_scale + 4);
         rows++;
@@ -1306,7 +1552,7 @@ void hw_ui_show_reply(const char *title,
     }
 
     tft_draw_text(MARGIN, 170, "Enter=send  Bksp=del", COL_DIM, COL_BG, 1);
-    tft_draw_text(MARGIN, 192, "ALT+Bksp = HOME", COL_DIM, COL_BG, 1);
+    tft_draw_text(MARGIN, 192, "ALT+CAPS=layout  ALT+Bksp=HOME", COL_DIM, COL_BG, 1);
 }
 
 void hw_ui_show_info(const char *version,
