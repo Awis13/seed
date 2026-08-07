@@ -27,3 +27,8 @@ __pycache__/
 # IDE
 .vscode/
 .idea/
+
+# T-Lora Pager seed
+seeds/esp32-tlora-pager/.pio/
+seeds/esp32-tlora-pager/data/wifi.json
+seeds/esp32-tlora-pager/data/auth_token.txt
