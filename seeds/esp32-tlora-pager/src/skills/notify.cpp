@@ -200,6 +200,7 @@ struct NotifyView {
     char source[NOTIFY_SOURCE_LEN];
     char title[NOTIFY_TITLE_LEN];
     char body[NOTIFY_BODY_LEN];
+    char key[NOTIFY_KEY_LEN];   /* client id, e.g. "hermes-chat" door vs real pages */
     char reply[NOTIFY_REPLY_LEN];
     NotifyOptions options;
 };
@@ -623,6 +624,7 @@ static void notify_fill_view(const Notification &e, const NotifyOptions &op,
     memcpy(out.source, e.source, sizeof(out.source));
     memcpy(out.title, e.title, sizeof(out.title));
     memcpy(out.body, e.body, sizeof(out.body));
+    memcpy(out.key, e.key, sizeof(out.key));
     if (reply) memcpy(out.reply, reply, NOTIFY_REPLY_LEN);
     else out.reply[0] = '\0';
     /* The labels come out with the entry rather than being fetched afterwards:

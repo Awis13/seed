@@ -37,6 +37,7 @@
 #include <ArduinoJson.h>
 #include <Update.h>
 #include <esp_ota_ops.h>
+#include <HTTPClient.h>
 #include "board_pins.h"
 #include "hw_ui.h"
 #include "hw_input.h"
@@ -45,7 +46,7 @@
 #include "hw_kb.h"
 
 // ===== Configuration =====
-#define SEED_VERSION        "0.8.3"
+#define SEED_VERSION        "0.9.8"
 #define HTTP_PORT           8080
 #define TOKEN_FILE          "/auth_token.txt"
 #define WIFI_CONFIG_FILE    "/wifi.json"
@@ -1056,10 +1057,12 @@ static void handle_wifi_post(AsyncWebServerRequest *request) {
 #include "skills/notify.cpp"
 // After notify: reuses notify_send_json / notify_send_error.
 #include "skills/progress.cpp"
+#include "skills/agents.cpp"
 
 static void skills_init() {
     skill_notify_init();
     skill_progress_init();
+    skill_agents_init();
 }
 
 // Build one second of the home clock face (tembed look, 480x222).
@@ -1129,8 +1132,21 @@ static void ui_go_clock(const char *note) {
 
 // --- Front-panel state (encoder) --------------------------------------------
 // MENU items
-enum { MENU_MESSAGES = 0, MENU_INFO, MENU_BACK, MENU_COUNT };
+enum { MENU_MESSAGES = 0, MENU_AGENTS, MENU_INFO, MENU_BACK, MENU_COUNT };
+// Card action sheet (click / Enter on a notification)
+enum { CARD_ACT_ACK = 0, CARD_ACT_REPLY, CARD_ACT_BACK, CARD_ACT_COUNT };
+// Agents list: 0..2 = agents, 3 = BACK
+enum { AGENTS_BACK = 3, AGENTS_LIST_COUNT = 4 };
+// In-chat menu (click while in agent chat room)
+enum { AGENT_ACT_CLEAR = 0, AGENT_ACT_BACK, AGENT_ACT_COUNT };
 static int menu_sel = 0;
+static int card_act_sel = 0;
+static int agents_sel = 0;
+static int agent_act_sel = 0;
+static int agent_focus = 0;   // which agent chat is open (0..AGENTS_N-1)
+static bool agent_compose = false;  // REPLY screen is for agent, not notify
+static int agent_scroll = -1;       // visual row; -1 = pin to latest
+static int agent_scroll_total = 0;  // last known wrapped row count
 static int msglist_sel = 0;
 // Cached ids for the visible msglist rows (map row → notify id).
 static uint32_t msglist_ids[HW_UI_MSGLIST_MAX];
@@ -1146,12 +1162,51 @@ static unsigned long ui_last_input_ms = 0;
 
 static void ui_note_input() { ui_last_input_ms = millis(); }
 
+// Keyboard shortcut HOME: leave any face, drop drafts, show clock.
+static void ui_go_home() {
+    notify_card_id = 0;
+    reply_buf[0] = '\0';
+    agent_compose = false;
+    hw_kb_reset_mods();
+    ui_go_clock(NULL);
+    ui_note_input();
+}
+
 static void ui_open_msglist();  // defined below
+static void ui_open_notify_id(uint32_t id);
+static void ui_open_card_act();
+static void ui_card_act_confirm();
+static void ui_open_agents();
+static void ui_open_agent_chat(int idx);
+static void ui_agent_chat_refresh();
+static void ui_open_agent_act();
+static int agents_index_from_source(const char *src);
+static bool notify_is_chat_door(const NotifyView &v);
+static int agents_index_from_door(const NotifyView &v);
+static void ui_show_agent_invite_from_view(const NotifyView &v, uint32_t id);
+static void ui_enter_agent_from_notify(uint32_t id, const NotifyView &v);
 
 static void ui_open_reply(uint32_t id, const char *title, char first) {
+    agent_compose = false;
     notify_card_id = id;
     snprintf(reply_title, sizeof(reply_title), "%s", title ? title : "");
     reply_buf[0] = '\0';
+    // Always start ABC — never inherit a stuck SYM latch from earlier typing.
+    hw_kb_reset_mods();
+    if (first && first != '\b' && first != '\n') {
+        reply_buf[0] = first;
+        reply_buf[1] = '\0';
+    }
+    hw_ui_show_reply(reply_title, reply_buf, hw_kb_caps(), hw_kb_symbol());
+    ui_note_input();
+}
+
+static void ui_open_agent_compose(char first) {
+    agent_compose = true;
+    notify_card_id = 0;
+    snprintf(reply_title, sizeof(reply_title), "-> %s", agents_name(agent_focus));
+    reply_buf[0] = '\0';
+    hw_kb_reset_mods();
     if (first && first != '\b' && first != '\n') {
         reply_buf[0] = first;
         reply_buf[1] = '\0';
@@ -1166,7 +1221,19 @@ static void ui_reply_redraw() {
 }
 
 static void ui_reply_submit() {
-    if (!notify_card_id || !reply_buf[0]) return;
+    if (!reply_buf[0]) return;
+    if (agent_compose) {
+        const char *aid = agents_id(agent_focus);
+        if (agents_send(aid, reply_buf)) {
+            hw_haptic_notify(0);
+            hw_sound_notify(0);
+        }
+        reply_buf[0] = '\0';
+        agent_compose = false;
+        ui_open_agent_chat(agent_focus);
+        return;
+    }
+    if (!notify_card_id) return;
     if (notify_set_reply(notify_card_id, reply_buf)) {
         hw_haptic_notify(0);
         hw_sound_notify(0);
@@ -1181,25 +1248,56 @@ static void ui_on_key(char c) {
     ui_note_input();
     HwUiScreen scr = hw_ui_screen();
 
-    // From a card: any printable starts a reply (Enter alone acks via encoder path).
+    // ALT (orange) + Backspace → home clock from any screen.
+    if (c == '\x1b') {
+        ui_go_home();
+        hw_haptic_notify(0);  // soft click so the shortcut is felt
+        return;
+    }
+
+    // From a card: typing jumps straight into reply (keep that).
+    // Enter / encoder: agent door → open chat; else Ack·Reply sheet.
     if (scr == HW_UI_NOTIFY && notify_card_id) {
         if (c == '\b') return;
         if (c == '\n') {
-            // Enter without draft = ack only
-            if (notify_card_id) notify_ack_id(notify_card_id);
-            notify_card_id = 0;
-            ui_go_clock(NULL);
+            NotifyView v;
+            if (notify_view_by_id(notify_card_id, v, NULL, NULL) &&
+                notify_is_chat_door(v)) {
+                ui_enter_agent_from_notify(notify_card_id, v);
+            } else {
+                ui_open_card_act();
+            }
+            return;
+        }
+        // Typing on a chat door → open room + compose. On a real page → reply.
+        NotifyView v;
+        if (notify_view_by_id(notify_card_id, v, NULL, NULL)) {
+            if (notify_is_chat_door(v)) {
+                ui_enter_agent_from_notify(notify_card_id, v);
+                if (c >= 0x20 && c <= 0x7E) ui_open_agent_compose(c);
+                return;
+            }
+        }
+        if (c >= 0x20 && c <= 0x7E) {
+            ui_open_reply(notify_card_id, reply_title[0] ? reply_title : NULL, c);
+            if (!reply_title[0]) {
+                NotifyView vv;
+                if (notify_view_by_id(notify_card_id, vv, NULL, NULL))
+                    snprintf(reply_title, sizeof(reply_title), "%s", vv.title);
+                ui_reply_redraw();
+            }
+            return;
+        }
+    }
+
+    // On Ack/Reply sheet: Enter confirms; typing still starts a reply.
+    if (scr == HW_UI_CARD_ACT && notify_card_id) {
+        if (c == '\n') {
+            ui_card_act_confirm();
             return;
         }
         if (c >= 0x20 && c <= 0x7E) {
             ui_open_reply(notify_card_id, reply_title[0] ? reply_title : NULL, c);
-            // refresh title from view if empty
-            if (!reply_title[0]) {
-                NotifyView v;
-                if (notify_view_by_id(notify_card_id, v, NULL, NULL))
-                    snprintf(reply_title, sizeof(reply_title), "%s", v.title);
-                ui_reply_redraw();
-            }
             return;
         }
     }
@@ -1226,6 +1324,18 @@ static void ui_on_key(char c) {
         }
     }
 
+    // Agent chat: type = compose to that agent; Enter = empty compose
+    if (scr == HW_UI_AGENT_CHAT) {
+        if (c == '\n') {
+            ui_open_agent_compose(0);
+            return;
+        }
+        if (c >= 0x20 && c <= 0x7E) {
+            ui_open_agent_compose(c);
+            return;
+        }
+    }
+
     // Clock / menu: 'm' opens messages, bare keys ignored
     if (scr == HW_UI_CLOCK && (c == 'm' || c == 'M')) {
         msglist_sel = 0;
@@ -1237,6 +1347,88 @@ static void ui_open_menu() {
     menu_sel = 0;
     hw_ui_show_menu(menu_sel);
     ui_note_input();
+}
+
+static void ui_open_agents() {
+    agents_sel = 0;
+    hw_ui_show_agents(agents_sel, agents_bridge_ok());
+    ui_note_input();
+}
+
+static int agents_index_from_source(const char *src) {
+    if (!src || !src[0]) return -1;
+    // notify source is short: "hermes", "grok", "claude"
+    return agents_find(src);
+}
+
+/* Chat-door vs real message:
+ *   door  = client id ends with "-chat" (bridge posts "hermes-chat" etc.)
+ *   page  = everything else — full severity card (info/warn/crit colours),
+ *           from any service/agent; reply works as before.
+ * Chat rooms (AGENTS menu) are separate from the message queue. */
+static bool notify_is_chat_door(const NotifyView &v) {
+    if (!v.key[0]) return false;
+    size_t n = strlen(v.key);
+    return n >= 5 && strcmp(v.key + (n - 5), "-chat") == 0;
+}
+
+static int agents_index_from_door(const NotifyView &v) {
+    if (!notify_is_chat_door(v)) return -1;
+    // Prefer source; fall back to key prefix "hermes-chat" → "hermes"
+    int ax = agents_index_from_source(v.source);
+    if (ax >= 0) return ax;
+    char id[AGENT_ID_LEN];
+    size_t n = strlen(v.key);
+    if (n <= 5) return -1;
+    size_t m = n - 5;
+    if (m >= sizeof(id)) m = sizeof(id) - 1;
+    memcpy(id, v.key, m);
+    id[m] = '\0';
+    return agents_find(id);
+}
+
+static void ui_agent_chat_refresh() {
+    static char lines[AGENT_THREAD_MAX][AGENT_TEXT_LEN];
+    static bool from_me[AGENT_THREAD_MAX];
+    static const char *line_ptrs[AGENT_THREAD_MAX];
+    int n = 0;
+    portENTER_CRITICAL(&agents_mux);
+    n = agents_thread_view(agent_focus, lines, from_me, AGENT_THREAD_MAX);
+    portEXIT_CRITICAL(&agents_mux);
+    for (int i = 0; i < n; i++) line_ptrs[i] = lines[i];
+    char foot[48];
+    snprintf(foot, sizeof(foot), "wheel=scroll  type=msg");
+    int total = 0;
+    agent_scroll = hw_ui_show_agent_chat(
+        agents_name(agent_focus), line_ptrs, from_me, n,
+        agent_scroll, &total, foot);
+    agent_scroll_total = total;
+    ui_note_input();
+}
+
+static void ui_open_agent_chat(int idx) {
+    if (idx < 0) idx = 0;
+    if (idx >= agents_count()) idx = agents_count() - 1;
+    agent_focus = idx;
+    agent_compose = false;
+    agent_scroll = -1;  // pin to latest when entering the room
+    ui_agent_chat_refresh();
+}
+
+static void ui_open_agent_act() {
+    agent_act_sel = AGENT_ACT_CLEAR;
+    hw_ui_show_agent_act(agent_act_sel, agents_name(agent_focus));
+    ui_note_input();
+}
+
+static void ui_agent_act_confirm() {
+    if (agent_act_sel == AGENT_ACT_CLEAR) {
+        agents_clear(agents_id(agent_focus));
+        hw_haptic_notify(0);
+        ui_open_agent_chat(agent_focus);
+    } else {
+        ui_open_agents();
+    }
 }
 
 static void ui_open_info() {
@@ -1251,9 +1443,11 @@ static void ui_open_info() {
 }
 
 // Build msglist from newest-first notify views (up to HW_UI_MSGLIST_MAX).
+// Unread flags drive the Nokia-style * NEW markers on the list face.
 static void ui_open_msglist() {
     static char titles[HW_UI_MSGLIST_MAX][41];
     static char levels[HW_UI_MSGLIST_MAX][8];
+    static bool unread[HW_UI_MSGLIST_MAX];
     static const char *title_ptrs[HW_UI_MSGLIST_MAX];
     static const char *level_ptrs[HW_UI_MSGLIST_MAX];
 
@@ -1265,14 +1459,34 @@ static void ui_open_msglist() {
         snprintf(titles[msglist_count], sizeof(titles[0]), "%s", v.title);
         snprintf(levels[msglist_count], sizeof(levels[0]), "%s",
                  notify_level_name(v.level));
+        unread[msglist_count] = v.unread;
         title_ptrs[msglist_count] = titles[msglist_count];
         level_ptrs[msglist_count] = levels[msglist_count];
         msglist_count++;
     }
     if (msglist_sel >= msglist_count) msglist_sel = msglist_count > 0 ? msglist_count - 1 : 0;
     if (msglist_sel < 0) msglist_sel = 0;
-    hw_ui_show_msglist(title_ptrs, level_ptrs, msglist_count, msglist_sel);
+    hw_ui_show_msglist(title_ptrs, level_ptrs, unread, msglist_count, msglist_sel);
     ui_note_input();
+}
+
+// Show the agent "door" card (pretty invite). Does not enter the room yet.
+static void ui_show_agent_invite_from_view(const NotifyView &v, uint32_t id) {
+    notify_card_id = id;
+    snprintf(reply_title, sizeof(reply_title), "%s", v.title);
+    int ax = agents_index_from_door(v);
+    const char *aname = (ax >= 0) ? agents_name(ax) : v.source;
+    hw_ui_show_agent_invite(aname, v.body, notify_unread_count());
+    ui_note_input();
+}
+
+// Enter the chat room from a chat-door notify (ack + open).
+static void ui_enter_agent_from_notify(uint32_t id, const NotifyView &v) {
+    int ax = agents_index_from_door(v);
+    if (ax < 0) return;
+    notify_ack_id(id);
+    notify_card_id = 0;
+    ui_open_agent_chat(ax);
 }
 
 static void ui_open_notify_id(uint32_t id) {
@@ -1281,11 +1495,43 @@ static void ui_open_notify_id(uint32_t id) {
         ui_open_msglist();
         return;
     }
+    // Only *-chat doors open the invite; real pages keep severity colours.
+    if (notify_is_chat_door(v)) {
+        ui_show_agent_invite_from_view(v, id);
+        return;
+    }
     notify_card_id = id;
     snprintf(reply_title, sizeof(reply_title), "%s", v.title);
     hw_ui_show_notify(notify_level_name(v.level), v.source, v.title,
                       v.body, notify_unread_count());
     ui_note_input();
+}
+
+static void ui_open_card_act() {
+    if (!notify_card_id) return;
+    card_act_sel = CARD_ACT_ACK;  // default: mark read
+    hw_ui_show_card_act(card_act_sel,
+                        reply_title[0] ? reply_title : NULL);
+    ui_note_input();
+}
+
+static void ui_card_act_confirm() {
+    if (!notify_card_id) {
+        ui_go_clock(NULL);
+        return;
+    }
+    if (card_act_sel == CARD_ACT_ACK) {
+        notify_ack_id(notify_card_id);
+        notify_card_id = 0;
+        if (notify_unread_count() > 0) ui_open_msglist();
+        else ui_go_clock("acked");
+    } else if (card_act_sel == CARD_ACT_REPLY) {
+        ui_open_reply(notify_card_id,
+                      reply_title[0] ? reply_title : NULL, 0);
+    } else {
+        // BACK → re-show the card
+        ui_open_notify_id(notify_card_id);
+    }
 }
 
 // Handle one click depending on the current face.
@@ -1299,11 +1545,27 @@ static void ui_on_click() {
         if (menu_sel == MENU_MESSAGES) {
             msglist_sel = 0;
             ui_open_msglist();
+        } else if (menu_sel == MENU_AGENTS) {
+            ui_open_agents();
         } else if (menu_sel == MENU_INFO) {
             ui_open_info();
         } else {
             ui_go_clock(NULL);
         }
+        break;
+    case HW_UI_AGENTS:
+        if (agents_sel == AGENTS_BACK) {
+            ui_open_menu();
+        } else {
+            ui_open_agent_chat(agents_sel);
+        }
+        break;
+    case HW_UI_AGENT_CHAT:
+        // Click → CLEAR CHAT / BACK sheet (chat room, not notify card)
+        ui_open_agent_act();
+        break;
+    case HW_UI_AGENT_ACT:
+        ui_agent_act_confirm();
         break;
     case HW_UI_MSGLIST:
         if (msglist_count == 0) {
@@ -1312,20 +1574,32 @@ static void ui_on_click() {
             ui_open_notify_id(msglist_ids[msglist_sel]);
         }
         break;
-    case HW_UI_NOTIFY:
-        // Click = ack (stronger than read) and back to list or clock.
-        if (notify_card_id) notify_ack_id(notify_card_id);
-        notify_card_id = 0;
-        if (notify_unread_count() > 0) ui_open_msglist();
-        else ui_go_clock(NULL);
+    case HW_UI_NOTIFY: {
+        // Chat door → open room. Severity page → Ack / Reply / Back.
+        NotifyView v;
+        if (notify_card_id && notify_view_by_id(notify_card_id, v, NULL, NULL) &&
+            notify_is_chat_door(v)) {
+            ui_enter_agent_from_notify(notify_card_id, v);
+        } else {
+            ui_open_card_act();
+        }
+        break;
+    }
+    case HW_UI_CARD_ACT:
+        ui_card_act_confirm();
         break;
     case HW_UI_INFO:
         ui_open_menu();
         break;
     case HW_UI_REPLY:
         // Encoder click = send if draft non-empty, else cancel
-        if (reply_buf[0]) ui_reply_submit();
-        else {
+        if (reply_buf[0]) {
+            ui_reply_submit();
+        } else if (agent_compose) {
+            agent_compose = false;
+            reply_buf[0] = '\0';
+            ui_open_agent_chat(agent_focus);
+        } else {
             notify_card_id = 0;
             reply_buf[0] = '\0';
             ui_go_clock(NULL);
@@ -1346,6 +1620,28 @@ static void ui_on_steps(int steps) {
         hw_ui_show_menu(menu_sel);
         break;
     }
+    case HW_UI_CARD_ACT: {
+        card_act_sel += steps;
+        while (card_act_sel < 0) card_act_sel += CARD_ACT_COUNT;
+        while (card_act_sel >= CARD_ACT_COUNT) card_act_sel -= CARD_ACT_COUNT;
+        hw_ui_show_card_act(card_act_sel,
+                            reply_title[0] ? reply_title : NULL);
+        break;
+    }
+    case HW_UI_AGENTS: {
+        agents_sel += steps;
+        while (agents_sel < 0) agents_sel += AGENTS_LIST_COUNT;
+        while (agents_sel >= AGENTS_LIST_COUNT) agents_sel -= AGENTS_LIST_COUNT;
+        hw_ui_show_agents(agents_sel, agents_bridge_ok());
+        break;
+    }
+    case HW_UI_AGENT_ACT: {
+        agent_act_sel += steps;
+        while (agent_act_sel < 0) agent_act_sel += AGENT_ACT_COUNT;
+        while (agent_act_sel >= AGENT_ACT_COUNT) agent_act_sel -= AGENT_ACT_COUNT;
+        hw_ui_show_agent_act(agent_act_sel, agents_name(agent_focus));
+        break;
+    }
     case HW_UI_MSGLIST:
         if (msglist_count <= 0) break;
         msglist_sel += steps;
@@ -1364,6 +1660,19 @@ static void ui_on_steps(int steps) {
         if (next >= n) next = n - 1;
         NotifyView v;
         if (notify_view(next, v)) ui_open_notify_id(v.id);
+        break;
+    }
+    case HW_UI_AGENT_CHAT: {
+        // Wheel scrolls the wrapped transcript. steps>0 = toward older (up).
+        // Pin-bottom (-1) first materializes to the latest viewport.
+        if (agent_scroll < 0) {
+            // compute max scroll via a dry refresh path
+            agent_scroll = agent_scroll_total;  // will clamp in paint
+        }
+        // Invert: positive encoder "down the page" = newer = decrease scroll
+        agent_scroll -= steps;
+        if (agent_scroll < 0) agent_scroll = 0;
+        ui_agent_chat_refresh();
         break;
     }
     case HW_UI_CLOCK:
@@ -1511,19 +1820,47 @@ void loop() {
         }
     }
 
+    // Agent thread inbound (display_force) — refresh open chat room live.
+    if (display_force && hw_ui_screen() == HW_UI_AGENT_CHAT) {
+        display_force = false;
+        // Stay pinned to latest if user was following the bottom.
+        if (agent_scroll < 0 ||
+            agent_scroll >= agent_scroll_total - 2) {
+            agent_scroll = -1;
+        }
+        ui_agent_chat_refresh();
+    }
+
     uint32_t arrived_id = 0;
     if (notify_take_arrival(&arrived_id) || display_force) {
         display_force = false;
         NotifyView v;
-        bool on_clock = (hw_ui_screen() == HW_UI_CLOCK);
+        HwUiScreen scr = hw_ui_screen();
+        bool on_clock = (scr == HW_UI_CLOCK);
         if (arrived_id && notify_view_by_id(arrived_id, v, NULL, NULL)) {
-            if (on_clock) {
+            if (notify_is_chat_door(v)) {
+                // Chat reply door (id "hermes-chat" etc.) — not a severity page.
+                int ax = agents_index_from_door(v);
+                if (ax >= 0 && scr == HW_UI_AGENT_CHAT && agent_focus == ax) {
+                    notify_ack_id(arrived_id);
+                    ui_agent_chat_refresh();
+                } else if (ax >= 0 && scr == HW_UI_REPLY && agent_compose &&
+                           agent_focus == ax) {
+                    // Typing in that room — leave compose; thread updates later.
+                } else {
+                    // Pretty door: open chat from it. Full text is in the room.
+                    ui_show_agent_invite_from_view(v, arrived_id);
+                }
+            } else if (on_clock || scr == HW_UI_MENU || scr == HW_UI_AGENTS ||
+                       scr == HW_UI_MSGLIST || scr == HW_UI_INFO) {
+                // Real message from any service: severity colours (info/warn/crit).
                 notify_card_id = arrived_id;
+                snprintf(reply_title, sizeof(reply_title), "%s", v.title);
                 hw_ui_show_notify(notify_level_name(v.level), v.source, v.title,
                                   v.body, notify_unread_count());
-                ui_note_input();  // starts idle timer for auto-return
+                ui_note_input();
             } else {
-                // Badge will update next time they return to the clock.
+                // In reply compose / sheets — badge only, don't yank the user.
                 hw_ui_invalidate_clock();
             }
         } else if (on_clock) {

@@ -53,9 +53,14 @@ Auth: `Authorization: Bearer <token>` on everything except `/health`.
 ## On-device UI
 
 - **Clock** — home (warm HH:MM, amber seconds, BAT %, unread badge, breathing rule on crit)
-- **Encoder click** → MENU → MESSAGES / INFO / BACK
-- **Card** — open from list; click = ack; type any key = free-text REPLY
-- **Enter** on reply = send (`reply` field) + mark read
+- **Encoder click** → MENU → MESSAGES / **AGENTS** / INFO / BACK
+- **Inbox list** — Nokia/pager style: `*` + bright title = NEW, dim = read; `I`/`W`/`C` severity chip; header `*NN NEW`
+- **Card (severity)** — real pages from any service: `info` (teal) / `warn` (amber) / `crit` (red); click/Enter = ACKNOWLEDGE · REPLY · BACK; type = free-text REPLY
+- **Chat door** — only when client `id` ends with `-chat` (e.g. bridge posts `hermes-chat`): pretty CHAT invite → opens AGENTS room. Not a severity page.
+- **AGENTS** — Grok / Claude / Hermes chat threads (bridge optional via `/agent_bridge.txt`)
+- **Enter** on reply = send (`reply` field or agent thread)
+
+**Two inboxes, one queue API:** `POST /notify` always lands in MESSAGES. Routing on device: `id: "*-chat"` → chat door UI; anything else (any `source`, any agent/service) → coloured severity card + reply.
 
 ## Out of scope (this PR)
 

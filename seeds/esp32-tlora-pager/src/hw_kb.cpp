@@ -1,5 +1,13 @@
 // Minimal TCA8418 driver + LilyGo T-Lora Pager keymap.
 // Event layout from LilyGoKeyboard.cpp (k--, row=k/10, col=k%10).
+//
+// Layer model (Pager has_symbol_key=false in LilyGoLib):
+//   - Letters by default.
+//   - Orange ALT (0x14): HOLD for symbols/digits (momentary). Factory text:
+//     "Middle orange button + Key = Symbol Mode".
+//   - CAPS (0x1C): toggle A/a.
+//   - Key 0x1E is SPACE in the 4x10 map — must NOT latch symbol mode
+//     (old seed treated 0x1E as SYM toggle → one space and only digits forever).
 
 #include "hw_kb.h"
 #include "board_pins.h"
@@ -19,19 +27,19 @@
 #define TCA_REG_DEBOUNCE_DIS2 0x2A
 #define TCA_REG_DEBOUNCE_DIS3 0x2B
 
-// After k-- (LilyGo specials)
-#define KEY_ALT        0x14
+// After k-- (LilyGo keyboardConfig for T-Lora Pager)
+#define KEY_ALT        0x14   // orange — hold = symbols
 #define KEY_CHAR_B     0x19
-#define KEY_CAPS       0x1C
+#define KEY_CAPS       0x1C   // toggle caps
 #define KEY_BACKSPACE  0x1D
-#define KEY_SYMBOL     0x1E
+#define KEY_SPACE      0x1E   // space (same code LilyGo lists as symbol_key_value)
 
 static bool kb_ok = false;
 static bool caps = false;
-static bool symbol = false;
-static bool alt = false;
+static bool symbol = false;   // true while ALT held
+static bool alt_held = false;
 
-// LilyGo 4x10 maps
+// LilyGo 4x10 maps (LilyGo_LoRa_Pager.cpp)
 static const char KEYMAP[4][10] = {
     {'q', 'w', 'e', 'r', 't', 'y', 'u', 'i', 'o', 'p'},
     {'a', 's', 'd', 'f', 'g', 'h', 'j', 'k', 'l', '\n'},
@@ -101,14 +109,20 @@ bool hw_kb_begin() {
     digitalWrite(PIN_KB_BACKLIGHT, LOW);
 
     kb_ok = true;
-    caps = symbol = alt = false;
-    Serial.println("[kb] TCA8418 4x10 ok");
+    caps = symbol = alt_held = false;
+    Serial.println("[kb] TCA8418 4x10 ok (ALT-hold=sym, CAPS=toggle)");
     return true;
 }
 
 bool hw_kb_ok() { return kb_ok; }
 bool hw_kb_caps() { return caps; }
 bool hw_kb_symbol() { return symbol; }
+
+void hw_kb_reset_mods() {
+    caps = false;
+    symbol = false;
+    alt_held = false;
+}
 
 bool hw_kb_read(char *out) {
     if (!kb_ok || !out) return false;
@@ -134,21 +148,33 @@ bool hw_kb_read(char *out) {
     if (k == 0 || k > 96) return false;
     k--;  // 0-based, LilyGo
 
-    // Modifiers / specials (index after k--)
-    if (k == KEY_SYMBOL) {
-        if (pressed) symbol = !symbol;
+    // Orange ALT: hold = symbol layer (not latch).
+    if (k == KEY_ALT) {
+        alt_held = pressed;
+        symbol = pressed;
         return false;
     }
+    // CAPS: toggle A/a
     if (k == KEY_CAPS) {
         if (pressed) caps = !caps;
         return false;
     }
-    if (k == KEY_ALT) {
-        if (pressed) alt = !alt;
+    if (k == KEY_BACKSPACE) {
+        if (pressed) {
+            // Orange ALT + Backspace = HOME (like Shift+Bksp on a laptop).
+            // Plain Backspace still deletes — hold ALT only for the shortcut.
+            *out = alt_held ? '\x1b' : '\b';
+            return true;
+        }
         return false;
     }
-    if (k == KEY_BACKSPACE) {
-        if (pressed) { *out = '\b'; return true; }
+    // Space is a real character (was wrongly used as SYM latch).
+    if (k == KEY_SPACE) {
+        if (pressed) {
+            // While ALT held, space is still space (not a digit).
+            *out = ' ';
+            return true;
+        }
         return false;
     }
 
@@ -158,9 +184,12 @@ bool hw_kb_read(char *out) {
     uint8_t col = k % 10;
     if (row >= 4 || col >= 10) return false;
 
-    char c = symbol ? SYMMAP[row][col] : KEYMAP[row][col];
+    // Use live ALT state for layer (symbol follows alt_held).
+    bool use_sym = alt_held;
+    char c = use_sym ? SYMMAP[row][col] : KEYMAP[row][col];
     if (c == '\0') return false;
-    if (!symbol && caps && c >= 'a' && c <= 'z') c = (char)toupper((unsigned char)c);
+    if (!use_sym && caps && c >= 'a' && c <= 'z')
+        c = (char)toupper((unsigned char)c);
     *out = c;
     return true;
 }

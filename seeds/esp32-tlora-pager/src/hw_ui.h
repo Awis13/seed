@@ -22,7 +22,11 @@ uint8_t hw_ui_get_brightness();
 enum HwUiScreen : uint8_t {
     HW_UI_CLOCK = 0,
     HW_UI_NOTIFY,
+    HW_UI_CARD_ACT,  // Ack / Reply / Back after click-Enter on a card
     HW_UI_MENU,
+    HW_UI_AGENTS,      // Grok / Claude / Hermes list
+    HW_UI_AGENT_CHAT,  // one agent thread
+    HW_UI_AGENT_ACT,   // CLEAR / BACK inside a chat room
     HW_UI_MSGLIST,
     HW_UI_INFO,
     HW_UI_REPLY,
@@ -60,13 +64,43 @@ void hw_ui_show_notify(const char *level,
                        const char *body,
                        int unread);
 
-// Menu: MESSAGES / INFO / BACK. selected is 0..2.
+// Agent chat door: big name + teaser. Click opens the room (not a full msg card).
+void hw_ui_show_agent_invite(const char *agent_name,
+                             const char *teaser,
+                             int unread);
+
+// Card action sheet: ACKNOWLEDGE / REPLY / BACK. selected is 0..2.
+// title is a short dim subtitle (message title).
+void hw_ui_show_card_act(int selected, const char *title);
+
+// Menu: MESSAGES / AGENTS / INFO / BACK. selected is 0..3.
 void hw_ui_show_menu(int selected);
 
-// Message list: one title per row (already truncated). selected is row index.
+// Agents list: GROK / CLAUDE / HERMES / BACK. selected is 0..3.
+void hw_ui_show_agents(int selected, bool bridge_ok);
+
+// One agent thread. lines[0..] oldest→newest, from_me[] marks user lines.
+// scroll_row: first visual row from top of the wrapped document.
+//   pass -1 to pin to the bottom (latest). Returns the actual scroll used.
+// total_rows_out: optional; total wrapped rows for encoder clamping.
+int hw_ui_show_agent_chat(const char *agent_name,
+                          const char *const *lines,
+                          const bool *from_me,
+                          int line_count,
+                          int scroll_row,
+                          int *total_rows_out,
+                          const char *footer);
+
+// In-chat sheet: CLEAR CHAT / BACK. selected is 0..1.
+void hw_ui_show_agent_act(int selected, const char *agent_name);
+
+// Message list: title + level + unread flag per row (Nokia/pager inbox).
+// Unread rows get a * marker and bright title; read rows are dim.
+// levels are "info"/"warn"/"crit"; unread[i] true = NEW.
 #define HW_UI_MSGLIST_MAX 8
 void hw_ui_show_msglist(const char *const *titles,
                         const char *const *levels,
+                        const bool *unread,
                         int count,
                         int selected);
 
