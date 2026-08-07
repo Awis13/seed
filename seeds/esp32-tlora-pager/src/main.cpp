@@ -3,13 +3,12 @@
 // The T-Lora Pager port of the ESP32 seed: just enough to boot, join WiFi and
 // let an AI agent grow it over the air.
 //
-// Bring-up seed, grown layer by layer. What is driven today (L1+L2):
+// Bring-up seed, grown layer by layer. What is driven today:
 //   - I2C on SDA=3/SCL=2 + scan (XL9555, BQ*, TCA8418, …)
-//   - XL9555 power rails raised the way LilyGoLib does in begin()
-//   - ST7796 480x222 status face + AW9364 backlight (GPIO42)
-// Not driven yet: TCA8418 keyboard, SX1262, GNSS, NFC, ES8311, BQ gauges as
-// skills. SPIFFS still ships WiFi + token so a dark-panel brick cannot lock us
-// out; the panel now also shows the token so AP provisioning is usable.
+//   - XL9555 power rails, ST7796 480x222 + AW9364, notify beeper,
+//     encoder UI, haptic, sound, keyboard reply, BQ27220 fuel gauge
+// Not driven yet: SX1262, GNSS, NFC, BQ25896 as skills.
+// SPIFFS still ships WiFi + token so a dark-panel brick cannot lock us out.
 // Endpoints:
 //   GET  /health            — alive check (no auth)
 //   GET  /capabilities      — hardware fingerprint
@@ -46,7 +45,7 @@
 #include "hw_kb.h"
 
 // ===== Configuration =====
-#define SEED_VERSION        "0.7.0"
+#define SEED_VERSION        "0.8.3"
 #define HTTP_PORT           8080
 #define TOKEN_FILE          "/auth_token.txt"
 #define WIFI_CONFIG_FILE    "/wifi.json"
@@ -169,9 +168,10 @@ struct HWProbe {
     I2CFound i2c0[MAX_I2C_FOUND];
     int i2c0_count;
 
-    // Battery via ADC on GPIO4 (resistor divider)
+    // Battery via BQ27220 fuel gauge (I2C 0x55)
     bool has_battery;
     float battery_v;
+    int battery_soc;   // 0..100, or -1 if Voltage ok but SoC not
 
     // Board guess
     const char *board;
@@ -191,11 +191,41 @@ static void i2c_scan(TwoWire &bus, I2CFound *results, int &count) {
     }
 }
 
-// This board reports its battery through a BQ27220 fuel gauge on I2C, not
-// through an ADC divider. Until that bus is up there is no reading to give, and
-// an invented one would be worse than none: /capabilities simply omits it.
+// BQ27220 standard commands: 0x08 = Voltage (mV), 0x2C = StateOfCharge (%).
+// Same part and registers as the T-Embed seed; capacity programming is left
+// alone so a wrong Design Capacity never bricks the gauge from OTA.
+static bool bq27220_read16(uint8_t reg, uint16_t &val) {
+    Wire.beginTransmission(BQ27220_ADDR);
+    Wire.write(reg);
+    if (Wire.endTransmission(false) != 0) return false;
+    if (Wire.requestFrom((int)BQ27220_ADDR, 2) != 2) return false;
+    val = Wire.read() | (Wire.read() << 8);
+    return true;
+}
+
 static void probe_battery() {
-    hw.has_battery = false;
+    uint16_t mv = 0, soc = 0;
+    if (bq27220_read16(0x08, mv) && mv > 2000 && mv < 6000) {
+        hw.has_battery = true;
+        hw.battery_v = mv / 1000.0f;
+        if (bq27220_read16(0x2C, soc) && soc <= 100) {
+            hw.battery_soc = (int)soc;
+        } else {
+            hw.battery_soc = -1;
+        }
+    } else {
+        hw.has_battery = false;
+        hw.battery_soc = -1;
+    }
+}
+
+// probe_battery() runs once at boot; re-read so the clock BAT % stays honest.
+static void battery_refresh() {
+    if (!hw.has_battery) return;
+    uint16_t mv = 0, soc = 0;
+    if (!bq27220_read16(0x08, mv) || mv <= 2000 || mv >= 6000) return;
+    hw.battery_v = mv / 1000.0f;
+    hw.battery_soc = (bq27220_read16(0x2C, soc) && soc <= 100) ? (int)soc : -1;
 }
 
 static void hw_probe() {
@@ -227,6 +257,12 @@ static void hw_probe() {
     for (int i = 0; i < hw.i2c0_count; i++) {
         Serial.printf("[probe]   0x%02X %s\n", hw.i2c0[i].addr,
             hw.i2c0[i].name ? hw.i2c0[i].name : "?");
+    }
+    if (hw.has_battery) {
+        Serial.printf("[probe] battery: %.2fV soc=%d%%\n",
+            hw.battery_v, hw.battery_soc);
+    } else {
+        Serial.printf("[probe] battery: not found\n");
     }
 }
 
@@ -568,14 +604,15 @@ static void handle_capabilities(AsyncWebServerRequest *request) {
     doc["display_h"] = 222;
     doc["backlight"] = hw_ui_get_brightness();
     doc["xl9555"] = hw_ui_expand_ok();
-    doc["peripherals_driven"] = "i2c-scan, xl9555, st7796, aw9364, notify, progress, haptic, sound, keyboard";
+    doc["peripherals_driven"] = "i2c-scan, xl9555, st7796, aw9364, notify, progress, haptic, sound, keyboard, bq27220";
     doc["haptic"] = hw_haptic_ok();
     doc["sound"] = hw_sound_ok();
     doc["keyboard"] = hw_kb_ok();
 
-    // Battery: BQ27220 fuel gauge, not read by this build.
+    // Battery: BQ27220 fuel gauge at I2C 0x55.
     if (hw.has_battery) {
         doc["battery_v"] = serialized(String(hw.battery_v, 2));
+        if (hw.battery_soc >= 0) doc["battery_soc"] = hw.battery_soc;
     }
 
     // I2C bus
@@ -920,8 +957,9 @@ static void handle_skill(AsyncWebServerRequest *request) {
     s += "6. GET /health — verify\n";
     s += "7. POST /firmware/confirm (or auto after 60s)\n\n";
     s += "## Board gotchas\n\n";
-    s += "- Driven: I2C scan, XL9555 rails, ST7796 480x222 + AW9364, notify beeper API\n";
-    s += "- Not yet: TCA8418 keyboard UI, SX1262/LoRa, GNSS, NFC, ES8311, BQ gauge skill, haptic\n";
+    s += "- Driven: I2C scan, XL9555, ST7796 + AW9364, notify, progress, haptic, sound, keyboard, BQ27220\n";
+    s += "- Not yet: SX1262/LoRa (MeshCore), GNSS, NFC, BQ25896 charger skill\n";
+    s += "- Battery: BQ27220 at 0x55 — Voltage 0x08, SoC 0x2C; BAT % on clock header; /capabilities battery_v/soc\n";
     s += "- Beeper model: any LAN service POSTs /notify; MeshCore/Telegram are later transports into the same inbox\n";
     s += "- Four devices share SPI (display, SX1262, SD, NFC): park every CS HIGH\n";
     s += "- SX1262 needs DIO3 TCXO 3.0V + DIO2 RF switch or it hears nothing\n";
@@ -1032,6 +1070,15 @@ static void ui_clock_paint(const char *note) {
     char ver[12];
     snprintf(ver, sizeof(ver), "v%s", SEED_VERSION);
 
+    char batt[16];
+    if (hw.has_battery && hw.battery_soc >= 0) {
+        snprintf(batt, sizeof(batt), "BAT %d%%", hw.battery_soc);
+    } else if (hw.has_battery) {
+        snprintf(batt, sizeof(batt), "BAT --");
+    } else {
+        batt[0] = '\0';
+    }
+
     char addr[24];
     char row1l[36], row1r[36], row2[56];
     row1l[0] = row1r[0] = row2[0] = '\0';
@@ -1068,7 +1115,7 @@ static void ui_clock_paint(const char *note) {
         snprintf(date, sizeof(date), "waiting for NTP");
     }
 
-    hw_ui_clock_tick(ver, addr, row1l, row1r, row2,
+    hw_ui_clock_tick(ver, batt, addr, row1l, row1r, row2,
                      notify_unread_count(),
                      ok, hh, mm, ss, date,
                      notify_crit_unread());
@@ -1451,6 +1498,19 @@ void loop() {
     // Notify skill: expiry, coalesced SPIFFS snapshot, auto-card on arrival
     // only when the user is on the clock (do not yank them out of a menu).
     notify_poll();
+
+    // Speaker + haptic FIRST — before any full-screen SPI paint can delay the
+    // cue. (Boot tone worked; notify was silent when paint ran first.)
+    {
+        uint8_t lvl = 0;
+        char src[NOTIFY_SOURCE_LEN];
+        if (notify_take_sound_arrival(&lvl, src, sizeof(src))) {
+            hw_sound_notify(lvl);   // amp + queue before haptic I2C
+            hw_haptic_notify(lvl);
+            hw_sound_poll();        // prime DMA immediately
+        }
+    }
+
     uint32_t arrived_id = 0;
     if (notify_take_arrival(&arrived_id) || display_force) {
         display_force = false;
@@ -1472,19 +1532,17 @@ void loop() {
         }
     }
 
-    // Haptic + speaker on notify arrival.
-    {
-        uint8_t lvl = 0;
-        char src[NOTIFY_SOURCE_LEN];
-        if (notify_take_sound_arrival(&lvl, src, sizeof(src))) {
-            hw_haptic_notify(lvl);
-            hw_sound_notify(lvl);
-        }
-    }
     hw_sound_poll();
 
     // Progress job reaping (TTL).
     progress_poll();
+
+    // Keep the fuel gauge current — probe_battery() only ran at boot.
+    static unsigned long last_battery = 0;
+    if (millis() - last_battery > 60000) {
+        last_battery = millis();
+        battery_refresh();
+    }
 
     // Home clock: 1 Hz field update + crit breathing rule.
     static unsigned long last_clock = 0;

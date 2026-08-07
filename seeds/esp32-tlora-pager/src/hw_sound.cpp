@@ -2,7 +2,10 @@
 //
 // Clocking: I2S master @ 16 kHz, MCLK = 256×fs = 4.096 MHz on GPIO10.
 // Codec init condensed from Espressif es8311 component for that pair.
-// Beep patterns mirror tembed sound.cpp (info 1×, warn 2×, crit 3× chirps).
+//
+// Beeps: same 1/2/3 pattern as tembed. Soft edges (ramp) so the PA does not
+// click; PA stays powered after begin — toggling EXP_AMP_EN after the boot
+// blip left subsequent notify cues silent (amp never came back cleanly).
 
 #include "hw_sound.h"
 #include "board_pins.h"
@@ -15,8 +18,13 @@
 
 #define ES_ADDR     0x18
 #define SND_RATE    16000
-#define SND_VOL     70          // 0..100 into DAC reg
-#define CHUNK       128         // mono frames per poll write
+#define SND_VOL     85          // 0..100 into DAC reg
+#define CHUNK       256         // frames per poll write (~16 ms @ 16 kHz)
+
+#define SND_TONE_AMP   20000    // of 32767
+#define SND_RAMP_MS        6    // envelope edge
+#define SND_HEAD_MS       12    // short lead-in silence (zero-cross)
+#define SND_PUMP_ROUNDS    4    // refill DMA several times per loop pass
 
 // ES8311 regs we touch
 #define ES_RESET    0x00
@@ -48,16 +56,17 @@ static uint8_t beep_n = 0;
 static uint8_t beep_i = 0;
 static uint32_t beep_frame = 0;
 static uint32_t phase = 0;          // 16.16 into 256-sine
+static uint32_t head_left = 0;      // leading silence frames
 static bool playing = false;
-static unsigned long amp_hold_until = 0;
+static bool amp_on = false;
 
-// 256-point sine, amplitude ~28000 (headroom under int16).
+// Full-scale 256-point sine; loudness is SND_TONE_AMP in the fill path.
 static int16_t SINE[256];
 static void sine_build() {
     static bool done = false;
     if (done) return;
     for (int i = 0; i < 256; i++) {
-        SINE[i] = (int16_t)(sinf((float)i * 6.2831853f / 256.0f) * 28000.0f);
+        SINE[i] = (int16_t)(sinf((float)i * 6.2831853f / 256.0f) * 32767.0f);
     }
     done = true;
 }
@@ -78,9 +87,13 @@ static bool es_read(uint8_t reg, uint8_t *val) {
     return true;
 }
 
-static void amp(bool on) {
-    hw_xl_pin(EXP_AMP_EN, on);
-    if (on) amp_hold_until = millis() + 400;
+// PA on and leave it on. Cutting EXP_AMP_EN after the boot cue made the next
+// notify silent on this board (rail did not recover for the cue window).
+static void amp_ensure() {
+    if (amp_on) return;
+    hw_xl_pin(EXP_AMP_EN, true);
+    amp_on = true;
+    es_write(ES_DAC31, 0x00);  // unmute DAC
 }
 
 // 16 kHz, 16-bit, MCLK 4.096 MHz (256×) — coeffs from esp-bsp es8311.c table.
@@ -152,6 +165,17 @@ static bool i2s_init() {
     return true;
 }
 
+static void queue_cue(const Beep *seq, uint8_t n, uint16_t extra_head_ms) {
+    beep_n = 0;
+    beep_i = 0;
+    beep_frame = 0;
+    phase = 0;
+    for (uint8_t i = 0; i < n && i < 4; i++) beeps[beep_n++] = seq[i];
+    head_left = (uint32_t)(SND_HEAD_MS + extra_head_ms) * SND_RATE / 1000;
+    playing = true;
+    amp_ensure();
+}
+
 bool hw_sound_begin() {
     sine_build();
     if (!es8311_init_16k()) {
@@ -164,11 +188,13 @@ bool hw_sound_begin() {
         snd_ok = false;
         return false;
     }
-    amp(true);   // rail up; held by poll
     snd_ok = true;
     Serial.println("[sound] ES8311 + I2S ok");
-    // Quiet identity chirp
-    hw_sound_notify(0);
+    amp_ensure();
+    delay(30);
+    // Soft boot identity (A5)
+    const Beep boot[] = {{880, 120, 0}};
+    queue_cue(boot, 1, 20);
     return true;
 }
 
@@ -176,43 +202,38 @@ bool hw_sound_ok() { return snd_ok; }
 
 void hw_sound_notify(uint8_t level) {
     if (!snd_ok) return;
-    beep_n = 0;
-    beep_i = 0;
-    beep_frame = 0;
-    phase = 0;
-    // Same musical idea as tembed: info one, warn two, crit three rising.
+    // Count = severity (tembed). Mid-range pitches for the pager speaker.
     if (level >= 2) {
-        beeps[beep_n++] = {1319, 70, 60};
-        beeps[beep_n++] = {1568, 70, 60};
-        beeps[beep_n++] = {2093, 120, 0};
+        const Beep seq[] = {{1175, 70, 55}, {1397, 70, 55}, {1760, 120, 0}};
+        queue_cue(seq, 3, 0);
     } else if (level == 1) {
-        beeps[beep_n++] = {988, 100, 90};
-        beeps[beep_n++] = {988, 100, 0};
+        const Beep seq[] = {{988, 100, 85}, {988, 110, 0}};
+        queue_cue(seq, 2, 0);
     } else {
-        beeps[beep_n++] = {880, 150, 0};
+        const Beep seq[] = {{880, 140, 0}};
+        queue_cue(seq, 1, 0);
     }
-    playing = true;
-    amp(true);
+    Serial.printf("[sound] cue level=%u beeps=%u\n", (unsigned)level, (unsigned)beep_n);
 }
 
-void hw_sound_poll() {
-    if (!snd_ok) return;
-
-    // Drop amp a bit after the last cue so the PA does not idle-hiss forever.
-    if (!playing && amp_hold_until && (long)(millis() - amp_hold_until) > 0) {
-        amp(false);
-        amp_hold_until = 0;
-    }
-    if (!playing || beep_i >= beep_n) {
-        if (playing) {
-            playing = false;
-            amp_hold_until = millis() + 300;
-        }
-        return;
+// One DMA refill. Returns true if a cue is still in progress.
+static bool sound_fill_once() {
+    if (!playing) return false;
+    if (beep_i >= beep_n && head_left == 0) {
+        playing = false;
+        return false;
     }
 
     int16_t stereo[CHUNK * 2];
     uint16_t made = 0;
+
+    while (made < CHUNK && head_left > 0) {
+        stereo[made * 2] = stereo[made * 2 + 1] = 0;
+        made++;
+        head_left--;
+    }
+
+    const uint32_t ramp = (uint32_t)SND_RAMP_MS * SND_RATE / 1000;
     while (made < CHUNK && beep_i < beep_n) {
         const Beep &b = beeps[beep_i];
         uint32_t on_f  = (uint32_t)b.on_ms  * SND_RATE / 1000;
@@ -220,23 +241,25 @@ void hw_sound_poll() {
         uint32_t total = on_f + gap_f;
         if (total == 0) { beep_i++; beep_frame = 0; continue; }
 
-        // phase step: freq / rate * 256 << 8  → 16.16 into 256 table
         uint32_t step = ((uint32_t)b.hz << 16) / SND_RATE;
 
         while (made < CHUNK && beep_frame < total) {
             int16_t s = 0;
             if (beep_frame < on_f) {
-                s = SINE[(phase >> 8) & 0xFF];
-                // short ramp in/out ~2 ms
-                uint32_t ramp = SND_RATE / 500;
-                if (ramp < 1) ramp = 1;
+                int32_t raw = SINE[(phase >> 8) & 0xFF];
                 int32_t env = 255;
-                if (beep_frame < ramp)
-                    env = (int32_t)(beep_frame * 255 / ramp);
-                else if (beep_frame > on_f - ramp)
-                    env = (int32_t)((on_f - beep_frame) * 255 / ramp);
-                s = (int16_t)((s * env) / 255);
+                if (ramp > 0) {
+                    if (beep_frame < ramp)
+                        env = (int32_t)(beep_frame * 255 / ramp);
+                    else if (beep_frame + ramp > on_f)
+                        env = (int32_t)((on_f - beep_frame) * 255 / ramp);
+                    if (env < 0) env = 0;
+                    if (env > 255) env = 255;
+                }
+                s = (int16_t)((raw * SND_TONE_AMP / 32767) * env / 255);
                 phase += step;
+            } else {
+                phase = 0;
             }
             stereo[made * 2]     = s;
             stereo[made * 2 + 1] = s;
@@ -250,6 +273,23 @@ void hw_sound_poll() {
         }
     }
 
-    size_t wrote = 0;
-    i2s_channel_write(i2s_tx, stereo, made * 4, &wrote, 0);
+    if (made == 0) return playing;
+    size_t want = (size_t)made * 4;
+    size_t off = 0;
+    while (off < want) {
+        size_t n = 0;
+        if (i2s_channel_write(i2s_tx, ((uint8_t *)stereo) + off, want - off,
+                              &n, pdMS_TO_TICKS(20)) != ESP_OK) break;
+        if (n == 0) break;
+        off += n;
+    }
+    return playing || head_left > 0 || beep_i < beep_n;
+}
+
+void hw_sound_poll() {
+    if (!snd_ok) return;
+    // Several refills per loop so a heavy UI paint cannot starve the cue.
+    for (int r = 0; r < SND_PUMP_ROUNDS; r++) {
+        if (!sound_fill_once()) break;
+    }
 }

@@ -338,6 +338,7 @@ static bool panel_begin() {
 
 // ---- clock field cache -----------------------------------------------------
 static char fld_ver[12]   = "";
+static char fld_batt[16]  = "";
 static char fld_addr[24]  = "";
 static char fld_time[8]   = "";
 static char fld_sec[4]    = "";
@@ -423,6 +424,7 @@ uint8_t hw_ui_get_brightness() { return bl_level; }
 
 void hw_ui_invalidate_clock() {
     clock_dirty = true;
+    fld_batt[0] = '\0';
     fld_ver[0] = fld_addr[0] = fld_time[0] = fld_sec[0] = '\0';
     fld_date[0] = fld_left[0] = fld_right[0] = fld_note[0] = '\0';
     clock_badge = -1;
@@ -444,6 +446,7 @@ void hw_ui_show_clock() {
 }
 
 void hw_ui_clock_tick(const char *version,
+                      const char *batt,
                       const char *ip_or_status,
                       const char *row1l,
                       const char *row1r,
@@ -456,13 +459,15 @@ void hw_ui_clock_tick(const char *version,
     if (!panel_ok || screen != HW_UI_CLOCK) return;
     (void)crit_unread;
 
-    // Header: version | badge | IP
+    // Header: version | badge | BAT | IP  (same three-slot idea as tembed)
     draw_field(fld_ver, sizeof(fld_ver), version ? version : "",
                MARGIN, HDR_Y, 2, COL_DIM, 'L', 80);
+    draw_field(fld_batt, sizeof(fld_batt), batt ? batt : "",
+               PANEL_W / 2, HDR_Y, 2, COL_DIM, 'C', 96);
     draw_field(fld_addr, sizeof(fld_addr), ip_or_status ? ip_or_status : "offline",
                PANEL_W - MARGIN, HDR_Y, 2, COL_DIM, 'R', 160);
 
-    // Unread badge — amber dot + count between version and centre
+    // Unread badge — amber dot + count between version and BAT
     int badge = unread > 9 ? 10 : unread;
     if (clock_dirty || badge != clock_badge) {
         clock_badge = badge;

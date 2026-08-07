@@ -34,7 +34,9 @@ HwUiScreen hw_ui_screen();
 void hw_ui_show_clock();
 
 // One-second field update on the clock face. No-op if another screen is up.
+// batt is "BAT 87%" / "BAT --" / empty (no gauge). Drawn centered in the header.
 void hw_ui_clock_tick(const char *version,
+                      const char *batt,
                       const char *ip_or_status,
                       const char *row1l,
                       const char *row1r,

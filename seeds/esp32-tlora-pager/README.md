@@ -2,7 +2,7 @@
 
 AI-growable seed for the **LILYGO T-Lora Pager** (ESP32-S3, 16 MB flash, 8 MB QSPI PSRAM).
 
-This is a full **pocket pager** port of the seed stack: HTTP notify inbox, Advisor-style clock face, encoder menu, progress bar, haptic (DRV2605), speaker beeps (ES8311), and free-text reply from the TCA8418 keyboard.
+This is a full **pocket pager** port of the seed stack: HTTP notify inbox, Advisor-style clock face, encoder menu, progress bar, haptic (DRV2605), speaker beeps (ES8311), free-text reply from the TCA8418 keyboard, and **BQ27220 battery %** on the clock header.
 
 ## Hardware (verified)
 
@@ -11,6 +11,7 @@ This is a full **pocket pager** port of the seed stack: HTTP notify inbox, Advis
 | ESP32-S3 | External QSPI flash + PSRAM (`qio_qspi`) |
 | Display | ST7796 480×222, AW9364 backlight on GPIO42 |
 | I2C | SDA=3 SCL=2 — XL9555, BQ25896/BQ27220, TCA8418, ES8311, DRV2605, … |
+| Fuel gauge | BQ27220 @ 0x55 — Voltage + SoC on clock (`BAT n%`) + `/capabilities` |
 | XL9555 @ 0x20 | Power rails for LoRa/GPS/NFC/KB/SD/amp (raised at boot) |
 | Encoder | A=40 B=41 C=7 |
 | Keyboard | TCA8418 4×10 @ 0x34, INT=6 |
@@ -51,11 +52,11 @@ Auth: `Authorization: Bearer <token>` on everything except `/health`.
 
 ## On-device UI
 
-- **Clock** — home (warm HH:MM, amber seconds, unread badge, breathing rule on crit)
+- **Clock** — home (warm HH:MM, amber seconds, BAT %, unread badge, breathing rule on crit)
 - **Encoder click** → MENU → MESSAGES / INFO / BACK
 - **Card** — open from list; click = ack; type any key = free-text REPLY
 - **Enter** on reply = send (`reply` field) + mark read
 
 ## Out of scope (this PR)
 
-MeshCore / SX1262, GNSS, NFC, full battery skill UI. The seed still exposes `/firmware/*` so an agent can grow those next.
+MeshCore / SX1262, GNSS, NFC, BQ25896 charger skill. The seed still exposes `/firmware/*` so an agent can grow those next.
