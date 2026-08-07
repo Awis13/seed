@@ -1,0 +1,1504 @@
+// ESP32 Seed - LILYGO T-Lora Pager 868 (ESP32-S3)
+//
+// The T-Lora Pager port of the ESP32 seed: just enough to boot, join WiFi and
+// let an AI agent grow it over the air.
+//
+// Bring-up seed, grown layer by layer. What is driven today (L1+L2):
+//   - I2C on SDA=3/SCL=2 + scan (XL9555, BQ*, TCA8418, …)
+//   - XL9555 power rails raised the way LilyGoLib does in begin()
+//   - ST7796 480x222 status face + AW9364 backlight (GPIO42)
+// Not driven yet: TCA8418 keyboard, SX1262, GNSS, NFC, ES8311, BQ gauges as
+// skills. SPIFFS still ships WiFi + token so a dark-panel brick cannot lock us
+// out; the panel now also shows the token so AP provisioning is usable.
+// Endpoints:
+//   GET  /health            — alive check (no auth)
+//   GET  /capabilities      — hardware fingerprint
+//   GET  /config.md         — node description
+//   POST /config.md         — update description
+//   GET  /events            — event log (?since=unix_ts)
+//   GET  /clock             — local time, timezone, NTP sync state
+//   POST /clock/tz          — set the POSIX TZ string (raw text/plain body)
+//   GET  /firmware/version  — version, partition, uptime
+//   POST /firmware/upload   — upload OTA binary (streaming)
+//   POST /firmware/apply    — reboot into new firmware
+//   POST /firmware/confirm  — confirm (cancel rollback)
+//   POST /firmware/rollback — revert to previous
+//   GET  /skill             — AI agent skill file
+//   GET  /                  — WiFi config page
+//   POST /wifi/config       — save WiFi credentials
+
+#include <Arduino.h>
+#include <stdlib.h>
+#include <time.h>
+#include <WiFi.h>
+#include <ESPmDNS.h>
+#include <SPIFFS.h>
+#include <Wire.h>
+#include <ESPAsyncWebServer.h>
+#include <ArduinoJson.h>
+#include <Update.h>
+#include <esp_ota_ops.h>
+#include "board_pins.h"
+#include "hw_ui.h"
+#include "hw_input.h"
+#include "hw_haptic.h"
+#include "hw_sound.h"
+#include "hw_kb.h"
+
+// ===== Configuration =====
+#define SEED_VERSION        "0.7.0"
+#define HTTP_PORT           8080
+#define TOKEN_FILE          "/auth_token.txt"
+#define WIFI_CONFIG_FILE    "/wifi.json"
+#define CONFIG_MD_FILE      "/config.md"
+#define TZ_FILE             "/tz.txt"
+// No location is baked into the seed: UTC until an agent posts a POSIX TZ.
+#define TZ_DEFAULT          "UTC0"
+// Anything older than this is the pre-NTP epoch, not a real wall clock.
+#define TIME_VALID_EPOCH    1700000000
+
+// Free GPIO for agents — only the external header pin is honestly free.
+// Everything else is claimed by a peripheral (see board_pins.h).
+static const int gpio_safe_pins_arr[] = { 9 };
+static const int *gpio_safe_pins = gpio_safe_pins_arr;
+static const int gpio_safe_pins_count = 1;
+
+// ===== Events Ring Buffer =====
+#define MAX_EVENTS          64
+#define EVENT_MSG_LEN       128
+
+struct EventEntry {
+    unsigned long timestamp;
+    char message[EVENT_MSG_LEN];
+};
+
+static EventEntry events_buf[MAX_EVENTS];
+static int events_head = 0;
+static int events_count = 0;
+
+static void event_add(const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    EventEntry *e = &events_buf[events_head];
+    struct timeval tv;
+    if (gettimeofday(&tv, NULL) == 0 && tv.tv_sec > 1700000000) {
+        e->timestamp = (unsigned long)tv.tv_sec;
+    } else {
+        e->timestamp = millis() / 1000;
+    }
+    vsnprintf(e->message, EVENT_MSG_LEN, fmt, ap);
+    events_head = (events_head + 1) % MAX_EVENTS;
+    if (events_count < MAX_EVENTS) events_count++;
+    va_end(ap);
+}
+
+// ===== Skill/plugin interface =====
+
+struct SkillEndpoint {
+    const char *method;       // "GET", "POST"
+    const char *path;         // "/gpio/list"
+    const char *description;  // "List available GPIO pins"
+};
+
+struct Skill {
+    const char *name;         // "gpio"
+    const char *version;      // "0.1.0"
+    const char *(*describe)();                          // returns markdown
+    const SkillEndpoint *endpoints;                     // NULL-terminated array
+    void (*register_routes)(AsyncWebServer &server);    // registers routes on the server
+    void (*tick)();           // called every loop() iteration, or nullptr if unused
+};
+
+#define MAX_SKILLS 16
+static const Skill *g_skills[MAX_SKILLS];
+static int g_skill_count = 0;
+
+static int skill_register(const Skill *skill) {
+    if (g_skill_count >= MAX_SKILLS) return -1;
+    g_skills[g_skill_count++] = skill;
+    return 0;
+}
+
+// ===== Hardware Probe (run once at boot, cached) =====
+
+// Known I2C device addresses
+struct I2CDevice {
+    uint8_t addr;
+    const char *name;
+};
+
+// Names for devices this board actually carries (LilyGo hardware table).
+// Unknown addresses still show up in the scan with name=null.
+static const I2CDevice known_i2c[] = {
+    {0x18, "ES8311 audio codec"},
+    {0x20, "XL9555 IO expander"},
+    {0x28, "BHI260AP sensor"},
+    {0x34, "TCA8418 keyboard"},
+    {0x51, "PCF85063A RTC"},
+    {0x55, "BQ27220 fuel gauge"},
+    {0x5A, "DRV2605 haptic"},
+    {0x6B, "BQ25896 charger"},
+    {0, NULL}
+};
+
+static const char *i2c_identify(uint8_t addr) {
+    for (int i = 0; known_i2c[i].name; i++) {
+        if (known_i2c[i].addr == addr) return known_i2c[i].name;
+    }
+    return NULL;
+}
+
+// Probe results (cached at boot)
+#define MAX_I2C_FOUND 16
+
+struct I2CFound {
+    uint8_t addr;
+    const char *name;
+};
+
+struct HWProbe {
+    // Chip
+    const char *chip_model;
+    uint8_t chip_revision;
+    uint32_t flash_size;
+    uint32_t flash_speed;
+    uint32_t psram_size;
+    float temp_c;
+
+    // I2C bus (SDA=3, SCL=2)
+    I2CFound i2c0[MAX_I2C_FOUND];
+    int i2c0_count;
+
+    // Battery via ADC on GPIO4 (resistor divider)
+    bool has_battery;
+    float battery_v;
+
+    // Board guess
+    const char *board;
+};
+
+static HWProbe hw;
+
+static void i2c_scan(TwoWire &bus, I2CFound *results, int &count) {
+    count = 0;
+    for (uint8_t addr = 0x08; addr < 0x78; addr++) {
+        bus.beginTransmission(addr);
+        if (bus.endTransmission() == 0 && count < MAX_I2C_FOUND) {
+            results[count].addr = addr;
+            results[count].name = i2c_identify(addr);
+            count++;
+        }
+    }
+}
+
+// This board reports its battery through a BQ27220 fuel gauge on I2C, not
+// through an ADC divider. Until that bus is up there is no reading to give, and
+// an invented one would be worse than none: /capabilities simply omits it.
+static void probe_battery() {
+    hw.has_battery = false;
+}
+
+static void hw_probe() {
+    memset(&hw, 0, sizeof(hw));
+
+    // Chip info
+    hw.chip_model = ESP.getChipModel();
+    hw.chip_revision = ESP.getChipRevision();
+    hw.flash_size = ESP.getFlashChipSize();
+    hw.flash_speed = ESP.getFlashChipSpeed();
+    hw.psram_size = ESP.getPsramSize();
+    hw.temp_c = temperatureRead();
+
+    // Wire is already up from hw_ui_begin(); just scan.
+    if (PIN_I2C_SDA >= 0 && PIN_I2C_SCL >= 0) {
+        i2c_scan(Wire, hw.i2c0, hw.i2c0_count);
+    }
+
+    probe_battery();
+
+    // Dedicated board build - this firmware only runs on T-Lora Pager hardware.
+    hw.board = "T-Lora-Pager";
+
+    Serial.printf("[probe] board: %s\n", hw.board);
+    Serial.printf("[probe] temp: %.1fC, flash: %uMB, psram: %uKB\n",
+        hw.temp_c, (unsigned)(hw.flash_size / 1024 / 1024),
+        (unsigned)(hw.psram_size / 1024));
+    Serial.printf("[probe] i2c: %d devices\n", hw.i2c0_count);
+    for (int i = 0; i < hw.i2c0_count; i++) {
+        Serial.printf("[probe]   0x%02X %s\n", hw.i2c0[i].addr,
+            hw.i2c0[i].name ? hw.i2c0[i].name : "?");
+    }
+}
+
+// ===== Globals =====
+static AsyncWebServer server(HTTP_PORT);
+static String auth_token = "";
+static String ap_ssid = "";
+static String mdns_name = "";
+static unsigned long boot_time = 0;
+
+// Provisioning AP state. The password is rolled on every raise and lives only
+// in this variable and on the device screen — never persisted, never sent over
+// the wire. ap_active is true only while the softAP is genuinely up; from_setup_ap()
+// keys off it so a gashed AP (softAPIP()==0.0.0.0) can never match a LAN client.
+static bool ap_active = false;
+static String ap_password = "";
+
+static String wifi_ssid = "";
+static String wifi_pass = "";
+
+// OTA state
+static bool firmware_confirmed = false;
+static bool firmware_confirm_attempted = false;
+static bool ota_in_progress = false;
+static bool ota_upload_started = false;
+static bool ota_upload_ok = false;
+static bool ota_upload_error = false;
+static char ota_upload_error_msg[128] = "";
+static size_t ota_bytes_written = 0;
+static volatile bool pending_restart = false;
+static volatile bool pending_rollback = false;
+
+// ===== Utilities =====
+
+static String get_mac_suffix() {
+    uint8_t mac[6];
+    WiFi.macAddress(mac);
+    char buf[5];
+    snprintf(buf, sizeof(buf), "%02X%02X", mac[4], mac[5]);
+    return String(buf);
+}
+
+static String read_spiffs_file(const char *path) {
+    File f = SPIFFS.open(path, FILE_READ);
+    if (!f) return "";
+    String content = f.readString();
+    f.close();
+    return content;
+}
+
+static bool write_spiffs_file(const char *path, const String &content) {
+    // The ATS-Mini bracketed this write with encoder-ISR pauses, because its
+    // encoder ISR read flash while SPIFFS had the cache disabled. This board has
+    // no encoder ISR yet, so the write stands alone - the hazard returns the
+    // day an ISR is added here.
+    File f = SPIFFS.open(path, FILE_WRITE);
+    if (!f) return false;
+    f.print(content);
+    f.close();
+    return true;
+}
+
+// Write to tmp then rename over path — notify's snapshot must never be empty
+// mid-write (power loss during a plain open(FILE_WRITE) would wipe the queue).
+static bool write_spiffs_file_atomic(const char *path, const char *tmp_path,
+                                     const String &content) {
+    if (!write_spiffs_file(tmp_path, content)) return false;
+    SPIFFS.remove(path);
+    return SPIFFS.rename(tmp_path, path);
+}
+
+// Raised by notify endpoints; loop() paints and clears it. The endpoints never
+// touch the panel themselves (AsyncTCP task must not hold SPI).
+static volatile bool display_force = false;
+
+// ===== Timezone =====
+//
+// The seed knows no city. It stores a raw POSIX TZ string in SPIFFS and hands
+// it to the C library; whoever provisions the node decides what "local" means.
+
+static String tz_string = TZ_DEFAULT;
+
+static void tz_apply() {
+    setenv("TZ", tz_string.c_str(), 1);
+    tzset();
+}
+
+static void tz_load() {
+    String stored = read_spiffs_file(TZ_FILE);
+    stored.trim();
+    if (stored.length() > 0) tz_string = stored;
+    tz_apply();
+}
+
+// POSIX TZ strings are printable ASCII without spaces, e.g. "UTC0" or
+// "CET-1CEST,M3.5.0,M10.5.0/3". Reject anything else rather than feed the
+// C library a string that silently degrades to UTC.
+static bool tz_valid(const String &tz) {
+    if (tz.length() == 0 || tz.length() > 63) return false;
+    for (unsigned int i = 0; i < tz.length(); i++) {
+        char c = tz.charAt(i);
+        if (c < 0x21 || c > 0x7E) return false;
+    }
+    return true;
+}
+
+// Local wall clock, or false before the first NTP sync (time() still near 0).
+static bool clock_local_time(struct tm &out) {
+    time_t now = time(NULL);
+    if (now <= TIME_VALID_EPOCH) return false;
+    return localtime_r(&now, &out) != NULL;
+}
+
+// ===== Auth =====
+
+static void token_load() {
+    auth_token = read_spiffs_file(TOKEN_FILE);
+    auth_token.trim();
+
+    if (auth_token.length() == 0) {
+        char buf[33];
+        for (int i = 0; i < 16; i++) {
+            snprintf(buf + i * 2, 3, "%02x", (uint8_t)esp_random());
+        }
+        buf[32] = '\0';
+        auth_token = String(buf);
+        write_spiffs_file(TOKEN_FILE, auth_token);
+    }
+}
+
+static bool check_token_constant_time(const String &provided) {
+    if (provided.length() != auth_token.length()) return false;
+    volatile uint8_t result = 0;
+    for (size_t i = 0; i < auth_token.length(); i++) {
+        result |= provided[i] ^ auth_token[i];
+    }
+    return result == 0;
+}
+
+static bool check_auth(AsyncWebServerRequest *request) {
+    if (!request->hasHeader("Authorization")) return false;
+    String auth = request->header("Authorization");
+    if (!auth.startsWith("Bearer ")) return false;
+    String token = auth.substring(7);
+    token.trim();
+    return check_token_constant_time(token);
+}
+
+static bool require_auth(AsyncWebServerRequest *request) {
+    if (check_auth(request)) return true;
+    request->send(401, "application/json",
+        "{\"error\":\"Authorization: Bearer <token> required\"}");
+    return false;
+}
+
+// ===== WiFi =====
+
+static void wifi_load_config() {
+    String json = read_spiffs_file(WIFI_CONFIG_FILE);
+    if (json.length() == 0) return;
+    JsonDocument doc;
+    if (deserializeJson(doc, json) != DeserializationError::Ok) return;
+    wifi_ssid = doc["ssid"].as<String>();
+    wifi_pass = doc["password"].as<String>();
+}
+
+static bool wifi_save_config(const String &ssid, const String &pass) {
+    JsonDocument doc;
+    doc["ssid"] = ssid;
+    doc["password"] = pass;
+    String json;
+    serializeJson(doc, json);
+    return write_spiffs_file(WIFI_CONFIG_FILE, json);
+}
+
+// ===== Provisioning AP =====
+//
+// The softAP is up only while somebody is actually provisioning the node, and
+// its password is random per raise. It used to run permanently in WIFI_AP_STA
+// with the password hardcoded as a #define in a public repo. Combined with
+// handle_wifi_page(), which handed the auth token to any client on the AP
+// subnet, that gave anyone within radio range of a seed sitting inside the
+// owner's LAN a token — and the token is POST /firmware/upload, i.e. arbitrary
+// code on a box behind the firewall.
+
+// The AP subnet is pinned rather than left on the ESP-IDF default of
+// 192.168.4.1/24. from_setup_ap() decides "this client came in over the setup
+// AP" by matching the first three octets, so an AP subnet that a STA network
+// might also use turns that test into a false positive reachable from the LAN.
+// 172.31.157.0/24 sits clear of the common consumer-router defaults and of the
+// 192.168.1.0/24 this node's owner runs at home.
+#define AP_IP_A 172
+#define AP_IP_B  31
+#define AP_IP_C 157
+#define AP_IP_D   1
+
+// One session's password. No lookalike glyphs — this gets typed off the device
+// screen; 12 chars out of a 32-symbol alphabet is 60 bits. Runs after RF is up
+// (wifi_setup() has switched WiFi on), which is what makes esp_random() a
+// hardware RNG rather than a seeded PRNG.
+static void ap_generate_password() {
+    static const char charset[] = "abcdefghijkmnpqrstuvwxyz23456789";
+    const uint32_t n = sizeof(charset) - 1;
+    ap_password = "";
+    for (int i = 0; i < 12; i++) {
+        ap_password += charset[esp_random() % n];
+    }
+}
+
+// Raise the provisioning softAP. `manual` is reserved for a future press-to-raise
+// gesture; today it is always false (called only from wifi_setup() when STA fails).
+static void ap_start(bool manual) {
+    if (ap_active) return;  // idempotent: a re-raise must not re-roll the password
+    (void)manual;
+    ap_generate_password();  // esp_random after RF is up
+    // Pin the subnet before the AP comes up, clear of the owner's LAN, so a LAN
+    // client can never land in it and pass from_setup_ap()'s /24 test. If the pin
+    // fails the AP would fall back to the default 192.168.4.1/24, where a LAN
+    // client could share that subnet and slip past from_setup_ap() — so refuse to
+    // raise the AP at all rather than expose the token-skipping path over the LAN.
+    if (!WiFi.softAPConfig(IPAddress(AP_IP_A, AP_IP_B, AP_IP_C, AP_IP_D),
+                           IPAddress(AP_IP_A, AP_IP_B, AP_IP_C, AP_IP_D),
+                           IPAddress(255, 255, 255, 0))) {
+        event_add("setup AP: subnet pin failed, not raising AP");
+        return;
+    }
+    WiFi.softAP(ap_ssid.c_str(), ap_password.c_str());
+    ap_active = true;
+    event_add("setup AP up: %s", ap_ssid.c_str());  // SSID only, never the password
+}
+
+// True only for a request that arrived over the provisioning AP while that AP is
+// actually up. Both halves matter: once the AP is down softAPIP() is 0.0.0.0 and
+// the subnet test is meaningless, and belonging to some subnet proves nothing on
+// its own. Reaching the node this way costs physical presence plus the per-boot
+// password shown on the screen, which is why this is the one path allowed to
+// skip the token.
+static bool from_setup_ap(AsyncWebServerRequest *request) {
+    if (!ap_active) return false;
+    IPAddress client_ip;
+    client_ip.fromString(request->client()->remoteIP().toString());
+    IPAddress ap_ip = WiFi.softAPIP();
+    return client_ip[0] == ap_ip[0] && client_ip[1] == ap_ip[1] &&
+           client_ip[2] == ap_ip[2];
+}
+
+static void wifi_setup() {
+    String suffix = get_mac_suffix();
+    ap_ssid = "Seed-" + suffix;
+    mdns_name = "seed-" + suffix;
+    mdns_name.toLowerCase();
+
+    // STA-only: the AP is not started up-front. It comes up only if the stored
+    // credentials fail to get us on the network (see below), so a provisioned
+    // node running on WiFi never offers a way in.
+    WiFi.mode(WIFI_STA);
+
+    // Start SNTP with the stored TZ before associating: the daemon is
+    // non-blocking and keeps retrying on its own, so the clock also syncs after
+    // a later reconnect (loop() re-begins WiFi) instead of only on a successful
+    // boot-time connect.
+    configTzTime(tz_string.c_str(), "pool.ntp.org", "time.nist.gov");
+
+    wifi_load_config();
+    if (wifi_ssid.length() > 0) {
+        Serial.printf("[wifi] STA begin ssid=%s\n", wifi_ssid.c_str());
+        WiFi.begin(wifi_ssid.c_str(), wifi_pass.c_str());
+        // 15 s: home APs often need more than 10 s after a cold bootloader exit.
+        int attempts = 0;
+        while (WiFi.status() != WL_CONNECTED && attempts < 30) {
+            delay(500);
+            attempts++;
+        }
+        if (WiFi.status() == WL_CONNECTED) {
+            Serial.printf("[wifi] STA up %s\n", WiFi.localIP().toString().c_str());
+        } else {
+            Serial.printf("[wifi] STA failed after %d attempts, raising setup AP\n", attempts);
+        }
+    } else {
+        Serial.println("[wifi] no credentials in SPIFFS — setup AP only");
+    }
+
+    // Nothing to provision if the stored credentials already got us online: in
+    // that case the AP is never started at all.
+    if (WiFi.status() != WL_CONNECTED) ap_start(false);
+
+    if (MDNS.begin(mdns_name.c_str())) {
+        MDNS.addService("http", "tcp", HTTP_PORT);
+        MDNS.addService("seed", "tcp", HTTP_PORT);
+    }
+}
+
+// ===== HTTP Handlers =====
+
+static void handle_health(AsyncWebServerRequest *request) {
+    JsonDocument doc;
+    doc["ok"] = true;
+    doc["uptime_sec"] = (millis() - boot_time) / 1000;
+    doc["type"] = "esp32-seed";
+    doc["version"] = SEED_VERSION;
+    doc["seed"] = true;
+    doc["arch"] = "xtensa-esp32s3";
+    String response;
+    serializeJson(doc, response);
+    request->send(200, "application/json", response);
+}
+
+static void handle_capabilities(AsyncWebServerRequest *request) {
+    if (!require_auth(request)) return;
+
+    JsonDocument doc;
+    doc["type"] = "esp32-seed";
+    doc["version"] = SEED_VERSION;
+    doc["seed"] = true;
+    doc["board"] = hw.board;
+    doc["hostname"] = mdns_name;
+
+    // Chip
+    doc["chip"] = hw.chip_model;
+    doc["chip_revision"] = hw.chip_revision;
+    doc["arch"] = "xtensa-esp32s3";
+    doc["os"] = "FreeRTOS";
+    doc["cpus"] = ESP.getChipCores();
+    doc["cpu_mhz"] = ESP.getCpuFreqMHz();
+    doc["free_heap"] = (unsigned long)ESP.getFreeHeap();
+    doc["min_free_heap"] = (unsigned long)ESP.getMinFreeHeap();
+    doc["flash_mb"] = (unsigned long)(hw.flash_size / 1024 / 1024);
+    doc["flash_mhz"] = (unsigned long)(hw.flash_speed / 1000000);
+    if (hw.psram_size > 0) {
+        doc["psram_kb"] = (unsigned long)(hw.psram_size / 1024);
+    }
+    doc["temp_c"] = serialized(String(hw.temp_c, 1));
+
+    // Honest to what this build actually drives.
+    doc["has_wifi"] = true;
+    doc["has_bluetooth"] = true;
+    doc["display"] = hw_ui_ready();
+    doc["display_w"] = 480;
+    doc["display_h"] = 222;
+    doc["backlight"] = hw_ui_get_brightness();
+    doc["xl9555"] = hw_ui_expand_ok();
+    doc["peripherals_driven"] = "i2c-scan, xl9555, st7796, aw9364, notify, progress, haptic, sound, keyboard";
+    doc["haptic"] = hw_haptic_ok();
+    doc["sound"] = hw_sound_ok();
+    doc["keyboard"] = hw_kb_ok();
+
+    // Battery: BQ27220 fuel gauge, not read by this build.
+    if (hw.has_battery) {
+        doc["battery_v"] = serialized(String(hw.battery_v, 2));
+    }
+
+    // I2C bus
+    if (hw.i2c0_count > 0) {
+        JsonArray bus0 = doc["i2c_bus0"].to<JsonArray>();
+        for (int i = 0; i < hw.i2c0_count; i++) {
+            JsonObject dev = bus0.add<JsonObject>();
+            char hex[7];
+            snprintf(hex, sizeof(hex), "0x%02X", hw.i2c0[i].addr);
+            dev["addr"] = String(hex);
+            if (hw.i2c0[i].name) dev["device"] = hw.i2c0[i].name;
+        }
+    }
+
+    // GPIO: no pin is declared safe until the board map is verified, so this
+    // array comes back empty rather than wrong.
+    JsonArray pins = doc["gpio_safe"].to<JsonArray>();
+    for (int i = 0; i < gpio_safe_pins_count; i++) pins.add(gpio_safe_pins[i]);
+
+    // WiFi
+    if (WiFi.status() == WL_CONNECTED) {
+        doc["wifi_ssid"] = WiFi.SSID();
+        doc["wifi_ip"] = WiFi.localIP().toString();
+        doc["wifi_rssi"] = WiFi.RSSI();
+    }
+    doc["ap_ssid"] = ap_ssid;
+    doc["ap_ip"] = WiFi.softAPIP().toString();
+
+    JsonArray ep = doc["endpoints"].to<JsonArray>();
+    const char *eps[] = {
+        "/health", "/capabilities", "/config.md", "/events",
+        "/clock", "/clock/tz",
+        "/firmware/version", "/firmware/upload", "/firmware/apply",
+        "/firmware/confirm", "/firmware/rollback",
+        "/skill", NULL
+    };
+    for (int i = 0; eps[i]; i++) ep.add(eps[i]);
+
+    // Skill endpoints
+    for (int i = 0; i < g_skill_count; i++) {
+        const SkillEndpoint *se = g_skills[i]->endpoints;
+        for (int j = 0; se[j].path; j++) ep.add(se[j].path);
+    }
+
+    String response;
+    serializeJson(doc, response);
+    request->send(200, "application/json", response);
+}
+
+static void handle_body_collect(AsyncWebServerRequest *request, uint8_t *data,
+                                 size_t len, size_t index, size_t total) {
+    if (index == 0) {
+        if (total > 4096) { request->send(413, "application/json", "{\"error\":\"too large\"}"); return; }
+        char *buf = (char*)malloc(total + 1);
+        if (!buf) { request->send(500, "application/json", "{\"error\":\"OOM\"}"); return; }
+        request->_tempObject = buf;
+    }
+    char *buf = (char*)request->_tempObject;
+    if (buf) memcpy(buf + index, data, len);
+    if (index + len == total && buf) buf[total] = '\0';
+}
+
+static void handle_config_get(AsyncWebServerRequest *request) {
+    if (!require_auth(request)) return;
+    String content = read_spiffs_file(CONFIG_MD_FILE);
+    /* No config stored yet: return an empty JSON object instead of a bare 200
+     * with an empty body, so a caller always gets valid, parseable content.
+     * Config is optional (empty = no settings), so this is not a 404. */
+    if (content.length() == 0) {
+        request->send(200, "application/json", "{}");
+        return;
+    }
+    request->send(200, "text/markdown; charset=utf-8", content);
+}
+
+static void handle_config_post(AsyncWebServerRequest *request) {
+    if (!require_auth(request)) return;
+    char *body = (char*)request->_tempObject;
+    if (!body) { request->send(400, "application/json", "{\"error\":\"no body\"}"); return; }
+    String content(body);
+    free(body);
+    request->_tempObject = nullptr;
+    bool ok = write_spiffs_file(CONFIG_MD_FILE, content);
+    request->send(ok ? 200 : 500, "application/json",
+        ok ? "{\"ok\":true}" : "{\"error\":\"write failed\"}");
+}
+
+static void handle_events(AsyncWebServerRequest *request) {
+    if (!require_auth(request)) return;
+    unsigned long since = 0;
+    if (request->hasParam("since"))
+        since = strtoul(request->getParam("since")->value().c_str(), NULL, 10);
+
+    JsonDocument doc;
+    JsonArray arr = doc.to<JsonArray>();
+    int start = (events_count < MAX_EVENTS) ? 0 : events_head;
+    for (int i = 0; i < events_count; i++) {
+        int idx = (start + i) % MAX_EVENTS;
+        if (events_buf[idx].timestamp >= since) {
+            JsonObject e = arr.add<JsonObject>();
+            e["ts"] = events_buf[idx].timestamp;
+            e["msg"] = events_buf[idx].message;
+        }
+    }
+    String response;
+    serializeJson(doc, response);
+    request->send(200, "application/json", response);
+}
+
+// --- Clock ---
+
+static void handle_clock_get(AsyncWebServerRequest *request) {
+    if (!require_auth(request)) return;
+
+    struct tm now;
+    bool synced = clock_local_time(now);
+
+    JsonDocument doc;
+    doc["tz"] = tz_string;
+    doc["synced"] = synced;
+    doc["epoch"] = (unsigned long)time(NULL);
+    if (synced) {
+        char buf[40];
+        strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &now);
+        doc["local_time"] = buf;
+        strftime(buf, sizeof(buf), "%Z", &now);
+        doc["tz_abbrev"] = buf;
+    }
+    String response;
+    serializeJson(doc, response);
+    request->send(200, "application/json", response);
+}
+
+// Body is a raw POSIX TZ string (text/plain), NOT JSON — collected by
+// handle_body_collect into request->_tempObject.
+static void handle_clock_tz(AsyncWebServerRequest *request) {
+    char *body = (char*)request->_tempObject;
+    if (!check_auth(request)) {
+        if (body) { free(body); request->_tempObject = nullptr; }
+        request->send(401, "application/json",
+            "{\"error\":\"Authorization: Bearer <token> required\"}");
+        return;
+    }
+    if (!body) {
+        request->send(400, "application/json",
+            "{\"error\":\"body must be a POSIX TZ string\"}");
+        return;
+    }
+    String tz(body);
+    free(body);
+    request->_tempObject = nullptr;
+
+    tz.trim();
+    if (!tz_valid(tz)) {
+        request->send(400, "application/json",
+            "{\"error\":\"invalid TZ (POSIX string, 1..63 printable chars)\"}");
+        return;
+    }
+    if (!write_spiffs_file(TZ_FILE, tz)) {
+        request->send(500, "application/json", "{\"error\":\"write failed\"}");
+        return;
+    }
+    tz_string = tz;
+    tz_apply();
+    event_add("timezone set to %s", tz_string.c_str());
+
+    JsonDocument doc;
+    doc["ok"] = true;
+    doc["tz"] = tz_string;
+    String response;
+    serializeJson(doc, response);
+    request->send(200, "application/json", response);
+}
+
+// --- Firmware OTA ---
+
+static void handle_firmware_version(AsyncWebServerRequest *request) {
+    if (!require_auth(request)) return;
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    JsonDocument doc;
+    doc["version"] = SEED_VERSION;
+    doc["build_date"] = __DATE__;
+    doc["build_time"] = __TIME__;
+    doc["uptime_sec"] = (millis() - boot_time) / 1000;
+    doc["partition"] = running ? running->label : "unknown";
+    doc["free_heap"] = (unsigned long)ESP.getFreeHeap();
+    doc["confirmed"] = firmware_confirmed;
+    String response;
+    serializeJson(doc, response);
+    request->send(200, "application/json", response);
+}
+
+static void handle_firmware_upload_body(AsyncWebServerRequest *request, uint8_t *data,
+                                         size_t len, size_t index, size_t total) {
+    if (index == 0) {
+        if (!check_auth(request)) {
+            ota_upload_error = true;
+            snprintf(ota_upload_error_msg, sizeof(ota_upload_error_msg), "auth required");
+            return;
+        }
+        if (ota_in_progress) {
+            ota_upload_error = true;
+            snprintf(ota_upload_error_msg, sizeof(ota_upload_error_msg), "already in progress");
+            return;
+        }
+        // OTA app slots are 4MB each (partitions/tlora-pager_16mb_ota.csv)
+        if (total == 0 || total > 0x400000) {
+            ota_upload_error = true;
+            snprintf(ota_upload_error_msg, sizeof(ota_upload_error_msg),
+                     "invalid size: %u", (unsigned)total);
+            return;
+        }
+
+        ota_in_progress = true;
+        ota_upload_started = false;
+        ota_upload_ok = false;
+        ota_upload_error = false;
+        ota_upload_error_msg[0] = '\0';
+        ota_bytes_written = 0;
+
+        event_add("ota upload started, size=%u", (unsigned)total);
+
+        if (!Update.begin(total, U_FLASH)) {
+            ota_upload_error = true;
+            snprintf(ota_upload_error_msg, sizeof(ota_upload_error_msg),
+                     "Update.begin failed: %s", Update.errorString());
+            ota_in_progress = false;
+            return;
+        }
+        ota_upload_started = true;
+    }
+
+    if (ota_upload_error) return;
+
+    if (ota_upload_started && Update.isRunning()) {
+        if (Update.write(data, len) != len) {
+            ota_upload_error = true;
+            snprintf(ota_upload_error_msg, sizeof(ota_upload_error_msg),
+                     "write failed: %s", Update.errorString());
+            Update.abort();
+            ota_in_progress = false;
+            return;
+        }
+        ota_bytes_written += len;
+    }
+
+    if (index + len == total && ota_upload_started) {
+        if (!Update.end(true)) {
+            ota_upload_error = true;
+            snprintf(ota_upload_error_msg, sizeof(ota_upload_error_msg),
+                     "end failed: %s", Update.errorString());
+        } else {
+            ota_upload_ok = true;
+            event_add("ota complete, %u bytes", (unsigned)ota_bytes_written);
+        }
+        ota_in_progress = false;
+    }
+}
+
+static void handle_firmware_upload(AsyncWebServerRequest *request) {
+    // The body handler authenticates the upload itself, but a POST with no body
+    // never reaches it and would otherwise report the md5 and size of whatever
+    // was last flashed. Checking here gates every path through, and makes the
+    // body handler's own "auth required" unreachable from this side.
+    if (!require_auth(request)) return;
+    if (ota_upload_error) {
+        JsonDocument doc;
+        doc["error"] = ota_upload_error_msg;
+        String response;
+        serializeJson(doc, response);
+        request->send(500, "application/json", response);
+        return;
+    }
+    if (!ota_upload_ok) {
+        request->send(400, "application/json", "{\"error\":\"no firmware uploaded\"}");
+        return;
+    }
+    JsonDocument doc;
+    doc["ok"] = true;
+    doc["bytes_written"] = ota_bytes_written;
+    doc["md5"] = Update.md5String();
+    String response;
+    serializeJson(doc, response);
+    request->send(200, "application/json", response);
+}
+
+static void handle_firmware_apply(AsyncWebServerRequest *request) {
+    if (!require_auth(request)) return;
+    if (!ota_upload_ok) {
+        request->send(400, "application/json",
+            "{\"error\":\"upload first via POST /firmware/upload\"}");
+        return;
+    }
+    event_add("ota apply: restarting");
+    pending_restart = true;
+    request->send(200, "application/json",
+        "{\"ok\":true,\"warning\":\"restarting in ~1s\"}");
+}
+
+static void handle_firmware_confirm(AsyncWebServerRequest *request) {
+    if (!require_auth(request)) return;
+    esp_err_t err = esp_ota_mark_app_valid_cancel_rollback();
+    firmware_confirmed = (err == ESP_OK);
+    if (firmware_confirmed) event_add("firmware confirmed");
+    JsonDocument doc;
+    doc["ok"] = firmware_confirmed;
+    doc["confirmed"] = firmware_confirmed;
+    String response;
+    serializeJson(doc, response);
+    request->send(firmware_confirmed ? 200 : 500, "application/json", response);
+}
+
+static void handle_firmware_rollback(AsyncWebServerRequest *request) {
+    if (!require_auth(request)) return;
+    event_add("ota rollback");
+    pending_restart = true;
+    pending_rollback = true;
+    request->send(200, "application/json",
+        "{\"ok\":true,\"warning\":\"rolling back in ~1s\"}");
+}
+
+// --- GET /skill ---
+
+static void handle_skill(AsyncWebServerRequest *request) {
+    if (!require_auth(request)) return;
+
+    String ip = WiFi.status() == WL_CONNECTED
+        ? WiFi.localIP().toString() : WiFi.softAPIP().toString();
+
+    String s = "# ESP32 Seed - T-Lora Pager\n\n";
+    s += "Host: " + ip + ":" + String(HTTP_PORT) + "\n";
+    s += "mDNS: " + mdns_name + ".local\n";
+    s += "AP: " + ap_ssid + "\n\n";
+    s += "Auth: `Authorization: Bearer <token>` (except /health)\n\n";
+    s += "## Grow cycle\n\n";
+    s += "ESP32 has no compiler. Build on host, upload binary:\n\n";
+    s += "1. GET /capabilities\n";
+    s += "2. Write firmware (PlatformIO/Arduino/ESP-IDF)\n";
+    s += "3. Compile: `pio run -e tlora-pager`\n";
+    s += "4. POST /firmware/upload — send .bin (`-H 'Content-Type: application/octet-stream'`)\n";
+    s += "5. POST /firmware/apply — reboot\n";
+    s += "6. GET /health — verify\n";
+    s += "7. POST /firmware/confirm (or auto after 60s)\n\n";
+    s += "## Board gotchas\n\n";
+    s += "- Driven: I2C scan, XL9555 rails, ST7796 480x222 + AW9364, notify beeper API\n";
+    s += "- Not yet: TCA8418 keyboard UI, SX1262/LoRa, GNSS, NFC, ES8311, BQ gauge skill, haptic\n";
+    s += "- Beeper model: any LAN service POSTs /notify; MeshCore/Telegram are later transports into the same inbox\n";
+    s += "- Four devices share SPI (display, SX1262, SD, NFC): park every CS HIGH\n";
+    s += "- SX1262 needs DIO3 TCXO 3.0V + DIO2 RF switch or it hears nothing\n";
+    s += "- Backlight is AW9364 pulse-count (0..16), not plain PWM\n";
+    s += "- Native USB-JTAG flash needs --after watchdog_reset\n\n";
+    s += "## API\n\n";
+    s += "| Method | Path | Description |\n";
+    s += "|--------|------|-------------|\n";
+    s += "| GET | /health | Alive (no auth) |\n";
+    s += "| GET | /capabilities | Hardware info |\n";
+    s += "| GET | /config.md | Node config |\n";
+    s += "| POST | /config.md | Update config |\n";
+    s += "| GET | /events | Event log |\n";
+    s += "| GET | /clock | Local time, timezone, NTP sync state |\n";
+    s += "| POST | /clock/tz | Set POSIX TZ, raw body e.g. `CET-1CEST,M3.5.0,M10.5.0/3` |\n";
+    s += "| GET | /firmware/version | Version |\n";
+    s += "| POST | /firmware/upload | Upload .bin |\n";
+    s += "| POST | /firmware/apply | Apply + reboot |\n";
+    s += "| POST | /firmware/confirm | Confirm |\n";
+    s += "| POST | /firmware/rollback | Rollback |\n";
+    s += "| GET | /skill | This file |\n";
+
+    // Skill endpoints
+    for (int i = 0; i < g_skill_count; i++) {
+        const SkillEndpoint *se = g_skills[i]->endpoints;
+        for (int j = 0; se[j].path; j++) {
+            s += "| " + String(se[j].method) + " | " + String(se[j].path) +
+                 " | " + String(se[j].description) + " |\n";
+        }
+    }
+
+    // Skill descriptions
+    for (int i = 0; i < g_skill_count; i++) {
+        s += "\n";
+        s += g_skills[i]->describe();
+    }
+
+    request->send(200, "text/markdown; charset=utf-8", s);
+}
+
+// --- WiFi config page ---
+
+static void handle_wifi_page(AsyncWebServerRequest *request) {
+    String html = "<!DOCTYPE html><html><head><meta charset='utf-8'>"
+        "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+        "<title>Seed WiFi</title>"
+        "<style>body{font-family:monospace;max-width:400px;margin:40px auto;padding:0 20px}"
+        "input{width:100%;padding:8px;margin:4px 0 12px;box-sizing:border-box}"
+        "button{padding:10px 20px;background:#333;color:#fff;border:none;cursor:pointer}"
+        "</style></head><body>"
+        "<h2>ESP32 Seed — WiFi</h2>"
+        "<form method='POST' action='/wifi/config'>"
+        "<label>SSID:</label><input type='text' name='ssid' required>"
+        "<label>Password:</label><input type='password' name='pass'>"
+        "<button type='submit'>Connect</button>"
+        "</form>"
+        "<p><a href='/ui' style='color:#58a6ff'>Radio UI</a></p>";
+    if (WiFi.status() == WL_CONNECTED)
+        html += "<p>Connected: " + WiFi.SSID() + " (" + WiFi.localIP().toString() + ")</p>";
+    // The token is handed out only over the provisioning AP (initial setup) —
+    // never to a client on the LAN, even one that happens to share our subnet.
+    if (from_setup_ap(request)) {
+        html += "<p>Token: " + auth_token + "</p>";
+    }
+    html += "</body></html>";
+    request->send(200, "text/html", html);
+}
+
+static void handle_wifi_post(AsyncWebServerRequest *request) {
+    // Rewriting the credentials moves the node to a different network, so off the
+    // provisioning AP this needs the token like any other mutating call —
+    // otherwise anyone on the LAN could repoint the device at their own AP.
+    if (!from_setup_ap(request) && !require_auth(request)) return;
+
+    String ssid = "", pass = "";
+    if (request->hasParam("ssid", true)) ssid = request->getParam("ssid", true)->value();
+    if (request->hasParam("pass", true)) pass = request->getParam("pass", true)->value();
+    if (ssid.length() == 0) {
+        request->send(400, "text/html", "<h2>SSID required</h2><a href='/'>Back</a>");
+        return;
+    }
+    wifi_save_config(ssid, pass);
+    wifi_ssid = ssid;
+    wifi_pass = pass;
+    request->send(200, "text/html",
+        "<h2>Saved. Connecting...</h2><p>" + ssid + "</p><a href='/'>Back</a>");
+    delay(1000);
+    WiFi.begin(wifi_ssid.c_str(), wifi_pass.c_str());
+}
+
+// ===== Skills =====
+// Included into this TU so they share auth, SPIFFS, event_add, display_force.
+// build_src_filter excludes skills/ from separate compilation (same as tembed).
+#include "skills/notify.cpp"
+// After notify: reuses notify_send_json / notify_send_error.
+#include "skills/progress.cpp"
+
+static void skills_init() {
+    skill_notify_init();
+    skill_progress_init();
+}
+
+// Build one second of the home clock face (tembed look, 480x222).
+// Lives after notify.cpp so it can read unread/crit without a second copy.
+static void ui_clock_paint(const char *note) {
+    if (!hw_ui_ready()) return;
+
+    char ver[12];
+    snprintf(ver, sizeof(ver), "v%s", SEED_VERSION);
+
+    char addr[24];
+    char row1l[36], row1r[36], row2[56];
+    row1l[0] = row1r[0] = row2[0] = '\0';
+
+    if (WiFi.status() == WL_CONNECTED) {
+        snprintf(addr, sizeof(addr), "%s", WiFi.localIP().toString().c_str());
+        snprintf(row1l, sizeof(row1l), "RSSI %d dBm", (int)WiFi.RSSI());
+        snprintf(row1r, sizeof(row1r), "%s.local", mdns_name.c_str());
+    } else if (ap_active) {
+        snprintf(addr, sizeof(addr), "AP %s", WiFi.softAPIP().toString().c_str());
+        snprintf(row1l, sizeof(row1l), "AP %s", ap_ssid.c_str());
+        snprintf(row1r, sizeof(row1r), "PW %s", ap_password.c_str());
+        snprintf(row2, sizeof(row2), "TOKEN %s", auth_token.c_str());
+    } else {
+        snprintf(addr, sizeof(addr), "offline");
+        snprintf(row1l, sizeof(row1l), "WiFi offline");
+        snprintf(row2, sizeof(row2), "SPIFFS wifi.json or setup AP");
+    }
+    if (note && note[0]) snprintf(row2, sizeof(row2), "%s", note);
+
+    // Progress borrows the note row when it is free (same rule as tembed).
+    int bar_pct = -1;
+    if (row2[0] == '\0') progress_status_line(row2, sizeof(row2), &bar_pct);
+
+    char date[28];
+    int hh = 0, mm = 0, ss = 0;
+    bool ok = false;
+    struct tm now;
+    if (clock_local_time(now)) {
+        ok = true;
+        hh = now.tm_hour; mm = now.tm_min; ss = now.tm_sec;
+        strftime(date, sizeof(date), "%a %d %b %Y", &now);
+    } else {
+        snprintf(date, sizeof(date), "waiting for NTP");
+    }
+
+    hw_ui_clock_tick(ver, addr, row1l, row1r, row2,
+                     notify_unread_count(),
+                     ok, hh, mm, ss, date,
+                     notify_crit_unread());
+    hw_ui_clock_bar(bar_pct);
+}
+
+static void ui_go_clock(const char *note) {
+    hw_ui_show_clock();
+    ui_clock_paint(note);
+}
+
+// --- Front-panel state (encoder) --------------------------------------------
+// MENU items
+enum { MENU_MESSAGES = 0, MENU_INFO, MENU_BACK, MENU_COUNT };
+static int menu_sel = 0;
+static int msglist_sel = 0;
+// Cached ids for the visible msglist rows (map row → notify id).
+static uint32_t msglist_ids[HW_UI_MSGLIST_MAX];
+static int msglist_count = 0;
+// Notify card currently shown (for ack-on-click / reply).
+static uint32_t notify_card_id = 0;
+static char reply_title[NOTIFY_TITLE_LEN];
+static char reply_buf[NOTIFY_REPLY_LEN];
+// Idle return to clock (Advisor: shelf is a clock). Longer while typing.
+static unsigned long ui_last_input_ms = 0;
+#define UI_IDLE_MS        15000
+#define UI_IDLE_REPLY_MS  60000
+
+static void ui_note_input() { ui_last_input_ms = millis(); }
+
+static void ui_open_msglist();  // defined below
+
+static void ui_open_reply(uint32_t id, const char *title, char first) {
+    notify_card_id = id;
+    snprintf(reply_title, sizeof(reply_title), "%s", title ? title : "");
+    reply_buf[0] = '\0';
+    if (first && first != '\b' && first != '\n') {
+        reply_buf[0] = first;
+        reply_buf[1] = '\0';
+    }
+    hw_ui_show_reply(reply_title, reply_buf, hw_kb_caps(), hw_kb_symbol());
+    ui_note_input();
+}
+
+static void ui_reply_redraw() {
+    hw_ui_show_reply(reply_title, reply_buf, hw_kb_caps(), hw_kb_symbol());
+    ui_note_input();
+}
+
+static void ui_reply_submit() {
+    if (!notify_card_id || !reply_buf[0]) return;
+    if (notify_set_reply(notify_card_id, reply_buf)) {
+        hw_haptic_notify(0);
+        hw_sound_notify(0);
+        event_add("reply id=%lu: %s", (unsigned long)notify_card_id, reply_buf);
+    }
+    notify_card_id = 0;
+    reply_buf[0] = '\0';
+    ui_go_clock("sent");
+}
+
+static void ui_on_key(char c) {
+    ui_note_input();
+    HwUiScreen scr = hw_ui_screen();
+
+    // From a card: any printable starts a reply (Enter alone acks via encoder path).
+    if (scr == HW_UI_NOTIFY && notify_card_id) {
+        if (c == '\b') return;
+        if (c == '\n') {
+            // Enter without draft = ack only
+            if (notify_card_id) notify_ack_id(notify_card_id);
+            notify_card_id = 0;
+            ui_go_clock(NULL);
+            return;
+        }
+        if (c >= 0x20 && c <= 0x7E) {
+            ui_open_reply(notify_card_id, reply_title[0] ? reply_title : NULL, c);
+            // refresh title from view if empty
+            if (!reply_title[0]) {
+                NotifyView v;
+                if (notify_view_by_id(notify_card_id, v, NULL, NULL))
+                    snprintf(reply_title, sizeof(reply_title), "%s", v.title);
+                ui_reply_redraw();
+            }
+            return;
+        }
+    }
+
+    if (scr == HW_UI_REPLY) {
+        if (c == '\n') {
+            ui_reply_submit();
+            return;
+        }
+        if (c == '\b') {
+            size_t n = strlen(reply_buf);
+            if (n > 0) reply_buf[n - 1] = '\0';
+            ui_reply_redraw();
+            return;
+        }
+        if (c >= 0x20 && c <= 0x7E) {
+            size_t n = strlen(reply_buf);
+            if (n + 1 < sizeof(reply_buf)) {
+                reply_buf[n] = c;
+                reply_buf[n + 1] = '\0';
+                ui_reply_redraw();
+            }
+            return;
+        }
+    }
+
+    // Clock / menu: 'm' opens messages, bare keys ignored
+    if (scr == HW_UI_CLOCK && (c == 'm' || c == 'M')) {
+        msglist_sel = 0;
+        ui_open_msglist();
+    }
+}
+
+static void ui_open_menu() {
+    menu_sel = 0;
+    hw_ui_show_menu(menu_sel);
+    ui_note_input();
+}
+
+static void ui_open_info() {
+    char ver[16];
+    snprintf(ver, sizeof(ver), "v%s", SEED_VERSION);
+    String ip = (WiFi.status() == WL_CONNECTED)
+        ? WiFi.localIP().toString() : String("");
+    hw_ui_show_info(ver, mdns_name.c_str(), ip.c_str(),
+                    auth_token.c_str(), ESP.getFreeHeap(),
+                    notify_unread_count());
+    ui_note_input();
+}
+
+// Build msglist from newest-first notify views (up to HW_UI_MSGLIST_MAX).
+static void ui_open_msglist() {
+    static char titles[HW_UI_MSGLIST_MAX][41];
+    static char levels[HW_UI_MSGLIST_MAX][8];
+    static const char *title_ptrs[HW_UI_MSGLIST_MAX];
+    static const char *level_ptrs[HW_UI_MSGLIST_MAX];
+
+    msglist_count = 0;
+    for (int i = 0; i < NOTIFY_MAX && msglist_count < HW_UI_MSGLIST_MAX; i++) {
+        NotifyView v;
+        if (!notify_view(i, v)) break;
+        msglist_ids[msglist_count] = v.id;
+        snprintf(titles[msglist_count], sizeof(titles[0]), "%s", v.title);
+        snprintf(levels[msglist_count], sizeof(levels[0]), "%s",
+                 notify_level_name(v.level));
+        title_ptrs[msglist_count] = titles[msglist_count];
+        level_ptrs[msglist_count] = levels[msglist_count];
+        msglist_count++;
+    }
+    if (msglist_sel >= msglist_count) msglist_sel = msglist_count > 0 ? msglist_count - 1 : 0;
+    if (msglist_sel < 0) msglist_sel = 0;
+    hw_ui_show_msglist(title_ptrs, level_ptrs, msglist_count, msglist_sel);
+    ui_note_input();
+}
+
+static void ui_open_notify_id(uint32_t id) {
+    NotifyView v;
+    if (!notify_view_by_id(id, v, NULL, NULL)) {
+        ui_open_msglist();
+        return;
+    }
+    notify_card_id = id;
+    snprintf(reply_title, sizeof(reply_title), "%s", v.title);
+    hw_ui_show_notify(notify_level_name(v.level), v.source, v.title,
+                      v.body, notify_unread_count());
+    ui_note_input();
+}
+
+// Handle one click depending on the current face.
+static void ui_on_click() {
+    ui_note_input();
+    switch (hw_ui_screen()) {
+    case HW_UI_CLOCK:
+        ui_open_menu();
+        break;
+    case HW_UI_MENU:
+        if (menu_sel == MENU_MESSAGES) {
+            msglist_sel = 0;
+            ui_open_msglist();
+        } else if (menu_sel == MENU_INFO) {
+            ui_open_info();
+        } else {
+            ui_go_clock(NULL);
+        }
+        break;
+    case HW_UI_MSGLIST:
+        if (msglist_count == 0) {
+            ui_open_menu();
+        } else {
+            ui_open_notify_id(msglist_ids[msglist_sel]);
+        }
+        break;
+    case HW_UI_NOTIFY:
+        // Click = ack (stronger than read) and back to list or clock.
+        if (notify_card_id) notify_ack_id(notify_card_id);
+        notify_card_id = 0;
+        if (notify_unread_count() > 0) ui_open_msglist();
+        else ui_go_clock(NULL);
+        break;
+    case HW_UI_INFO:
+        ui_open_menu();
+        break;
+    case HW_UI_REPLY:
+        // Encoder click = send if draft non-empty, else cancel
+        if (reply_buf[0]) ui_reply_submit();
+        else {
+            notify_card_id = 0;
+            reply_buf[0] = '\0';
+            ui_go_clock(NULL);
+        }
+        break;
+    }
+}
+
+// Handle encoder detents.
+static void ui_on_steps(int steps) {
+    if (steps == 0) return;
+    ui_note_input();
+    switch (hw_ui_screen()) {
+    case HW_UI_MENU: {
+        menu_sel += steps;
+        while (menu_sel < 0) menu_sel += MENU_COUNT;
+        while (menu_sel >= MENU_COUNT) menu_sel -= MENU_COUNT;
+        hw_ui_show_menu(menu_sel);
+        break;
+    }
+    case HW_UI_MSGLIST:
+        if (msglist_count <= 0) break;
+        msglist_sel += steps;
+        if (msglist_sel < 0) msglist_sel = 0;
+        if (msglist_sel >= msglist_count) msglist_sel = msglist_count - 1;
+        ui_open_msglist();
+        break;
+    case HW_UI_NOTIFY: {
+        // Scroll the queue: next/prev message by position in newest-first list.
+        if (!notify_card_id) break;
+        int idx = notify_index_of(notify_card_id);
+        if (idx < 0) break;
+        int n = notify_count();
+        int next = idx + steps;
+        if (next < 0) next = 0;
+        if (next >= n) next = n - 1;
+        NotifyView v;
+        if (notify_view(next, v)) ui_open_notify_id(v.id);
+        break;
+    }
+    case HW_UI_CLOCK:
+    case HW_UI_INFO:
+    case HW_UI_REPLY:
+        break;
+    }
+}
+
+// ===== Routes =====
+
+static void setup_routes() {
+    server.on("/health", HTTP_GET, handle_health);
+    server.on("/capabilities", HTTP_GET, handle_capabilities);
+    server.on("/config.md", HTTP_GET, handle_config_get);
+    server.on("/config.md", HTTP_POST, handle_config_post, NULL, handle_body_collect);
+    server.on("/events", HTTP_GET, handle_events);
+    server.on("/clock", HTTP_GET, handle_clock_get);
+    server.on("/clock/tz", HTTP_POST, handle_clock_tz, NULL, handle_body_collect);
+    server.on("/firmware/version", HTTP_GET, handle_firmware_version);
+    server.on("/firmware/upload", HTTP_POST, handle_firmware_upload, NULL, handle_firmware_upload_body);
+    server.on("/firmware/apply", HTTP_POST, handle_firmware_apply);
+    server.on("/firmware/confirm", HTTP_POST, handle_firmware_confirm);
+    server.on("/firmware/rollback", HTTP_POST, handle_firmware_rollback);
+    server.on("/skill", HTTP_GET, handle_skill);
+    server.on("/", HTTP_GET, handle_wifi_page);
+    server.on("/wifi/config", HTTP_POST, handle_wifi_post);
+
+    // Register skill routes (notify uses AsyncURIMatcher::exact)
+    for (int i = 0; i < g_skill_count; i++) {
+        g_skills[i]->register_routes(server);
+    }
+}
+
+// ===== Main =====
+
+void setup() {
+    // No power-hold line is driven here. The board runs from USB during bring-up.
+    Serial.begin(115200);
+    delay(500);
+    boot_time = millis();
+
+    if (!SPIFFS.begin(true)) {
+        Serial.println("[!] SPIFFS failed");
+    }
+
+    // Panel + I2C first so the face can say "connecting..." while STA associates.
+    hw_ui_begin();
+    hw_input_begin();
+    hw_haptic_begin();  // after Wire is up (hw_ui_begin)
+    hw_sound_begin();
+    hw_kb_begin();
+    hw_probe();
+    tz_load();        // before wifi_setup(): configTzTime() needs the TZ string
+    wifi_setup();     // RF up; raises the setup AP if STA fails
+    token_load();     // after wifi_setup(): needs RF up for a real hardware RNG
+    skills_init();    // notify store load + route registration data
+    ui_go_clock(WiFi.status() == WL_CONNECTED ? "ready" : "click = menu");
+    ui_note_input();
+    setup_routes();
+    server.begin();
+
+    Serial.printf("\nESP32 Seed v%s (T-Lora Pager)\n", SEED_VERSION);
+    // Token stays off Serial; it is on the panel now.
+    if (WiFi.status() == WL_CONNECTED)
+        Serial.printf("http://%s:%d/health\n", WiFi.localIP().toString().c_str(), HTTP_PORT);
+    if (ap_active)
+        Serial.printf("setup AP: %s\n", ap_ssid.c_str());
+
+    event_add("seed started v%s", SEED_VERSION);
+}
+
+void loop() {
+    // Deferred restart
+    static unsigned long restart_at = 0;
+    if (pending_restart && restart_at == 0) restart_at = millis();
+    if (pending_restart && restart_at > 0 && millis() - restart_at > 1000) {
+        if (pending_rollback) esp_ota_mark_app_invalid_rollback_and_reboot();
+        ESP.restart();
+    }
+
+    // Auto-confirm after 60s
+    if (!firmware_confirmed && !firmware_confirm_attempted &&
+        (millis() - boot_time) > 60000 && WiFi.status() == WL_CONNECTED) {
+        firmware_confirm_attempted = true;
+        esp_err_t err = esp_ota_mark_app_valid_cancel_rollback();
+        firmware_confirmed = true;
+        if (err == ESP_OK) event_add("firmware auto-confirmed");
+    }
+
+    // WiFi reconnect
+    static unsigned long last_wifi = 0;
+    static bool was_connected = false;
+    bool now_connected = WiFi.status() == WL_CONNECTED;
+    if (wifi_ssid.length() > 0 && !now_connected &&
+        millis() - last_wifi > 30000) {
+        WiFi.begin(wifi_ssid.c_str(), wifi_pass.c_str());
+        last_wifi = millis();
+    }
+    if (now_connected != was_connected) {
+        was_connected = now_connected;
+        if (hw_ui_screen() == HW_UI_CLOCK) {
+            hw_ui_invalidate_clock();
+            ui_clock_paint(now_connected ? "wifi up" : "wifi lost");
+        }
+    }
+
+    // Front panel: encoder + click (must run before screens consume edges).
+    hw_input_poll();
+    int steps = hw_input_steps();
+    bool click = hw_input_click();
+    if (steps) ui_on_steps(steps);
+    if (click) ui_on_click();
+
+    // Keyboard → chars into reply / open compose from card.
+    {
+        char kc = 0;
+        while (hw_kb_read(&kc)) ui_on_key(kc);
+    }
+
+    // Idle → clock (longer while typing a reply).
+    {
+        unsigned long idle = (hw_ui_screen() == HW_UI_REPLY) ? UI_IDLE_REPLY_MS : UI_IDLE_MS;
+        if (hw_ui_screen() != HW_UI_CLOCK &&
+            (millis() - ui_last_input_ms) > idle) {
+            notify_card_id = 0;
+            reply_buf[0] = '\0';
+            ui_go_clock(NULL);
+        }
+    }
+
+    // Notify skill: expiry, coalesced SPIFFS snapshot, auto-card on arrival
+    // only when the user is on the clock (do not yank them out of a menu).
+    notify_poll();
+    uint32_t arrived_id = 0;
+    if (notify_take_arrival(&arrived_id) || display_force) {
+        display_force = false;
+        NotifyView v;
+        bool on_clock = (hw_ui_screen() == HW_UI_CLOCK);
+        if (arrived_id && notify_view_by_id(arrived_id, v, NULL, NULL)) {
+            if (on_clock) {
+                notify_card_id = arrived_id;
+                hw_ui_show_notify(notify_level_name(v.level), v.source, v.title,
+                                  v.body, notify_unread_count());
+                ui_note_input();  // starts idle timer for auto-return
+            } else {
+                // Badge will update next time they return to the clock.
+                hw_ui_invalidate_clock();
+            }
+        } else if (on_clock) {
+            hw_ui_invalidate_clock();
+            ui_clock_paint(NULL);
+        }
+    }
+
+    // Haptic + speaker on notify arrival.
+    {
+        uint8_t lvl = 0;
+        char src[NOTIFY_SOURCE_LEN];
+        if (notify_take_sound_arrival(&lvl, src, sizeof(src))) {
+            hw_haptic_notify(lvl);
+            hw_sound_notify(lvl);
+        }
+    }
+    hw_sound_poll();
+
+    // Progress job reaping (TTL).
+    progress_poll();
+
+    // Home clock: 1 Hz field update + crit breathing rule.
+    static unsigned long last_clock = 0;
+    if (hw_ui_screen() == HW_UI_CLOCK) {
+        if (millis() - last_clock >= 1000) {
+            last_clock = millis();
+            ui_clock_paint(NULL);
+        }
+        hw_ui_clock_rule_tick(notify_crit_unread());
+    }
+
+    for (int i = 0; i < g_skill_count; i++) {
+        if (g_skills[i]->tick) g_skills[i]->tick();
+    }
+
+    delay(10);
+}
