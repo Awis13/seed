@@ -349,11 +349,15 @@ static char fld_note[56]  = "";
 static int  clock_badge   = -1;
 static bool clock_dirty   = true;
 
-// Selection caches for partial repaint (menu / msglist). -1 = need full paint.
+// Selection caches for partial repaint (menu / msglist / card_act / agents).
 static int menu_sel_drawn = -1;
+static int card_act_sel_drawn = -1;
+static int agents_sel_drawn = -1;
+static int agent_act_sel_drawn = -1;
 static int msglist_sel_drawn = -1;
 static int msglist_top_drawn = -1;
 static int msglist_count_drawn = -1;
+static uint8_t msglist_unread_mask = 0;  // bit i = unread for partial-redraw guard
 static int clock_bar_drawn = -1;  // progress band; -1 = bare ground
 
 // Geometry of big time block (measured once at first paint)
@@ -436,9 +440,13 @@ void hw_ui_show_clock() {
     screen = HW_UI_CLOCK;
     // Leaving interactive faces: next visit must full-paint.
     menu_sel_drawn = -1;
+    card_act_sel_drawn = -1;
+    agents_sel_drawn = -1;
+    agent_act_sel_drawn = -1;
     msglist_sel_drawn = -1;
     msglist_top_drawn = -1;
     msglist_count_drawn = -1;
+    msglist_unread_mask = 0;
     tft_fill(COL_BG);
     tft_hline(MARGIN, RULE_Y, PANEL_W - 2 * MARGIN, COL_RULE);
     hw_ui_invalidate_clock();
@@ -630,12 +638,78 @@ void hw_ui_show_notify(const char *level,
     }
 }
 
+void hw_ui_show_agent_invite(const char *agent_name,
+                             const char *teaser,
+                             int unread) {
+    if (!panel_ok) return;
+    screen = HW_UI_NOTIFY;  // same input paths as notify card
+
+    const uint16_t accent = COL_ACCENT;
+    tft_fill(COL_BG);
+
+    // Full-width amber header
+    tft_fill_rect(0, 0, PANEL_W, 28, accent);
+    tft_draw_text(MARGIN, 6, "CHAT", COL_BG, accent, 2);
+    if (unread > 0) {
+        char badge[16];
+        snprintf(badge, sizeof(badge), "%d", unread > 9 ? 9 : unread);
+        tft_draw_text_r(PANEL_W - MARGIN, 8, badge, COL_BG, accent, 2);
+    }
+
+    // Big agent name
+    char name[20];
+    snprintf(name, sizeof(name), "%s",
+             agent_name && agent_name[0] ? agent_name : "AGENT");
+    for (char *p = name; *p; p++) if (*p >= 'a' && *p <= 'z') *p -= 32;
+    tft_draw_text(MARGIN, 48, name, COL_ACCENT, COL_BG, 3);
+
+    tft_draw_text(MARGIN, 84, "NEW REPLY", COL_DIM, COL_BG, 2);
+
+    // Teaser box
+    tft_fill_rect(MARGIN, 118, PANEL_W - 2 * MARGIN, 52, COL_RULE);
+    tft_fill_rect(MARGIN + 2, 120, PANEL_W - 2 * MARGIN - 4, 48, COL_BG);
+    if (teaser && teaser[0]) {
+        // scale 2, ~36 cols
+        const int max_cols = 34;
+        char line[40];
+        int n = 0;
+        while (teaser[n] && n < max_cols) n++;
+        if (n >= (int)sizeof(line)) n = (int)sizeof(line) - 1;
+        memcpy(line, teaser, n);
+        line[n] = '\0';
+        tft_draw_text(MARGIN + 10, 132, line, COL_TIME, COL_BG, 2);
+    }
+
+    tft_draw_text(MARGIN, 188, "click / Enter  =  open chat", COL_DIM, COL_BG, 1);
+    tft_draw_text(MARGIN, 204, "scroll list from MENU > MESSAGES", COL_DIM, COL_BG, 1);
+}
+
 // Menu row geometry — fixed so selection can repaint one bar without a wipe.
-static const int MENU_N = 3;
-static const int MENU_ROW0_Y = 48;
-static const int MENU_ROW_H = 36;
+static const int MENU_N = 4;
+static const int MENU_ROW0_Y = 40;
+static const int MENU_ROW_H = 34;
 static const int MENU_BAR_H = 28;
-static const char *const MENU_ITEMS[MENU_N] = {"MESSAGES", "INFO", "BACK"};
+static const char *const MENU_ITEMS[MENU_N] = {
+    "MESSAGES", "AGENTS", "INFO", "BACK"
+};
+
+// Agents list (same geometry language as menu).
+static const int AGENTS_LIST_N = 4;
+static const int AGENTS_ROW0_Y = 48;
+static const int AGENTS_ROW_H = 34;
+static const int AGENTS_BAR_H = 28;
+static const char *const AGENTS_LIST_ITEMS[AGENTS_LIST_N] = {
+    "GROK", "CLAUDE", "HERMES", "BACK"
+};
+
+// Card action sheet (after click/Enter on a notification).
+static const int CARD_ACT_N = 3;
+static const int CARD_ACT_ROW0_Y = 72;
+static const int CARD_ACT_ROW_H = 36;
+static const int CARD_ACT_BAR_H = 28;
+static const char *const CARD_ACT_ITEMS[CARD_ACT_N] = {
+    "ACKNOWLEDGE", "REPLY", "BACK"
+};
 
 static void menu_draw_row(int i, bool on) {
     uint16_t y = (uint16_t)(MENU_ROW0_Y + i * MENU_ROW_H);
@@ -648,6 +722,45 @@ static void menu_draw_row(int i, bool on) {
         tft_fill_rect(MARGIN, bar_y, bar_w, MENU_BAR_H, COL_BG);
         tft_draw_text(MARGIN + 12, y, MENU_ITEMS[i], COL_TIME, COL_BG, 2);
     }
+}
+
+static void card_act_draw_row(int i, bool on) {
+    uint16_t y = (uint16_t)(CARD_ACT_ROW0_Y + i * CARD_ACT_ROW_H);
+    uint16_t bar_y = y - 4;
+    uint16_t bar_w = PANEL_W - 2 * MARGIN;
+    if (on) {
+        tft_fill_rect(MARGIN, bar_y, bar_w, CARD_ACT_BAR_H, COL_ACCENT);
+        tft_draw_text(MARGIN + 12, y, CARD_ACT_ITEMS[i], COL_BG, COL_ACCENT, 2);
+    } else {
+        tft_fill_rect(MARGIN, bar_y, bar_w, CARD_ACT_BAR_H, COL_BG);
+        tft_draw_text(MARGIN + 12, y, CARD_ACT_ITEMS[i], COL_TIME, COL_BG, 2);
+    }
+}
+
+void hw_ui_show_card_act(int selected, const char *title) {
+    if (!panel_ok) return;
+    if (selected < 0) selected = 0;
+    if (selected >= CARD_ACT_N) selected = CARD_ACT_N - 1;
+
+    if (screen == HW_UI_CARD_ACT && card_act_sel_drawn >= 0 &&
+        card_act_sel_drawn != selected) {
+        card_act_draw_row(card_act_sel_drawn, false);
+        card_act_draw_row(selected, true);
+        card_act_sel_drawn = selected;
+        return;
+    }
+    if (screen == HW_UI_CARD_ACT && card_act_sel_drawn == selected) return;
+
+    screen = HW_UI_CARD_ACT;
+    tft_fill(COL_BG);
+    tft_fill_rect(0, 0, PANEL_W, 22, COL_ACCENT);
+    tft_draw_text(MARGIN, 4, "MESSAGE", COL_BG, COL_ACCENT, 2);
+    // Dim title of the card this action applies to
+    tft_draw_text(MARGIN, 36,
+                  title && title[0] ? title : "(msg)",
+                  COL_DIM, COL_BG, 1);
+    for (int i = 0; i < CARD_ACT_N; i++) card_act_draw_row(i, i == selected);
+    card_act_sel_drawn = selected;
 }
 
 void hw_ui_show_menu(int selected) {
@@ -672,11 +785,277 @@ void hw_ui_show_menu(int selected) {
     menu_sel_drawn = selected;
 }
 
-// Msglist: only re-stripe rows when selection moves inside the same window.
+static void agents_list_draw_row(int i, bool on) {
+    uint16_t y = (uint16_t)(AGENTS_ROW0_Y + i * AGENTS_ROW_H);
+    uint16_t bar_y = y - 4;
+    uint16_t bar_w = PANEL_W - 2 * MARGIN;
+    if (on) {
+        tft_fill_rect(MARGIN, bar_y, bar_w, AGENTS_BAR_H, COL_ACCENT);
+        tft_draw_text(MARGIN + 12, y, AGENTS_LIST_ITEMS[i], COL_BG, COL_ACCENT, 2);
+    } else {
+        tft_fill_rect(MARGIN, bar_y, bar_w, AGENTS_BAR_H, COL_BG);
+        tft_draw_text(MARGIN + 12, y, AGENTS_LIST_ITEMS[i], COL_TIME, COL_BG, 2);
+    }
+}
+
+void hw_ui_show_agents(int selected, bool bridge_ok) {
+    if (!panel_ok) return;
+    if (selected < 0) selected = 0;
+    if (selected >= AGENTS_LIST_N) selected = AGENTS_LIST_N - 1;
+
+    if (screen == HW_UI_AGENTS && agents_sel_drawn >= 0 &&
+        agents_sel_drawn != selected) {
+        agents_list_draw_row(agents_sel_drawn, false);
+        agents_list_draw_row(selected, true);
+        agents_sel_drawn = selected;
+        return;
+    }
+    if (screen == HW_UI_AGENTS && agents_sel_drawn == selected) return;
+
+    screen = HW_UI_AGENTS;
+    tft_fill(COL_BG);
+    tft_fill_rect(0, 0, PANEL_W, 22, COL_ACCENT);
+    tft_draw_text(MARGIN, 4, "AGENTS", COL_BG, COL_ACCENT, 2);
+    tft_draw_text_r(PANEL_W - MARGIN, 6,
+                    bridge_ok ? "bridge" : "local",
+                    COL_BG, COL_ACCENT, 1);
+    for (int i = 0; i < AGENTS_LIST_N; i++)
+        agents_list_draw_row(i, i == selected);
+    agents_sel_drawn = selected;
+}
+
+// Advance one wrap step of *p; return bytes consumed, write painted text to line[].
+// first=true → prepend "> " or "< ".
+static int agent_chat_next_row(const char **pp, bool mine, bool first,
+                               int max_cols, char *line, size_t line_n) {
+    if (!pp || !*pp || !line || line_n < 4) return 0;
+    const char *p = *pp;
+    int budget = max_cols - (first ? 2 : 0);
+    if (budget < 4) budget = 4;
+
+    if (!*p) {
+        // empty message: one row with prefix only
+        if (first) {
+            snprintf(line, line_n, "%s", mine ? "> " : "< ");
+            return 0;
+        }
+        line[0] = '\0';
+        return 0;
+    }
+
+    int n = 0, last_sp = -1;
+    while (p[n] && n < budget) {
+        if (p[n] == ' ') last_sp = n;
+        n++;
+    }
+    if (p[n] && last_sp > 0) n = last_sp + 1;
+    if (n <= 0) n = 1;
+
+    int take = n;
+    while (take > 0 && p[take - 1] == ' ') take--;
+
+    int off = 0;
+    if (first) {
+        line[0] = mine ? '>' : '<';
+        line[1] = ' ';
+        off = 2;
+    }
+    if (take + off >= (int)line_n) take = (int)line_n - 1 - off;
+    if (take < 0) take = 0;
+    memcpy(line + off, p, take);
+    line[off + take] = '\0';
+
+    *pp = p + n;
+    while (**pp == ' ') (*pp)++;
+    return n;
+}
+
+static int agent_chat_wrap_rows(const char *raw, bool mine, int max_cols) {
+    if (!raw) raw = "";
+    const char *p = raw;
+    bool first = true;
+    int rows = 0;
+    char discard[48];
+    if (!*raw) return 1;
+    while (*p) {
+        agent_chat_next_row(&p, mine, first, max_cols, discard, sizeof(discard));
+        rows++;
+        first = false;
+        if (rows > 400) break;
+    }
+    return rows > 0 ? rows : 1;
+}
+
+int hw_ui_show_agent_chat(const char *agent_name,
+                          const char *const *lines,
+                          const bool *from_me,
+                          int line_count,
+                          int scroll_row,
+                          int *total_rows_out,
+                          const char *footer) {
+    if (!panel_ok) return 0;
+
+    const uint8_t sc = 2;
+    const int max_cols = (int)((PANEL_W - 2 * MARGIN) / (6 * sc));
+    const int row_h = 7 * sc + 4;
+    const uint16_t y0 = 30;
+    const uint16_t y_max = 178;
+    const int vis = (int)((y_max - y0) / row_h);  // ~7 rows at scale 2
+
+    if (line_count < 0) line_count = 0;
+
+    int total = 0;
+    for (int i = 0; i < line_count; i++) {
+        bool mine = from_me && from_me[i];
+        const char *raw = (lines && lines[i]) ? lines[i] : "";
+        total += agent_chat_wrap_rows(raw, mine, max_cols);
+    }
+    if (total < 1) total = 1;
+    if (total_rows_out) *total_rows_out = total;
+
+    int max_scroll = total - vis;
+    if (max_scroll < 0) max_scroll = 0;
+    int scroll = scroll_row;
+    if (scroll < 0 || scroll > max_scroll) scroll = max_scroll;  // pin bottom
+
+    char head[24];
+    snprintf(head, sizeof(head), "%s",
+             agent_name && agent_name[0] ? agent_name : "AGENT");
+
+    // Scroll-only path: do NOT wipe the whole panel (that was the flicker).
+    // Keep chrome (header/footer) and only repaint the body rectangle.
+    static char chat_head[24] = "";
+    bool same_room = (screen == HW_UI_AGENT_CHAT &&
+                      strncmp(chat_head, head, sizeof(chat_head)) == 0);
+    screen = HW_UI_AGENT_CHAT;
+    agents_sel_drawn = -1;
+
+    if (!same_room) {
+        tft_fill(COL_BG);
+        tft_fill_rect(0, 0, PANEL_W, 22, COL_ACCENT);
+        tft_draw_text(MARGIN, 4, head, COL_BG, COL_ACCENT, 2);
+        tft_draw_text(MARGIN, 186,
+                      footer && footer[0] ? footer : "wheel=scroll  type=msg",
+                      COL_DIM, COL_BG, 1);
+        tft_draw_text(MARGIN, 204, "ALT+Bksp=HOME  click=CLEAR",
+                      COL_DIM, COL_BG, 1);
+        snprintf(chat_head, sizeof(chat_head), "%s", head);
+    } else {
+        // Body only — solid fill then redraw text (no full-screen flash).
+        tft_fill_rect(0, y0, PANEL_W, (uint16_t)(y_max - y0), COL_BG);
+    }
+
+    // Scroll badge on amber header (always refresh — small region).
+    {
+        char sb[16];
+        if (max_scroll <= 0) snprintf(sb, sizeof(sb), "CHAT");
+        else {
+            int pct = (int)((scroll * 100L) / (max_scroll ? max_scroll : 1));
+            snprintf(sb, sizeof(sb), "%d%%", pct);
+        }
+        // Erase badge strip then draw (opaque so old digits do not ghost).
+        tft_fill_rect(PANEL_W - 72, 0, 72, 22, COL_ACCENT);
+        tft_draw_text_r(PANEL_W - MARGIN, 6, sb, COL_BG, COL_ACCENT, 1);
+    }
+
+    int row_i = 0;
+    uint16_t y = y0;
+    for (int i = 0; i < line_count; i++) {
+        bool mine = from_me && from_me[i];
+        const char *raw = (lines && lines[i]) ? lines[i] : "";
+        const char *p = raw;
+        bool first = true;
+        if (!*raw) {
+            if (row_i >= scroll && y + row_h <= y_max) {
+                char line[8];
+                snprintf(line, sizeof(line), "%s", mine ? "> " : "< ");
+                tft_draw_text(MARGIN, y, line,
+                              mine ? COL_ACCENT : COL_TIME, COL_BG, sc);
+                y = (uint16_t)(y + row_h);
+            }
+            row_i++;
+            continue;
+        }
+        while (*p) {
+            char line[48];
+            agent_chat_next_row(&p, mine, first, max_cols, line, sizeof(line));
+            if (row_i >= scroll && y + row_h <= y_max) {
+                tft_draw_text(MARGIN, y, line,
+                              mine ? COL_ACCENT : COL_TIME, COL_BG, sc);
+                y = (uint16_t)(y + row_h);
+            }
+            row_i++;
+            first = false;
+            if (y > y_max && row_i > scroll + vis + 2) break;
+        }
+    }
+
+    // Chevrons in body corners (already wiped with body fill).
+    if (scroll > 0)
+        tft_draw_text(PANEL_W - MARGIN - 12, 28, "^", COL_ACCENT, COL_BG, 1);
+    if (scroll < max_scroll)
+        tft_draw_text(PANEL_W - MARGIN - 12, 170, "v", COL_ACCENT, COL_BG, 1);
+
+    return scroll;
+}
+
+static const int AGENT_ACT_N = 2;
+static const char *const AGENT_ACT_ITEMS[AGENT_ACT_N] = {
+    "CLEAR CHAT", "BACK"
+};
+
+void hw_ui_show_agent_act(int selected, const char *agent_name) {
+    if (!panel_ok) return;
+    if (selected < 0) selected = 0;
+    if (selected >= AGENT_ACT_N) selected = AGENT_ACT_N - 1;
+
+    if (screen == HW_UI_AGENT_ACT && agent_act_sel_drawn >= 0 &&
+        agent_act_sel_drawn != selected) {
+        // reuse card_act row geometry
+        uint16_t y0 = (uint16_t)(CARD_ACT_ROW0_Y + agent_act_sel_drawn * CARD_ACT_ROW_H);
+        uint16_t y1 = (uint16_t)(CARD_ACT_ROW0_Y + selected * CARD_ACT_ROW_H);
+        uint16_t bar_w = PANEL_W - 2 * MARGIN;
+        tft_fill_rect(MARGIN, y0 - 4, bar_w, CARD_ACT_BAR_H, COL_BG);
+        tft_draw_text(MARGIN + 12, y0, AGENT_ACT_ITEMS[agent_act_sel_drawn],
+                      COL_TIME, COL_BG, 2);
+        tft_fill_rect(MARGIN, y1 - 4, bar_w, CARD_ACT_BAR_H, COL_ACCENT);
+        tft_draw_text(MARGIN + 12, y1, AGENT_ACT_ITEMS[selected],
+                      COL_BG, COL_ACCENT, 2);
+        agent_act_sel_drawn = selected;
+        return;
+    }
+    if (screen == HW_UI_AGENT_ACT && agent_act_sel_drawn == selected) return;
+
+    screen = HW_UI_AGENT_ACT;
+    tft_fill(COL_BG);
+    tft_fill_rect(0, 0, PANEL_W, 22, COL_ACCENT);
+    tft_draw_text(MARGIN, 4, "CHAT", COL_BG, COL_ACCENT, 2);
+    tft_draw_text(MARGIN, 36,
+                  agent_name && agent_name[0] ? agent_name : "AGENT",
+                  COL_DIM, COL_BG, 1);
+    for (int i = 0; i < AGENT_ACT_N; i++) {
+        uint16_t y = (uint16_t)(CARD_ACT_ROW0_Y + i * CARD_ACT_ROW_H);
+        bool on = (i == selected);
+        uint16_t bar_w = PANEL_W - 2 * MARGIN;
+        if (on) {
+            tft_fill_rect(MARGIN, y - 4, bar_w, CARD_ACT_BAR_H, COL_ACCENT);
+            tft_draw_text(MARGIN + 12, y, AGENT_ACT_ITEMS[i], COL_BG, COL_ACCENT, 2);
+        } else {
+            tft_fill_rect(MARGIN, y - 4, bar_w, CARD_ACT_BAR_H, COL_BG);
+            tft_draw_text(MARGIN + 12, y, AGENT_ACT_ITEMS[i], COL_TIME, COL_BG, 2);
+        }
+    }
+    agent_act_sel_drawn = selected;
+}
+
+// Msglist — Nokia 3310 / classic pager inbox language:
+//   * = NEW (unread), dim title = already read
+//   single-letter severity chip I/W/C with colour
+//   header carries NEW count like "2 New messages"
 static const int MSGLIST_VIS = 5;
-static const int MSGLIST_ROW0_Y = 36;
+static const int MSGLIST_ROW0_Y = 34;
 static const int MSGLIST_ROW_H = 32;
-static const int MSGLIST_BAR_H = 28;
+static const int MSGLIST_BAR_H = 30;
 
 static int msglist_top_for(int selected, int count) {
     int top = selected - MSGLIST_VIS / 2;
@@ -686,26 +1065,75 @@ static int msglist_top_for(int selected, int count) {
     return top;
 }
 
+static char msglist_level_letter(const char *level) {
+    if (!level || !level[0]) return 'I';
+    if (level[0] == 'c' || level[0] == 'C') return 'C';
+    if (level[0] == 'w' || level[0] == 'W') return 'W';
+    return 'I';
+}
+
+static uint16_t msglist_level_color(const char *level) {
+    if (!level || !level[0]) return COL_INFO;
+    if (level[0] == 'c' || level[0] == 'C') return COL_CRIT;
+    if (level[0] == 'w' || level[0] == 'W') return COL_WARN;
+    return COL_INFO;
+}
+
+static uint8_t msglist_mask_of(const bool *unread, int count) {
+    uint8_t m = 0;
+    if (!unread) return 0;
+    for (int i = 0; i < count && i < 8; i++)
+        if (unread[i]) m |= (uint8_t)(1u << i);
+    return m;
+}
+
+// Row:  [*| ][W]  Title…     — * only when NEW; title bright vs dim.
 static void msglist_draw_row(const char *const *titles,
                              const char *const *levels,
+                             const bool *unread,
                              int i, uint16_t y, bool on) {
     uint16_t bar_w = PANEL_W - 2 * MARGIN;
+    bool is_new = unread && unread[i];
+    const char *lvl = (levels && levels[i]) ? levels[i] : "info";
+    uint16_t sev = msglist_level_color(lvl);
+    char letter[2] = { msglist_level_letter(lvl), '\0' };
+
     uint16_t bg = on ? COL_ACCENT : COL_BG;
-    uint16_t fg = on ? COL_BG : COL_TIME;
+    // Unread title = warm white; read = slate (Nokia bold vs plain).
+    uint16_t title_fg = on ? COL_BG : (is_new ? COL_TIME : COL_DIM);
+    uint16_t mark_fg  = on ? COL_BG : (is_new ? COL_ACCENT : COL_RULE);
+    uint16_t chip_fg  = on ? COL_BG : sev;
+
     tft_fill_rect(MARGIN, y - 2, bar_w, MSGLIST_BAR_H, bg);
 
-    char lvl[8];
-    snprintf(lvl, sizeof(lvl), "%s",
-             (levels && levels[i] && levels[i][0]) ? levels[i] : "info");
-    for (char *p = lvl; *p; p++) if (*p >= 'a' && *p <= 'z') *p -= 32;
-    tft_draw_text(MARGIN + 8, y + 4, lvl, on ? COL_BG : COL_DIM, bg, 1);
+    // Left severity tick — full height when NEW, hairline when read.
+    if (!on) {
+        tft_fill_rect(MARGIN, y - 2, is_new ? 4 : 2, MSGLIST_BAR_H, sev);
+    }
 
-    const char *t = (titles && titles[i]) ? titles[i] : "?";
-    tft_draw_text(MARGIN + 56, y + 2, t, fg, bg, 2);
+    // Status glyph: * NEW  /  · read  (classic pager envelope substitute)
+    tft_draw_text(MARGIN + 10, y + 4, is_new ? "*" : ".", mark_fg, bg, 2);
+
+    // Severity letter chip
+    tft_draw_text(MARGIN + 30, y + 4, letter, chip_fg, bg, 2);
+
+    // Title — truncate so it never crashes the right edge (scale-2 ~12px/glyph)
+    const char *raw = (titles && titles[i] && titles[i][0]) ? titles[i] : "(no title)";
+    char t[36];
+    // ~28 glyphs fit after mark+chip (x≈54 … 468)
+    snprintf(t, sizeof(t), "%s", raw);
+    if (strlen(t) > 28) {
+        t[27] = '.';
+        t[26] = '.';
+        t[25] = '.';
+        t[28] = '\0';
+    }
+    tft_draw_text(MARGIN + 52, y + 4, t, title_fg, bg, 2);
 }
 
 void hw_ui_show_msglist(const char *const *titles,
                         const char *const *levels,
+                        const bool *unread,
                         int count,
                         int selected) {
     if (!panel_ok) return;
@@ -716,22 +1144,23 @@ void hw_ui_show_msglist(const char *const *titles,
     if (count > 0 && selected >= count) selected = count - 1;
 
     int top = (count > 0) ? msglist_top_for(selected, count) : 0;
+    uint8_t mask = msglist_mask_of(unread, count);
 
-    // Same list content + same scroll window → only move the bar between rows.
+    // Same list + unread set + scroll window → only move the selection bar.
     if (screen == HW_UI_MSGLIST &&
         msglist_count_drawn == count &&
         msglist_top_drawn == top &&
+        msglist_unread_mask == mask &&
         msglist_sel_drawn >= 0 &&
         msglist_sel_drawn != selected &&
         count > 0) {
-        // Unselect old row if still visible
         int old_row = msglist_sel_drawn - top;
         int new_row = selected - top;
         if (old_row >= 0 && old_row < MSGLIST_VIS)
-            msglist_draw_row(titles, levels, msglist_sel_drawn,
+            msglist_draw_row(titles, levels, unread, msglist_sel_drawn,
                              (uint16_t)(MSGLIST_ROW0_Y + old_row * MSGLIST_ROW_H), false);
         if (new_row >= 0 && new_row < MSGLIST_VIS)
-            msglist_draw_row(titles, levels, selected,
+            msglist_draw_row(titles, levels, unread, selected,
                              (uint16_t)(MSGLIST_ROW0_Y + new_row * MSGLIST_ROW_H), true);
         msglist_sel_drawn = selected;
         return;
@@ -739,37 +1168,68 @@ void hw_ui_show_msglist(const char *const *titles,
     if (screen == HW_UI_MSGLIST &&
         msglist_count_drawn == count &&
         msglist_top_drawn == top &&
+        msglist_unread_mask == mask &&
         msglist_sel_drawn == selected) {
         return;  // nothing changed
     }
 
     screen = HW_UI_MSGLIST;
     tft_fill(COL_BG);
+
+    // Header — amber bar, Nokia-style NEW tally on the right.
+    int n_new = 0;
+    if (unread) {
+        for (int i = 0; i < count; i++) if (unread[i]) n_new++;
+    }
     tft_fill_rect(0, 0, PANEL_W, 22, COL_ACCENT);
     char head[24];
-    snprintf(head, sizeof(head), "MSG  %02d", count);
+    snprintf(head, sizeof(head), "INBOX  %02d", count);
     tft_draw_text(MARGIN, 4, head, COL_BG, COL_ACCENT, 2);
-    tft_draw_text_r(PANEL_W - MARGIN, 4, "CLICK OPEN", COL_BG, COL_ACCENT, 1);
+    if (n_new > 0) {
+        char right[20];
+        snprintf(right, sizeof(right), "*%02d NEW", n_new > 99 ? 99 : n_new);
+        tft_draw_text_r(PANEL_W - MARGIN, 4, right, COL_BG, COL_ACCENT, 2);
+    } else if (count > 0) {
+        tft_draw_text_r(PANEL_W - MARGIN, 4, "ALL READ", COL_BG, COL_ACCENT, 1);
+    }
+
+    // Hairline under header (pager chrome)
+    tft_hline(0, 22, PANEL_W, COL_RULE);
 
     if (count == 0) {
-        tft_draw_text(MARGIN, 80, "INBOX EMPTY", COL_DIM, COL_BG, 2);
+        tft_draw_text(MARGIN, 80, "NO MESSAGES", COL_DIM, COL_BG, 2);
         tft_draw_text(MARGIN, 120, "click = back", COL_DIM, COL_BG, 1);
         msglist_sel_drawn = -1;
         msglist_top_drawn = -1;
         msglist_count_drawn = 0;
+        msglist_unread_mask = 0;
         return;
     }
 
     for (int row = 0; row < MSGLIST_VIS; row++) {
         int i = top + row;
         if (i >= count) break;
-        msglist_draw_row(titles, levels, i,
+        msglist_draw_row(titles, levels, unread, i,
                          (uint16_t)(MSGLIST_ROW0_Y + row * MSGLIST_ROW_H),
                          i == selected);
+        // Subtle separator between rows (Symbian-era lists had rules)
+        if (row + 1 < MSGLIST_VIS && (i + 1) < count) {
+            uint16_t ry = (uint16_t)(MSGLIST_ROW0_Y + row * MSGLIST_ROW_H + MSGLIST_BAR_H - 1);
+            tft_hline(MARGIN + 8, ry, PANEL_W - 2 * MARGIN - 8, COL_RULE);
+        }
     }
+
+    // Footer legend — teaches the * glyph once, classic phone chrome.
+    tft_hline(0, PANEL_H - 18, PANEL_W, COL_RULE);
+    tft_draw_text(MARGIN, PANEL_H - 14, "* NEW   . read   I/W/C level",
+                  COL_DIM, COL_BG, 1);
+    tft_draw_text_r(PANEL_W - MARGIN, PANEL_H - 14, "click open",
+                    COL_DIM, COL_BG, 1);
+
     msglist_sel_drawn = selected;
     msglist_top_drawn = top;
     msglist_count_drawn = count;
+    msglist_unread_mask = mask;
 }
 
 void hw_ui_show_reply(const char *title,
@@ -782,11 +1242,11 @@ void hw_ui_show_reply(const char *title,
     tft_fill(COL_BG);
     tft_fill_rect(0, 0, PANEL_W, 22, COL_ACCENT);
     tft_draw_text(MARGIN, 4, "REPLY", COL_BG, COL_ACCENT, 2);
-    char mods[16];
-    snprintf(mods, sizeof(mods), "%s%s",
-             caps ? "CAPS " : "",
-             symbol ? "SYM" : "");
-    if (mods[0]) tft_draw_text_r(PANEL_W - MARGIN, 4, mods, COL_BG, COL_ACCENT, 1);
+    // Layer badge: hold orange ALT for 123, CAPS toggles case.
+    char mods[20];
+    if (symbol) snprintf(mods, sizeof(mods), "%s123", caps ? "CAPS " : "");
+    else        snprintf(mods, sizeof(mods), "%sABC",  caps ? "CAPS " : "");
+    tft_draw_text_r(PANEL_W - MARGIN, 4, mods, COL_BG, COL_ACCENT, 1);
 
     // Original title, dim
     tft_draw_text(MARGIN, 32, title && title[0] ? title : "(msg)", COL_DIM, COL_BG, 1);
@@ -796,38 +1256,57 @@ void hw_ui_show_reply(const char *title,
     tft_fill_rect(MARGIN + 2, 58, PANEL_W - 2 * MARGIN - 4, 96, COL_BG);
 
     const char *buf = buffer ? buffer : "";
-    // Wrap draft at ~70 cols scale 2 would be wide — use scale 1
-    const int max_cols = 70;
-    char line[80];
+    // Scale-2 glyphs are 12px wide (6*2). Old code used max_cols=70 as if
+    // scale-1 → draft ran off the right edge of the box.
+    const uint8_t draft_scale = 2;
+    const uint16_t draft_x = MARGIN + 8;
+    const uint16_t box_inner_r = PANEL_W - MARGIN - 4;  // inner fill edge
+    const uint16_t draft_w = (box_inner_r > draft_x + 4)
+                                 ? (uint16_t)(box_inner_r - draft_x - 4) : 40;
+    int max_cols = (int)(draft_w / (6 * draft_scale));
+    if (max_cols < 8) max_cols = 8;
+    if (max_cols > 60) max_cols = 60;
+
+    char line[64];
     const char *p = buf;
     uint16_t y = 64;
     int rows = 0;
-    while ((*p || rows == 0) && rows < 5 && y + 14 < 150) {
+    const int max_rows = 5;
+    while ((*p || rows == 0) && rows < max_rows && y + 14 < 150) {
         int n = 0;
-        while (p[n] && p[n] != '\n' && n < max_cols) n++;
+        // Prefer break at last space within the column budget.
+        int last_sp = -1;
+        while (p[n] && p[n] != '\n' && n < max_cols) {
+            if (p[n] == ' ') last_sp = n;
+            n++;
+        }
+        if (p[n] && p[n] != '\n' && last_sp > 0) n = last_sp + 1;  // keep space on this line end / next start clean
         if (n == 0 && !*p) {
-            // empty draft: show cursor only
-            tft_draw_text(MARGIN + 8, y, "_", COL_ACCENT, COL_BG, 2);
+            tft_draw_text(draft_x, y, "_", COL_ACCENT, COL_BG, draft_scale);
             break;
         }
-        memcpy(line, p, n);
-        line[n] = '\0';
-        // append cursor on last fragment
+        if (n == 0 && *p) { n = 1; }  // single overlong glyph: force progress
+        int take = n;
+        // Drop trailing space from the painted line (it was a wrap break).
+        while (take > 0 && p[take - 1] == ' ') take--;
+        if (take >= (int)sizeof(line)) take = (int)sizeof(line) - 1;
+        memcpy(line, p, take);
+        line[take] = '\0';
         bool last = (p[n] == '\0');
-        if (last && n < (int)sizeof(line) - 2) {
-            line[n] = '_';
-            line[n + 1] = '\0';
+        if (last && take + 1 < (int)sizeof(line)) {
+            line[take] = '_';
+            line[take + 1] = '\0';
         }
-        tft_draw_text(MARGIN + 8, y, line, COL_TIME, COL_BG, 2);
+        tft_draw_text(draft_x, y, line, COL_TIME, COL_BG, draft_scale);
         p += n;
         if (*p == '\n') p++;
-        y += 18;
+        y += (uint16_t)(7 * draft_scale + 4);
         rows++;
         if (last) break;
     }
 
-    tft_draw_text(MARGIN, 170, "Enter=send  Bksp=del  Esc=cancel", COL_DIM, COL_BG, 1);
-    tft_draw_text(MARGIN, 192, "Type on the keyboard", COL_DIM, COL_BG, 1);
+    tft_draw_text(MARGIN, 170, "Enter=send  Bksp=del", COL_DIM, COL_BG, 1);
+    tft_draw_text(MARGIN, 192, "ALT+Bksp = HOME", COL_DIM, COL_BG, 1);
 }
 
 void hw_ui_show_info(const char *version,

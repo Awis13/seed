@@ -9,10 +9,13 @@ bool hw_kb_begin();
 bool hw_kb_ok();
 
 // Poll FIFO. On press of a character key: *out = char, return true.
-// Specials: '\b' backspace, '\n' enter. Modifier toggles are silent (false).
-// Only reports presses, not releases.
+// Specials: '\b' backspace, '\n' enter, '\x1b' = HOME (ALT/orange + Backspace).
+// Modifier toggles are silent (false). Only reports presses, not releases.
 bool hw_kb_read(char *out);
 
 // Current modifier state (for UI badge).
 bool hw_kb_caps();
 bool hw_kb_symbol();
+
+// Clear CAPS/SYM before opening the reply composer.
+void hw_kb_reset_mods();
