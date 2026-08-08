@@ -60,6 +60,17 @@ Auth: `Authorization: Bearer <token>` on everything except `/health`.
 
 **Canonical dual-path notify egress** is the home gateway (`POST :8325/notify-out` — WiFi + private mesh DM). Services should not invent extra mesh endpoints on the pager; the pager is inbox + status.
 
+## Gateway vs this device
+
+| | **Gateway (home-rig)** | **This device (seed)** |
+|--|------------------------|-------------------------|
+| Address | `192.168.1.138:8325` | `192.168.1.116:8080` / WG `10.66.0.2` |
+| Role | Dual-path **egress** (`POST /notify-out` = WiFi + private mesh DM) | **Inbox**, cards, keyboard `reply`, status |
+| Code | `~/meshcore/` on home-rig (not this seed tree) | this directory |
+| Agents | Services that need mesh fallback → gateway | Session “page Nikolai” → `POST /notify` here |
+
+Do **not** add service mesh-notify endpoints on the pager. Mesh RX/TX here is private-link client (P1/M1/C1), not a second public API for home services.
+
 ## MeshCore private link
 
 - **Radio:** SX1262, 869.618 MHz SF8 BW62.5 TX22 (aligned with Heltec companion).
@@ -81,6 +92,10 @@ Auth: `Authorization: Bearer <token>` on everything except `/health`.
 - **Card (severity)** — real pages from any service: `info` (teal) / `warn` (amber) / `crit` (red); click/Enter = ACKNOWLEDGE · REPLY · BACK; type = free-text REPLY
 - **Chat door** — only when client `id` ends with `-chat` (e.g. bridge posts `hermes-chat`): pretty CHAT invite → opens AGENTS room. Not a severity page.
 - **AGENTS** — Grok / Claude / Hermes chat threads; replies go WiFi bridge when online, else mesh uplink `C1`
+- **SETTINGS** — LAYOUT · BACKLIGHT (full/day/room/night) · AUTO-DIM on|off
+  - **Auto-dim** (default on): 30s → dim preset, 120s → screen off; knob/key/notify wakes.
+    Crit unread floors at dim (breathing rule stays visible). Progress bar keeps panel lit.
+    CPU core at 80 MHz. Persist `/backlight.json`. API: `GET|POST /backlight`.
 - **Keyboard layouts** (SETTINGS → LAYOUT, persist `/kb_layout.txt`):
   - **ABC** — Latin
   - **RU PHON** — Apple `Russian - Phonetic` (Mac muscle memory: `privet` → привет)

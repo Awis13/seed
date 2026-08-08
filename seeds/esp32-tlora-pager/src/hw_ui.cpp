@@ -348,10 +348,38 @@ static int utf8_next(const char *s, uint32_t *cp) {
     return 1;
 }
 
+// Degree ° (U+00B0) — small ring in the top of a 5×7 cell.
+// Column-major, bit0 = top row. Looks like a raised hollow circle.
+static const uint8_t FONT_DEGREE[5] PROGMEM = {
+    0x00, 0x06, 0x09, 0x09, 0x06
+};
+// Straight apostrophe / primes often arrive as Unicode (not ASCII 0x27).
+// Map them to the ASCII glyph so notify text does not show '?'.
+//   U+00B0 °   U+00BA º   U+2032 ′   U+2018/9 ‘ ’   U+201B ‛
+//   U+02BC ʼ   U+FF07 ＇ (fullwidth)
+
 // Resolve glyph pointer for a Unicode codepoint (5 bytes each).
 static const uint8_t *font_glyph(uint32_t cp) {
     if (cp >= 0x20 && cp <= 0x7E)
         return &FONT5X7[(cp - 0x20) * 5];
+    // Degrees / ring-like
+    if (cp == 0x00B0 || cp == 0x00BA || cp == 0x02DA /* ˚ */ ||
+        cp == 0x2070 /* ⁰ */ || cp == 0x2218 /* ∘ */)
+        return FONT_DEGREE;
+    // Apostrophes / primes → ASCII '
+    if (cp == 0x2018 || cp == 0x2019 || cp == 0x201B || cp == 0x2032 ||
+        cp == 0x02BC || cp == 0xFF07 || cp == 0x0060 /* ` as soft apos */)
+        return &FONT5X7[('\'' - 0x20) * 5];
+    // Curly double quotes → ASCII "
+    if (cp == 0x201C || cp == 0x201D || cp == 0x201E || cp == 0x00AB ||
+        cp == 0x00BB || cp == 0xFF02)
+        return &FONT5X7[('"' - 0x20) * 5];
+    // En/em dash → ASCII -
+    if (cp == 0x2013 || cp == 0x2014 || cp == 0x2212)
+        return &FONT5X7[('-' - 0x20) * 5];
+    // Non-breaking space → space
+    if (cp == 0x00A0)
+        return &FONT5X7[(' ' - 0x20) * 5];
     if (cp == 0x0401) return FONT_CYR_YO_UP;
     if (cp == 0x0451) return FONT_CYR_YO_LO;
     if (cp >= 0x0410 && cp <= 0x042F)
@@ -480,6 +508,7 @@ static char fld_note[56]  = "";
 static int  clock_badge   = -1;
 static int  clock_mesh_ui = -1;
 static int  clock_mesh_age_bucket = -2;  // -2 dirty; -1 never; else minutes (or hours*1000)
+static int  clock_wg_ui = -1;
 static bool clock_dirty   = true;
 
 // Selection caches for partial repaint (menu / msglist / card_act / agents).
@@ -489,7 +518,13 @@ static int agents_sel_drawn = -1;
 static int agent_act_sel_drawn = -1;
 static int layout_sel_drawn = -1;
 static int layout_cur_drawn = -1;
+static int settings_sel_drawn = -1;
+static char settings_bl_cache[12];
+static char settings_idle_cache[8];
 static int mesh_sel_drawn = -1;
+static int wifi_sel_drawn = -1;
+static int wifi_list_sel_drawn = -1;
+static int wifi_list_n_drawn = -1;
 static int msglist_sel_drawn = -1;
 static int msglist_top_drawn = -1;
 static int msglist_count_drawn = -1;
@@ -572,6 +607,7 @@ void hw_ui_invalidate_clock() {
     clock_badge = -1;
     clock_mesh_ui = -1;
     clock_mesh_age_bucket = -2;
+    clock_wg_ui = -1;
     clock_bar_drawn = -1;
 }
 
@@ -585,6 +621,12 @@ void hw_ui_show_clock() {
     agent_act_sel_drawn = -1;
     layout_sel_drawn = -1;
     layout_cur_drawn = -1;
+    settings_sel_drawn = -1;
+    wifi_sel_drawn = -1;
+    wifi_list_sel_drawn = -1;
+    wifi_list_n_drawn = -1;
+    settings_bl_cache[0] = '\0';
+    settings_idle_cache[0] = '\0';
     mesh_sel_drawn = -1;
     msglist_sel_drawn = -1;
     msglist_top_drawn = -1;
@@ -608,11 +650,12 @@ void hw_ui_clock_tick(const char *version,
                       const char *date_str,
                       bool crit_unread,
                       int mesh_ui,
-                      int mesh_age_s) {
+                      int mesh_age_s,
+                      int wg_ui) {
     if (!panel_ok || screen != HW_UI_CLOCK) return;
     (void)crit_unread;
 
-    // Header: version | badge | M+age | BAT | IP
+    // Header: version | badge | W | M+age | BAT | IP
     draw_field(fld_ver, sizeof(fld_ver), version ? version : "",
                MARGIN, HDR_Y, 2, COL_DIM, 'L', 80);
     draw_field(fld_batt, sizeof(fld_batt), batt ? batt : "",
@@ -632,6 +675,20 @@ void hw_ui_clock_tick(const char *version,
             if (badge > 9) snprintf(b, sizeof(b), "9+");
             else snprintf(b, sizeof(b), "%d", badge);
             tft_draw_text(bx + 8, HDR_Y, b, COL_ACCENT, COL_BG, 2);
+        }
+    }
+
+    // WireGuard "W" just left of MeshCore slot.
+    if (clock_dirty || wg_ui != clock_wg_ui) {
+        clock_wg_ui = wg_ui;
+        const int wx = PANEL_W / 2 - 140;
+        tft_fill_rect(wx - 2, HDR_Y, 20, 16, COL_BG);
+        if (wg_ui > WG_UI_OFF) {
+            uint16_t col = COL_DIM;
+            if (wg_ui == WG_UI_OK) col = COL_INFO;
+            else if (wg_ui == WG_UI_STALE) col = COL_WARN;
+            else if (wg_ui == WG_UI_DOWN) col = COL_CRIT;
+            tft_draw_text((uint16_t)wx, HDR_Y, "W", col, COL_BG, 2);
         }
     }
 
@@ -797,28 +854,48 @@ void hw_ui_show_notify(const char *level,
     // 3px level accent bar on the left of the card body
     tft_fill_rect(0, 60, 3, 140, accent);
 
-    tft_draw_text(MARGIN + 4, 64, title && title[0] ? title : "(no title)",
+    // Title scale 2 (was already). Body was scale 1 — hard to read on the go;
+    // bump to 2 so a normal notify is a bit larger without eating the whole card.
+    const uint8_t body_scale = 2;
+    const uint16_t body_adv = 6 * body_scale;          // px per glyph
+    const uint16_t body_line_h = 7 * body_scale + 4;   // glyph + gap
+    const int max_cols = (int)((PANEL_W - MARGIN - 4 - MARGIN) / body_adv);
+    // ~36 cols @ scale 2 on 480px panel
+
+    tft_draw_text(MARGIN + 4, 58, title && title[0] ? title : "(no title)",
                   COL_TIME, COL_BG, 2);
 
     if (body && body[0]) {
-        const int max_cols = 72;
-        char line[80];
+        char line[96];
         const char *p = body;
-        uint16_t y = 100;
+        uint16_t y = 90;
         int rows = 0;
-        while (*p && rows < 5 && y + 14 < PANEL_H - 20) {
-            int n = 0;
-            while (p[n] && p[n] != '\n' && n < max_cols) n++;
-            if (p[n] && p[n] != '\n') {
+        const int max_rows = 5;
+        while (*p && rows < max_rows && y + body_line_h <= PANEL_H - 8) {
+            // Walk by UTF-8 codepoints so Cyrillic doesn't blow the col budget.
+            int n = 0;   // bytes
+            int cols = 0;
+            while (p[n] && p[n] != '\n' && cols < max_cols) {
+                uint32_t cp = 0;
+                int k = utf8_next(p + n, &cp);
+                if (k <= 0) break;
+                n += k;
+                cols++;
+            }
+            if (p[n] && p[n] != '\n' && cols >= max_cols) {
+                // Prefer break on last space in this window.
                 int cut = n;
-                while (cut > 24 && p[cut] != ' ') cut--;
+                while (cut > 8 && p[cut] != ' ') cut--;
                 if (p[cut] == ' ') n = cut;
             }
+            if (n <= 0) break;
+            if (n >= (int)sizeof(line)) n = (int)sizeof(line) - 1;
             memcpy(line, p, n); line[n] = '\0';
-            tft_draw_text(MARGIN + 4, y, line, COL_FG, COL_BG, 1);
+            tft_draw_text(MARGIN + 4, y, line, COL_FG, COL_BG, body_scale);
             p += n;
             if (*p == ' ' || *p == '\n') p++;
-            y += 16; rows++;
+            y += body_line_h;
+            rows++;
         }
     }
 }
@@ -870,12 +947,21 @@ void hw_ui_show_agent_invite(const char *agent_name,
 }
 
 // Menu row geometry — fixed so selection can repaint one bar without a wipe.
-static const int MENU_N = 6;
+static const int MENU_N = 7;
 static const int MENU_ROW0_Y = 32;
-static const int MENU_ROW_H = 28;
-static const int MENU_BAR_H = 24;
+static const int MENU_ROW_H = 26;
+static const int MENU_BAR_H = 22;
 static const char *const MENU_ITEMS[MENU_N] = {
-    "MESSAGES", "AGENTS", "MESHCORE", "SETTINGS", "INFO", "BACK"
+    "MESSAGES", "AGENTS", "MESHCORE", "WIFI", "SETTINGS", "INFO", "BACK"
+};
+
+// WiFi submenu
+static const int WIFI_MENU_N = 4;
+static const int WIFI_MENU_ROW0_Y = 48;
+static const int WIFI_MENU_ROW_H = 32;
+static const int WIFI_MENU_BAR_H = 28;
+static const char *const WIFI_MENU_ITEMS[WIFI_MENU_N] = {
+    "STATUS", "SCAN", "PROFILES", "BACK"
 };
 
 // MeshCore submenu
@@ -1042,6 +1128,67 @@ void hw_ui_show_layout(int selected, int current_layout) {
     layout_cur_drawn = current_layout;
 }
 
+// SETTINGS: LAYOUT / BACKLIGHT / AUTO-DIM / BACK
+static const int SETTINGS_N = 4;
+static const int SETTINGS_ROW0_Y = 48;
+static const int SETTINGS_ROW_H = 34;
+static const int SETTINGS_BAR_H = 28;
+
+static void settings_draw_row(int i, bool on,
+                              const char *bl_label, const char *idle_word) {
+    uint16_t y = (uint16_t)(SETTINGS_ROW0_Y + i * SETTINGS_ROW_H);
+    uint16_t bar_y = y - 4;
+    uint16_t bar_w = PANEL_W - 2 * MARGIN;
+    char label[36];
+    if (i == 0) snprintf(label, sizeof(label), "LAYOUT");
+    else if (i == 1) snprintf(label, sizeof(label), "BACKLIGHT %s",
+                              bl_label && bl_label[0] ? bl_label : "?");
+    else if (i == 2) snprintf(label, sizeof(label), "AUTO-DIM %s",
+                              idle_word && idle_word[0] ? idle_word : "?");
+    else snprintf(label, sizeof(label), "BACK");
+    if (on) {
+        tft_fill_rect(MARGIN, bar_y, bar_w, SETTINGS_BAR_H, COL_ACCENT);
+        tft_draw_text(MARGIN + 8, y, label, COL_BG, COL_ACCENT, 2);
+    } else {
+        tft_fill_rect(MARGIN, bar_y, bar_w, SETTINGS_BAR_H, COL_BG);
+        tft_draw_text(MARGIN + 8, y, label, COL_TIME, COL_BG, 2);
+    }
+}
+
+void hw_ui_show_settings(int selected,
+                         const char *bl_label,
+                         const char *idle_word) {
+    if (!panel_ok) return;
+    if (selected < 0) selected = 0;
+    if (selected >= SETTINGS_N) selected = SETTINGS_N - 1;
+    if (!bl_label) bl_label = "";
+    if (!idle_word) idle_word = "";
+
+    bool labels_same =
+        (strncmp(settings_bl_cache, bl_label, sizeof(settings_bl_cache) - 1) == 0) &&
+        (strncmp(settings_idle_cache, idle_word, sizeof(settings_idle_cache) - 1) == 0);
+
+    if (screen == HW_UI_SETTINGS && settings_sel_drawn >= 0 &&
+        settings_sel_drawn != selected && labels_same) {
+        settings_draw_row(settings_sel_drawn, false, bl_label, idle_word);
+        settings_draw_row(selected, true, bl_label, idle_word);
+        settings_sel_drawn = selected;
+        return;
+    }
+    if (screen == HW_UI_SETTINGS && settings_sel_drawn == selected && labels_same)
+        return;
+
+    screen = HW_UI_SETTINGS;
+    tft_fill(COL_BG);
+    tft_fill_rect(0, 0, PANEL_W, 22, COL_ACCENT);
+    tft_draw_text(MARGIN, 4, "SETTINGS", COL_BG, COL_ACCENT, 2);
+    for (int i = 0; i < SETTINGS_N; i++)
+        settings_draw_row(i, i == selected, bl_label, idle_word);
+    settings_sel_drawn = selected;
+    snprintf(settings_bl_cache, sizeof(settings_bl_cache), "%s", bl_label);
+    snprintf(settings_idle_cache, sizeof(settings_idle_cache), "%s", idle_word);
+}
+
 static void mesh_draw_row(int i, bool on) {
     uint16_t y = (uint16_t)(MESH_ROW0_Y + i * MESH_ROW_H);
     uint16_t bar_y = y - 4;
@@ -1100,6 +1247,213 @@ void hw_ui_show_mesh_ping(const char *phase,
     tft_draw_text_r(PANEL_W - MARGIN, 4,
                     phase && phase[0] ? phase : "…",
                     COL_BG, accent, 2);
+
+    uint16_t y = 32;
+    for (int i = 0; i < n_lines; i++) {
+        const char *ln = (lines && lines[i]) ? lines[i] : "";
+        tft_draw_text(MARGIN, y, ln, COL_TIME, COL_BG, 1);
+        y = (uint16_t)(y + 16);
+        if (y > PANEL_H - 24) break;
+    }
+    tft_draw_text(MARGIN, PANEL_H - 16, "click = back", COL_DIM, COL_BG, 1);
+}
+
+// ---- dual-path ping result (glance: WiFi | Mesh) ---------------------------
+// Simple geometric icons so the eye hits OK/NO before reading text.
+
+static void ping_draw_wifi_icon(int cx, int cy, uint16_t col) {
+    /* Arc bars + stem — readable at a glance on 480×222. */
+    for (int b = 0; b < 3; b++) {
+        int w = 10 + b * 14;
+        int y = cy - 22 + b * 10;
+        tft_fill_rect((uint16_t)(cx - w / 2), (uint16_t)y,
+                      (uint16_t)w, 4, col);
+    }
+    tft_fill_rect((uint16_t)(cx - 3), (uint16_t)(cy + 10), 6, 10, col);
+    tft_fill_rect((uint16_t)(cx - 8), (uint16_t)(cy + 18), 16, 4, col);
+}
+
+static void ping_draw_mesh_icon(int cx, int cy, uint16_t col) {
+    /* Three nodes + links — MeshCore private path, not WiFi. */
+    auto node = [&](int x, int y) {
+        tft_fill_rect((uint16_t)(x - 5), (uint16_t)(y - 5), 10, 10, col);
+    };
+    int x0 = cx - 22, x1 = cx + 22, y0 = cy - 14, y1 = cy + 18;
+    node(x0, y0);
+    node(x1, y0);
+    node(cx, y1);
+    /* links */
+    tft_fill_rect((uint16_t)(x0 + 4), (uint16_t)(y0 - 1),
+                  (uint16_t)(x1 - x0 - 8), 3, col);
+    /* diagonals approximated as thick steps */
+    for (int i = 0; i < 18; i++) {
+        int t = i;
+        tft_fill_rect((uint16_t)(x0 + t), (uint16_t)(y0 + t), 3, 3, col);
+        tft_fill_rect((uint16_t)(x1 - t), (uint16_t)(y0 + t), 3, 3, col);
+    }
+}
+
+static void ping_draw_path_column(int cx, bool ok,
+                                  const char *label,
+                                  void (*draw_icon)(int, int, uint16_t),
+                                  const char *sub1, const char *sub2) {
+    uint16_t col = ok ? COL_INFO : COL_CRIT;
+    uint16_t muted = ok ? COL_TIME : COL_DIM;
+
+    /* label above icon */
+    int lab_w = (int)strlen(label) * 12;  // scale-2 cell ≈12px
+    tft_draw_text((uint16_t)(cx - lab_w / 2), 30, label, muted, COL_BG, 2);
+
+    draw_icon(cx, 88, col);
+
+    /* big OK / NO */
+    const char *word = ok ? "OK" : "NO";
+    int ww = (int)strlen(word) * 18;  // scale 3
+    tft_draw_text((uint16_t)(cx - ww / 2), 130, word, col, COL_BG, 3);
+
+    /* strength lines — slightly smaller */
+    uint16_t y = 162;
+    if (sub1 && sub1[0]) {
+        int sw = (int)strlen(sub1) * 12;
+        tft_draw_text((uint16_t)(cx - sw / 2), y, sub1, muted, COL_BG, 2);
+        y = (uint16_t)(y + 22);
+    }
+    if (sub2 && sub2[0]) {
+        int sw = (int)strlen(sub2) * 6;
+        tft_draw_text((uint16_t)(cx - sw / 2), y, sub2, COL_DIM, COL_BG, 1);
+    }
+}
+
+void hw_ui_show_mesh_ping_result(bool wifi_ok, const char *wifi_sub1,
+                                 const char *wifi_sub2,
+                                 bool mesh_ok, const char *mesh_sub1,
+                                 const char *mesh_sub2) {
+    if (!panel_ok) return;
+    screen = HW_UI_MESH_PING;
+
+    tft_fill(COL_BG);
+    uint16_t accent = (wifi_ok || mesh_ok) ? COL_INFO : COL_CRIT;
+    if (wifi_ok && mesh_ok) accent = COL_INFO;
+    else if (wifi_ok || mesh_ok) accent = COL_WARN;
+
+    tft_fill_rect(0, 0, PANEL_W, 22, accent);
+    tft_draw_text(MARGIN, 4, "MESH PING", COL_BG, accent, 2);
+    const char *tag = (wifi_ok && mesh_ok) ? "BOTH"
+                    : (wifi_ok ? "WIFI" : (mesh_ok ? "MESH" : "NONE"));
+    tft_draw_text_r(PANEL_W - MARGIN, 4, tag, COL_BG, accent, 2);
+
+    /* vertical divider */
+    tft_fill_rect(PANEL_W / 2 - 1, 28, 2, PANEL_H - 48, COL_RULE);
+
+    ping_draw_path_column(PANEL_W / 4, wifi_ok, "WiFi",
+                          ping_draw_wifi_icon, wifi_sub1, wifi_sub2);
+    ping_draw_path_column(3 * PANEL_W / 4, mesh_ok, "Mesh",
+                          ping_draw_mesh_icon, mesh_sub1, mesh_sub2);
+
+    tft_draw_text(MARGIN, PANEL_H - 16, "click = back", COL_DIM, COL_BG, 1);
+}
+
+static void wifi_menu_draw_row(int i, bool on) {
+    uint16_t y = (uint16_t)(WIFI_MENU_ROW0_Y + i * WIFI_MENU_ROW_H);
+    uint16_t bar_y = y - 4;
+    uint16_t bar_w = PANEL_W - 2 * MARGIN;
+    if (on) {
+        tft_fill_rect(MARGIN, bar_y, bar_w, WIFI_MENU_BAR_H, COL_ACCENT);
+        tft_draw_text(MARGIN + 12, y, WIFI_MENU_ITEMS[i], COL_BG, COL_ACCENT, 2);
+    } else {
+        tft_fill_rect(MARGIN, bar_y, bar_w, WIFI_MENU_BAR_H, COL_BG);
+        tft_draw_text(MARGIN + 12, y, WIFI_MENU_ITEMS[i], COL_TIME, COL_BG, 2);
+    }
+}
+
+void hw_ui_show_wifi(int selected) {
+    if (!panel_ok) return;
+    if (selected < 0) selected = 0;
+    if (selected >= WIFI_MENU_N) selected = WIFI_MENU_N - 1;
+
+    if (screen == HW_UI_WIFI && wifi_sel_drawn >= 0 &&
+        wifi_sel_drawn != selected) {
+        wifi_menu_draw_row(wifi_sel_drawn, false);
+        wifi_menu_draw_row(selected, true);
+        wifi_sel_drawn = selected;
+        return;
+    }
+    if (screen == HW_UI_WIFI && wifi_sel_drawn == selected) return;
+
+    screen = HW_UI_WIFI;
+    tft_fill(COL_BG);
+    tft_fill_rect(0, 0, PANEL_W, 22, COL_ACCENT);
+    tft_draw_text(MARGIN, 4, "WIFI", COL_BG, COL_ACCENT, 2);
+    tft_draw_text_r(PANEL_W - MARGIN, 6, "STA+WG", COL_BG, COL_ACCENT, 1);
+    tft_draw_text(MARGIN, 32, "networks + tunnel", COL_DIM, COL_BG, 1);
+    for (int i = 0; i < WIFI_MENU_N; i++) wifi_menu_draw_row(i, i == selected);
+    wifi_sel_drawn = selected;
+}
+
+void hw_ui_show_wifi_list(const char *header,
+                          const char *const *titles,
+                          int n,
+                          int selected) {
+    if (!panel_ok) return;
+    if (n < 0) n = 0;
+    if (n > HW_UI_WIFI_LIST_MAX) n = HW_UI_WIFI_LIST_MAX;
+    if (selected < 0) selected = 0;
+    if (n > 0 && selected >= n) selected = n - 1;
+
+    const int ROW0 = 36;
+    const int ROWH = 22;
+    const int BARH = 20;
+
+    auto draw_row = [&](int i, bool on) {
+        uint16_t y = (uint16_t)(ROW0 + i * ROWH);
+        uint16_t bar_y = y - 2;
+        uint16_t bar_w = PANEL_W - 2 * MARGIN;
+        const char *t = (titles && titles[i]) ? titles[i] : "";
+        char label[40];
+        snprintf(label, sizeof(label), "%.36s", t);
+        if (on) {
+            tft_fill_rect(MARGIN, bar_y, bar_w, BARH, COL_ACCENT);
+            tft_draw_text(MARGIN + 8, y, label, COL_BG, COL_ACCENT, 1);
+        } else {
+            tft_fill_rect(MARGIN, bar_y, bar_w, BARH, COL_BG);
+            tft_draw_text(MARGIN + 8, y, label, COL_TIME, COL_BG, 1);
+        }
+    };
+
+    if (screen == HW_UI_WIFI_LIST && wifi_list_sel_drawn >= 0 &&
+        wifi_list_n_drawn == n && wifi_list_sel_drawn != selected && n > 0) {
+        draw_row(wifi_list_sel_drawn, false);
+        draw_row(selected, true);
+        wifi_list_sel_drawn = selected;
+        return;
+    }
+
+    screen = HW_UI_WIFI_LIST;
+    tft_fill(COL_BG);
+    tft_fill_rect(0, 0, PANEL_W, 22, COL_ACCENT);
+    tft_draw_text(MARGIN, 4, header && header[0] ? header : "WIFI",
+                  COL_BG, COL_ACCENT, 2);
+    if (n == 0) {
+        tft_draw_text(MARGIN, 80, "empty", COL_DIM, COL_BG, 2);
+        tft_draw_text(MARGIN, PANEL_H - 16, "click = back", COL_DIM, COL_BG, 1);
+    } else {
+        for (int i = 0; i < n; i++) draw_row(i, i == selected);
+        tft_draw_text(MARGIN, PANEL_H - 16, "click = connect / open",
+                      COL_DIM, COL_BG, 1);
+    }
+    wifi_list_sel_drawn = selected;
+    wifi_list_n_drawn = n;
+}
+
+void hw_ui_show_wifi_info(const char *const *lines, int n_lines) {
+    if (!panel_ok) return;
+    screen = HW_UI_WIFI_INFO;
+    if (n_lines < 0) n_lines = 0;
+    if (n_lines > 12) n_lines = 12;
+
+    tft_fill(COL_BG);
+    tft_fill_rect(0, 0, PANEL_W, 22, COL_ACCENT);
+    tft_draw_text(MARGIN, 4, "WIFI STATUS", COL_BG, COL_ACCENT, 2);
 
     uint16_t y = 32;
     for (int i = 0; i < n_lines; i++) {

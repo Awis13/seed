@@ -24,7 +24,11 @@
 //   POST /firmware/rollback — revert to previous
 //   GET  /skill             — AI agent skill file
 //   GET  /                  — WiFi config page
-//   POST /wifi/config       — save WiFi credentials
+//   POST /wifi/config       — save WiFi credentials (adds to multi-profile list)
+//   GET  /wifi/status       — STA + profiles
+//   GET  /wifi/scan         — nearby SSIDs (blocking)
+//   POST /wifi/networks     — replace multi-profile list (JSON)
+//   WireGuard skill: /wg/*  — tunnel to home gateway
 
 #include <Arduino.h>
 #include <stdlib.h>
@@ -47,14 +51,18 @@
 #include "hw_kb.h"
 
 // ===== Configuration =====
-#define SEED_VERSION        "0.9.25"
+#define SEED_VERSION        "0.9.37"
+// Core clock: datasheet puts 240 vs 80 ~11.5mA apart on WAITI. Periph bus holds
+// at 80 for every PLL-fed core clock; go lower and RMT/I2S retimes. Same floor
+// as tembed idle policy (no light sleep — notify latency is the job).
+#define CPU_MHZ             80
 #define HTTP_PORT           8080
 #define TOKEN_FILE          "/auth_token.txt"
 #define WIFI_CONFIG_FILE    "/wifi.json"
 #define CONFIG_MD_FILE      "/config.md"
 #define TZ_FILE             "/tz.txt"
-// No location is baked into the seed: UTC until an agent posts a POSIX TZ.
-#define TZ_DEFAULT          "UTC0"
+// Prague (CET/CEST). Overridable via POST /clock/tz or SPIFFS /tz.txt.
+#define TZ_DEFAULT          "CET-1CEST,M3.5.0,M10.5.0/3"
 // Anything older than this is the pre-NTP epoch, not a real wall clock.
 #define TIME_VALID_EPOCH    1700000000
 
@@ -285,6 +293,16 @@ static String ap_password = "";
 static String wifi_ssid = "";
 static String wifi_pass = "";
 
+/* Multi-profile STA: try each known network in order on boot / reconnect. */
+#define WIFI_MAX_NETS 6
+struct WifiNet {
+    char ssid[33];
+    char pass[65];
+};
+static WifiNet wifi_nets[WIFI_MAX_NETS];
+static int wifi_net_count = 0;
+static int wifi_net_idx = 0;
+
 // OTA state
 static bool firmware_confirmed = false;
 static bool firmware_confirm_attempted = false;
@@ -422,22 +440,136 @@ static bool require_auth(AsyncWebServerRequest *request) {
 
 // ===== WiFi =====
 
+static void wifi_nets_clear() {
+    wifi_net_count = 0;
+    wifi_net_idx = 0;
+    memset(wifi_nets, 0, sizeof(wifi_nets));
+}
+
+static void wifi_nets_set_active(int idx) {
+    if (idx < 0 || idx >= wifi_net_count) return;
+    wifi_net_idx = idx;
+    wifi_ssid = wifi_nets[idx].ssid;
+    wifi_pass = wifi_nets[idx].pass;
+}
+
+/* Upsert one profile; promotes it to active ssid/password fields. */
+static bool wifi_nets_upsert(const char *ssid, const char *pass) {
+    if (!ssid || !ssid[0]) return false;
+    if (!pass) pass = "";
+    for (int i = 0; i < wifi_net_count; i++) {
+        if (strcmp(wifi_nets[i].ssid, ssid) == 0) {
+            snprintf(wifi_nets[i].pass, sizeof(wifi_nets[i].pass), "%s", pass);
+            wifi_nets_set_active(i);
+            return true;
+        }
+    }
+    if (wifi_net_count >= WIFI_MAX_NETS) {
+        /* Drop oldest, shift. */
+        memmove(&wifi_nets[0], &wifi_nets[1],
+                sizeof(WifiNet) * (WIFI_MAX_NETS - 1));
+        wifi_net_count = WIFI_MAX_NETS - 1;
+    }
+    int i = wifi_net_count++;
+    snprintf(wifi_nets[i].ssid, sizeof(wifi_nets[i].ssid), "%s", ssid);
+    snprintf(wifi_nets[i].pass, sizeof(wifi_nets[i].pass), "%s", pass);
+    wifi_nets_set_active(i);
+    return true;
+}
+
+static bool wifi_persist_profiles() {
+    JsonDocument doc;
+    if (wifi_net_count > 0) {
+        doc["ssid"] = wifi_nets[wifi_net_idx].ssid;
+        doc["password"] = wifi_nets[wifi_net_idx].pass;
+    } else {
+        doc["ssid"] = wifi_ssid;
+        doc["password"] = wifi_pass;
+    }
+    JsonArray arr = doc["networks"].to<JsonArray>();
+    for (int i = 0; i < wifi_net_count; i++) {
+        JsonObject o = arr.add<JsonObject>();
+        o["ssid"] = wifi_nets[i].ssid;
+        o["password"] = wifi_nets[i].pass;
+    }
+    String json;
+    serializeJson(doc, json);
+    return write_spiffs_file(WIFI_CONFIG_FILE, json);
+}
+
 static void wifi_load_config() {
+    wifi_nets_clear();
     String json = read_spiffs_file(WIFI_CONFIG_FILE);
     if (json.length() == 0) return;
     JsonDocument doc;
     if (deserializeJson(doc, json) != DeserializationError::Ok) return;
-    wifi_ssid = doc["ssid"].as<String>();
-    wifi_pass = doc["password"].as<String>();
+
+    if (doc["networks"].is<JsonArray>()) {
+        JsonArray arr = doc["networks"].as<JsonArray>();
+        for (JsonObject o : arr) {
+            const char *s = o["ssid"] | "";
+            const char *p = o["password"] | "";
+            if (!s[0]) continue;
+            if (wifi_net_count >= WIFI_MAX_NETS) break;
+            snprintf(wifi_nets[wifi_net_count].ssid,
+                     sizeof(wifi_nets[wifi_net_count].ssid), "%s", s);
+            snprintf(wifi_nets[wifi_net_count].pass,
+                     sizeof(wifi_nets[wifi_net_count].pass), "%s", p);
+            wifi_net_count++;
+        }
+    }
+    /* Legacy single pair always accepted (and merged if not in list). */
+    const char *leg_s = doc["ssid"] | "";
+    const char *leg_p = doc["password"] | "";
+    if (leg_s[0]) {
+        bool found = false;
+        for (int i = 0; i < wifi_net_count; i++) {
+            if (strcmp(wifi_nets[i].ssid, leg_s) == 0) {
+                found = true;
+                wifi_net_idx = i;
+                break;
+            }
+        }
+        if (!found) wifi_nets_upsert(leg_s, leg_p);
+        else wifi_nets_set_active(wifi_net_idx);
+    } else if (wifi_net_count > 0) {
+        wifi_nets_set_active(0);
+    }
 }
 
 static bool wifi_save_config(const String &ssid, const String &pass) {
-    JsonDocument doc;
-    doc["ssid"] = ssid;
-    doc["password"] = pass;
-    String json;
-    serializeJson(doc, json);
-    return write_spiffs_file(WIFI_CONFIG_FILE, json);
+    wifi_nets_upsert(ssid.c_str(), pass.c_str());
+    return wifi_persist_profiles();
+}
+
+/* Try each profile up to attempts_each * 500ms. Returns true on connect. */
+static bool wifi_try_profiles(int attempts_each) {
+    if (wifi_net_count == 0 && wifi_ssid.length() > 0) {
+        wifi_nets_upsert(wifi_ssid.c_str(), wifi_pass.c_str());
+    }
+    if (wifi_net_count == 0) return false;
+
+    for (int n = 0; n < wifi_net_count; n++) {
+        int idx = (wifi_net_idx + n) % wifi_net_count;
+        wifi_nets_set_active(idx);
+        Serial.printf("[wifi] try ssid=%s\n", wifi_ssid.c_str());
+        WiFi.disconnect(false, false);
+        delay(100);
+        WiFi.begin(wifi_ssid.c_str(), wifi_pass.c_str());
+        int attempts = 0;
+        while (WiFi.status() != WL_CONNECTED && attempts < attempts_each) {
+            delay(500);
+            attempts++;
+        }
+        if (WiFi.status() == WL_CONNECTED) {
+            wifi_persist_profiles(); /* remember last-good as primary */
+            Serial.printf("[wifi] STA up %s on %s\n",
+                          WiFi.localIP().toString().c_str(), wifi_ssid.c_str());
+            return true;
+        }
+        Serial.printf("[wifi] fail ssid=%s\n", wifi_ssid.c_str());
+    }
+    return false;
 }
 
 // ===== Provisioning AP =====
@@ -529,19 +661,10 @@ static void wifi_setup() {
     configTzTime(tz_string.c_str(), "pool.ntp.org", "time.nist.gov");
 
     wifi_load_config();
-    if (wifi_ssid.length() > 0) {
-        Serial.printf("[wifi] STA begin ssid=%s\n", wifi_ssid.c_str());
-        WiFi.begin(wifi_ssid.c_str(), wifi_pass.c_str());
-        // 15 s: home APs often need more than 10 s after a cold bootloader exit.
-        int attempts = 0;
-        while (WiFi.status() != WL_CONNECTED && attempts < 30) {
-            delay(500);
-            attempts++;
-        }
-        if (WiFi.status() == WL_CONNECTED) {
-            Serial.printf("[wifi] STA up %s\n", WiFi.localIP().toString().c_str());
-        } else {
-            Serial.printf("[wifi] STA failed after %d attempts, raising setup AP\n", attempts);
+    if (wifi_net_count > 0 || wifi_ssid.length() > 0) {
+        /* ~15s per profile (30 * 500ms). Multi-profile walks the list. */
+        if (!wifi_try_profiles(30)) {
+            Serial.println("[wifi] all profiles failed, raising setup AP");
         }
     } else {
         Serial.println("[wifi] no credentials in SPIFFS — setup AP only");
@@ -604,9 +727,9 @@ static void handle_capabilities(AsyncWebServerRequest *request) {
     doc["display"] = hw_ui_ready();
     doc["display_w"] = 480;
     doc["display_h"] = 222;
-    doc["backlight"] = hw_ui_get_brightness();
+    doc["backlight"] = hw_ui_get_brightness();  // boot path; live = GET /backlight
     doc["xl9555"] = hw_ui_expand_ok();
-    doc["peripherals_driven"] = "i2c-scan, xl9555, st7796, aw9364, notify, progress, haptic, sound, keyboard, bq27220";
+    doc["peripherals_driven"] = "i2c-scan, xl9555, st7796, aw9364, backlight-idle, notify, progress, haptic, sound, keyboard, bq27220";
     doc["haptic"] = hw_haptic_ok();
     doc["sound"] = hw_sound_ok();
     doc["keyboard"] = hw_kb_ok();
@@ -1044,12 +1167,101 @@ static void handle_wifi_post(AsyncWebServerRequest *request) {
         return;
     }
     wifi_save_config(ssid, pass);
-    wifi_ssid = ssid;
-    wifi_pass = pass;
     request->send(200, "text/html",
         "<h2>Saved. Connecting...</h2><p>" + ssid + "</p><a href='/'>Back</a>");
-    delay(1000);
+    delay(500);
+    WiFi.disconnect(false, false);
+    delay(100);
     WiFi.begin(wifi_ssid.c_str(), wifi_pass.c_str());
+}
+
+static void handle_wifi_status(AsyncWebServerRequest *request) {
+    if (!require_auth(request)) return;
+    JsonDocument doc;
+    doc["connected"] = (WiFi.status() == WL_CONNECTED);
+    doc["ssid"] = WiFi.status() == WL_CONNECTED ? WiFi.SSID() : wifi_ssid;
+    doc["ip"] = WiFi.status() == WL_CONNECTED
+        ? WiFi.localIP().toString() : "";
+    if (WiFi.status() == WL_CONNECTED) doc["rssi"] = WiFi.RSSI();
+    doc["active_idx"] = wifi_net_idx;
+    doc["profile_count"] = wifi_net_count;
+    JsonArray arr = doc["networks"].to<JsonArray>();
+    for (int i = 0; i < wifi_net_count; i++) {
+        JsonObject o = arr.add<JsonObject>();
+        o["ssid"] = wifi_nets[i].ssid;
+        o["has_pass"] = wifi_nets[i].pass[0] != '\0';
+        o["active"] = (i == wifi_net_idx);
+    }
+    String response;
+    serializeJson(doc, response);
+    request->send(200, "application/json", response);
+}
+
+static void handle_wifi_scan(AsyncWebServerRequest *request) {
+    if (!require_auth(request)) return;
+    /* Blocking scan — ok for rare field use; keeps UI free of softAP dance. */
+    int n = WiFi.scanNetworks(/*async=*/false, /*hidden=*/true);
+    JsonDocument doc;
+    doc["count"] = n < 0 ? 0 : n;
+    JsonArray arr = doc["networks"].to<JsonArray>();
+    for (int i = 0; i < n && i < 24; i++) {
+        JsonObject o = arr.add<JsonObject>();
+        o["ssid"] = WiFi.SSID(i);
+        o["rssi"] = WiFi.RSSI(i);
+        o["secure"] = (WiFi.encryptionType(i) != WIFI_AUTH_OPEN);
+    }
+    WiFi.scanDelete();
+    String response;
+    serializeJson(doc, response);
+    request->send(200, "application/json", response);
+}
+
+static void handle_wifi_networks_post(AsyncWebServerRequest *request) {
+    if (!require_auth(request)) return;
+    char *body = (char *)request->_tempObject;
+    if (!body) {
+        request->send(400, "application/json", "{\"error\":\"body required\"}");
+        return;
+    }
+    JsonDocument input;
+    if (deserializeJson(input, body) != DeserializationError::Ok) {
+        free(body);
+        request->_tempObject = nullptr;
+        request->send(400, "application/json", "{\"error\":\"bad json\"}");
+        return;
+    }
+    free(body);
+    request->_tempObject = nullptr;
+
+    if (!input["networks"].is<JsonArray>()) {
+        request->send(400, "application/json",
+                      "{\"error\":\"need networks:[{ssid,password}]\"}");
+        return;
+    }
+    wifi_nets_clear();
+    for (JsonObject o : input["networks"].as<JsonArray>()) {
+        const char *s = o["ssid"] | "";
+        const char *p = o["password"] | "";
+        if (!s[0]) continue;
+        wifi_nets_upsert(s, p);
+    }
+    if (wifi_net_count == 0) {
+        request->send(400, "application/json", "{\"error\":\"empty list\"}");
+        return;
+    }
+    wifi_persist_profiles();
+    event_add("wifi profiles=%d primary=%s", wifi_net_count, wifi_ssid.c_str());
+
+    JsonDocument out;
+    out["ok"] = true;
+    out["count"] = wifi_net_count;
+    out["ssid"] = wifi_ssid;
+    String response;
+    serializeJson(out, response);
+    request->send(200, "application/json", response);
+
+    /* Kick reconnect with new list. */
+    WiFi.disconnect(false, false);
 }
 
 // ===== Skills =====
@@ -1060,12 +1272,16 @@ static void handle_wifi_post(AsyncWebServerRequest *request) {
 #include "skills/progress.cpp"
 #include "skills/agents.cpp"
 #include "skills/meshcore.cpp"
+#include "skills/backlight.cpp"
+#include "skills/wg.cpp"
 
 static void skills_init() {
     skill_notify_init();
     skill_progress_init();
     skill_agents_init();
     skill_meshcore_init();
+    skill_backlight_init();
+    skill_wg_init();
 }
 
 // Build one second of the home clock face (tembed look, 480x222).
@@ -1103,6 +1319,10 @@ static void ui_clock_paint(const char *note) {
         snprintf(row1l, sizeof(row1l), "WiFi offline");
         snprintf(row2, sizeof(row2), "SPIFFS wifi.json or setup AP");
     }
+    if (hw_kb_locked()) {
+        /* LOCK takes the note row so pocket mode is obvious. */
+        snprintf(row2, sizeof(row2), "LOCKED  long CAPS unlock");
+    }
     if (note && note[0]) snprintf(row2, sizeof(row2), "%s", note);
 
     // Progress borrows the note row when it is free (same rule as tembed).
@@ -1126,7 +1346,8 @@ static void ui_clock_paint(const char *note) {
                      ok, hh, mm, ss, date,
                      notify_crit_unread(),
                      mesh_ui_state(),
-                     mesh_alive_age_s());
+                     mesh_alive_age_s(),
+                     wg_ui_state());
     hw_ui_clock_bar(bar_pct);
 }
 
@@ -1141,6 +1362,7 @@ enum {
     MENU_MESSAGES = 0,
     MENU_AGENTS,
     MENU_MESHCORE,
+    MENU_WIFI,
     MENU_SETTINGS,
     MENU_INFO,
     MENU_BACK,
@@ -1154,14 +1376,41 @@ enum { AGENTS_BACK = 3, AGENTS_LIST_COUNT = 4 };
 enum { AGENT_ACT_CLEAR = 0, AGENT_ACT_BACK, AGENT_ACT_COUNT };
 // Layout picker: 0=ABC 1=PHON 2=RU 3=BACK
 enum { LAYOUT_BACK = 3, LAYOUT_LIST_COUNT = 4 };
+// SETTINGS: 0=LAYOUT 1=BACKLIGHT 2=AUTO-DIM 3=BACK
+enum {
+    SETTINGS_LAYOUT = 0,
+    SETTINGS_BACKLIGHT = 1,
+    SETTINGS_AUTODIM = 2,
+    SETTINGS_BACK = 3,
+    SETTINGS_LIST_COUNT = 4
+};
 // MeshCore menu: 0=STATUS 1=PING 2=BACK
 enum { MESH_ACT_STATUS = 0, MESH_ACT_PING = 1, MESH_ACT_BACK = 2, MESH_LIST_COUNT = 3 };
+// WiFi menu: 0=STATUS 1=SCAN 2=PROFILES 3=BACK
+enum {
+    WIFI_ACT_STATUS = 0,
+    WIFI_ACT_SCAN = 1,
+    WIFI_ACT_PROFILES = 2,
+    WIFI_ACT_BACK = 3,
+    WIFI_LIST_COUNT = 4
+};
+// WiFi list mode (scan results vs saved profiles)
+enum { WIFI_LIST_SCAN = 0, WIFI_LIST_PROFILES = 1 };
 static int menu_sel = 0;
 static int card_act_sel = 0;
 static int agents_sel = 0;
 static int agent_act_sel = 0;
 static int layout_sel = 0;
+static int settings_sel = 0;
 static int mesh_sel = 0;
+static int wifi_sel = 0;
+static int wifi_list_sel = 0;
+static int wifi_list_mode = WIFI_LIST_SCAN;
+static int wifi_list_count = 0;
+static char wifi_list_titles[HW_UI_WIFI_LIST_MAX][36];
+static char wifi_list_ssids[HW_UI_WIFI_LIST_MAX][33];
+static bool wifi_compose = false;           // REPLY screen = enter WiFi password
+static char wifi_pending_ssid[33] = "";
 
 // Home MeshCore gateway (Heltec daemon). Overridable via SPIFFS /mesh_gw.txt
 #define MESH_GW_PATH "/mesh_gw.txt"
@@ -1181,12 +1430,32 @@ static char reply_title[NOTIFY_TITLE_LEN];
 // UTF-8 draft: keep room for ~40 Cyrillic codepoints (2–3 bytes each).
 static char reply_buf[192];
 // Idle return to clock (Advisor: shelf is a clock). Longer while typing.
+// Same timestamp drives backlight auto-dim.
 static unsigned long ui_last_input_ms = 0;
 #define UI_IDLE_MS        15000
 #define UI_IDLE_REPLY_MS  60000
 #define KB_LAYOUT_PATH    "/kb_layout.txt"
 
+static_assert(BL_IDLE_DIM_MS > UI_IDLE_MS,
+              "backlight must not dim while a message card can still be on screen");
+
 static void ui_note_input() { ui_last_input_ms = millis(); }
+
+// SETTINGS face: rebuild labels from backlight skill and paint.
+static void ui_open_settings() {
+    char bl[BL_LABEL_MAX];
+    bl_level_label(backlight_wanted(), bl, sizeof(bl));
+    hw_ui_show_settings(settings_sel, bl, bl_idle_word());
+    ui_note_input();
+}
+
+// Hand the idle policy the elapsed time + what is drawn. Loop only.
+static void ui_backlight_idle() {
+    BacklightPanel panel;
+    panel.on_bar = progress_shown.present;
+    panel.crit_unread = notify_crit_unread();
+    backlight_idle(millis() - ui_last_input_ms, panel);
+}
 
 // ---- keyboard layout persist ----------------------------------------------
 static void kb_layout_load() {
@@ -1215,6 +1484,122 @@ static void mesh_gw_load() {
     s.trim();
     if (s.startsWith("http://") && s.length() < (int)sizeof(mesh_gw_url))
         snprintf(mesh_gw_url, sizeof(mesh_gw_url), "%s", s.c_str());
+}
+
+// ---- Reply upstream ---------------------------------------------------------
+//
+// A reply typed on a card is stored on the device and read back by whoever is
+// still waiting on the line (GET /notify/one). That only serves a caller that
+// stayed. Pushing the same reply to the home gateway serves the one that did
+// not: the gateway holds the routing table and hands it to whichever service
+// asked the question.
+//
+// Two paths, same order the rest of this firmware uses. WiFi is
+// POST {gw}/reply, unauthenticated because the gateway is reachable only over
+// the home LAN or the WireGuard tunnel. When that does not land — no STA, no
+// route, anything but a 2xx — one private mesh DM carries R1|key|reply instead,
+// which is the C1 uplink mechanism with a single frame and no reassembly.
+//
+// The client key is the card's `id`. Without one there is nobody to route to,
+// so nothing is sent and the reply behaves exactly as it did before: stored,
+// and available to a poller.
+//
+// Neither path is allowed to fail loudly. The reply is already in the store by
+// the time this runs, so a gateway that is down costs a routed delivery and
+// nothing else.
+#define REPLY_UP_FRAME_MAX  150   // one MeshCore DM, same budget as C1 uplink
+
+// Staged by Enter, drained by loop(). ui_reply_submit() runs on the loop task
+// already — it is reached from the keyboard drain — so this is not about task
+// safety but about the clock: an HTTP POST with a 5 s timeout inside the key
+// handler freezes the panel between the keystroke and the "sent" face. Raising
+// a flag lets the card paint and return to the clock first, and the blocking
+// work happens further down the same loop pass with nothing left on screen
+// waiting for it. One slot, because it is drained on the pass that fills it and
+// a second Enter cannot arrive inside one iteration.
+static volatile bool reply_up_pending = false;
+static char reply_up_key[NOTIFY_KEY_LEN];
+static char reply_up_text[NOTIFY_REPLY_LEN];
+
+static void reply_upstream_queue(const char *key, const char *text) {
+    if (!key || !key[0] || !text || !text[0]) return;
+    snprintf(reply_up_key, sizeof(reply_up_key), "%s", key);
+    snprintf(reply_up_text, sizeof(reply_up_text), "%s", text);
+    reply_up_pending = true;
+}
+
+// POST {gw}/reply {"key":…,"reply":…}. True only on 2xx — anything else is a
+// gateway that did not take it, and the mesh path is what that is for.
+static bool reply_upstream_http(const char *key, const char *text) {
+    if (WiFi.status() != WL_CONNECTED) return false;
+    if (!mesh_gw_url[0]) return false;
+
+    size_t bl = strlen(mesh_gw_url);
+    while (bl > 0 && mesh_gw_url[bl - 1] == '/') bl--;
+    char url[sizeof(mesh_gw_url) + 8];
+    snprintf(url, sizeof(url), "%.*s/reply", (int)bl, mesh_gw_url);
+
+    JsonDocument doc;
+    doc["key"] = key;
+    doc["reply"] = text;
+    String body;
+    serializeJson(doc, body);
+
+    HTTPClient http;
+    http.setTimeout(5000);
+    if (!http.begin(url)) return false;
+    http.addHeader("Content-Type", "application/json");
+    int code = http.POST(body);
+    http.end();
+    return code >= 200 && code < 300;
+}
+
+// One private DM: R1|key|reply, cut to the frame budget on a codepoint
+// boundary. A reply long enough to need splitting is a reply the gateway can
+// act on truncated — the whole text stays on the device for GET /notify/one —
+// so this stays one frame rather than growing a second reassembly protocol.
+static bool reply_upstream_mesh(const char *key, const char *text) {
+    if (!g_mesh.has_identity || !g_mesh.radio_ready) return false;
+    if (!g_mesh.heltec_pk_hex[0]) return false;
+    if (!mesh_client_ready()) return false;
+
+    char frame[REPLY_UP_FRAME_MAX + 1];
+    int n = snprintf(frame, sizeof(frame), "R1|%s|", key);
+    if (n < 0 || n >= (int)sizeof(frame)) return false;
+
+    size_t room = sizeof(frame) - 1 - (size_t)n;
+    size_t take = strlen(text);
+    if (take > room) take = room;
+    // text[take] is the first byte left behind: a continuation byte there means
+    // the cut landed inside a character, so give the whole character back.
+    while (take > 0 && ((unsigned char)text[take] & 0xC0) == 0x80) take--;
+    if (take == 0) return false;
+    memcpy(frame + n, text, take);
+    frame[n + take] = '\0';
+
+    uint32_t ack = 0, est = 0;
+    return mesh_client_send_to_gateway(frame, &ack, &est);
+}
+
+static void reply_upstream_poll() {
+    if (!reply_up_pending) return;
+    reply_up_pending = false;
+
+    char key[NOTIFY_KEY_LEN];
+    char text[NOTIFY_REPLY_LEN];
+    snprintf(key, sizeof(key), "%s", reply_up_key);
+    snprintf(text, sizeof(text), "%s", reply_up_text);
+    if (!key[0] || !text[0]) return;
+
+    if (reply_upstream_http(key, text)) {
+        event_add("reply upstream wifi ok: %s", key);
+        return;
+    }
+    if (reply_upstream_mesh(key, text)) {
+        event_add("reply upstream mesh R1: %s", key);
+        return;
+    }
+    event_add("reply upstream unreachable: %s (kept on device)", key);
 }
 
 // Pull one JSON string field "key":"value" into out (best-effort, no nested).
@@ -1263,6 +1648,172 @@ static void ui_open_meshcore() {
     ui_note_input();
 }
 
+static void ui_reply_paint();  // defined later (WiFi password reuses reply face)
+
+static void ui_open_wifi() {
+    wifi_sel = 0;
+    wifi_compose = false;
+    hw_ui_show_wifi(wifi_sel);
+    ui_note_input();
+}
+
+static void ui_wifi_paint_list() {
+    const char *ptrs[HW_UI_WIFI_LIST_MAX];
+    for (int i = 0; i < wifi_list_count; i++)
+        ptrs[i] = wifi_list_titles[i];
+    const char *hdr = (wifi_list_mode == WIFI_LIST_PROFILES) ? "PROFILES" : "SCAN";
+    hw_ui_show_wifi_list(hdr, ptrs, wifi_list_count, wifi_list_sel);
+    ui_note_input();
+}
+
+static void ui_wifi_show_status() {
+    static char lines[12][42];
+    static const char *ptrs[12];
+    int n = 0;
+    auto add = [&](const char *fmt, ...) {
+        if (n >= 12) return;
+        va_list ap;
+        va_start(ap, fmt);
+        vsnprintf(lines[n], sizeof(lines[0]), fmt, ap);
+        va_end(ap);
+        ptrs[n] = lines[n];
+        n++;
+    };
+    if (WiFi.status() == WL_CONNECTED) {
+        add("SSID %s", WiFi.SSID().c_str());
+        add("IP   %s", WiFi.localIP().toString().c_str());
+        add("RSSI %d dBm", (int)WiFi.RSSI());
+    } else if (ap_active) {
+        add("AP %s", ap_ssid.c_str());
+        add("IP %s", WiFi.softAPIP().toString().c_str());
+        add("offline STA");
+    } else {
+        add("STA offline");
+    }
+    add("profiles %d  idx %d", wifi_net_count, wifi_net_idx);
+    for (int i = 0; i < wifi_net_count && n < 10; i++) {
+        add("%c %s", (i == wifi_net_idx) ? '*' : ' ', wifi_nets[i].ssid);
+    }
+    switch (wg_ui_state()) {
+    case WG_UI_OK:    add("WG  UP (tunnel)"); break;
+    case WG_UI_WAIT:  add("WG  wait"); break;
+    case WG_UI_STALE: add("WG  stale"); break;
+    case WG_UI_DOWN:  add("WG  DOWN"); break;
+    default:          add("WG  off / no config"); break;
+    }
+    hw_ui_show_wifi_info(ptrs, n);
+    ui_note_input();
+}
+
+static void ui_wifi_do_scan() {
+    /* Blocking scan — paint "SCAN…" first so the panel is not frozen blank. */
+    static const char *wait_lines[] = { "scanning…", "hold on" };
+    hw_ui_show_wifi_info(wait_lines, 2);
+    delay(50);
+
+    int found = WiFi.scanNetworks(/*async=*/false, /*hidden=*/false);
+    wifi_list_mode = WIFI_LIST_SCAN;
+    wifi_list_count = 0;
+    wifi_list_sel = 0;
+    if (found < 0) found = 0;
+    for (int i = 0; i < found && wifi_list_count < HW_UI_WIFI_LIST_MAX; i++) {
+        String ss = WiFi.SSID(i);
+        if (ss.length() == 0) continue;
+        snprintf(wifi_list_ssids[wifi_list_count],
+                 sizeof(wifi_list_ssids[0]), "%s", ss.c_str());
+        bool known = false;
+        for (int j = 0; j < wifi_net_count; j++) {
+            if (strcmp(wifi_nets[j].ssid, wifi_list_ssids[wifi_list_count]) == 0) {
+                known = true;
+                break;
+            }
+        }
+        snprintf(wifi_list_titles[wifi_list_count],
+                 sizeof(wifi_list_titles[0]),
+                 "%s%c %ddBm",
+                 wifi_list_ssids[wifi_list_count],
+                 known ? '*' : ' ',
+                 (int)WiFi.RSSI(i));
+        wifi_list_count++;
+    }
+    WiFi.scanDelete();
+    ui_wifi_paint_list();
+}
+
+static void ui_wifi_show_profiles() {
+    wifi_list_mode = WIFI_LIST_PROFILES;
+    wifi_list_count = 0;
+    wifi_list_sel = 0;
+    for (int i = 0; i < wifi_net_count && wifi_list_count < HW_UI_WIFI_LIST_MAX; i++) {
+        snprintf(wifi_list_ssids[wifi_list_count],
+                 sizeof(wifi_list_ssids[0]), "%s", wifi_nets[i].ssid);
+        snprintf(wifi_list_titles[wifi_list_count],
+                 sizeof(wifi_list_titles[0]),
+                 "%c %s",
+                 (i == wifi_net_idx) ? '*' : ' ',
+                 wifi_nets[i].ssid);
+        wifi_list_count++;
+    }
+    ui_wifi_paint_list();
+}
+
+static void ui_wifi_open_password(const char *ssid) {
+    if (!ssid || !ssid[0]) return;
+    snprintf(wifi_pending_ssid, sizeof(wifi_pending_ssid), "%s", ssid);
+    wifi_compose = true;
+    agent_compose = false;
+    notify_card_id = 0;
+    snprintf(reply_title, sizeof(reply_title), "PASS %s", ssid);
+    reply_buf[0] = '\0';
+    hw_kb_reset_mods();
+    ui_reply_paint();
+    ui_note_input();
+}
+
+/* Connect to a saved profile by ssid, or open password entry if unknown. */
+static void ui_wifi_connect_ssid(const char *ssid) {
+    if (!ssid || !ssid[0]) return;
+    for (int i = 0; i < wifi_net_count; i++) {
+        if (strcmp(wifi_nets[i].ssid, ssid) == 0) {
+            wifi_nets_set_active(i);
+            wifi_persist_profiles();
+            static char lines[4][40];
+            static const char *ptrs[4];
+            snprintf(lines[0], sizeof(lines[0]), "connecting…");
+            snprintf(lines[1], sizeof(lines[1]), "%s", ssid);
+            ptrs[0] = lines[0];
+            ptrs[1] = lines[1];
+            hw_ui_show_wifi_info(ptrs, 2);
+            delay(30);
+            WiFi.disconnect(false, false);
+            delay(80);
+            WiFi.begin(wifi_ssid.c_str(), wifi_pass.c_str());
+            int tries = 0;
+            while (WiFi.status() != WL_CONNECTED && tries < 20) {
+                delay(500);
+                tries++;
+            }
+            if (WiFi.status() == WL_CONNECTED) {
+                snprintf(lines[0], sizeof(lines[0]), "OK %s",
+                         WiFi.localIP().toString().c_str());
+                snprintf(lines[1], sizeof(lines[1]), "SSID %s", ssid);
+                snprintf(lines[2], sizeof(lines[2]), "RSSI %d", (int)WiFi.RSSI());
+                ptrs[2] = lines[2];
+                hw_ui_show_wifi_info(ptrs, 3);
+                event_add("wifi menu connect %s", ssid);
+            } else {
+                snprintf(lines[0], sizeof(lines[0]), "FAIL %s", ssid);
+                snprintf(lines[1], sizeof(lines[1]), "check password");
+                hw_ui_show_wifi_info(ptrs, 2);
+            }
+            ui_note_input();
+            return;
+        }
+    }
+    /* Unknown network from scan → type password. */
+    ui_wifi_open_password(ssid);
+}
+
 // MESHCORE → STATUS: pair keys + RF policy (from SPIFFS /mesh_*).
 static void ui_mesh_show_status() {
     static char lines[HW_UI_MESH_PING_LINES][40];
@@ -1278,8 +1829,8 @@ static void ui_mesh_show_status() {
     ui_note_input();
 }
 
-// MESHCORE → PING GATEWAY: probe home Heltec daemon, show full path info.
-// Today: WiFi RTT to gateway /ping (mesh LoRa RTT when pager RX is ready).
+// MESHCORE → PING GATEWAY: dual-path glance (WiFi HTTP + Mesh private DM).
+// Final face = two big icons (who is up) + strength under each.
 static void ui_mesh_ping_gateway() {
     static char lines[HW_UI_MESH_PING_LINES][48];
     static const char *ptrs[HW_UI_MESH_PING_LINES];
@@ -1294,96 +1845,135 @@ static void ui_mesh_ping_gateway() {
         n++;
     };
 
+    char wifi_s1[24] = "", wifi_s2[24] = "";
+    char mesh_s1[24] = "", mesh_s2[24] = "";
+    bool wifi_ok = false;
+    bool mesh_ok = false;
+
     // --- phase: start ---
     n = 0;
-    push("path: WIFI (mesh RTT later)");
+    push("probing WiFi + Mesh…");
     push("gw: %s", mesh_gw_url);
     push("wifi: %s",
          WiFi.status() == WL_CONNECTED
              ? WiFi.localIP().toString().c_str()
              : "OFFLINE");
-    push("sending GET /ping …");
     hw_ui_show_mesh_ping("PING…", ptrs, n);
     ui_note_input();
     yield();
 
+    // ---- WiFi path: GET gateway /ping ----
+    unsigned long wifi_rtt = 0;
+    int wifi_rssi = 0;
     if (WiFi.status() != WL_CONNECTED) {
+        snprintf(wifi_s1, sizeof(wifi_s1), "offline");
+        snprintf(wifi_s2, sizeof(wifi_s2), "no STA");
+    } else {
+        wifi_rssi = WiFi.RSSI();
+        char url[128];
+        unsigned long t0 = millis();
+        snprintf(url, sizeof(url), "%s/ping?t=%lu", mesh_gw_url, t0);
+
         n = 0;
-        push("wifi: OFFLINE");
-        push("cannot reach home gateway");
-        push("join LAN or wait for mesh RX");
-        hw_ui_show_mesh_ping("FAIL", ptrs, n);
-        ui_note_input();
-        return;
+        push("WiFi GET /ping …");
+        push("%s", mesh_gw_url);
+        push("RSSI %d dBm", wifi_rssi);
+        hw_ui_show_mesh_ping("WIFI", ptrs, n);
+        yield();
+
+        HTTPClient http;
+        http.setTimeout(4000);
+        if (http.begin(url)) {
+            int code = http.GET();
+            wifi_rtt = millis() - t0;
+            http.end();
+            if (code > 0 && code < 400) {
+                wifi_ok = true;
+                snprintf(wifi_s1, sizeof(wifi_s1), "%d dBm", wifi_rssi);
+                snprintf(wifi_s2, sizeof(wifi_s2), "%lu ms", wifi_rtt);
+            } else {
+                snprintf(wifi_s1, sizeof(wifi_s1), "HTTP %d", code);
+                snprintf(wifi_s2, sizeof(wifi_s2), "%lu ms", wifi_rtt);
+            }
+        } else {
+            snprintf(wifi_s1, sizeof(wifi_s1), "begin fail");
+            snprintf(wifi_s2, sizeof(wifi_s2), "bad URL");
+        }
     }
 
-    char url[128];
-    unsigned long t0 = millis();
-    snprintf(url, sizeof(url), "%s/ping?t=%lu", mesh_gw_url, t0);
-
+    // ---- Mesh path: sparse private probe, wait ACK ----
     n = 0;
-    push("wifi: %s", WiFi.localIP().toString().c_str());
-    push("GET %s", mesh_gw_url);
-    push("waiting…");
-    hw_ui_show_mesh_ping("WIFI", ptrs, n);
+    push("Mesh private DM …");
+    push("MC|k → Heltec");
+    if (!g_mesh.has_identity) push("no identity");
+    else if (!g_mesh.radio_ready) push("radio not ready");
+    else if (!g_mesh.heltec_pk_hex[0]) push("no GW pubkey");
+    else push("waiting ACK…");
+    hw_ui_show_mesh_ping("MESH", ptrs, n);
     yield();
 
-    HTTPClient http;
-    http.setTimeout(4000);
-    if (!http.begin(url)) {
-        n = 0;
-        push("http.begin failed");
-        push("%s", mesh_gw_url);
-        hw_ui_show_mesh_ping("FAIL", ptrs, n);
-        ui_note_input();
-        return;
-    }
-    int code = http.GET();
-    unsigned long rtt = millis() - t0;
-    String body = (code > 0) ? http.getString() : String("");
-    http.end();
-
-    n = 0;
-    if (code <= 0) {
-        push("http error %d", code);
-        push("rtt %lu ms (fail)", rtt);
-        push("gw %s", mesh_gw_url);
-        push("is meshcore-daemon up?");
-        hw_ui_show_mesh_ping("FAIL", ptrs, n);
-        ui_note_input();
-        return;
+    uint32_t ok_before = g_mesh.last_ok_ms;
+    uint32_t rtt_before = g_mesh.last_rtt_ms;
+    bool tx = false;
+    if (g_mesh.has_identity && g_mesh.radio_ready && g_mesh.heltec_pk_hex[0]) {
+        tx = mesh_probe_gateway(nullptr);
+        unsigned long t_wait = millis();
+        /* ACK often ~0.5–2s on local path; multi-hop a bit more. */
+        while (millis() - t_wait < 2800UL) {
+            skill_meshcore_poll();
+            if (g_mesh.last_ok_ms != ok_before && g_mesh.last_ok_ms != 0)
+                break;
+            delay(25);
+            yield();
+        }
     }
 
-    // Parse rich /ping JSON (best-effort flat key scan)
-    char name[24] = "", pk[20] = "", mode[16] = "", ch_n[24] = "";
-    long freq = 0, sf = 0, tx = 0, up_s = 0;
-    if (!json_str_field(body.c_str(), "pk16", pk, sizeof(pk)))
-        json_str_field(body.c_str(), "pk8", pk, sizeof(pk));
-    json_num_field(body.c_str(), "freq", &freq);  // 869.618 -> 869
-    json_num_field(body.c_str(), "sf", &sf);
-    json_num_field(body.c_str(), "tx_power", &tx);
-    json_num_field(body.c_str(), "daemon_uptime_s", &up_s);
-    json_str_field(body.c_str(), "notify_mode", mode, sizeof(mode));
-    const char *c0 = strstr(body.c_str(), "channel0");
-    if (c0) json_str_field(c0, "name", ch_n, sizeof(ch_n));
-    const char *rad = strstr(body.c_str(), "\"radio\"");
-    if (rad) json_str_field(rad, "name", name, sizeof(name));
+    if (g_mesh.last_ok_ms != ok_before && g_mesh.last_ok_ms != 0) {
+        mesh_ok = true;
+        uint32_t rtt = g_mesh.last_rtt_ms ? g_mesh.last_rtt_ms
+                                          : (rtt_before ? rtt_before : 0);
+        if (rtt)
+            snprintf(mesh_s1, sizeof(mesh_s1), "%lu ms", (unsigned long)rtt);
+        else
+            snprintf(mesh_s1, sizeof(mesh_s1), "ACK");
+        snprintf(mesh_s2, sizeof(mesh_s2), "live");
+    } else if (tx) {
+        /* TX accepted but no ACK in window — still show last-known if fresh. */
+        int age = mesh_alive_age_s();
+        if (age >= 0 && age < 120) {
+            mesh_ok = true;
+            if (g_mesh.last_rtt_ms)
+                snprintf(mesh_s1, sizeof(mesh_s1), "%lu ms",
+                         (unsigned long)g_mesh.last_rtt_ms);
+            else
+                snprintf(mesh_s1, sizeof(mesh_s1), "recent");
+            snprintf(mesh_s2, sizeof(mesh_s2), "age %ds", age);
+        } else {
+            snprintf(mesh_s1, sizeof(mesh_s1), "no ACK");
+            snprintf(mesh_s2, sizeof(mesh_s2), age >= 0 ? "stale" : "timeout");
+        }
+    } else if (!g_mesh.has_identity) {
+        snprintf(mesh_s1, sizeof(mesh_s1), "no keys");
+        snprintf(mesh_s2, sizeof(mesh_s2), "pair first");
+    } else if (!g_mesh.radio_ready) {
+        snprintf(mesh_s1, sizeof(mesh_s1), "radio");
+        snprintf(mesh_s2, sizeof(mesh_s2), "%s", g_mesh.radio_state);
+    } else if (!g_mesh.heltec_pk_hex[0]) {
+        snprintf(mesh_s1, sizeof(mesh_s1), "no GW");
+        snprintf(mesh_s2, sizeof(mesh_s2), "pair meta");
+    } else {
+        int age = mesh_alive_age_s();
+        snprintf(mesh_s1, sizeof(mesh_s1), "TX fail");
+        if (age >= 0)
+            snprintf(mesh_s2, sizeof(mesh_s2), "age %ds", age);
+        else
+            snprintf(mesh_s2, sizeof(mesh_s2), "never");
+    }
 
-    n = 0;
-    push("RTT  %lu ms   HTTP %d", rtt, code);
-    push("path WIFI->gateway (LAN)");
-    push("mesh: private DM only (no Public)");
-    if (name[0]) push("node %s", name);
-    if (pk[0])   push("pk   %s...", pk);
-    if (freq)    push("RF   %ld MHz  SF%ld  TX%ld", freq, sf, tx);
-    if (ch_n[0]) push("ch0  %s", ch_n);
-    else         push("pair: set pager_pubkey on GW");
-    if (mode[0]) push("egress %s", mode);
-    if (up_s)    push("daemon up %ldh%ldm", up_s / 3600, (up_s / 60) % 60);
-    push("me   %s", WiFi.localIP().toString().c_str());
-
-    hw_ui_show_mesh_ping("OK", ptrs, n);
-    hw_haptic_notify(0);
+    hw_ui_show_mesh_ping_result(wifi_ok, wifi_s1, wifi_s2,
+                                mesh_ok, mesh_s1, mesh_s2);
+    if (wifi_ok || mesh_ok) hw_haptic_notify(0);
+    else hw_haptic_notify(1);
     ui_note_input();
 }
 
@@ -1460,6 +2050,7 @@ static void ui_enter_agent_from_notify(uint32_t id, const NotifyView &v);
 // first_utf8: optional first character (UTF-8); NULL/empty = empty draft.
 static void ui_open_reply(uint32_t id, const char *title, const char *first_utf8) {
     agent_compose = false;
+    wifi_compose = false;
     notify_card_id = id;
     snprintf(reply_title, sizeof(reply_title), "%s", title ? title : "");
     reply_buf[0] = '\0';
@@ -1475,6 +2066,7 @@ static void ui_open_reply(uint32_t id, const char *title, const char *first_utf8
 
 static void ui_open_agent_compose(const char *first_utf8) {
     agent_compose = true;
+    wifi_compose = false;
     notify_card_id = 0;
     snprintf(reply_title, sizeof(reply_title), "-> %s", agents_name(agent_focus));
     reply_buf[0] = '\0';
@@ -1503,6 +2095,19 @@ static bool utf8_is_printable(const char *u) {
 
 static void ui_reply_submit() {
     if (!reply_buf[0]) return;
+    if (wifi_compose) {
+        /* Save password for pending SSID and connect. */
+        char ssid[33];
+        snprintf(ssid, sizeof(ssid), "%s", wifi_pending_ssid);
+        wifi_nets_upsert(ssid, reply_buf);
+        wifi_persist_profiles();
+        reply_buf[0] = '\0';
+        wifi_compose = false;
+        wifi_pending_ssid[0] = '\0';
+        hw_haptic_notify(0);
+        ui_wifi_connect_ssid(ssid);
+        return;
+    }
     if (agent_compose) {
         const char *aid = agents_id(agent_focus);
         if (agents_send(aid, reply_buf)) {
@@ -1519,6 +2124,13 @@ static void ui_reply_submit() {
         hw_haptic_notify(0);
         hw_sound_notify(0);
         event_add("reply id=%lu: %s", (unsigned long)notify_card_id, reply_buf);
+        // Read the card back rather than sending reply_buf: the store cleaned
+        // and truncated it, and what goes upstream must be what GET /notify/one
+        // serves. A card with no client id has nowhere to go — that is the whole
+        // condition, and it leaves the reply stored exactly as before.
+        NotifyView v;
+        if (notify_view_by_id(notify_card_id, v, NULL, NULL) && v.key[0])
+            reply_upstream_queue(v.key, v.reply);
     }
     notify_card_id = 0;
     reply_buf[0] = '\0';
@@ -1812,6 +2424,11 @@ static void ui_card_act_confirm() {
 
 // Handle one click depending on the current face.
 static void ui_on_click() {
+    // Blanked panel: first click only wakes (does not open menu).
+    if (backlight_blanked()) {
+        ui_note_input();
+        return;
+    }
     ui_note_input();
     switch (hw_ui_screen()) {
     case HW_UI_CLOCK:
@@ -1825,14 +2442,51 @@ static void ui_on_click() {
             ui_open_agents();
         } else if (menu_sel == MENU_MESHCORE) {
             ui_open_meshcore();
+        } else if (menu_sel == MENU_WIFI) {
+            ui_open_wifi();
         } else if (menu_sel == MENU_SETTINGS) {
-            layout_sel = (int)hw_kb_layout();
-            hw_ui_show_layout(layout_sel, (int)hw_kb_layout());
-            ui_note_input();
+            settings_sel = 0;
+            ui_open_settings();
         } else if (menu_sel == MENU_INFO) {
             ui_open_info();
         } else {
             ui_go_clock(NULL);
+        }
+        break;
+    case HW_UI_WIFI:
+        if (wifi_sel == WIFI_ACT_BACK) {
+            ui_open_menu();
+        } else if (wifi_sel == WIFI_ACT_STATUS) {
+            ui_wifi_show_status();
+        } else if (wifi_sel == WIFI_ACT_SCAN) {
+            ui_wifi_do_scan();
+        } else if (wifi_sel == WIFI_ACT_PROFILES) {
+            ui_wifi_show_profiles();
+        }
+        break;
+    case HW_UI_WIFI_LIST:
+        if (wifi_list_count == 0) {
+            ui_open_wifi();
+        } else {
+            ui_wifi_connect_ssid(wifi_list_ssids[wifi_list_sel]);
+        }
+        break;
+    case HW_UI_WIFI_INFO:
+        ui_open_wifi();
+        break;
+    case HW_UI_SETTINGS:
+        if (settings_sel == SETTINGS_BACK) {
+            ui_open_menu();
+        } else if (settings_sel == SETTINGS_LAYOUT) {
+            layout_sel = (int)hw_kb_layout();
+            hw_ui_show_layout(layout_sel, (int)hw_kb_layout());
+            ui_note_input();
+        } else if (settings_sel == SETTINGS_BACKLIGHT) {
+            backlight_menu_click();
+            ui_open_settings();
+        } else if (settings_sel == SETTINGS_AUTODIM) {
+            backlight_idle_toggle();
+            ui_open_settings();
         }
         break;
     case HW_UI_MESHCORE:
@@ -1850,7 +2504,7 @@ static void ui_on_click() {
         break;
     case HW_UI_LAYOUT:
         if (layout_sel == LAYOUT_BACK) {
-            ui_open_menu();
+            ui_open_settings();
         } else {
             hw_kb_set_layout((HwKbLayout)layout_sel);
             kb_layout_save();
@@ -1902,6 +2556,11 @@ static void ui_on_click() {
         // Encoder click = send if draft non-empty, else cancel
         if (reply_buf[0]) {
             ui_reply_submit();
+        } else if (wifi_compose) {
+            wifi_compose = false;
+            wifi_pending_ssid[0] = '\0';
+            reply_buf[0] = '\0';
+            ui_open_wifi();
         } else if (agent_compose) {
             agent_compose = false;
             reply_buf[0] = '\0';
@@ -1918,6 +2577,11 @@ static void ui_on_click() {
 // Handle encoder detents.
 static void ui_on_steps(int steps) {
     if (steps == 0) return;
+    // Blanked: detents only wake (no menu navigation under the dark).
+    if (backlight_blanked()) {
+        ui_note_input();
+        return;
+    }
     ui_note_input();
     switch (hw_ui_screen()) {
     case HW_UI_MENU: {
@@ -1925,6 +2589,13 @@ static void ui_on_steps(int steps) {
         while (menu_sel < 0) menu_sel += MENU_COUNT;
         while (menu_sel >= MENU_COUNT) menu_sel -= MENU_COUNT;
         hw_ui_show_menu(menu_sel);
+        break;
+    }
+    case HW_UI_SETTINGS: {
+        settings_sel += steps;
+        while (settings_sel < 0) settings_sel += SETTINGS_LIST_COUNT;
+        while (settings_sel >= SETTINGS_LIST_COUNT) settings_sel -= SETTINGS_LIST_COUNT;
+        ui_open_settings();
         break;
     }
     case HW_UI_CARD_ACT: {
@@ -1954,6 +2625,21 @@ static void ui_on_steps(int steps) {
         while (layout_sel < 0) layout_sel += LAYOUT_LIST_COUNT;
         while (layout_sel >= LAYOUT_LIST_COUNT) layout_sel -= LAYOUT_LIST_COUNT;
         hw_ui_show_layout(layout_sel, (int)hw_kb_layout());
+        break;
+    }
+    case HW_UI_WIFI: {
+        wifi_sel += steps;
+        while (wifi_sel < 0) wifi_sel += WIFI_LIST_COUNT;
+        while (wifi_sel >= WIFI_LIST_COUNT) wifi_sel -= WIFI_LIST_COUNT;
+        hw_ui_show_wifi(wifi_sel);
+        break;
+    }
+    case HW_UI_WIFI_LIST: {
+        if (wifi_list_count <= 0) break;
+        wifi_list_sel += steps;
+        while (wifi_list_sel < 0) wifi_list_sel += wifi_list_count;
+        while (wifi_list_sel >= wifi_list_count) wifi_list_sel -= wifi_list_count;
+        ui_wifi_paint_list();
         break;
     }
     case HW_UI_MESHCORE: {
@@ -2021,6 +2707,10 @@ static void setup_routes() {
     server.on("/skill", HTTP_GET, handle_skill);
     server.on("/", HTTP_GET, handle_wifi_page);
     server.on("/wifi/config", HTTP_POST, handle_wifi_post);
+    server.on("/wifi/status", HTTP_GET, handle_wifi_status);
+    server.on("/wifi/scan", HTTP_GET, handle_wifi_scan);
+    server.on("/wifi/networks", HTTP_POST, handle_wifi_networks_post, NULL,
+              handle_body_collect);
 
     // Register skill routes (notify uses AsyncURIMatcher::exact)
     for (int i = 0; i < g_skill_count; i++) {
@@ -2035,6 +2725,7 @@ void setup() {
     Serial.begin(115200);
     delay(500);
     boot_time = millis();
+    setCpuFrequencyMhz(CPU_MHZ);
 
     if (!SPIFFS.begin(true)) {
         Serial.println("[!] SPIFFS failed");
@@ -2042,6 +2733,8 @@ void setup() {
 
     // Panel + I2C first so the face can say "connecting..." while STA associates.
     hw_ui_begin();
+    // Reclaim AW9364 from the boot pulse in hw_ui; load /backlight.json.
+    backlight_begin();
     hw_input_begin();
     hw_haptic_begin();  // after Wire is up (hw_ui_begin)
     hw_sound_begin();
@@ -2058,7 +2751,8 @@ void setup() {
     setup_routes();
     server.begin();
 
-    Serial.printf("\nESP32 Seed v%s (T-Lora Pager)\n", SEED_VERSION);
+    Serial.printf("\nESP32 Seed v%s (T-Lora Pager) cpu=%u MHz\n",
+                  SEED_VERSION, (unsigned)ESP.getCpuFreqMHz());
     // Token stays off Serial; it is on the panel now.
     if (WiFi.status() == WL_CONNECTED)
         Serial.printf("http://%s:%d/health\n", WiFi.localIP().toString().c_str(), HTTP_PORT);
@@ -2086,17 +2780,26 @@ void loop() {
         if (err == ESP_OK) event_add("firmware auto-confirmed");
     }
 
-    // WiFi reconnect
+    // WiFi reconnect — walk multi-profile list every 30s while offline.
     static unsigned long last_wifi = 0;
     static bool was_connected = false;
     bool now_connected = WiFi.status() == WL_CONNECTED;
-    if (wifi_ssid.length() > 0 && !now_connected &&
+    if ((wifi_net_count > 0 || wifi_ssid.length() > 0) && !now_connected &&
         millis() - last_wifi > 30000) {
-        WiFi.begin(wifi_ssid.c_str(), wifi_pass.c_str());
         last_wifi = millis();
+        /* One profile attempt (~5s) so loop stays responsive. */
+        if (wifi_net_count > 1) {
+            wifi_net_idx = (wifi_net_idx + 1) % wifi_net_count;
+            wifi_nets_set_active(wifi_net_idx);
+        }
+        Serial.printf("[wifi] reconnect try %s\n", wifi_ssid.c_str());
+        WiFi.disconnect(false, false);
+        delay(50);
+        WiFi.begin(wifi_ssid.c_str(), wifi_pass.c_str());
     }
     if (now_connected != was_connected) {
         was_connected = now_connected;
+        if (now_connected) wifi_persist_profiles();
         if (hw_ui_screen() == HW_UI_CLOCK) {
             hw_ui_invalidate_clock();
             ui_clock_paint(now_connected ? "wifi up" : "wifi lost");
@@ -2104,17 +2807,37 @@ void loop() {
     }
 
     // Front panel: encoder + click (must run before screens consume edges).
+    // Pocket lock (long CAPS): swallow wheel + click — keys already silent in
+    // hw_kb. Still poll+drain so detents don't queue and fire after unlock.
     hw_input_poll();
     int steps = hw_input_steps();
     bool click = hw_input_click();
-    if (steps) ui_on_steps(steps);
-    if (click) ui_on_click();
+    if (!hw_kb_locked()) {
+        if (steps) ui_on_steps(steps);
+        if (click) ui_on_click();
+    }
 
     // Keyboard → UTF-8 into reply / open compose from card.
-    // ALT+CAPS cycles layout; refresh reply badge if it changed.
+    // ALT+CAPS cycles layout; long CAPS = full lock (kb + wheel). Refresh badges.
+    // Any key also wakes a blanked panel (stamps idle clock).
     {
         char u8[5];
-        while (hw_kb_read(u8, sizeof(u8))) ui_on_key(u8);
+        while (hw_kb_read(u8, sizeof(u8))) {
+            if (backlight_blanked()) {
+                ui_note_input();
+                continue;  // first key on dark: wake only
+            }
+            ui_on_key(u8);
+        }
+        if (hw_kb_take_lock_changed()) {
+            hw_haptic_notify(hw_kb_locked() ? 1 : 0);
+            if (hw_kb_locked()) hw_sound_notify(0);
+            if (hw_ui_screen() == HW_UI_CLOCK) {
+                hw_ui_invalidate_clock();
+                ui_clock_paint(hw_kb_locked() ? "LOCKED" : "unlocked");
+            }
+            ui_note_input();
+        }
         if (hw_kb_take_layout_changed()) {
             kb_layout_save();
             hw_haptic_notify(0);
@@ -2123,6 +2846,10 @@ void loop() {
                 hw_ui_show_layout(layout_sel, (int)hw_kb_layout());
         }
     }
+
+    // Idle policy owns brightness; drive pulses after the decision.
+    ui_backlight_idle();
+    backlight_poll();
 
     // Idle → clock (longer while typing a reply).
     {
@@ -2138,6 +2865,11 @@ void loop() {
     // Notify skill: expiry, coalesced SPIFFS snapshot, auto-card on arrival
     // only when the user is on the clock (do not yank them out of a menu).
     notify_poll();
+
+    // Typed reply on its way to the gateway. After the keyboard drain above, so
+    // an Enter is carried on the pass that produced it, and after the card has
+    // already painted its way back to the clock.
+    reply_upstream_poll();
 
     // Speaker + haptic FIRST — before any full-screen SPI paint can delay the
     // cue. (Boot tone worked; notify was silent when paint ran first.)
