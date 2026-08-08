@@ -2,8 +2,16 @@
  * skills/meshcore.cpp — MeshCore private-link transport into notify
  *
  * Home Heltec gateway (daemon :8325) sends:
- *   P1|level|source|title|body
- * as a MeshCore private DM (never Public).
+ *   P1|level|source|title|body[|key]
+ * as a MeshCore private DM (never Public). `key` is the card's client id and is
+ * optional; see notify_ingest_p1() for how it is told apart from a body that is
+ * allowed to contain separators of its own.
+ *
+ * The pager answers on the same link with one frame:
+ *   R1|key|reply
+ * built in main.cpp (reply_upstream_mesh) when WiFi cannot reach the gateway.
+ * M1 carries no key: its last field is an arbitrary chunk, so a key sitting
+ * between the title and the chunk could not be told from the chunk itself.
  *
  * Pair identity (Ed25519) lives on SPIFFS:
  *   /mesh_identity.id  — pub(32)+prv(64) MeshCore LocalIdentity blob
@@ -602,7 +610,8 @@ static const SkillEndpoint meshcore_endpoints[] = {
 static const char *meshcore_describe() {
     return "## Skill: meshcore\n\n"
            "Private MeshCore link to home Heltec gateway.\n"
-           "Notify: `P1|level|source|title|body` → same cards as WiFi `/notify`.\n"
+           "Notify: `P1|level|source|title|body[|key]` → same cards as WiFi `/notify`.\n"
+           "Reply: card reply goes up as `R1|key|reply` when WiFi is down.\n"
            "Clock `M`: sparse private keepalive `MC|k` (default every 15 min),\n"
            "MeshCore ACK via stored path/repeaters — never Public flood.\n"
            "SPIFFS: `/mesh_identity.id`, `/mesh_pair.json`, `/mesh_probe_s.txt`.\n";

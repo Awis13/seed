@@ -1246,9 +1246,46 @@ static uint32_t notify_ingest(const char *level_s,
     return id;
 }
 
+/*
+ * Could this be a client key rather than the tail of a body?
+ *
+ * The alphabet is the one every key this pager is sent already uses —
+ * "pingani-a1b2", "hermes-chat", "k1c.print" — and it deliberately excludes the
+ * space, which is what keeps ordinary prose from qualifying. See
+ * notify_ingest_p1() for why a guess is needed here at all.
+ */
+static bool notify_key_plausible(const char *s) {
+    if (!s || !s[0]) return false;
+    size_t n = strlen(s);
+    if (n >= NOTIFY_KEY_LEN) return false;
+    for (size_t i = 0; i < n; i++) {
+        char c = s[i];
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+            (c >= '0' && c <= '9') ||
+            c == '-' || c == '_' || c == '.' || c == ':')
+            continue;
+        return false;
+    }
+    return true;
+}
+
 /* Wire format from home-rig MeshCore gateway:
  *   P1|<info|warn|crit>|<source>|<title>|<body>
- * body may contain '|'. Returns notify id or 0. */
+ *   P1|<info|warn|crit>|<source>|<title>|<body>|<key>
+ * body may contain '|'. Returns notify id or 0.
+ *
+ * The trailing key is the client id, and it is what a reply typed on the card
+ * needs in order to be routed back to whoever asked — a card without one has
+ * nobody upstream, on this transport as much as on the WiFi one.
+ *
+ * Recovering it means guessing, because the body in front of it is unescaped
+ * and may hold separators of its own. The guess is the last '|' of the
+ * remainder, taken only when what follows it could be a key at all
+ * (notify_key_plausible). A five-field frame whose body happens to end in
+ * "|something-like-this" is therefore read as six and loses that tail off the
+ * body. That is the whole cost of the ambiguity, and it is paid in a few
+ * characters of one message rather than in the routing of every reply.
+ */
 static uint32_t notify_ingest_p1(const char *wire) {
     if (!wire || strncmp(wire, "P1|", 3) != 0) return 0;
     const char *p = wire + 3;
@@ -1277,7 +1314,23 @@ static uint32_t notify_ingest_p1(const char *wire) {
     memcpy(title, p, n);
     body = a + 1;
 
-    return notify_ingest(level, source, title, body, NULL);
+    /* Split the optional trailing key off the body. The body copy only happens
+       on that path; a five-field frame keeps pointing straight into `wire`. */
+    char body_buf[NOTIFY_BODY_LEN] = {0};
+    char key[NOTIFY_KEY_LEN] = {0};
+    const char *last = strrchr(body, '|');
+    if (last && notify_key_plausible(last + 1)) {
+        size_t bn = (size_t)(last - body);
+        if (bn >= sizeof(body_buf)) bn = sizeof(body_buf) - 1;
+        /* Back off a cut that landed inside a UTF-8 sequence: notify_copy_text()
+           can only keep the boundary honest on text it is handed whole. */
+        while (bn > 0 && ((unsigned char)body[bn] & 0xC0) == 0x80) bn--;
+        memcpy(body_buf, body, bn);
+        snprintf(key, sizeof(key), "%s", last + 1);
+        body = body_buf;
+    }
+
+    return notify_ingest(level, source, title, body, key[0] ? key : NULL);
 }
 
 /* --- Endpoints --- */
