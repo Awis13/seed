@@ -988,12 +988,12 @@ static const char *const LAYOUT_ITEMS[LAYOUT_N] = {
 };
 
 // Agents list (same geometry language as menu).
-static const int AGENTS_LIST_N = 4;
+static const int AGENTS_LIST_N = 5;
 static const int AGENTS_ROW0_Y = 48;
 static const int AGENTS_ROW_H = 34;
 static const int AGENTS_BAR_H = 28;
 static const char *const AGENTS_LIST_ITEMS[AGENTS_LIST_N] = {
-    "GROK", "CLAUDE", "HERMES", "BACK"
+    "GROK", "CLAUDE", "HERMES", "OPENCODE", "BACK"
 };
 
 // Card action sheet (after click/Enter on a notification).
