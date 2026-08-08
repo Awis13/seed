@@ -977,8 +977,10 @@ static void agents_register_routes(AsyncWebServer &server) {
         if (!body) { notify_send_error(req, 400, "JSON body required"); return; }
         JsonDocument input;
         if (deserializeJson(input, body) != DeserializationError::Ok) {
+            free(body);
             notify_send_error(req, 400, "invalid JSON"); return;
         }
+        free(body);
         const char *agent  = input["agent"]  | "";
         const char *text   = input["text"]   | "";
         const char *sess   = input["session"] | "";
@@ -1010,8 +1012,10 @@ static void agents_register_routes(AsyncWebServer &server) {
         if (!body) { notify_send_error(req, 400, "JSON body required"); return; }
         JsonDocument input;
         if (deserializeJson(input, body) != DeserializationError::Ok) {
+            free(body);
             notify_send_error(req, 400, "invalid JSON"); return;
         }
+        free(body);
         bool all = input["all"] | false;
         const char *agent = input["agent"] | "";
         bool ok = all ? agents_clear("*") : agents_clear(agent);
@@ -1029,8 +1033,10 @@ static void agents_register_routes(AsyncWebServer &server) {
         if (!body) { notify_send_error(req, 400, "JSON body required"); return; }
         JsonDocument input;
         if (deserializeJson(input, body) != DeserializationError::Ok) {
+            free(body);
             notify_send_error(req, 400, "invalid JSON"); return;
         }
+        free(body);
         const char *agent = input["agent"] | "";
         const char *text  = input["text"]  | "";
         if (agents_find(agent) < 0) { notify_send_error(req, 400, "agent must be grok, claude or hermes"); return; }
@@ -1048,6 +1054,8 @@ static void agents_register_routes(AsyncWebServer &server) {
         if (!require_auth(req)) return;
         char *body = notify_take_body(req);
         String url = body ? String(body) : String("");
+        free(body);
+        req->_tempObject = nullptr;
         url.trim();
         if (url.length() > 0 && !url.startsWith("http://")) {
             notify_send_error(req, 400, "URL must start with http://"); return;
@@ -1069,8 +1077,10 @@ static void agents_register_routes(AsyncWebServer &server) {
         if (!body) { notify_send_error(req, 400, "JSON body required"); return; }
         JsonDocument input;
         if (deserializeJson(input, body) != DeserializationError::Ok) {
+            free(body);
             notify_send_error(req, 400, "invalid JSON"); return;
         }
+        free(body);
         const char *agent = input["agent"] | "";
         const char *sess  = input["session"] | "";
         int idx = agents_find(agent);
@@ -1095,8 +1105,10 @@ static void agents_register_routes(AsyncWebServer &server) {
         if (!body) { notify_send_error(req, 400, "JSON body required"); return; }
         JsonDocument input;
         if (deserializeJson(input, body) != DeserializationError::Ok) {
+            free(body);
             notify_send_error(req, 400, "invalid JSON"); return;
         }
+        free(body);
         const char *agent = input["agent"] | "";
         const char *sess  = input["session"] | "";
         int idx = agents_find(agent);

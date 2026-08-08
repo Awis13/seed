@@ -61,6 +61,10 @@
 #define WIFI_CONFIG_FILE    "/wifi.json"
 #define CONFIG_MD_FILE      "/config.md"
 #define TZ_FILE             "/tz.txt"
+// Max POST body collected into _tempObject by handle_body_collect (all routes
+// incl. /agents/*). Was 4 KB; fat chat posts (16 KB plan) need headroom for
+// JSON + escaping. 20 KB covers a 16 KB message with margin.
+#define HTTP_BODY_MAX       20480
 // Prague (CET/CEST). Overridable via POST /clock/tz or SPIFFS /tz.txt.
 #define TZ_DEFAULT          "CET-1CEST,M3.5.0,M10.5.0/3"
 // Anything older than this is the pre-NTP epoch, not a real wall clock.
@@ -790,7 +794,7 @@ static void handle_capabilities(AsyncWebServerRequest *request) {
 static void handle_body_collect(AsyncWebServerRequest *request, uint8_t *data,
                                  size_t len, size_t index, size_t total) {
     if (index == 0) {
-        if (total > 4096) { request->send(413, "application/json", "{\"error\":\"too large\"}"); return; }
+        if (total > HTTP_BODY_MAX) { request->send(413, "application/json", "{\"error\":\"body too large\"}"); return; }
         char *buf = (char*)malloc(total + 1);
         if (!buf) { request->send(500, "application/json", "{\"error\":\"OOM\"}"); return; }
         request->_tempObject = buf;
