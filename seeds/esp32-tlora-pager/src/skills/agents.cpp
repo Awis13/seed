@@ -162,72 +162,58 @@ static void agents_session_sanitize(const char *in, char *out, size_t out_n) {
     out[j] = '\0';
 }
 
-/* JSON-escape for a JSONL "text" value. Keeeps UTF-8 (Cyrillic) bytes as-is;
- * quotes/backslashes doubled, control chars \uXXXX. */
-static void agents_json_escape(const char *in, char *out, size_t out_n) {
-    if (!out || out_n == 0) return;
-    size_t j = 0;
-    if (in) {
-        for (const char *p = in; *p && j + 1 < out_n; p++) {
-            unsigned char c = (unsigned char)*p;
-            if (c == '"' || c == '\\') {
-                if (j + 2 >= out_n) break;
-                out[j++] = '\\'; out[j++] = (char)c;
-            } else if (c < 0x20 || c == 0x7f) {
-                if (j + 6 >= out_n) break;
-                j += (size_t)snprintf(out + j, 7, "\\u%04x", c);
-            } else {
-                out[j++] = (char)c;
-            }
-        }
-    }
-    out[j] = '\0';
-}
-
 /* Append one message to the JSONL file for (agent, active session) and fold it
  * into the RAM viewport index. On a full/broken store it silently keeps the
- * last persisted window (no hardlock). */
+ * last persisted window (no hardlock).
+ *
+ * Written STREAMING (field by field, small stack): this runs on the 8 KB
+ * loop task from the keyboard path, and the old esc[1088]+line[1088] buffers
+ * overran it (Stack canary / loopTask panic on Enter). */
 static void agents_store_append(int idx, bool from_me, const char *text) {
     AgentSlot &a = g_agents[idx];
     uint32_t ts = agents_now_s();
-    /* RAM viewport first — the chat keeps working even when the disk write
-     * fails (card removed / store full). Never surface a "message lost". */
     agents_view_append(a, from_me, ts, text);
     if (!agents_store_ready()) return;
     String path = agents_log_path(a.id, a.sessions[a.active_idx]);
     File f = g_store->open(path.c_str(), "a");
     if (!f) return;
-    char esc[AGENT_JSONL_MAX];
-    agents_json_escape(text, esc, sizeof(esc));
-    char line[AGENT_JSONL_MAX];
-    int n = snprintf(line, sizeof(line),
-                     "{\"ts\":%lu,\"from_me\":%s,\"text\":\"%s\"}\n",
-                     (unsigned long)ts, from_me ? "true" : "false", esc);
-    bool ok = (n > 0 && (size_t)n < sizeof(line));
-    if (ok) {
-        /* write() returns the bytes actually handed to the disk layer
-         * (0/short on full or broken media). Success = full line landed.
-         * lines/file_sync advance ONLY on a real persisted write, so a later
-         * sync re-reads from a correct offset and never folds an unpersisted
-         * line twice. */
-        size_t w = (size_t)n;
-        ok = (f.write((const uint8_t *)line, w) == w);
-        f.flush();          // push buffered FAT/SPIFFS sectors to the card
-        f.close();          // File::close() is void — write() carried the check
-        if (ok) {
-            a.lines++;
-            a.session_lines[a.active_idx]++;
-            a.file_sync += (uint32_t)w;
+    uint32_t written = 0;
+    {
+        char pfx[96];
+        int pn = snprintf(pfx, sizeof(pfx), "{\"ts\":%lu,\"from_me\":%s,\"text\":\"",
+                          (unsigned long)ts, from_me ? "true" : "false");
+        if (pn > 0 && (size_t)pn < sizeof(pfx))
+            written += (uint32_t)f.write((const uint8_t *)pfx, (size_t)pn);
+        char esc[64];
+        const char *p = text;
+        size_t ej = 0;
+        while (p && *p) {
+            unsigned char c = (unsigned char)*p;
+            if (c == '"' || c == '\\') {
+                if (ej + 2 > sizeof(esc)) { written += (uint32_t)f.write((const uint8_t *)esc, ej); ej = 0; }
+                esc[ej++] = '\\'; esc[ej++] = (char)c;
+            } else if (c < 0x20 || c == 0x7f) {
+                if (ej + 6 > sizeof(esc)) { written += (uint32_t)f.write((const uint8_t *)esc, ej); ej = 0; }
+                ej += (size_t)snprintf(esc + ej, sizeof(esc) - ej, "\\u%04x", c);
+            } else {
+                if (ej + 1 > sizeof(esc)) { written += (uint32_t)f.write((const uint8_t *)esc, ej); ej = 0; }
+                esc[ej++] = (char)c;
+            }
+            p++;
         }
-    } else {
-        f.close();
+        if (ej > 0) written += (uint32_t)f.write((const uint8_t *)esc, ej);
+        char sfx[4] = "\"}\n";
+        written += (uint32_t)f.write((const uint8_t *)sfx, 3);
+    }
+    f.flush();
+    f.close();
+    if (written > 0) {
+        a.lines++;
+        a.session_lines[a.active_idx]++;
+        a.file_sync += written;
     }
 }
 
-/* Fold one line into the tail window (keeps newest AGENT_VIEW_MAX).
- * Keeps the invariant  view[0] == absolute line win_start  so
- * agents_thread_is_tail() stays correct on a live tail (a full window drops
- * its oldest line, so win_start moves up exactly one). */
 static void agents_view_append(AgentSlot &a, bool from_me, uint32_t ts,
                                const char *text) {
     if (a.vn >= AGENT_VIEW_MAX) {
