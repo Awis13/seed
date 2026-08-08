@@ -2280,9 +2280,9 @@ static void ui_agent_chat_refresh() {
     static bool from_me[AGENT_THREAD_MAX];
     static const char *line_ptrs[AGENT_THREAD_MAX];
     int n = 0;
-    portENTER_CRITICAL(&agents_mux);
+    agents_lock();
     n = agents_thread_view(agent_focus, lines, from_me, AGENT_THREAD_MAX);
-    portEXIT_CRITICAL(&agents_mux);
+    agents_unlock();
     for (int i = 0; i < n; i++) line_ptrs[i] = lines[i];
     char foot[48];
     snprintf(foot, sizeof(foot), "wheel=scroll  type=msg");
