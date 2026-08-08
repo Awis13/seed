@@ -32,6 +32,7 @@ enum HwUiScreen : uint8_t {
     HW_UI_AGENTS,      // Grok / Claude / Hermes list
     HW_UI_AGENT_CHAT,  // one agent thread
     HW_UI_AGENT_ACT,   // CLEAR / BACK inside a chat room
+    HW_UI_AGENT_SESSIONS,  // session list inside one agent
     HW_UI_MSGLIST,
     HW_UI_INFO,
     HW_UI_REPLY,
@@ -162,6 +163,17 @@ void hw_ui_show_wifi_info(const char *const *lines, int n_lines);
 
 // Agents list: GROK / CLAUDE / HERMES / BACK. selected is 0..3.
 void hw_ui_show_agents(int selected, bool bridge_ok);
+
+// Session list inside one agent: N existing sessions + "NEW SESSION" + "BACK".
+// titles[i] short UTF-8, msgs[i] = message count (negative = no badge),
+// active[i] marks the current session with a * prefix. count up to 10.
+// selected is the highlighted row.
+void hw_ui_show_agent_sessions(const char *agent_name,
+                               const char *const *titles,
+                               const int *msgs,
+                               const bool *active,
+                               int count,
+                               int selected);
 
 // One agent thread. lines[0..] oldest→newest, from_me[] marks user lines.
 // scroll_row: first visual row from top of the wrapped document.

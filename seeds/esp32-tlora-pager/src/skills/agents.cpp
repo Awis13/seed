@@ -9,13 +9,16 @@
  * SPIFFS:
  *   /agent_bridge.txt  — base URL, e.g. http://192.168.1.138:8090  (one line)
  *
- * History (C1):
+ * History:
  *   Non-transient per-(agent, session) history lives on removable SD as an
  *   append-only JSONL file, one message per line:  {ts, from_me, text}.
  *   Only a small viewport window (the last AGENT_VIEW_MAX messages of the
  *   current session) is kept in RAM as an index; the rest stays on disk, so a
  *   "very long history" costs no extra static RAM. Multiple sessions exist per
- *   agent under the key (agent, session); the active session is selectable.
+ *   agent under the key (agent, session); one is active and selectable.
+ *   The chat screen scrolls the whole history page-by-page (older pages are
+ *   loaded from disk on demand) and shows the message timestamp with the
+ *   sender marker.
  *
  *   Store selection is graceful: SD is mounted on the SHARED FSPI bus
  *   (hw_ui_spi(), same instance the ST7796 and SX1262 use — NOT a second
@@ -60,6 +63,7 @@
 
 struct AgentLine {
     bool from_me;
+    uint32_t ts;            // unix seconds (C1 JSONL "ts"); 0 = unknown
     char text[AGENT_TEXT_LEN];
 };
 
@@ -69,16 +73,18 @@ struct AgentSlot {
     char sessions[AGENT_SESSIONS_MAX][AGENT_SESSION_LEN];
     uint8_t n_sessions;
     uint8_t active_idx;         // into sessions[]
+    uint32_t session_lines[AGENT_SESSIONS_MAX];  // persisted msg count per session
     uint32_t file_sync;         // JSONL bytes already folded into view+lines
     uint32_t lines;             // total messages in the active session
     uint8_t vn;                 // messages currently in the view window
-    AgentLine view[AGENT_VIEW_MAX];   // tail of the active session
+    uint32_t win_start;         // absolute line index of view[0] (tail or loaded page)
+    AgentLine view[AGENT_VIEW_MAX];   // window over the active session
 };
 
 static AgentSlot g_agents[AGENTS_N] = {
-    { "grok",   "GROK",   {}, 0, 0, 0, 0, 0, {} },
-    { "claude", "CLAUDE", {}, 0, 0, 0, 0, 0, {} },
-    { "hermes", "HERMES", {}, 0, 0, 0, 0, 0, {} },
+    { "grok",   "GROK",   {}, 0, 0, {}, 0, 0, 0, 0, {} },
+    { "claude", "CLAUDE", {}, 0, 0, {}, 0, 0, 0, 0, {} },
+    { "hermes", "HERMES", {}, 0, 0, {}, 0, 0, 0, 0, {} },
 };
 
 static char g_bridge[AGENT_BRIDGE_LEN] = "";
@@ -106,9 +112,29 @@ static unsigned long agents_now_s() {
 }
 
 /* Forward decls (defined later in this TU; store section uses them early). */
-static void agents_view_append(AgentSlot &a, bool from_me, const char *text);
+static void agents_view_append(AgentSlot &a, bool from_me, uint32_t ts,
+                               const char *text);
 static int agents_find(const char *id);
 static int agents_session_add(int idx, const char *name);
+
+/* Public UI accessors (non-static on purpose — main.cpp needs them cleanly).
+ * Session list, timestamps and the long-scroll paging contract for the chat. */
+int    agents_session_count(int idx);
+const char *agents_session_name(int idx, int i);
+bool   agents_session_is_active(int idx, int i);
+int    agents_session_msg_count(int idx, int i);
+bool   agents_session_refresh_counts(int idx);   // recount all store sessions
+const char *agents_active_session(int idx);
+bool   agents_session_select(int idx, const char *name);
+int    agents_session_create(int idx, const char *wanted, bool &created);
+uint32_t agents_thread_total(int idx);           // messages in active session
+uint32_t agents_thread_start(int idx);           // absolute line of view[0]
+bool   agents_thread_is_tail(int idx);           // window pinned at latest?
+uint32_t agents_thread_line_ts(int idx, int i);  // ts of view[i] (0 unknown)
+void   agents_thread_goto_tail(int idx);         // rewind to latest (sync)
+void   agents_thread_goto_page(int idx, uint32_t end_line);  // load older page
+int    agents_thread_view(int idx, char out[][AGENT_TEXT_LEN], bool *from_me,
+                          uint32_t *ts_out, int max_lines);
 
 /* ---- store ---------------------------------------------------------------- */
 
@@ -163,9 +189,10 @@ static void agents_json_escape(const char *in, char *out, size_t out_n) {
  * last persisted window (no hardlock). */
 static void agents_store_append(int idx, bool from_me, const char *text) {
     AgentSlot &a = g_agents[idx];
+    uint32_t ts = agents_now_s();
     /* RAM viewport first — the chat keeps working even when the disk write
      * fails (card removed / store full). Never surface a "message lost". */
-    agents_view_append(a, from_me, text);
+    agents_view_append(a, from_me, ts, text);
     if (!agents_store_ready()) return;
     String path = agents_log_path(a.id, a.sessions[a.active_idx]);
     File f = g_store->open(path.c_str(), "a");
@@ -175,7 +202,7 @@ static void agents_store_append(int idx, bool from_me, const char *text) {
     char line[AGENT_JSONL_MAX];
     int n = snprintf(line, sizeof(line),
                      "{\"ts\":%lu,\"from_me\":%s,\"text\":\"%s\"}\n",
-                     agents_now_s(), from_me ? "true" : "false", esc);
+                     (unsigned long)ts, from_me ? "true" : "false", esc);
     bool ok = (n > 0 && (size_t)n < sizeof(line));
     if (ok) {
         /* write() returns the bytes actually handed to the disk layer
@@ -189,6 +216,7 @@ static void agents_store_append(int idx, bool from_me, const char *text) {
         f.close();          // File::close() is void — write() carried the check
         if (ok) {
             a.lines++;
+            a.session_lines[a.active_idx]++;
             a.file_sync += (uint32_t)w;
         }
     } else {
@@ -196,37 +224,78 @@ static void agents_store_append(int idx, bool from_me, const char *text) {
     }
 }
 
-/* Fold one line into the tail window (keeps newest AGENT_VIEW_MAX). */
-static void agents_view_append(AgentSlot &a, bool from_me, const char *text) {
+/* Fold one line into the tail window (keeps newest AGENT_VIEW_MAX).
+ * Keeps the invariant  view[0] == absolute line win_start  so
+ * agents_thread_is_tail() stays correct on a live tail (a full window drops
+ * its oldest line, so win_start moves up exactly one). */
+static void agents_view_append(AgentSlot &a, bool from_me, uint32_t ts,
+                               const char *text) {
     if (a.vn >= AGENT_VIEW_MAX) {
         memmove(&a.view[0], &a.view[1], (AGENT_VIEW_MAX - 1) * sizeof(AgentLine));
         a.view[AGENT_VIEW_MAX - 1].from_me = from_me;
+        a.view[AGENT_VIEW_MAX - 1].ts = ts;
         snprintf(a.view[AGENT_VIEW_MAX - 1].text, sizeof(a.view[0].text),
                  "%s", text ? text : "");
+        a.win_start++;
     } else {
         a.view[a.vn].from_me = from_me;
+        a.view[a.vn].ts = ts;
         snprintf(a.view[a.vn].text, sizeof(a.view[0].text), "%s", text ? text : "");
         a.vn++;
     }
 }
 
-static char *agents_jsonl_next_line(File &f, char *buf, size_t buf_n) {
-    size_t i = 0;
-    int c;
-    while (i + 1 < buf_n && (c = f.read()) != -1) {
-        if (c == '\n') break;
-        buf[i++] = (char)c;
-    }
-    if (i == 0 && c == -1) return nullptr;
-    buf[i] = '\0';
-    while (i > 0 && buf[i - 1] == '\r') buf[--i] = '\0';
-    return buf;
-}
+/* Buffered JSONL line scanner. Reads the file in 512-byte blocks instead of
+ * one f.read() per byte — the long-history page load / delta-sync / tail read
+ * paths run on the shared SPI bus and must not freeze the UI on long files. */
+struct AgentJScanner {
+    explicit AgentJScanner(File &file) : f(file), pos(0), len(0), eof(false) {}
+    File f;
+    uint8_t buf[512];
+    size_t pos;      // next unconsumed byte in buf
+    size_t len;      // valid bytes in buf (0 → refill)
+    bool eof;
 
-static bool agents_jsonl_parse(char *buf, bool &from_me, char *text, size_t text_n) {
+    /* One line into [out, n-1]; false at end of file. Strips trailing \r. */
+    bool next(char *out, size_t n) {
+        if (!out || n == 0) return false;
+        size_t i = 0;
+        while (true) {
+            if (pos >= len) {
+                if (eof) break;
+                len = f.read(buf, sizeof(buf));
+                pos = 0;
+                if (len == 0) { eof = true; break; }
+            }
+            uint8_t c = buf[pos++];
+            if (c == '\n') break;
+            if (i + 1 >= n) {   // out buffer full mid-line → drain the rest
+                while (true) {
+                    if (pos >= len) {
+                        if (eof) break;
+                        len = f.read(buf, sizeof(buf));
+                        pos = 0;
+                        if (len == 0) { eof = true; break; }
+                    }
+                    if (buf[pos++] == '\n') break;
+                }
+                break;
+            }
+            out[i++] = (char)c;
+        }
+        if (i == 0) return false;
+        out[i] = '\0';
+        while (i > 0 && out[i - 1] == '\r') out[--i] = '\0';
+        return true;
+    }
+};
+
+static bool agents_jsonl_parse(char *buf, bool &from_me, uint32_t &ts,
+                               char *text, size_t text_n) {
     JsonDocument doc;
     if (deserializeJson(doc, buf) != DeserializationError::Ok) return false;
     from_me = doc["from_me"] | false;
+    ts = doc["ts"] | 0u;
     const char *t = doc["text"] | "";
     snprintf(text, text_n, "%s", t);
     return true;
@@ -240,28 +309,31 @@ static void agents_sync_view(int idx) {
     if (!agents_store_ready()) return;
     String path = agents_log_path(a.id, a.sessions[a.active_idx]);
     if (!g_store->exists(path.c_str())) {
-        a.file_sync = 0; a.lines = 0; a.vn = 0;
+        a.file_sync = 0; a.lines = 0; a.vn = 0; a.win_start = 0;
         return;
     }
     File f = g_store->open(path.c_str(), "r");
-    if (!f) { a.file_sync = 0; a.lines = 0; a.vn = 0; return; }
+    if (!f) { a.file_sync = 0; a.lines = 0; a.vn = 0; a.win_start = 0; return; }
 
     size_t sz = f.size();
     if (sz < a.file_sync) {          // file shrank under us → full rebuild
-        a.file_sync = 0; a.lines = 0; a.vn = 0;
+        a.file_sync = 0; a.lines = 0; a.vn = 0; a.win_start = 0;
     }
     if (a.file_sync < f.size() && f.seek(a.file_sync)) {
         char lbuf[AGENT_JSONL_MAX];
         char text[AGENT_TEXT_LEN];
         bool from_me;
-        while (agents_jsonl_next_line(f, lbuf, sizeof(lbuf))) {
-            if (lbuf[0] && agents_jsonl_parse(lbuf, from_me, text, sizeof(text))) {
-                agents_view_append(a, from_me, text);
+        uint32_t ts;
+        AgentJScanner sc(f);
+        while (sc.next(lbuf, sizeof(lbuf))) {
+            if (lbuf[0] && agents_jsonl_parse(lbuf, from_me, ts, text, sizeof(text))) {
+                agents_view_append(a, from_me, ts, text);
                 a.lines++;
             }
         }
     }
     a.file_sync = (uint32_t)f.size();
+    a.session_lines[a.active_idx] = a.lines;
     f.close();
 }
 
@@ -271,13 +343,8 @@ static void agents_manifest_load() {
     File f = g_store->open(AGENT_MANIFEST, "r");
     if (!f) return;
     char ln[AGENT_ID_LEN + 1 + AGENT_SESSION_LEN + 2];
-    int c, i;
-    while (f.available()) {
-        i = 0;
-        while (i + 1 < (int)sizeof(ln) && (c = f.read()) != -1 && c != '\n')
-            ln[i++] = (char)c;
-        ln[i] = '\0';
-        while (i > 0 && ln[i - 1] == '\r') ln[--i] = '\0';
+    AgentJScanner sc(f);
+    while (sc.next(ln, sizeof(ln))) {
         if (!ln[0]) continue;
         char *tab = strchr(ln, '\t');
         if (!tab || !tab[1]) continue;
@@ -331,31 +398,93 @@ static int agents_session_add(int idx, const char *name) {
     return a.n_sessions - 1;
 }
 
-static const char *agents_active_session(int idx) {
+const char *agents_active_session(int idx) {
     if (idx < 0 || idx >= AGENTS_N) return "";
     return g_agents[idx].sessions[g_agents[idx].active_idx];
 }
 
+int agents_session_count(int idx) {
+    if (idx < 0 || idx >= AGENTS_N) return 0;
+    return g_agents[idx].n_sessions;
+}
+
+const char *agents_session_name(int idx, int i) {
+    if (idx < 0 || idx >= AGENTS_N || i < 0 || i >= g_agents[idx].n_sessions)
+        return "";
+    return g_agents[idx].sessions[i];
+}
+
+bool agents_session_is_active(int idx, int i) {
+    if (idx < 0 || idx >= AGENTS_N || i < 0 || i >= g_agents[idx].n_sessions)
+        return false;
+    return (i == g_agents[idx].active_idx);
+}
+
+int agents_session_msg_count(int idx, int i) {
+    if (idx < 0 || idx >= AGENTS_N || i < 0 || i >= g_agents[idx].n_sessions)
+        return 0;
+    return (int)g_agents[idx].session_lines[i];
+}
+
+/* Recount every session's persisted lines for the agent (cache the counts so
+ * the session-list screen is honest about message numbers without holding the
+ * full history). Opens ≤ AGENT_SESSIONS_MAX files; runs only on screen open.
+ * The active session's window index is not clobbered: if its file count moved
+ * away from the RAM index, re-sync (delta or full) so win_start/lines stay
+ * consistent with view[]. */
+bool agents_session_refresh_counts(int idx) {
+    if (idx < 0 || idx >= AGENTS_N || !agents_store_ready()) return false;
+    agents_lock();
+    AgentSlot &a = g_agents[idx];
+    for (int j = 0; j < a.n_sessions; j++) {
+        String path = agents_log_path(a.id, a.sessions[j]);
+        uint32_t cnt = 0;
+        File f = g_store->open(path.c_str(), "r");
+        if (f) {
+            uint8_t chunk[256];
+            size_t r;
+            while ((r = f.read(chunk, sizeof(chunk))) > 0) {
+                for (size_t k = 0; k < r; k++)
+                    if (chunk[k] == '\n') cnt++;
+            }
+            f.close();
+        }
+        a.session_lines[j] = cnt;
+        if (j == a.active_idx && a.lines != cnt)
+            agents_sync_view(idx);   // re-anchor window + win_start to the file
+    }
+    agents_unlock();
+    return true;
+}
+
 /* Select an existing session: rewind + reload the viewport from SD. */
-static bool agents_session_select(int idx, const char *name) {
+bool agents_session_select(int idx, const char *name) {
     if (idx < 0 || idx >= AGENTS_N || !name || !name[0]) return false;
+    agents_lock();
     int in_list = agents_session_exists(idx, name);
-    if (in_list < 0) return false;
+    if (in_list < 0) { agents_unlock(); return false; }
     g_agents[idx].active_idx = (uint8_t)in_list;
-    g_agents[idx].file_sync = 0; g_agents[idx].lines = 0; g_agents[idx].vn = 0;
+    g_agents[idx].file_sync = 0;
+    g_agents[idx].lines = 0;
+    g_agents[idx].vn = 0;
+    g_agents[idx].win_start = 0;
     agents_sync_view(idx);
+    g_agents[idx].win_start = (g_agents[idx].lines > g_agents[idx].vn)
+        ? (g_agents[idx].lines - g_agents[idx].vn) : 0;
+    agents_unlock();
     return true;
 }
 
 /* Create a fresh session (or reuse an existing name) and make it active.
  * Returns the index in the session list, or -1 on full/empty. */
-static int agents_session_create(int idx, const char *wanted, bool &created) {
+int agents_session_create(int idx, const char *wanted, bool &created) {
     if (idx < 0 || idx >= AGENTS_N) return -1;
+    agents_lock();
     AgentSlot &a = g_agents[idx];
     char name[AGENT_SESSION_LEN];
     if (wanted && wanted[0]) {
         agents_session_sanitize(wanted, name, sizeof(name));
-        if (!name[0]) return -1;
+        if (!name[0]) { agents_unlock(); return -1; }
     } else {
         unsigned long s = agents_now_s();
         for (int k = 0;; k++) {
@@ -367,15 +496,126 @@ static int agents_session_create(int idx, const char *wanted, bool &created) {
     int in_list = agents_session_exists(idx, name);
     created = (in_list < 0);
     if (created) {
-        if (a.n_sessions >= AGENT_SESSIONS_MAX) return -1;
+        if (a.n_sessions >= AGENT_SESSIONS_MAX) { agents_unlock(); return -1; }
         in_list = agents_session_add(idx, name);
     }
     a.active_idx = (uint8_t)in_list;
-    a.file_sync = 0; a.lines = 0; a.vn = 0;
+    a.file_sync = 0; a.lines = 0; a.vn = 0; a.win_start = 0;
     if (created) agents_manifest_persist();
     event_add("agent %s session %s %s", a.id,
               created ? "new" : "select", name);
+    agents_unlock();
     return in_list;
+}
+
+/* ---- viewport / long-scroll ----------------------------------------------- */
+
+/* Build window = the last AGENT_VIEW_MAX lines of the active session ending at
+ * end_line (exclusive), by one forward scan (keeps a sliding window). Used for
+ * scrolling back through very long history. Caller holds no lock (internal). */
+static void agents_load_page(int idx, uint32_t end_line) {
+    AgentSlot &a = g_agents[idx];
+    if (!agents_store_ready()) return;
+    if (end_line > a.lines) end_line = a.lines;
+    uint32_t keep_from = (end_line > AGENT_VIEW_MAX) ? (end_line - AGENT_VIEW_MAX) : 0;
+    String path = agents_log_path(a.id, a.sessions[a.active_idx]);
+    File f = g_store->open(path.c_str(), "r");
+    if (!f) { a.vn = 0; a.win_start = 0; return; }
+    char lbuf[AGENT_JSONL_MAX];
+    char text[AGENT_TEXT_LEN];
+    bool from_me;
+    uint32_t ts;
+    uint32_t line_idx = 0;
+    a.vn = 0;
+    a.win_start = keep_from;
+    AgentJScanner sc(f);
+    while (sc.next(lbuf, sizeof(lbuf))) {
+        if (lbuf[0] && line_idx >= keep_from && line_idx < end_line &&
+            agents_jsonl_parse(lbuf, from_me, ts, text, sizeof(text))) {
+            agents_view_append(a, from_me, ts, text);
+        }
+        line_idx++;
+    }
+    f.close();
+}
+
+/* Re-pin the window to the newest messages of the active session. If the user
+ * was browsing an old page the window is stale, so force a full rebuild; if it
+ * is already the tail, a cheap delta-sync folds any new arrivals. */
+void agents_thread_goto_tail(int idx) {
+    if (idx < 0 || idx >= AGENTS_N) return;
+    agents_lock();
+    AgentSlot &a = g_agents[idx];
+    bool at_tail = ((uint32_t)a.win_start + a.vn) >= a.lines;
+    if (!at_tail) {
+        a.file_sync = 0; a.lines = 0; a.vn = 0;
+    }
+    agents_sync_view(idx);
+    a.win_start = (a.lines > a.vn) ? (a.lines - a.vn) : 0;
+    agents_unlock();
+}
+
+/* Load an older page: the window becomes the last AGENT_VIEW_MAX lines ending
+ * at end_line (usually the current window's win_start) so wheel-up browsing
+ * walks a very long history. If end_line ≥ total, falls back to the tail.
+ * Page-load rescans the file from byte 0 (O(up-to-end)); realistic session
+ * sizes are fast, and the newest page is always O(delta). */
+void agents_thread_goto_page(int idx, uint32_t end_line) {
+    if (idx < 0 || idx >= AGENTS_N) return;
+    agents_lock();
+    AgentSlot &a = g_agents[idx];
+    if (end_line >= a.lines) {
+        a.vn = 0; a.win_start = a.lines;
+    } else {
+        agents_load_page(idx, end_line);
+    }
+    agents_unlock();
+}
+
+uint32_t agents_thread_total(int idx) {
+    return (idx >= 0 && idx < AGENTS_N) ? g_agents[idx].lines : 0;
+}
+
+uint32_t agents_thread_start(int idx) {
+    return (idx >= 0 && idx < AGENTS_N) ? g_agents[idx].win_start : 0;
+}
+
+bool agents_thread_is_tail(int idx) {
+    if (idx < 0 || idx >= AGENTS_N) return true;
+    const AgentSlot &a = g_agents[idx];
+    return ((uint32_t)a.win_start + a.vn) >= a.lines;
+}
+
+uint32_t agents_thread_line_ts(int idx, int i) {
+    if (idx < 0 || idx >= AGENTS_N) return 0;
+    const AgentSlot &a = g_agents[idx];
+    return (i >= 0 && i < a.vn) ? a.view[i].ts : 0;
+}
+
+/* Read the very last message of the active session straight from the store
+ * (used by GET /agents when the RAM window is a rewound page, not the tail). */
+static bool agents_file_last(int idx, char *text, size_t text_n,
+                             bool *from_me, uint32_t *ts) {
+    AgentSlot &a = g_agents[idx];
+    if (!agents_store_ready()) return false;
+    String path = agents_log_path(a.id, a.sessions[a.active_idx]);
+    File f = g_store->open(path.c_str(), "r");
+    if (!f) return false;
+    char lbuf[AGENT_JSONL_MAX];
+    char t2[AGENT_TEXT_LEN];
+    bool fm = false;
+    uint32_t t = 0;
+    bool found = false;
+    AgentJScanner sc(f);
+    while (sc.next(lbuf, sizeof(lbuf))) {
+        if (lbuf[0] && agents_jsonl_parse(lbuf, fm, t, t2, sizeof(t2))) found = true;
+    }
+    f.close();
+    if (!found) return false;
+    if (text) snprintf(text, text_n, "%s", t2);
+    if (from_me) *from_me = fm;
+    if (ts) *ts = t;
+    return true;
 }
 
 /* UTF-8 lead length (1..4). Invalid lead → 1 so we never stall. */
@@ -434,16 +674,20 @@ static void agents_push_line(int idx, bool from_me, const char *text) {
 
 /* Chronological view (oldest first) for the scrollable chat. Synced from SD
  * first. Returns count. Caller may hold the lock (recursive + sync locks). */
-static int agents_thread_view(int idx, char out[][AGENT_TEXT_LEN], bool *from_me,
-                              int max_lines) {
+/* Copy the current window (oldest→newest) for the chat renderer. No disk
+ * reads here — goto_tail / goto_page own the sync. ts_out[i] is the message
+ * unix ts (0 = unknown). Returns count. Caller may hold the recursive lock. */
+int agents_thread_view(int idx, char out[][AGENT_TEXT_LEN], bool *from_me,
+                       uint32_t *ts_out, int max_lines) {
     if (idx < 0 || idx >= AGENTS_N || max_lines <= 0) return 0;
+    int n = 0;
     agents_lock();
-    agents_sync_view(idx);
     AgentSlot &a = g_agents[idx];
-    int n = a.vn < max_lines ? a.vn : max_lines;
+    n = a.vn < max_lines ? a.vn : max_lines;
     for (int i = 0; i < n; i++) {
         snprintf(out[i], AGENT_TEXT_LEN, "%s", a.view[i].text);
         if (from_me) from_me[i] = a.view[i].from_me;
+        if (ts_out)  ts_out[i] = a.view[i].ts;
     }
     agents_unlock();
     return n;
@@ -608,25 +852,42 @@ static void agents_on_inbound(const char *agent_id, const char *text) {
     display_force = true;
 }
 
-/* Clear the ACTIVE session for one agent (or all active sessions if "*"). */
+/* Clear a session's history. Single agent → the ACTIVE session only (UI path);
+ * "*"/empty → every session file + per-session counter for an agent (or all
+ * agents). The session stays registered either way; the active one restarts
+ * with the "chat cleared" line. */
 static bool agents_clear(const char *agent_id) {
     agents_lock();
     bool any = false;
-    auto clear_one = [&](int i) -> void {
+    bool all = (!agent_id || !agent_id[0] || strcmp(agent_id, "*") == 0);
+    auto clear_agent = [&](int i) -> void {
         AgentSlot &a = g_agents[i];
-        if (agents_store_ready()) {
-            String path = agents_log_path(a.id, a.sessions[a.active_idx]);
-            g_store->remove(path.c_str());
+        if (all) {
+            for (int j = 0; j < a.n_sessions; j++) {
+                if (agents_store_ready()) {
+                    String path = agents_log_path(a.id, a.sessions[j]);
+                    g_store->remove(path.c_str());
+                }
+                a.session_lines[j] = 0;
+            }
+            a.file_sync = 0; a.lines = 0; a.vn = 0; a.win_start = 0;
+            agents_push_line(i, false, "chat cleared - type to talk");
+        } else {
+            if (agents_store_ready()) {
+                String path = agents_log_path(a.id, a.sessions[a.active_idx]);
+                g_store->remove(path.c_str());
+            }
+            a.file_sync = 0; a.lines = 0; a.vn = 0; a.win_start = 0;
+            a.session_lines[a.active_idx] = 0;
+            agents_push_line(i, false, "chat cleared - type to talk");
         }
-        a.file_sync = 0; a.lines = 0; a.vn = 0;
-        agents_push_line(i, false, "chat cleared - type to talk");
         any = true;
     };
-    if (!agent_id || !agent_id[0] || strcmp(agent_id, "*") == 0) {
-        for (int i = 0; i < AGENTS_N; i++) clear_one(i);
+    if (all) {
+        for (int i = 0; i < AGENTS_N; i++) clear_agent(i);
     } else {
         int idx = agents_find(agent_id);
-        if (idx >= 0) clear_one(idx);
+        if (idx >= 0) clear_agent(idx);
     }
     agents_unlock();
     display_force = true;
@@ -683,10 +944,26 @@ static void agents_register_routes(AsyncWebServer &server) {
             o["messages"] = a.lines;
             o["active"] = a.sessions[a.active_idx];
             JsonArray sess = o["sessions"].to<JsonArray>();
-            for (int j = 0; j < a.n_sessions; j++) sess.add(a.sessions[j]);
+            JsonArray smsg = o["session_msgs"].to<JsonArray>();
+            for (int j = 0; j < a.n_sessions; j++) {
+                sess.add(a.sessions[j]);
+                smsg.add(a.session_lines[j]);
+            }
             if (a.vn > 0) {
                 o["last"] = a.view[a.vn - 1].text;
                 o["last_from_me"] = a.view[a.vn - 1].from_me;
+                o["last_ts"] = a.view[a.vn - 1].ts;
+            }
+            /* Honest tail for GET even when the RAM window is a rewound page. */
+            if (!agents_thread_is_tail(i)) {
+                bool lfm = false;
+                uint32_t lts = 0;
+                char lt[AGENT_TEXT_LEN];
+                if (agents_file_last(i, lt, sizeof(lt), &lfm, &lts)) {
+                    o["last"] = lt;
+                    o["last_from_me"] = lfm;
+                    o["last_ts"] = lts;
+                }
             }
         }
         agents_unlock();
@@ -880,7 +1157,8 @@ static void skill_agents_init() {
 
     for (int i = 0; i < AGENTS_N; i++) {
         AgentSlot &a = g_agents[i];
-        a.active_idx = 0; a.file_sync = 0; a.lines = 0; a.vn = 0;
+        a.active_idx = 0; a.file_sync = 0; a.lines = 0; a.vn = 0; a.win_start = 0;
+        for (int j = 0; j < AGENT_SESSIONS_MAX; j++) a.session_lines[j] = 0;
         agents_session_add(i, g_session);               // default always present
     }
     agents_manifest_load();                             // existing sessions
@@ -893,6 +1171,7 @@ static void skill_agents_init() {
         snprintf(intro, sizeof(intro), "hi - type to talk to %s", g_agents[i].name);
         if (g_agents[i].lines == 0)
             agents_push_line(i, false, intro);
+        agents_thread_goto_tail(i);
     }
 
     skill_register(&agents_skill);

@@ -1420,6 +1420,19 @@ static int agent_focus = 0;   // which agent chat is open (0..AGENTS_N-1)
 static bool agent_compose = false;  // REPLY screen is for agent, not notify
 static int agent_scroll = -1;       // visual row; -1 = pin to latest
 static int agent_scroll_total = 0;  // last known wrapped row count
+static int agent_sess_sel = 0;      // selected row on the agent SESSIONS list
+// Chat window copy: only the current viewport (AGENT_THREAD_MAX lines) — the
+// full history lives on SD, so no whole-thread RAM snapshot is held.
+static char ag_chat_lines[AGENT_THREAD_MAX][AGENT_TEXT_LEN];
+static bool ag_chat_from_me[AGENT_THREAD_MAX];
+static uint32_t ag_chat_ts[AGENT_THREAD_MAX];
+static const char *ag_chat_ptrs[AGENT_THREAD_MAX];
+// Session-list screen rows: N sessions + "NEW SESSION" + "BACK".
+// ag_sess_msgs[i] < 0 ⇒ no message-count badge on that row.
+static char ag_sess_titles[AGENT_SESSIONS_MAX + 2][AGENT_SESSION_LEN + 2];
+static int  ag_sess_msgs[AGENT_SESSIONS_MAX + 2];
+static bool ag_sess_active[AGENT_SESSIONS_MAX + 2];
+static const char *ag_sess_ptrs[AGENT_SESSIONS_MAX + 2];
 static int msglist_sel = 0;
 // Cached ids for the visible msglist rows (map row → notify id).
 static uint32_t msglist_ids[HW_UI_MSGLIST_MAX];
@@ -2038,6 +2051,8 @@ static void ui_open_notify_id(uint32_t id);
 static void ui_open_card_act();
 static void ui_card_act_confirm();
 static void ui_open_agents();
+static void ui_open_agent_sessions(int idx);
+static void ui_agent_sessions_refresh();
 static void ui_open_agent_chat(int idx);
 static void ui_agent_chat_refresh();
 static void ui_open_agent_act();
@@ -2275,21 +2290,44 @@ static int agents_index_from_door(const NotifyView &v) {
     return agents_find(id);
 }
 
+static void agents_head_time(uint32_t ts, char *out, size_t out_n) {
+    out[0] = '\0';
+    if (!out || out_n < 4 || ts <= 1700000000u) return;  // no wall clock yet
+    time_t t = (time_t)ts;
+    struct tm tmv;
+    if (!localtime_r(&t, &tmv)) return;
+    strftime(out, out_n, "%H:%M", &tmv);
+}
+
 static void ui_agent_chat_refresh() {
-    static char lines[AGENT_THREAD_MAX][AGENT_TEXT_LEN];
-    static bool from_me[AGENT_THREAD_MAX];
-    static const char *line_ptrs[AGENT_THREAD_MAX];
     int n = 0;
     agents_lock();
-    n = agents_thread_view(agent_focus, lines, from_me, AGENT_THREAD_MAX);
+    n = agents_thread_view(agent_focus, ag_chat_lines, ag_chat_from_me,
+                           ag_chat_ts, AGENT_THREAD_MAX);
     agents_unlock();
-    for (int i = 0; i < n; i++) line_ptrs[i] = lines[i];
-    char foot[48];
-    snprintf(foot, sizeof(foot), "wheel=scroll  type=msg");
+    for (int i = 0; i < n; i++) ag_chat_ptrs[i] = ag_chat_lines[i];
+
+    // Header: agent · active session (recency/identity at a glance).
+    char head[32];
+    const char *sess = agents_active_session(agent_focus);
+    if (sess && sess[0])
+        snprintf(head, sizeof(head), "%s · %s", agents_name(agent_focus), sess);
+    else
+        snprintf(head, sizeof(head), "%s", agents_name(agent_focus));
+
+    // Footer: local time of the bottommost message + scroll hint.
+    char foot[56];
+    char tbuf[8];
+    tbuf[0] = '\0';
+    if (n > 0) agents_head_time(ag_chat_ts[n - 1], tbuf, sizeof(tbuf));
+    if (tbuf[0])
+        snprintf(foot, sizeof(foot), "%s  wheel=scroll  type=msg", tbuf);
+    else
+        snprintf(foot, sizeof(foot), "wheel=scroll  type=msg");
+
     int total = 0;
-    agent_scroll = hw_ui_show_agent_chat(
-        agents_name(agent_focus), line_ptrs, from_me, n,
-        agent_scroll, &total, foot);
+    agent_scroll = hw_ui_show_agent_chat(head, ag_chat_ptrs, ag_chat_from_me,
+                                         n, agent_scroll, &total, foot);
     agent_scroll_total = total;
     ui_note_input();
 }
@@ -2300,7 +2338,55 @@ static void ui_open_agent_chat(int idx) {
     agent_focus = idx;
     agent_compose = false;
     agent_scroll = -1;  // pin to latest when entering the room
+    agents_thread_goto_tail(idx);  // load the session's history from the store
     ui_agent_chat_refresh();
+}
+
+/* Sessions screen for the focused agent: existing sessions (with honest
+ * message counts) + "NEW SESSION" + "BACK". Counts are refreshed on open.
+ * When the session registry is full the NEW row turns into a visible
+ * "MAX n SESSIONS" note and is not selectable — no silent refusal. */
+static void ui_agent_sessions_refresh() {
+    int n = agents_session_count(agent_focus);
+    bool full = (n >= AGENT_SESSIONS_MAX);
+    int total = n + 2;
+    for (int i = 0; i < n; i++) {
+        snprintf(ag_sess_titles[i], sizeof(ag_sess_titles[0]), "%s",
+                 agents_session_name(agent_focus, i));
+        ag_sess_msgs[i] = agents_session_msg_count(agent_focus, i);
+        ag_sess_active[i] = agents_session_is_active(agent_focus, i);
+        ag_sess_ptrs[i] = ag_sess_titles[i];
+    }
+    if (full)
+        snprintf(ag_sess_titles[n], sizeof(ag_sess_titles[0]),
+                 "MAX %d SESSIONS", AGENT_SESSIONS_MAX);
+    else
+        snprintf(ag_sess_titles[n], sizeof(ag_sess_titles[0]), "NEW SESSION");
+    ag_sess_msgs[n] = -1; ag_sess_active[n] = false;
+    ag_sess_ptrs[n] = ag_sess_titles[n];
+    snprintf(ag_sess_titles[n + 1], sizeof(ag_sess_titles[0]), "BACK");
+    ag_sess_msgs[n + 1] = -1; ag_sess_active[n + 1] = false;
+    ag_sess_ptrs[n + 1] = ag_sess_titles[n + 1];
+
+    if (agent_sess_sel >= total) agent_sess_sel = total - 1;
+    if (agent_sess_sel < 0) agent_sess_sel = 0;
+    if (full && agent_sess_sel == n)
+        agent_sess_sel = n + 1;   // never land on the disabled NEW row
+    hw_ui_show_agent_sessions(agents_name(agent_focus), ag_sess_ptrs,
+                              ag_sess_msgs, ag_sess_active, total,
+                              agent_sess_sel);
+    ui_note_input();
+}
+
+static void ui_open_agent_sessions(int idx) {
+    if (idx < 0) idx = 0;
+    if (idx >= agents_count()) idx = agents_count() - 1;
+    agent_focus = idx;
+    agents_session_refresh_counts(idx);
+    agent_sess_sel = 0;
+    for (int i = 0; i < agents_session_count(idx); i++)
+        if (agents_session_is_active(idx, i)) { agent_sess_sel = i; break; }
+    ui_agent_sessions_refresh();
 }
 
 static void ui_open_agent_act() {
@@ -2518,9 +2604,35 @@ static void ui_on_click() {
         if (agents_sel == AGENTS_BACK) {
             ui_open_menu();
         } else {
-            ui_open_agent_chat(agents_sel);
+            ui_open_agent_sessions(agents_sel);
         }
         break;
+    case HW_UI_AGENT_SESSIONS: {
+        int n = agents_session_count(agent_focus);
+        if (agent_sess_sel < n) {  // existing session → open its chat
+            const char *nm = agents_session_name(agent_focus, agent_sess_sel);
+            if (nm && nm[0] && agents_session_select(agent_focus, nm)) {
+                hw_haptic_notify(0);
+                ui_open_agent_chat(agent_focus);
+            }
+        } else if (agent_sess_sel == n) {  // NEW SESSION
+            if (n >= AGENT_SESSIONS_MAX) {
+                break;   // row is disabled (shown as "MAX n SESSIONS")
+            }
+            bool created = false;
+            int r = agents_session_create(agent_focus, nullptr, created);
+            if (r >= 0) {
+                agents_push_line(agent_focus, false, "new session - type to talk");
+                hw_haptic_notify(0);
+                ui_open_agent_chat(agent_focus);
+            } else {
+                event_add("agent new session refused (full)");
+            }
+        } else {  // BACK
+            ui_open_agents();
+        }
+        break;
+    }
     case HW_UI_AGENT_CHAT:
         // Click → CLEAR CHAT / BACK sheet (chat room, not notify card)
         ui_open_agent_act();
@@ -2613,6 +2725,22 @@ static void ui_on_steps(int steps) {
         hw_ui_show_agents(agents_sel, agents_bridge_ok());
         break;
     }
+    case HW_UI_AGENT_SESSIONS: {
+        int n = agents_session_count(agent_focus);
+        int cnt = n + 2;
+        if (cnt <= 0) break;
+        agent_sess_sel += steps;
+        while (agent_sess_sel < 0) agent_sess_sel += cnt;
+        while (agent_sess_sel >= cnt) agent_sess_sel -= cnt;
+        if (n >= AGENT_SESSIONS_MAX && agent_sess_sel == n) {
+            // full registry — NEW row disabled: skip over it
+            agent_sess_sel += (steps > 0) ? 1 : -1;
+            if (agent_sess_sel < 0) agent_sess_sel = cnt - 1;
+            if (agent_sess_sel >= cnt) agent_sess_sel = 0;
+        }
+        ui_agent_sessions_refresh();
+        break;
+    }
     case HW_UI_AGENT_ACT: {
         agent_act_sel += steps;
         while (agent_act_sel < 0) agent_act_sel += AGENT_ACT_COUNT;
@@ -2670,15 +2798,40 @@ static void ui_on_steps(int steps) {
         break;
     }
     case HW_UI_AGENT_CHAT: {
-        // Wheel scrolls the wrapped transcript. steps>0 = toward older (up).
-        // Pin-bottom (-1) first materializes to the latest viewport.
+        // Wheel scrolls the wrapped transcript. steps>0 = newer (down the
+        // page, scroll decreases); steps<0 = older (scroll increases).
+        // The RAM window holds the newest messages; scrolling past its top
+        // loads the previous page from the store (long-history browsing).
         if (agent_scroll < 0) {
-            // compute max scroll via a dry refresh path
-            agent_scroll = agent_scroll_total;  // will clamp in paint
+            // pin-bottom (-1) first materializes to the latest viewport
+            agent_scroll = agent_scroll_total;
         }
-        // Invert: positive encoder "down the page" = newer = decrease scroll
-        agent_scroll -= steps;
-        if (agent_scroll < 0) agent_scroll = 0;
+        if (steps > 0) {  // toward newer
+            int ns = agent_scroll - steps;
+            if (ns < 0) {
+                if (!agents_thread_is_tail(agent_focus)) {
+                    agents_thread_goto_tail(agent_focus);  // back to live chat
+                    agent_scroll = -1;
+                    ui_agent_chat_refresh();
+                    break;
+                }
+                ns = 0;
+            }
+            agent_scroll = ns;
+        } else {          // toward older
+            int ns = agent_scroll + (-steps);
+            if (ns > agent_scroll_total) {
+                uint32_t start = agents_thread_start(agent_focus);
+                if (start > 0) {
+                    agents_thread_goto_page(agent_focus, start);  // older page
+                    agent_scroll = -1;  // pin to bottom of the loaded page
+                    ui_agent_chat_refresh();
+                    break;
+                }
+                ns = agent_scroll_total;
+            }
+            agent_scroll = ns;
+        }
         ui_agent_chat_refresh();
         break;
     }
