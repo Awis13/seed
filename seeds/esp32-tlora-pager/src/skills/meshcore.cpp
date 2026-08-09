@@ -275,11 +275,13 @@ static void mesh_reasm_gc() {
     }
 }
 
-static MeshReasm *mesh_reasm_get(char kind, const char *mid) {
+static MeshReasm *mesh_reasm_get(char kind, const char *mid,
+                                 const char *agent = NULL) {
     mesh_reasm_gc();
     for (int i = 0; i < MESH_REASM_SLOTS; i++) {
         if (g_reasm[i].used && g_reasm[i].kind == kind &&
-            strcmp(g_reasm[i].mid, mid) == 0)
+            strcmp(g_reasm[i].mid, mid) == 0 &&
+            (kind != 'C' || strcmp(g_reasm[i].agent, agent ? agent : "") == 0))
             return &g_reasm[i];
     }
     for (int i = 0; i < MESH_REASM_SLOTS; i++) {
@@ -288,6 +290,8 @@ static MeshReasm *mesh_reasm_get(char kind, const char *mid) {
             g_reasm[i].used = true;
             g_reasm[i].kind = kind;
             snprintf(g_reasm[i].mid, sizeof(g_reasm[i].mid), "%s", mid);
+            if (kind == 'C' && agent)
+                snprintf(g_reasm[i].agent, sizeof(g_reasm[i].agent), "%s", agent);
             g_reasm[i].started_ms = millis();
             return &g_reasm[i];
         }
@@ -300,6 +304,8 @@ static MeshReasm *mesh_reasm_get(char kind, const char *mid) {
     g_reasm[victim].used = true;
     g_reasm[victim].kind = kind;
     snprintf(g_reasm[victim].mid, sizeof(g_reasm[victim].mid), "%s", mid);
+    if (kind == 'C' && agent)
+        snprintf(g_reasm[victim].agent, sizeof(g_reasm[victim].agent), "%s", agent);
     g_reasm[victim].started_ms = millis();
     return &g_reasm[victim];
 }
@@ -415,7 +421,7 @@ static uint32_t mesh_on_private_text(const char *text) {
         if (!a) return 0;
         const char *chunk = a + 1;
 
-        MeshReasm *r = mesh_reasm_get('C', mid);
+        MeshReasm *r = mesh_reasm_get('C', mid, agent);
         if (r->got_count == 0) {
             snprintf(r->agent, sizeof(r->agent), "%s", agent);
             r->side = side;

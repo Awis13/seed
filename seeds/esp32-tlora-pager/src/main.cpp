@@ -52,7 +52,7 @@
 #include "hw_kb.h"
 
 // ===== Configuration =====
-#define SEED_VERSION        "0.9.37"
+#define SEED_VERSION        "0.9.38"
 // Core clock: datasheet puts 240 vs 80 ~11.5mA apart on WAITI. Periph bus holds
 // at 80 for every PLL-fed core clock; go lower and RMT/I2S retimes. Same floor
 // as tembed idle policy (no light sleep — notify latency is the job).
@@ -284,19 +284,13 @@ static void hw_probe() {
 // ===== Globals =====
 static AsyncWebServer server(HTTP_PORT);
 static String auth_token = "";
-static String ap_ssid = "";
 static String mdns_name = "";
 static unsigned long boot_time = 0;
 
-// Provisioning AP state. The password is rolled on every raise and lives only
-// in this variable and on the device screen — never persisted, never sent over
-// the wire. ap_active is true only while the softAP is genuinely up; from_setup_ap()
-// keys off it so a gashed AP (softAPIP()==0.0.0.0) can never match a LAN client.
-static bool ap_active = false;
-static String ap_password = "";
-
 static String wifi_ssid = "";
 static String wifi_pass = "";
+static bool wifi_user_off = false;
+static bool mdns_started = false;
 
 /* Multi-profile STA: try each known network in order on boot / reconnect. */
 #define WIFI_MAX_NETS 6
@@ -547,117 +541,11 @@ static bool wifi_save_config(const String &ssid, const String &pass) {
     return wifi_persist_profiles();
 }
 
-/* Try each profile up to attempts_each * 500ms. Returns true on connect. */
-static bool wifi_try_profiles(int attempts_each) {
-    if (wifi_net_count == 0 && wifi_ssid.length() > 0) {
-        wifi_nets_upsert(wifi_ssid.c_str(), wifi_pass.c_str());
-    }
-    if (wifi_net_count == 0) return false;
-
-    for (int n = 0; n < wifi_net_count; n++) {
-        int idx = (wifi_net_idx + n) % wifi_net_count;
-        wifi_nets_set_active(idx);
-        Serial.printf("[wifi] try ssid=%s\n", wifi_ssid.c_str());
-        WiFi.disconnect(false, false);
-        delay(100);
-        WiFi.begin(wifi_ssid.c_str(), wifi_pass.c_str());
-        int attempts = 0;
-        while (WiFi.status() != WL_CONNECTED && attempts < attempts_each) {
-            delay(500);
-            attempts++;
-        }
-        if (WiFi.status() == WL_CONNECTED) {
-            wifi_persist_profiles(); /* remember last-good as primary */
-            Serial.printf("[wifi] STA up %s on %s\n",
-                          WiFi.localIP().toString().c_str(), wifi_ssid.c_str());
-            return true;
-        }
-        Serial.printf("[wifi] fail ssid=%s\n", wifi_ssid.c_str());
-    }
-    return false;
-}
-
-// ===== Provisioning AP =====
-//
-// The softAP is up only while somebody is actually provisioning the node, and
-// its password is random per raise. It used to run permanently in WIFI_AP_STA
-// with the password hardcoded as a #define in a public repo. Combined with
-// handle_wifi_page(), which handed the auth token to any client on the AP
-// subnet, that gave anyone within radio range of a seed sitting inside the
-// owner's LAN a token — and the token is POST /firmware/upload, i.e. arbitrary
-// code on a box behind the firewall.
-
-// The AP subnet is pinned rather than left on the ESP-IDF default of
-// 192.168.4.1/24. from_setup_ap() decides "this client came in over the setup
-// AP" by matching the first three octets, so an AP subnet that a STA network
-// might also use turns that test into a false positive reachable from the LAN.
-// 172.31.157.0/24 sits clear of the common consumer-router defaults and of the
-// 192.168.1.0/24 this node's owner runs at home.
-#define AP_IP_A 172
-#define AP_IP_B  31
-#define AP_IP_C 157
-#define AP_IP_D   1
-
-// One session's password. No lookalike glyphs — this gets typed off the device
-// screen; 12 chars out of a 32-symbol alphabet is 60 bits. Runs after RF is up
-// (wifi_setup() has switched WiFi on), which is what makes esp_random() a
-// hardware RNG rather than a seeded PRNG.
-static void ap_generate_password() {
-    static const char charset[] = "abcdefghijkmnpqrstuvwxyz23456789";
-    const uint32_t n = sizeof(charset) - 1;
-    ap_password = "";
-    for (int i = 0; i < 12; i++) {
-        ap_password += charset[esp_random() % n];
-    }
-}
-
-// Raise the provisioning softAP. `manual` is reserved for a future press-to-raise
-// gesture; today it is always false (called only from wifi_setup() when STA fails).
-static void ap_start(bool manual) {
-    if (ap_active) return;  // idempotent: a re-raise must not re-roll the password
-    (void)manual;
-    ap_generate_password();  // esp_random after RF is up
-    // Pin the subnet before the AP comes up, clear of the owner's LAN, so a LAN
-    // client can never land in it and pass from_setup_ap()'s /24 test. If the pin
-    // fails the AP would fall back to the default 192.168.4.1/24, where a LAN
-    // client could share that subnet and slip past from_setup_ap() — so refuse to
-    // raise the AP at all rather than expose the token-skipping path over the LAN.
-    if (!WiFi.softAPConfig(IPAddress(AP_IP_A, AP_IP_B, AP_IP_C, AP_IP_D),
-                           IPAddress(AP_IP_A, AP_IP_B, AP_IP_C, AP_IP_D),
-                           IPAddress(255, 255, 255, 0))) {
-        event_add("setup AP: subnet pin failed, not raising AP");
-        return;
-    }
-    WiFi.softAP(ap_ssid.c_str(), ap_password.c_str());
-    ap_active = true;
-    event_add("setup AP up: %s", ap_ssid.c_str());  // SSID only, never the password
-}
-
-// True only for a request that arrived over the provisioning AP while that AP is
-// actually up. Both halves matter: once the AP is down softAPIP() is 0.0.0.0 and
-// the subnet test is meaningless, and belonging to some subnet proves nothing on
-// its own. Reaching the node this way costs physical presence plus the per-boot
-// password shown on the screen, which is why this is the one path allowed to
-// skip the token.
-static bool from_setup_ap(AsyncWebServerRequest *request) {
-    if (!ap_active) return false;
-    IPAddress client_ip;
-    client_ip.fromString(request->client()->remoteIP().toString());
-    IPAddress ap_ip = WiFi.softAPIP();
-    return client_ip[0] == ap_ip[0] && client_ip[1] == ap_ip[1] &&
-           client_ip[2] == ap_ip[2];
-}
-
 static void wifi_setup() {
+    WiFi.mode(WIFI_STA);
     String suffix = get_mac_suffix();
-    ap_ssid = "Seed-" + suffix;
     mdns_name = "seed-" + suffix;
     mdns_name.toLowerCase();
-
-    // STA-only: the AP is not started up-front. It comes up only if the stored
-    // credentials fail to get us on the network (see below), so a provisioned
-    // node running on WiFi never offers a way in.
-    WiFi.mode(WIFI_STA);
 
     // Start SNTP with the stored TZ before associating: the daemon is
     // non-blocking and keeps retrying on its own, so the clock also syncs after
@@ -667,21 +555,12 @@ static void wifi_setup() {
 
     wifi_load_config();
     if (wifi_net_count > 0 || wifi_ssid.length() > 0) {
-        /* ~15s per profile (30 * 500ms). Multi-profile walks the list. */
-        if (!wifi_try_profiles(30)) {
-            Serial.println("[wifi] all profiles failed, raising setup AP");
-        }
+        // Boot must never wait for infrastructure. Start one asynchronous STA
+        // attempt; loop() rotates profiles later while UI and MeshCore are live.
+        Serial.printf("[wifi] boot async try %s\n", wifi_ssid.c_str());
+        WiFi.begin(wifi_ssid.c_str(), wifi_pass.c_str());
     } else {
-        Serial.println("[wifi] no credentials in SPIFFS — setup AP only");
-    }
-
-    // Nothing to provision if the stored credentials already got us online: in
-    // that case the AP is never started at all.
-    if (WiFi.status() != WL_CONNECTED) ap_start(false);
-
-    if (MDNS.begin(mdns_name.c_str())) {
-        MDNS.addService("http", "tcp", HTTP_PORT);
-        MDNS.addService("seed", "tcp", HTTP_PORT);
+        Serial.println("[wifi] no credentials — continuing mesh-only");
     }
 }
 
@@ -768,8 +647,6 @@ static void handle_capabilities(AsyncWebServerRequest *request) {
         doc["wifi_ip"] = WiFi.localIP().toString();
         doc["wifi_rssi"] = WiFi.RSSI();
     }
-    doc["ap_ssid"] = ap_ssid;
-    doc["ap_ip"] = WiFi.softAPIP().toString();
 
     JsonArray ep = doc["endpoints"].to<JsonArray>();
     const char *eps[] = {
@@ -1070,12 +947,12 @@ static void handle_skill(AsyncWebServerRequest *request) {
     if (!require_auth(request)) return;
 
     String ip = WiFi.status() == WL_CONNECTED
-        ? WiFi.localIP().toString() : WiFi.softAPIP().toString();
+        ? WiFi.localIP().toString() : String("offline");
 
     String s = "# ESP32 Seed - T-Lora Pager\n\n";
     s += "Host: " + ip + ":" + String(HTTP_PORT) + "\n";
     s += "mDNS: " + mdns_name + ".local\n";
-    s += "AP: " + ap_ssid + "\n\n";
+    s += "WiFi mode: STA only; no provisioning AP\n\n";
     s += "Auth: `Authorization: Bearer <token>` (except /health)\n\n";
     s += "## Grow cycle\n\n";
     s += "ESP32 has no compiler. Build on host, upload binary:\n\n";
@@ -1133,6 +1010,7 @@ static void handle_skill(AsyncWebServerRequest *request) {
 // --- WiFi config page ---
 
 static void handle_wifi_page(AsyncWebServerRequest *request) {
+    if (!require_auth(request)) return;
     String html = "<!DOCTYPE html><html><head><meta charset='utf-8'>"
         "<meta name='viewport' content='width=device-width,initial-scale=1'>"
         "<title>Seed WiFi</title>"
@@ -1149,20 +1027,12 @@ static void handle_wifi_page(AsyncWebServerRequest *request) {
         "<p><a href='/ui' style='color:#58a6ff'>Radio UI</a></p>";
     if (WiFi.status() == WL_CONNECTED)
         html += "<p>Connected: " + WiFi.SSID() + " (" + WiFi.localIP().toString() + ")</p>";
-    // The token is handed out only over the provisioning AP (initial setup) —
-    // never to a client on the LAN, even one that happens to share our subnet.
-    if (from_setup_ap(request)) {
-        html += "<p>Token: " + auth_token + "</p>";
-    }
     html += "</body></html>";
     request->send(200, "text/html", html);
 }
 
 static void handle_wifi_post(AsyncWebServerRequest *request) {
-    // Rewriting the credentials moves the node to a different network, so off the
-    // provisioning AP this needs the token like any other mutating call —
-    // otherwise anyone on the LAN could repoint the device at their own AP.
-    if (!from_setup_ap(request) && !require_auth(request)) return;
+    if (!require_auth(request)) return;
 
     String ssid = "", pass = "";
     if (request->hasParam("ssid", true)) ssid = request->getParam("ssid", true)->value();
@@ -1174,6 +1044,8 @@ static void handle_wifi_post(AsyncWebServerRequest *request) {
     wifi_save_config(ssid, pass);
     request->send(200, "text/html",
         "<h2>Saved. Connecting...</h2><p>" + ssid + "</p><a href='/'>Back</a>");
+    wifi_user_off = false;
+    WiFi.mode(WIFI_STA);
     delay(500);
     WiFi.disconnect(false, false);
     delay(100);
@@ -1184,6 +1056,7 @@ static void handle_wifi_status(AsyncWebServerRequest *request) {
     if (!require_auth(request)) return;
     JsonDocument doc;
     doc["connected"] = (WiFi.status() == WL_CONNECTED);
+    doc["user_off"] = wifi_user_off;
     doc["ssid"] = WiFi.status() == WL_CONNECTED ? WiFi.SSID() : wifi_ssid;
     doc["ip"] = WiFi.status() == WL_CONNECTED
         ? WiFi.localIP().toString() : "";
@@ -1204,7 +1077,11 @@ static void handle_wifi_status(AsyncWebServerRequest *request) {
 
 static void handle_wifi_scan(AsyncWebServerRequest *request) {
     if (!require_auth(request)) return;
-    /* Blocking scan — ok for rare field use; keeps UI free of softAP dance. */
+    /* Blocking scan — user-triggered only; firmware remains STA-only. */
+    if (wifi_user_off) {
+        wifi_user_off = false;
+        WiFi.mode(WIFI_STA);
+    }
     int n = WiFi.scanNetworks(/*async=*/false, /*hidden=*/true);
     JsonDocument doc;
     doc["count"] = n < 0 ? 0 : n;
@@ -1266,7 +1143,10 @@ static void handle_wifi_networks_post(AsyncWebServerRequest *request) {
     request->send(200, "application/json", response);
 
     /* Kick reconnect with new list. */
+    wifi_user_off = false;
+    WiFi.mode(WIFI_STA);
     WiFi.disconnect(false, false);
+    WiFi.begin(wifi_ssid.c_str(), wifi_pass.c_str());
 }
 
 // ===== Skills =====
@@ -1316,15 +1196,10 @@ static void ui_clock_paint(const char *note) {
         snprintf(addr, sizeof(addr), "%s", WiFi.localIP().toString().c_str());
         snprintf(row1l, sizeof(row1l), "RSSI %d dBm", (int)WiFi.RSSI());
         snprintf(row1r, sizeof(row1r), "%s.local", mdns_name.c_str());
-    } else if (ap_active) {
-        snprintf(addr, sizeof(addr), "AP %s", WiFi.softAPIP().toString().c_str());
-        snprintf(row1l, sizeof(row1l), "AP %s", ap_ssid.c_str());
-        snprintf(row1r, sizeof(row1r), "PW %s", ap_password.c_str());
-        snprintf(row2, sizeof(row2), "TOKEN %s", auth_token.c_str());
     } else {
         snprintf(addr, sizeof(addr), "offline");
         snprintf(row1l, sizeof(row1l), "WiFi offline");
-        snprintf(row2, sizeof(row2), "SPIFFS wifi.json or setup AP");
+        snprintf(row2, sizeof(row2), "mesh ready - STA retry async");
     }
     if (hw_kb_locked()) {
         /* LOCK takes the note row so pocket mode is obvious. */
@@ -1414,7 +1289,6 @@ static int mesh_sel = 0;
 static int wifi_sel = 0;
 // User turned WiFi off from the menu: suppress the loop() auto-reconnect until
 // they toggle it back on (garden mesh-only testing).
-static bool wifi_user_off = false;
 static int wifi_list_sel = 0;
 static int wifi_list_mode = WIFI_LIST_SCAN;
 static int wifi_list_count = 0;
@@ -1707,12 +1581,8 @@ static void ui_wifi_show_status() {
         add("SSID %s", WiFi.SSID().c_str());
         add("IP   %s", WiFi.localIP().toString().c_str());
         add("RSSI %d dBm", (int)WiFi.RSSI());
-    } else if (ap_active) {
-        add("AP %s", ap_ssid.c_str());
-        add("IP %s", WiFi.softAPIP().toString().c_str());
-        add("offline STA");
     } else {
-        add("STA offline");
+        add("WiFi %s", wifi_user_off ? "OFF (mesh only)" : "STA offline");
     }
     add("profiles %d  idx %d", wifi_net_count, wifi_net_idx);
     for (int i = 0; i < wifi_net_count && n < 10; i++) {
@@ -1732,19 +1602,22 @@ static void ui_wifi_show_status() {
 // WiFi on/off switch for mesh-only testing in the garden: STA ON (reconnect via
 // saved profiles) or STA OFF (disconnect, leave mesh/WG path alone).
 static void ui_wifi_toggle() {
-    if (WiFi.status() == WL_CONNECTED) {
-        WiFi.disconnect(false, false);
+    if (!wifi_user_off) {
         wifi_user_off = true;
+        WiFi.disconnect(true, false);
+        WiFi.mode(WIFI_OFF);
         event_add("wifi off (mesh only)");
         Serial.println("[wifi] user toggled OFF");
     } else {
         wifi_user_off = false;
-        if (wifi_try_profiles(30)) {
-            event_add("wifi on (reconnected)");
-            Serial.println("[wifi] user toggled ON — connected");
+        WiFi.mode(WIFI_STA);
+        if (wifi_net_count > 0 || wifi_ssid.length() > 0) {
+            WiFi.begin(wifi_ssid.c_str(), wifi_pass.c_str());
+            event_add("wifi on (async reconnect)");
+            Serial.println("[wifi] user toggled ON — reconnecting");
         } else {
-            event_add("wifi on requested, no profile matched");
-            Serial.println("[wifi] user toggled ON — no profile matched");
+            event_add("wifi on requested, no saved profile");
+            Serial.println("[wifi] user toggled ON — no saved profile");
         }
     }
     ui_wifi_show_status();
@@ -1756,6 +1629,11 @@ static void ui_wifi_do_scan() {
     static const char *wait_lines[] = { "scanning…", "hold on" };
     hw_ui_show_wifi_info(wait_lines, 2);
     delay(50);
+
+    if (wifi_user_off) {
+        wifi_user_off = false;
+        WiFi.mode(WIFI_STA);
+    }
 
     int found = WiFi.scanNetworks(/*async=*/false, /*hidden=*/false);
     wifi_list_mode = WIFI_LIST_SCAN;
@@ -1831,27 +1709,17 @@ static void ui_wifi_connect_ssid(const char *ssid) {
             ptrs[1] = lines[1];
             hw_ui_show_wifi_info(ptrs, 2);
             delay(30);
+            wifi_user_off = false;
+            WiFi.mode(WIFI_STA);
             WiFi.disconnect(false, false);
             delay(80);
             WiFi.begin(wifi_ssid.c_str(), wifi_pass.c_str());
-            int tries = 0;
-            while (WiFi.status() != WL_CONNECTED && tries < 20) {
-                delay(500);
-                tries++;
-            }
-            if (WiFi.status() == WL_CONNECTED) {
-                snprintf(lines[0], sizeof(lines[0]), "OK %s",
-                         WiFi.localIP().toString().c_str());
-                snprintf(lines[1], sizeof(lines[1]), "SSID %s", ssid);
-                snprintf(lines[2], sizeof(lines[2]), "RSSI %d", (int)WiFi.RSSI());
-                ptrs[2] = lines[2];
-                hw_ui_show_wifi_info(ptrs, 3);
-                event_add("wifi menu connect %s", ssid);
-            } else {
-                snprintf(lines[0], sizeof(lines[0]), "FAIL %s", ssid);
-                snprintf(lines[1], sizeof(lines[1]), "check password");
-                hw_ui_show_wifi_info(ptrs, 2);
-            }
+            snprintf(lines[0], sizeof(lines[0]), "CONNECTING");
+            snprintf(lines[1], sizeof(lines[1]), "%s", ssid);
+            snprintf(lines[2], sizeof(lines[2]), "async - UI stays live");
+            ptrs[2] = lines[2];
+            hw_ui_show_wifi_info(ptrs, 3);
+            event_add("wifi menu async connect %s", ssid);
             ui_note_input();
             return;
         }
@@ -2933,7 +2801,7 @@ void setup() {
     mesh_gw_load();   // SPIFFS /mesh_gw.txt → home Heltec daemon URL
     hw_probe();
     tz_load();        // before wifi_setup(): configTzTime() needs the TZ string
-    wifi_setup();     // RF up; raises the setup AP if STA fails
+    wifi_setup();     // non-blocking STA attempt; never raises an AP
     token_load();     // after wifi_setup(): needs RF up for a real hardware RNG
     skills_init();    // notify store load + route registration data
     ui_go_clock(WiFi.status() == WL_CONNECTED ? "ready" : "click = menu");
@@ -2946,8 +2814,6 @@ void setup() {
     // Token stays off Serial; it is on the panel now.
     if (WiFi.status() == WL_CONNECTED)
         Serial.printf("http://%s:%d/health\n", WiFi.localIP().toString().c_str(), HTTP_PORT);
-    if (ap_active)
-        Serial.printf("setup AP: %s\n", ap_ssid.c_str());
 
     event_add("seed started v%s", SEED_VERSION);
 }
@@ -2961,9 +2827,11 @@ void loop() {
         ESP.restart();
     }
 
-    // Auto-confirm after 60s
+    // Auto-confirm after 60s of healthy runtime. Confirmation is local flash
+    // metadata and must not depend on infrastructure Wi-Fi; otherwise a valid
+    // mesh-only boot can roll back merely because the router is absent.
     if (!firmware_confirmed && !firmware_confirm_attempted &&
-        (millis() - boot_time) > 60000 && WiFi.status() == WL_CONNECTED) {
+        (millis() - boot_time) > 60000) {
         firmware_confirm_attempted = true;
         esp_err_t err = esp_ota_mark_app_valid_cancel_rollback();
         firmware_confirmed = true;
@@ -2991,7 +2859,17 @@ void loop() {
     }
     if (now_connected != was_connected) {
         was_connected = now_connected;
-        if (now_connected) wifi_persist_profiles();
+        if (now_connected) {
+            wifi_persist_profiles();
+            if (!mdns_started && MDNS.begin(mdns_name.c_str())) {
+                MDNS.addService("http", "tcp", HTTP_PORT);
+                MDNS.addService("seed", "tcp", HTTP_PORT);
+                mdns_started = true;
+            }
+        } else if (mdns_started) {
+            MDNS.end();
+            mdns_started = false;
+        }
         if (hw_ui_screen() == HW_UI_CLOCK) {
             hw_ui_invalidate_clock();
             ui_clock_paint(now_connected ? "wifi up" : "wifi lost");
