@@ -52,7 +52,7 @@
 #include "hw_kb.h"
 
 // ===== Configuration =====
-#define SEED_VERSION        "0.9.38"
+#define SEED_VERSION        "0.9.39"
 // Core clock: datasheet puts 240 vs 80 ~11.5mA apart on WAITI. Periph bus holds
 // at 80 for every PLL-fed core clock; go lower and RMT/I2S retimes. Same floor
 // as tembed idle policy (no light sleep — notify latency is the job).
@@ -1079,7 +1079,6 @@ static void handle_wifi_scan(AsyncWebServerRequest *request) {
     if (!require_auth(request)) return;
     /* Blocking scan — user-triggered only; firmware remains STA-only. */
     if (wifi_user_off) {
-        wifi_user_off = false;
         WiFi.mode(WIFI_STA);
     }
     int n = WiFi.scanNetworks(/*async=*/false, /*hidden=*/true);
@@ -1093,6 +1092,10 @@ static void handle_wifi_scan(AsyncWebServerRequest *request) {
         o["secure"] = (WiFi.encryptionType(i) != WIFI_AUTH_OPEN);
     }
     WiFi.scanDelete();
+    if (wifi_user_off) {
+        WiFi.disconnect(true, false);
+        WiFi.mode(WIFI_OFF);
+    }
     String response;
     serializeJson(doc, response);
     request->send(200, "application/json", response);
@@ -1460,6 +1463,7 @@ static bool reply_upstream_mesh(const char *key, const char *text) {
     if (!g_mesh.has_identity || !g_mesh.radio_ready) return false;
     if (!g_mesh.heltec_pk_hex[0]) return false;
     if (!mesh_client_ready()) return false;
+    if (mesh_client_ack_pending()) return false;
 
     char frame[REPLY_UP_FRAME_MAX + 1];
     int n = snprintf(frame, sizeof(frame), "R1|%s|", key);
@@ -1481,7 +1485,6 @@ static bool reply_upstream_mesh(const char *key, const char *text) {
 
 static void reply_upstream_poll() {
     if (!reply_up_pending) return;
-    reply_up_pending = false;
 
     char key[NOTIFY_KEY_LEN];
     char text[NOTIFY_REPLY_LEN];
@@ -1490,13 +1493,19 @@ static void reply_upstream_poll() {
     if (!key[0] || !text[0]) return;
 
     if (reply_upstream_http(key, text)) {
+        reply_up_pending = false;
         event_add("reply upstream wifi ok: %s", key);
         return;
     }
+    // C1/probe/R1 share one MeshCore ACK slot. Keep this reply pending until
+    // the current private frame completes instead of overwriting its CRC.
+    if (mesh_client_ack_pending()) return;
     if (reply_upstream_mesh(key, text)) {
+        reply_up_pending = false;
         event_add("reply upstream mesh R1: %s", key);
         return;
     }
+    reply_up_pending = false;
     event_add("reply upstream unreachable: %s (kept on device)", key);
 }
 
@@ -1631,7 +1640,6 @@ static void ui_wifi_do_scan() {
     delay(50);
 
     if (wifi_user_off) {
-        wifi_user_off = false;
         WiFi.mode(WIFI_STA);
     }
 
@@ -1661,6 +1669,10 @@ static void ui_wifi_do_scan() {
         wifi_list_count++;
     }
     WiFi.scanDelete();
+    if (wifi_user_off) {
+        WiFi.disconnect(true, false);
+        WiFi.mode(WIFI_OFF);
+    }
     ui_wifi_paint_list();
 }
 

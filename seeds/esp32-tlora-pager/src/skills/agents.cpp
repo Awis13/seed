@@ -897,9 +897,9 @@ void agents_gps_pending(const char *agent_id) {
 }
 
 /* Public: send a line as the user, into the agent's ACTIVE session.
- * Path: local thread/history → WiFi bridge if up → else MeshCore C1 uplink.
- * Codex owns a dedicated gateway inbox and therefore always uses C1; sending
- * it to the legacy /v1/chat bridge while WiFi is up would bypass Codex.
+ * Path: local thread/history → owned transport. OpenCode and Codex have
+ * dedicated gateway inboxes and always use C1; the legacy /v1/chat bridge
+ * would create a second, ambiguous consumer while WiFi is up.
  * Downlink reply uses the same C1 (or WiFi /agents/inbound). One chat loop. */
 static bool agents_send(const char *agent_id, const char *text) {
     int idx = agents_find(agent_id);
@@ -919,7 +919,8 @@ static bool agents_send(const char *agent_id, const char *text) {
     agents_unlock();
     display_force = true;
 
-    bool mesh_owned = strcmp(agent_id, "codex") == 0;
+    bool mesh_owned = strcmp(agent_id, "codex") == 0 ||
+                      strcmp(agent_id, "opencode") == 0;
     bool wifi_ok = mesh_owned
         ? false
         : agents_bridge_post(agent_id, agents_active_session(idx), cleaned);

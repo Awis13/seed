@@ -277,6 +277,8 @@ public:
   }
 
   uint32_t lastSendMs() const { return last_msg_sent_ms; }
+  bool ackPending() const { return expected_ack_crc != 0; }
+  void cancelPendingAck() { expected_ack_crc = 0; }
 
   void tick() {
     // keep RTC moving
@@ -334,6 +336,14 @@ bool mesh_client_send_to_gateway(const char *text, uint32_t *expected_ack,
                                  uint32_t *est_timeout_ms) {
   if (!g_client || !g_ready) return false;
   return g_client->sendToGateway(text, expected_ack, est_timeout_ms);
+}
+
+bool mesh_client_ack_pending() {
+  return g_ready && g_client && g_client->ackPending();
+}
+
+void mesh_client_cancel_pending_ack() {
+  if (g_client) g_client->cancelPendingAck();
 }
 
 uint32_t mesh_client_last_send_ms() {

@@ -19,6 +19,12 @@ bool mesh_client_ready();
 bool mesh_client_send_to_gateway(const char *text, uint32_t *expected_ack,
                                  uint32_t *est_timeout_ms);
 
+// Exactly one private send may await a MeshCore ACK at a time. Multi-part
+// callers use these to serialize frames and cancel a timed-out expectation
+// before retrying the same frame.
+bool mesh_client_ack_pending();
+void mesh_client_cancel_pending_ack();
+
 // Last send millis (for ACK RTT).
 uint32_t mesh_client_last_send_ms();
 
