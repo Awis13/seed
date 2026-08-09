@@ -1393,13 +1393,14 @@ enum {
 };
 // MeshCore menu: 0=STATUS 1=PING 2=BACK
 enum { MESH_ACT_STATUS = 0, MESH_ACT_PING = 1, MESH_ACT_BACK = 2, MESH_LIST_COUNT = 3 };
-// WiFi menu: 0=STATUS 1=SCAN 2=PROFILES 3=BACK
+// WiFi menu: 0=STATUS 1=SCAN 2=PROFILES 3=TOGGLE 4=BACK
 enum {
     WIFI_ACT_STATUS = 0,
     WIFI_ACT_SCAN = 1,
     WIFI_ACT_PROFILES = 2,
-    WIFI_ACT_BACK = 3,
-    WIFI_LIST_COUNT = 4
+    WIFI_ACT_TOGGLE = 3,
+    WIFI_ACT_BACK = 4,
+    WIFI_LIST_COUNT = 5
 };
 // WiFi list mode (scan results vs saved profiles)
 enum { WIFI_LIST_SCAN = 0, WIFI_LIST_PROFILES = 1 };
@@ -1722,6 +1723,26 @@ static void ui_wifi_show_status() {
     default:          add("WG  off / no config"); break;
     }
     hw_ui_show_wifi_info(ptrs, n);
+    ui_note_input();
+}
+
+// WiFi on/off switch for mesh-only testing in the garden: STA ON (reconnect via
+// saved profiles) or STA OFF (disconnect, leave mesh/WG path alone).
+static void ui_wifi_toggle() {
+    if (WiFi.status() == WL_CONNECTED) {
+        WiFi.disconnect(false, false);
+        event_add("wifi off (mesh only)");
+        Serial.println("[wifi] user toggled OFF");
+    } else {
+        if (wifi_try_profiles(30)) {
+            event_add("wifi on (reconnected)");
+            Serial.println("[wifi] user toggled ON — connected");
+        } else {
+            event_add("wifi on requested, no profile matched");
+            Serial.println("[wifi] user toggled ON — no profile matched");
+        }
+    }
+    ui_wifi_show_status();
     ui_note_input();
 }
 
@@ -2557,6 +2578,8 @@ static void ui_on_click() {
             ui_wifi_do_scan();
         } else if (wifi_sel == WIFI_ACT_PROFILES) {
             ui_wifi_show_profiles();
+        } else if (wifi_sel == WIFI_ACT_TOGGLE) {
+            ui_wifi_toggle();
         }
         break;
     case HW_UI_WIFI_LIST:
