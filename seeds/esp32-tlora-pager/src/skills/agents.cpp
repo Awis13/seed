@@ -146,7 +146,10 @@ static bool agents_store_ready() { return g_store != nullptr; }
 /* Flat key path (no directory on SPIFFS; FAT root on SD). Session is already
  * sanitised to [A-Za-z0-9._-]. */
 static String agents_log_path(const char *agent_id, const char *session) {
-    return String("/") + AGENT_LOG_PREFIX + "." + agent_id + "." + session + ".jsonl";
+    /* SPIFFS object-name limit is 32 bytes (31 usable incl. NUL). A suffix of
+     * ".jsonl" pushed the opencode agent's path past it — file never created,
+     * empty thread, black chat screen. Drop the extension; content stays JSONL. */
+    return String("/") + AGENT_LOG_PREFIX + "." + agent_id + "." + session;
 }
 
 static void agents_session_sanitize(const char *in, char *out, size_t out_n) {
