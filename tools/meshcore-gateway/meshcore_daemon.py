@@ -1,0 +1,1045 @@
+#!/usr/bin/env python3
+"""MeshCore Home Rig Daemon — Heltec V3 Companion USB gateway.
+
+Roles:
+  1) Mesh command bot (ping/status/…) → DM reply
+  2) Pager transport: P1|level|source|title|body → POST pager /notify
+  3) HTTP webhook POST /send → mesh DM to target contact
+  4) HTTP POST /pager → force-send a P1 notify over mesh channel (optional)
+
+Payload (our layer on top of MeshCore text):
+  P1|<info|warn|crit>|<source>|<title>|<body>
+  M1|mid|i|n|level|source|title|chunk   — long notify
+  C1|agent|mid|i|n|side|chunk           — chat (side u=uplink user, a=agent)
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import os
+import shutil
+import signal
+import subprocess
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+from typing import Any
+
+import yaml
+from aiohttp import web
+from meshcore import EventType, MeshCore
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+log = logging.getLogger("meshcore-daemon")
+
+cfg: dict = {}
+mc: MeshCore | None = None
+target_contact = None
+start_time = time.monotonic()
+inet_was_up = True
+
+# Uplink C1 reassembly (pager → home). Keyed by mid.
+_c1_uplink: dict[str, dict[str, Any]] = {}
+# Dedicated agent channels. Each C1 uplink is queued only for the matching
+# bridge and each downlink must present the exact source/id pair. This keeps
+# OpenCode and Codex from consuming or spoofing one another's conversations.
+AGENT_CHANNELS: dict[str, dict[str, str]] = {
+    "opencode": {
+        "source": "opencode-pager",
+        "id": "opencode-chat",
+        "title": "OPENCODE",
+    },
+    "codex": {
+        "source": "codex-pager",
+        "id": "codex-chat",
+        "title": "CODEX",
+    },
+}
+_agent_inboxes: dict[str, list[dict[str, Any]]] = {
+    agent: [] for agent in AGENT_CHANNELS
+}
+_AGENT_INBOX_MAX = 200
+
+
+def _agent_channel_for_payload(payload: dict) -> tuple[str, dict[str, str]] | None:
+    """Return the exact channel selected by a trusted source/id tuple."""
+    source = str(payload.get("source") or "")
+    key = str(payload.get("id") or "")
+    for agent, channel in AGENT_CHANNELS.items():
+        if source == channel["source"] and key == channel["id"]:
+            return agent, channel
+    return None
+
+
+def enqueue_agent_message(agent: str, text: str, ts: int | None = None) -> bool:
+    queue = _agent_inboxes.get(agent)
+    if queue is None:
+        return False
+    queue.append({"text": text, "ts": int(time.time()) if ts is None else ts})
+    if len(queue) > _AGENT_INBOX_MAX:
+        del queue[: len(queue) - _AGENT_INBOX_MAX]
+    return True
+
+
+def drain_agent_messages(agent: str) -> list[dict[str, Any]]:
+    queue = _agent_inboxes.get(agent)
+    if queue is None:
+        return []
+    items = list(queue)
+    queue.clear()
+    return items
+
+
+def load_config() -> dict:
+    config_path = Path(__file__).parent / "config.yaml"
+    with open(config_path) as f:
+        return yaml.safe_load(f) or {}
+
+
+def truncate(text: str, limit: int = 200) -> str:
+    text = text.strip()
+    if len(text) <= limit:
+        return text
+    return text[: limit - 3] + "..."
+
+
+def run_shell(cmd: str, timeout: int = 10) -> str:
+    try:
+        r = subprocess.run(
+            cmd, shell=True, capture_output=True, text=True, timeout=timeout
+        )
+        out = (r.stdout + r.stderr).strip()
+        return out if out else "(no output)"
+    except subprocess.TimeoutExpired:
+        return "(timeout)"
+    except Exception as e:
+        return f"(error: {e})"
+
+
+def check_inet(host: str = "8.8.8.8") -> bool:
+    try:
+        subprocess.run(
+            ["ping", "-c", "1", "-W", "3", host],
+            capture_output=True,
+            timeout=5,
+        )
+        return True
+    except Exception:
+        return False
+
+
+# ── P1 payload ───────────────────────────────────────────────────────────────
+
+def parse_p1(text: str) -> dict | None:
+    """Parse P1|level|source|title|body — body may contain |."""
+    if not text.startswith("P1|"):
+        return None
+    parts = text.split("|", 4)
+    if len(parts) < 5:
+        return None
+    _, level, source, title, body = parts
+    level = (level or "info").strip().lower()
+    if level not in ("info", "warn", "crit"):
+        level = "info"
+    return {
+        "level": level,
+        "source": (source or "mesh")[:16],
+        "title": (title or "mesh")[:40],
+        "body": (body or "")[:256],
+    }
+
+
+def _utf8_fit(text: str, max_bytes: int) -> str:
+    raw = (text or "").encode("utf-8")
+    if len(raw) <= max_bytes:
+        return text or ""
+    return raw[:max_bytes].decode("utf-8", errors="ignore")
+
+
+def _utf8_chunks(raw: bytes, room: int) -> list[str]:
+    """Split UTF-8 bytes without dropping a complete final multibyte char."""
+    chunks: list[str] = []
+    i = 0
+    while i < len(raw):
+        end = min(i + room, len(raw))
+        while end > i:
+            try:
+                piece = raw[i:end].decode("utf-8")
+                break
+            except UnicodeDecodeError:
+                end -= 1
+        if end == i:
+            # room is always >=16 for mesh frames, so this is defensive only.
+            end = min(i + 1, len(raw))
+            piece = raw[i:end].decode("utf-8", errors="ignore")
+        chunks.append(piece)
+        i = end
+    return chunks
+
+
+def encode_p1(payload: dict) -> str:
+    """Single-frame notify. Prefer encode_mesh_frames() for long bodies."""
+    frames = encode_mesh_frames(payload)
+    return frames[0] if frames else "P1|info|home|notify|"
+
+
+def encode_mesh_frames(payload: dict) -> list[str]:
+    """Build private-DM frame(s). MeshCore text MTU ~160; keep limit ≤150.
+
+    Short body → one P1|level|source|title|body
+    Long body  → M1|mid|i|n|level|source|title|chunk  (1-based i, n parts)
+    Chat door (source/id ends with -chat or source in grok|claude|hermes):
+                 C1|agent|mid|i|n|a|chunk  (side a=agent, u=user)
+    """
+    limit = int(cfg.get("mesh_msg_limit", 150))
+    level = (payload.get("level") or "info").strip().lower()
+    if level not in ("info", "warn", "crit"):
+        level = "info"
+    source = (payload.get("source") or "home")[:16]
+    title = (payload.get("title") or "notify")[:60]
+    body = payload.get("body") or ""
+    key = payload.get("id") or ""
+    force_p1 = bool(payload.get("_force_p1"))
+    if not force_p1 and isinstance(key, str) and key.endswith("-chat"):
+        agent = key.replace("-chat", "")[:12] or source[:12]
+        return _encode_c1(agent, body, side="a", limit=limit)
+    if not force_p1 and (source in ("grok", "claude", "hermes") or
+                         source.endswith("-chat")):
+        agent = source.replace("-chat", "")[:12]
+        return _encode_c1(agent, body, side="a", limit=limit)
+
+    prefix = f"P1|{level}|{source}|{title}|"
+    # A P1 may carry the client id as its final field.  The pager uses ids that
+    # end in "-chat" as doors: Enter opens that agent room instead of the
+    # ordinary Ack/Reply sheet.
+    suffix = f"|{key}" if force_p1 and isinstance(key, str) and key else ""
+    room = max(0, limit - len(prefix.encode("utf-8")) -
+               len(suffix.encode("utf-8")))
+    raw = body.encode("utf-8")
+    if len(raw) <= room:
+        return [prefix + body + suffix]
+
+    # Multi-part notify reassembly on pager
+    mid = f"{int(time.time()) & 0xFFFF:04x}"
+    # header worst-case: M1|ffff|99|99|crit|src16|title60|
+    parts: list[bytes] = []
+    # provisional part count — iterate until stable
+    n_guess = max(1, (len(raw) + 80) // 80)
+    while True:
+        hdr_sample = f"M1|{mid}|{n_guess}|{n_guess}|{level}|{source}|{title}|"
+        room = max(24, limit - len(hdr_sample.encode("utf-8")))
+        chunks = _utf8_chunks(raw, room)
+        if len(chunks) == n_guess or n_guess > 64:
+            n_guess = len(chunks) or 1
+            break
+        n_guess = len(chunks) or 1
+    frames = []
+    n = max(1, len(chunks))
+    for i, ch in enumerate(chunks, 1):
+        frames.append(f"M1|{mid}|{i}|{n}|{level}|{source}|{title}|{ch}")
+    return frames or [prefix + _utf8_fit(body, room)]
+
+
+def _encode_c1(agent: str, body: str, side: str = "a", limit: int = 150) -> list[str]:
+    """Chat multi-part: C1|agent|mid|i|n|side|chunk"""
+    agent = (agent or "chat")[:12]
+    side = "u" if side == "u" else "a"
+    mid = f"{int(time.time()) & 0xFFFF:04x}"
+    raw = (body or "").encode("utf-8")
+    if not raw:
+        return [f"C1|{agent}|{mid}|1|1|{side}|"]
+    n_guess = max(1, (len(raw) + 70) // 70)
+    while True:
+        hdr = f"C1|{agent}|{mid}|{n_guess}|{n_guess}|{side}|"
+        room = max(16, limit - len(hdr.encode("utf-8")))
+        chunks = _utf8_chunks(raw, room)
+        if len(chunks) == n_guess or n_guess > 64:
+            break
+        n_guess = len(chunks) or 1
+    n = max(1, len(chunks))
+    return [f"C1|{agent}|{mid}|{i}|{n}|{side}|{ch}" for i, ch in enumerate(chunks, 1)]
+
+
+def normalize_payload(data: dict) -> dict:
+    level = (data.get("level") or "info").strip().lower()
+    if level not in ("info", "warn", "crit"):
+        level = "info"
+    return {
+        "level": level,
+        "source": (data.get("source") or "home")[:16],
+        "title": (data.get("title") or "notify")[:60],
+        "body": (data.get("body") or "")[:2000],
+        "id": data.get("id"),  # optional client key (*-chat door)
+    }
+
+
+def pager_post_notify(payload: dict) -> tuple[int, str]:
+    """Direct LAN POST to T-Lora seed /notify."""
+    pager = cfg.get("pager") or {}
+    url = (pager.get("url") or "").rstrip("/") + "/notify"
+    token = pager.get("token") or os.environ.get("PAGER_TOKEN", "")
+    if not url.startswith("http"):
+        return 0, "pager url not set"
+    if not token:
+        return 0, "pager token not set"
+
+    body = {
+        "level": payload["level"],
+        "source": payload["source"],
+        "title": payload["title"],
+        "body": payload["body"],
+    }
+    key = payload.get("id") or ""
+    if isinstance(key, str) and key.endswith("-chat"):
+        body["id"] = key[:24]
+    elif (payload.get("source") or "").endswith("-chat"):
+        body["id"] = (payload["source"])[:24]
+
+    data = json.dumps(body).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=data,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {token}",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=4) as resp:
+            return resp.getcode(), resp.read().decode("utf-8", errors="replace")[:300]
+    except urllib.error.HTTPError as e:
+        return e.code, e.read().decode("utf-8", errors="replace")[:300]
+    except Exception as e:
+        return 0, str(e)
+
+
+def mesh_pager_dst() -> str | None:
+    """Full public key (64 hex) or prefix of the paired pager node. Never Public."""
+    m = cfg.get("mesh") or {}
+    pk = (m.get("pager_pubkey") or m.get("pager_pk") or "").strip().lower()
+    if not pk or pk in ("", "change_me", "none"):
+        return None
+    # allow 0x prefix
+    if pk.startswith("0x"):
+        pk = pk[2:]
+    return pk
+
+
+async def mesh_send_p1(payload: dict) -> tuple[bool, str]:
+    """TX private DM frame(s) to the paired pager only. NEVER Public channel.
+
+    Long bodies / chat become multi-part M1/C1 frames; pager reassemblies.
+    Small gap between parts so the radio stack can ACK without flooding.
+    """
+    if not mc or not mc.is_connected:
+        return False, "mesh not connected"
+    dst = mesh_pager_dst()
+    if not dst:
+        return False, "pager not paired (set mesh.pager_pubkey)"
+    frames = encode_mesh_frames(payload)
+    if not frames:
+        return False, "empty frames"
+    try:
+        sent = 0
+        for i, wire in enumerate(frames):
+            # send_msg() only means that the radio accepted the packet. It does
+            # not mean the pager received it. Wait for the MeshCore ACK, retry
+            # twice, and let the SDK reset a stale direct path to flood on the
+            # final attempt.
+            result = await mc.commands.send_msg_with_retry(
+                dst,
+                wire,
+                max_attempts=3,
+                max_flood_attempts=2,
+                flood_after=2,
+                timeout=2.5,
+                min_timeout=1.5,
+            )
+            if result is None:
+                return False, f"part {i+1}/{len(frames)}: no delivery ACK after retries"
+            if result.type == EventType.ERROR:
+                return False, f"part {i+1}/{len(frames)}: {result.payload}"
+            sent += 1
+            if i + 1 < len(frames):
+                await asyncio.sleep(0.35)  # ~one SF8 airtime between parts
+        head = frames[0][:50]
+        return True, f"dm:{dst[:12]}… acked_parts={sent} {head}"
+    except Exception as e:
+        return False, str(e)
+
+
+async def notify_out(payload: dict, mode: str | None = None) -> dict:
+    """
+    Seamless home→pager egress. Same notify payload; two transports.
+
+    User-facing cards on the pager are identical (POST /notify shape).
+    WiFi when the pager is on LAN; private MeshCore DM when paired / offline.
+
+    mode:
+      both        — try WiFi AND private mesh DM (recommended)
+      prefer_wifi — mesh DM only if WiFi fails
+      wifi_only
+      mesh_only
+    """
+    payload = normalize_payload(payload)
+    mode = (mode or (cfg.get("notify") or {}).get("mode") or "both").lower()
+
+    out: dict = {
+        "payload": payload,
+        "mode": mode,
+        "wifi": None,
+        "mesh": None,
+        "mesh_policy": "private_dm_only",
+    }
+
+    do_wifi = mode in ("both", "prefer_wifi", "wifi_only")
+    do_mesh = mode in ("both", "mesh_only")
+    wifi_ok = False
+
+    if do_wifi:
+        code, resp = await asyncio.to_thread(pager_post_notify, payload)
+        wifi_ok = 200 <= code < 300
+        out["wifi"] = {"http": code, "ok": wifi_ok, "resp": resp[:200]}
+        log.info("notify-out wifi → %s %s", code, resp[:80])
+
+    if mode == "prefer_wifi":
+        do_mesh = not wifi_ok
+
+    if do_mesh:
+        ok, detail = await mesh_send_p1(payload)
+        mesh_result = {"ok": ok, "detail": detail[:200]}
+
+        # C1 is the persistent agent-thread transport. Mirror trusted agent
+        # replies as a short P1 chat door so Enter opens the matching room.
+        channel_match = _agent_channel_for_payload(payload)
+        if channel_match:
+            agent, channel = channel_match
+            visible = dict(payload)
+            visible["_force_p1"] = True
+            visible["id"] = channel["id"]
+            visible["title"] = channel["title"]
+            visible["body"] = _utf8_fit(str(payload.get("body") or ""), 80)
+            visible_ok, visible_detail = await mesh_send_p1(visible)
+            mesh_result["thread_ok"] = ok
+            mesh_result["visible_ok"] = visible_ok
+            mesh_result["visible_detail"] = visible_detail[:200]
+            mesh_result["ok"] = bool(ok or visible_ok)
+            log.info("notify-out %s visible → %s %s", agent, visible_ok,
+                     visible_detail[:80])
+
+        out["mesh"] = mesh_result
+        log.info("notify-out mesh-dm → %s %s", mesh_result["ok"], detail[:80])
+
+    out["ok"] = bool(
+        (out.get("wifi") or {}).get("ok") or (out.get("mesh") or {}).get("ok")
+    )
+    out["paired"] = bool(mesh_pager_dst())
+    return out
+
+
+# ── Commands ─────────────────────────────────────────────────────────────────
+
+def cmd_help() -> str:
+    return (
+        "Commands:\n"
+        "ping — pong\n"
+        "status — system info\n"
+        "inet — check internet\n"
+        "mesh — radio self info\n"
+        "reboot — sudo reboot\n"
+        "wol <mac> — wake-on-lan\n"
+        "sh <cmd> — run shell\n"
+        "help — this message\n"
+        "\n"
+        "Pager: send P1|level|source|title|body"
+    )
+
+
+def cmd_ping() -> str:
+    return "pong"
+
+
+def cmd_status() -> str:
+    uptime_s = int(time.monotonic() - start_time)
+    h, m = divmod(uptime_s // 60, 60)
+    daemon_up = f"{h}h{m}m"
+    load = os.getloadavg()
+    load_str = f"{load[0]:.1f} {load[1]:.1f} {load[2]:.1f}"
+    try:
+        import psutil
+
+        mem = psutil.virtual_memory()
+        ram = f"{mem.used // (1024**2)}M/{mem.total // (1024**2)}M ({mem.percent}%)"
+        disk = psutil.disk_usage("/")
+        disk_str = f"{disk.used // (1024**3)}G/{disk.total // (1024**3)}G ({disk.percent}%)"
+    except ImportError:
+        ram = run_shell("free -m | awk '/Mem:/{printf \"%sM/%sM\", $3, $2}'")
+        disk_str = run_shell("df -h / | awk 'NR==2{printf \"%s/%s\", $3, $2}'")
+    inet = "up" if check_inet(cfg.get("monitor", {}).get("ping_host", "8.8.8.8")) else "DOWN"
+    return truncate(
+        f"Daemon: {daemon_up}\nLoad: {load_str}\nRAM: {ram}\nDisk: {disk_str}\nInet: {inet}"
+    )
+
+
+def cmd_inet() -> str:
+    host = cfg.get("monitor", {}).get("ping_host", "8.8.8.8")
+    ping_ok = check_inet(host)
+    result = f"Ping {host}: {'OK' if ping_ok else 'FAIL'}"
+    if ping_ok and shutil.which("speedtest-cli"):
+        st = run_shell("speedtest-cli --simple", timeout=30)
+        result += f"\n{st}"
+    return truncate(result)
+
+
+def cmd_mesh() -> str:
+    if not mc or not mc.self_info:
+        return "mesh not connected"
+    s = mc.self_info
+    name = s.get("name") or "?"
+    pk = (s.get("public_key") or "")[:12]
+    freq = s.get("radio_freq")
+    return truncate(f"node {name}\npk {pk}…\nfreq {freq} SF{s.get('radio_sf')}")
+
+
+def cmd_reboot() -> str:
+    asyncio.get_event_loop().call_later(2, lambda: os.system("sudo reboot"))
+    return "Rebooting in 2s..."
+
+
+def cmd_wol(mac: str) -> str:
+    if shutil.which("wakeonlan"):
+        return run_shell(f"wakeonlan {mac}")
+    if shutil.which("etherwake"):
+        return run_shell(f"sudo etherwake {mac}")
+    try:
+        import socket
+
+        mac_bytes = bytes.fromhex(mac.replace(":", "").replace("-", ""))
+        packet = b"\xff" * 6 + mac_bytes * 16
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+            s.sendto(packet, ("255.255.255.255", 9))
+        return f"WOL sent to {mac}"
+    except Exception as e:
+        return f"WOL error: {e}"
+
+
+def cmd_sh(cmd: str) -> str:
+    timeout = cfg.get("shell_timeout", 10)
+    return truncate(run_shell(cmd, timeout=timeout))
+
+
+COMMANDS = {
+    "help": lambda _: cmd_help(),
+    "ping": lambda _: cmd_ping(),
+    "status": lambda _: cmd_status(),
+    "inet": lambda _: cmd_inet(),
+    "mesh": lambda _: cmd_mesh(),
+    "reboot": lambda _: cmd_reboot(),
+    "wol": lambda args: cmd_wol(args) if args else "Usage: wol <mac>",
+    "sh": lambda args: cmd_sh(args) if args else "Usage: sh <command>",
+}
+
+
+def handle_command(text: str) -> str:
+    text = text.strip()
+    parts = text.split(None, 1)
+    cmd = parts[0].lower() if parts else ""
+    args = parts[1] if len(parts) > 1 else ""
+    handler = COMMANDS.get(cmd)
+    if handler:
+        try:
+            return handler(args)
+        except Exception as e:
+            return f"Error: {e}"
+    return f"Unknown: {cmd}\nhelp — list"
+
+
+# ── Mesh handlers ────────────────────────────────────────────────────────────
+
+async def on_mesh_message(event):
+    global target_contact
+    data = event.payload if isinstance(event.payload, dict) else {}
+    text = (data.get("text") or "").strip()
+    sender = data.get("pubkey_prefix") or data.get("public_key") or "unknown"
+    if isinstance(sender, str) and len(sender) > 12:
+        sender = sender[:12]
+    log.info("Mesh msg from %s: %r", sender, text[:120])
+
+    # Sparse pager keepalive: "MC|k" (or bare "K").
+    # No shell bot, but send tiny app-level pong "MC|a" so the pager can refresh
+    # its alive counter even if the MeshCore protocol ACK is missed (shared SPI).
+    if text in ("K", "MC|k") or text.startswith("MC|k"):
+        log.info("mesh keepalive from %s — pong MC|a", sender)
+        if cfg.get("target_node", "CHANGE_ME") == "CHANGE_ME" and target_contact is None:
+            await resolve_contact(str(sender))
+        try:
+            # Prefer full pager pubkey if configured
+            dst = mesh_pager_dst() or sender
+            await mc.commands.send_msg(dst, "MC|a")
+        except Exception as e:
+            log.warning("keepalive pong failed: %s", e)
+        return
+
+    # Chat / multi-part notify frames — never shell-bot
+    if text.startswith("C1|"):
+        await handle_c1_uplink(sender, text)
+        return
+    if text.startswith("M1|") or text.startswith("P1|"):
+        # Inbound P1/M1 from pager is unusual; ignore bot, optional LAN mirror
+        if text.startswith("P1|"):
+            p1 = parse_p1(text)
+            if p1:
+                code, resp = await asyncio.to_thread(pager_post_notify, p1)
+                log.info("pager /notify (mesh P1) → %s %s", code, resp[:80])
+        return
+
+    # Auto-learn target
+    if cfg.get("target_node", "CHANGE_ME") == "CHANGE_ME" and target_contact is None:
+        await resolve_contact(str(sender))
+
+    response = handle_command(text)
+    log.info("Response: %s", response[:120])
+    await reply_to(sender, response)
+
+
+def _agent_bridge_url() -> str:
+    ab = cfg.get("agent_bridge") or {}
+    url = (ab.get("url") or os.environ.get("AGENT_BRIDGE_URL") or "http://127.0.0.1:8091")
+    return str(url).rstrip("/")
+
+
+def _http_json_post(url: str, body: dict, timeout: float = 30.0) -> tuple[int, str]:
+    data = json.dumps(body).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.getcode(), resp.read().decode("utf-8", errors="replace")[:400]
+    except urllib.error.HTTPError as e:
+        return e.code, e.read().decode("utf-8", errors="replace")[:400]
+    except Exception as e:
+        return 0, str(e)
+
+
+async def handle_c1_uplink(sender: str, text: str) -> None:
+    """Reassemble C1|agent|mid|i|n|side|chunk from pager; side=u → agent bridge."""
+    # C1|agent|mid|i|n|side|chunk
+    parts = text.split("|", 6)
+    if len(parts) < 7:
+        log.warning("bad C1 from %s: %r", sender, text[:80])
+        return
+    _, agent, mid, si, sn, side, chunk = parts
+    try:
+        i, n = int(si), int(sn)
+    except ValueError:
+        return
+    if n < 1 or n > 64 or i < 1 or i > n:
+        return
+    agent = (agent or "hermes")[:12].lower()
+    side = (side or "u")[:1]
+    key = f"{agent}:{mid}"
+    now = time.time()
+    # GC stale
+    dead = [k for k, v in _c1_uplink.items() if now - v.get("t0", 0) > 60]
+    for k in dead:
+        _c1_uplink.pop(k, None)
+
+    slot = _c1_uplink.get(key)
+    if not slot:
+        slot = {"t0": now, "n": n, "side": side, "agent": agent, "chunks": {}}
+        _c1_uplink[key] = slot
+    slot["chunks"][i] = chunk or ""
+    slot["t0"] = now
+    if len(slot["chunks"]) < n:
+        log.info("C1 uplink %s part %s/%s", key, i, n)
+        return
+
+    full = "".join(slot["chunks"].get(j, "") for j in range(1, n + 1))
+    _c1_uplink.pop(key, None)
+    log.info("C1 uplink complete %s side=%s len=%d", key, side, len(full))
+
+    if side != "u":
+        # Agent→pager frames should not hit the gateway as RX (they are TX from us)
+        return
+
+    # Dedicated OpenCode/Codex channels go straight to their own LAN inbox.
+    # The pager's WiFi may be off; only the always-on gateway needs LAN access.
+    if enqueue_agent_message(agent, full):
+        log.info("%s inbox +1 (%d pending)", agent, len(_agent_inboxes[agent]))
+        return
+
+    # Forward to pager-agent-bridge (same contract as WiFi AGENTS skill)
+
+    bridge = _agent_bridge_url()
+    code, resp = await asyncio.to_thread(
+        _http_json_post,
+        f"{bridge}/v1/chat",
+        {
+            "agent": agent,
+            "session": "pager-mesh",
+            "text": full,
+            "from": "tlora-mesh",
+        },
+        30.0,
+    )
+    log.info("agent bridge ← mesh chat %s → %s %s", agent, code, resp[:120])
+    # Bridge replies async via pager_push → notify-out mesh C1 downlink.
+    # No mesh bot-reply here.
+
+
+async def reply_to(sender_prefix: str, text: str) -> None:
+    if not mc:
+        return
+    contact = await find_contact_by_prefix(sender_prefix)
+    if not contact and target_contact:
+        contact = target_contact
+    if not contact:
+        log.warning("no contact for reply to %s", sender_prefix)
+        return
+    try:
+        await mc.commands.send_msg(contact, truncate(text, cfg.get("mesh_msg_limit", 200)))
+    except Exception as e:
+        log.error("send_msg failed: %s", e)
+
+
+async def find_contact_by_prefix(prefix: str):
+    if not mc or not prefix:
+        return None
+    # library helper if present
+    fn = getattr(mc, "get_contact_by_key_prefix", None)
+    if callable(fn):
+        try:
+            c = fn(prefix)
+            if c:
+                return c
+        except Exception:
+            pass
+    try:
+        result = await mc.commands.get_contacts()
+    except Exception as e:
+        log.error("get_contacts: %s", e)
+        return None
+    if not result or result.type == EventType.ERROR:
+        return None
+    payload = result.payload
+    # dict keyed by pubkey, or list
+    items: list[Any]
+    if isinstance(payload, dict):
+        items = list(payload.values()) if payload else []
+        # also try keys
+        for k, v in payload.items():
+            if str(k).startswith(prefix):
+                return v if v is not None else k
+    elif isinstance(payload, list):
+        items = payload
+    else:
+        return None
+    for c in items:
+        pk = c if isinstance(c, str) else getattr(c, "public_key", "") or ""
+        if str(pk).startswith(prefix):
+            return c
+    return None
+
+
+async def resolve_contact(prefix: str | None = None):
+    global target_contact
+    target_prefix = prefix or cfg.get("target_node", "CHANGE_ME")
+    if not target_prefix or target_prefix == "CHANGE_ME":
+        log.warning("target_node not set — will use first incoming sender")
+        return
+    c = await find_contact_by_prefix(target_prefix)
+    if c:
+        target_contact = c
+        log.info("Target contact resolved: %s", target_prefix)
+    else:
+        log.warning("Target contact %s not found", target_prefix)
+
+
+# ── HTTP ─────────────────────────────────────────────────────────────────────
+
+async def webhook_send(request: web.Request) -> web.Response:
+    if target_contact is None:
+        return web.Response(text="No target contact\n", status=503)
+    body = await request.text()
+    if not body.strip():
+        return web.Response(text="Empty body\n", status=400)
+    msg = truncate(body, cfg.get("mesh_msg_limit", 200))
+    log.info("Webhook send: %s", msg)
+    try:
+        result = await mc.commands.send_msg(target_contact, msg)
+        if result and result.type == EventType.ERROR:
+            return web.Response(text=f"Send error: {result.payload}\n", status=500)
+    except Exception as e:
+        return web.Response(text=f"Send error: {e}\n", status=500)
+    return web.Response(text="OK\n")
+
+
+async def webhook_pager(request: web.Request) -> web.Response:
+    """Legacy alias: LAN-only push to pager /notify (no mesh TX)."""
+    ctype = request.headers.get("Content-Type", "")
+    if "json" in ctype:
+        try:
+            data = await request.json()
+        except Exception:
+            return web.Response(text="bad json\n", status=400)
+        payload = normalize_payload(data)
+    else:
+        text = (await request.text()).strip()
+        p1 = parse_p1(text)
+        payload = p1 or {
+            "level": "info",
+            "source": "mesh",
+            "title": "MESH",
+            "body": text[:256],
+        }
+    code, resp = await asyncio.to_thread(pager_post_notify, payload)
+    return web.Response(
+        text=json.dumps({"http": code, "resp": resp}) + "\n",
+        content_type="application/json",
+        status=200 if 200 <= code < 300 else 502,
+    )
+
+
+async def webhook_notify_out(request: web.Request) -> web.Response:
+    """
+    Main egress for home notifications via Heltec gateway.
+
+    POST JSON:
+      {level, source, title, body, id?, mode?}
+    mode: both | prefer_wifi | wifi_only | mesh_only  (default from config)
+
+    - wifi_only / both / prefer_wifi → LAN POST pager /notify
+    - both / mesh_only / prefer_wifi(on wifi fail) → private MeshCore DM (pager_pubkey) P1|…
+    """
+    try:
+        data = await request.json()
+    except Exception:
+        # plain P1 or text
+        text = (await request.text()).strip()
+        p1 = parse_p1(text)
+        if not p1:
+            data = {
+                "level": "info",
+                "source": "home",
+                "title": "notify",
+                "body": text[:256],
+            }
+        else:
+            data = p1
+    mode = data.pop("mode", None) if isinstance(data, dict) else None
+    if not isinstance(data, dict):
+        return web.json_response({"ok": False, "error": "JSON object required"}, status=400)
+    result = await notify_out(data, mode=mode)
+    status = 200 if result.get("ok") else 502
+    return web.json_response(result, status=status)
+
+
+async def webhook_health(request: web.Request) -> web.Response:
+    info = {}
+    if mc and mc.self_info:
+        info = {
+            "name": mc.self_info.get("name"),
+            "pk": (mc.self_info.get("public_key") or "")[:16],
+            "freq": mc.self_info.get("radio_freq"),
+            "connected": bool(mc.is_connected),
+        }
+    return web.json_response(
+        {
+            "ok": True,
+            "service": "meshcore-daemon",
+            "radio": info,
+            "notify_mode": (cfg.get("notify") or {}).get("mode", "both"),
+            "endpoints": [
+                "/health", "/ping", "/send", "/pager", "/notify-out",
+                "/opencode/inbox", "/codex/inbox",
+            ],
+        }
+    )
+
+
+async def webhook_ping(request: web.Request) -> web.Response:
+    """Rich gateway probe for the pager MESHCORE → PING screen.
+
+    Query: ?t=<client_ms> echoed back so the pager can compute RTT.
+    """
+    qs = request.rel_url.query
+    client_t = qs.get("t")
+    try:
+        client_t_i = int(client_t) if client_t is not None else None
+    except ValueError:
+        client_t_i = None
+
+    radio: dict = {}
+    if mc and mc.self_info:
+        s = mc.self_info
+        radio = {
+            "name": s.get("name"),
+            "public_key": s.get("public_key"),
+            "pk8": (s.get("public_key") or "")[:8],
+            "pk16": (s.get("public_key") or "")[:16],
+            "freq": s.get("radio_freq"),
+            "bw": s.get("radio_bw"),
+            "sf": s.get("radio_sf"),
+            "cr": s.get("radio_cr"),
+            "tx_power": s.get("tx_power"),
+            "max_tx_power": s.get("max_tx_power"),
+            "connected": bool(mc.is_connected),
+        }
+
+    # channel 0 snapshot (best-effort)
+    ch0: dict = {}
+    if mc and mc.is_connected:
+        try:
+            r = await mc.commands.get_channel(0)
+            if r and r.type != EventType.ERROR and isinstance(r.payload, dict):
+                ch0 = {
+                    "idx": r.payload.get("channel_idx", 0),
+                    "name": r.payload.get("channel_name"),
+                    "hash": r.payload.get("channel_hash"),
+                }
+        except Exception as e:
+            ch0 = {"error": str(e)[:80]}
+
+    uptime_s = int(time.monotonic() - start_time)
+    body = {
+        "ok": True,
+        "service": "meshcore-daemon",
+        "role": "home-gateway",
+        "server_ms": int(time.time() * 1000),
+        "client_t": client_t_i,
+        "daemon_uptime_s": uptime_s,
+        "notify_mode": (cfg.get("notify") or {}).get("mode", "both"),
+        "mesh_channel": int((cfg.get("mesh") or {}).get("channel", 0)),
+        "radio": radio,
+        "channel0": ch0,
+        "transport": {
+            "wifi_path": "POST /notify on pager LAN",
+            "mesh_path": "private DM to mesh.pager_pubkey only (never Public)",
+            "pager_paired": bool(mesh_pager_dst()),
+            "pager_pk8": (mesh_pager_dst() or "")[:8] or None,
+            "note": "same notify UI either path; pager needs MeshCore identity for DM RX",
+        },
+    }
+    return web.json_response(body)
+
+
+async def webhook_agent_inbox(request: web.Request) -> web.Response:
+    """Drain one agent's isolated uplink queue."""
+    agent = request.match_info["agent"]
+    if agent not in AGENT_CHANNELS:
+        return web.json_response({"ok": False, "error": "unknown agent"}, status=404)
+    items = drain_agent_messages(agent)
+    return web.json_response({"ok": True, "count": len(items), "items": items})
+
+
+def create_webhook_app() -> web.Application:
+    app = web.Application()
+    app.router.add_post("/send", webhook_send)
+    app.router.add_post("/pager", webhook_pager)
+    app.router.add_post("/notify-out", webhook_notify_out)
+    app.router.add_get("/{agent:opencode|codex}/inbox", webhook_agent_inbox)
+    app.router.add_get("/health", webhook_health)
+    app.router.add_get("/ping", webhook_ping)
+    return app
+
+
+async def internet_monitor():
+    global inet_was_up
+    monitor_cfg = cfg.get("monitor", {})
+    if not monitor_cfg.get("enabled", True):
+        log.info("Internet monitor disabled")
+        return
+    interval = monitor_cfg.get("interval_seconds", 300)
+    host = monitor_cfg.get("ping_host", "8.8.8.8")
+    log.info("Internet monitor every %ss ping %s", interval, host)
+    while True:
+        await asyncio.sleep(interval)
+        is_up = await asyncio.to_thread(check_inet, host)
+        if inet_was_up and not is_up:
+            log.warning("Internet DOWN")
+            if target_contact and mc:
+                await mc.commands.send_msg(target_contact, "ALERT: Internet is DOWN")
+        elif not inet_was_up and is_up:
+            log.info("Internet restored")
+            if target_contact and mc:
+                await mc.commands.send_msg(target_contact, "Internet restored")
+        inet_was_up = is_up
+
+
+async def main():
+    global cfg, mc
+
+    cfg = load_config()
+    # env overrides for secrets
+    if os.environ.get("PAGER_TOKEN"):
+        cfg.setdefault("pager", {})["token"] = os.environ["PAGER_TOKEN"]
+    if os.environ.get("PAGER_URL"):
+        cfg.setdefault("pager", {})["url"] = os.environ["PAGER_URL"]
+
+    serial_cfg = cfg.get("serial", {})
+    port = serial_cfg.get("port", "/dev/ttyUSB0")
+    baud = serial_cfg.get("baudrate", 115200)
+
+    log.info("Connecting MeshCore companion on %s…", port)
+    mc = await MeshCore.create_serial(port, baudrate=baud)
+    if mc is None or not mc.is_connected:
+        raise SystemExit(f"Failed to open companion on {port}")
+    log.info(
+        "Connected name=%s pk=%s… freq=%s",
+        (mc.self_info or {}).get("name"),
+        ((mc.self_info or {}).get("public_key") or "")[:12],
+        (mc.self_info or {}).get("radio_freq"),
+    )
+
+    mc.subscribe(EventType.CONTACT_MSG_RECV, on_mesh_message)
+    # channel flood messages (if library emits them)
+    if hasattr(EventType, "CHANNEL_MSG_RECV"):
+        mc.subscribe(EventType.CHANNEL_MSG_RECV, on_mesh_message)
+
+    await mc.start_auto_message_fetching()
+    await resolve_contact()
+
+    asyncio.create_task(internet_monitor())
+
+    webhook_cfg = cfg.get("webhook", {})
+    app = create_webhook_app()
+    runner = web.AppRunner(app)
+    await runner.setup()
+    host = webhook_cfg.get("host", "0.0.0.0")
+    port_w = int(webhook_cfg.get("port", 8325))
+    await web.TCPSite(runner, host, port_w).start()
+    log.info(
+        "Webhook http://%s:%s  (/health /send /pager /notify-out) mode=%s",
+        host,
+        port_w,
+        (cfg.get("notify") or {}).get("mode", "both"),
+    )
+
+    stop = asyncio.Event()
+    loop = asyncio.get_event_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, stop.set)
+        except NotImplementedError:
+            pass
+    await stop.wait()
+    log.info("Shutting down…")
+    await runner.cleanup()
+    await mc.disconnect()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

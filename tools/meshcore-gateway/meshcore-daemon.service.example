@@ -1,0 +1,16 @@
+[Unit]
+Description=MeshCore private pager gateway
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=REPLACE_WITH_USER
+WorkingDirectory=/opt/meshcore-gateway
+EnvironmentFile=-/etc/meshcore-gateway.env
+ExecStart=/opt/meshcore-gateway/.venv/bin/python /opt/meshcore-gateway/meshcore_daemon.py
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

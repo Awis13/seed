@@ -1,0 +1,31 @@
+serial:
+  port: /dev/ttyUSB0
+  baudrate: 115200
+
+webhook:
+  host: 0.0.0.0
+  port: 8325
+
+pager:
+  url: http://PAGER-IP:8080
+  token: ""  # Prefer PAGER_TOKEN in the service environment.
+  ack_mesh: false
+
+notify:
+  # both, prefer_wifi, wifi_only, or mesh_only
+  mode: both
+
+mesh:
+  # Exact 64-character MeshCore public key. Private DM only.
+  pager_pubkey: REPLACE_WITH_PAGER_PUBLIC_KEY
+
+monitor:
+  enabled: true
+  interval_seconds: 300
+  ping_host: 8.8.8.8
+
+mesh_msg_limit: 150
+shell_timeout: 10
+
+agent_bridge:
+  url: http://127.0.0.1:8091
