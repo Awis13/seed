@@ -1412,6 +1412,9 @@ static int layout_sel = 0;
 static int settings_sel = 0;
 static int mesh_sel = 0;
 static int wifi_sel = 0;
+// User turned WiFi off from the menu: suppress the loop() auto-reconnect until
+// they toggle it back on (garden mesh-only testing).
+static bool wifi_user_off = false;
 static int wifi_list_sel = 0;
 static int wifi_list_mode = WIFI_LIST_SCAN;
 static int wifi_list_count = 0;
@@ -1731,9 +1734,11 @@ static void ui_wifi_show_status() {
 static void ui_wifi_toggle() {
     if (WiFi.status() == WL_CONNECTED) {
         WiFi.disconnect(false, false);
+        wifi_user_off = true;
         event_add("wifi off (mesh only)");
         Serial.println("[wifi] user toggled OFF");
     } else {
+        wifi_user_off = false;
         if (wifi_try_profiles(30)) {
             event_add("wifi on (reconnected)");
             Serial.println("[wifi] user toggled ON — connected");
@@ -2966,11 +2971,13 @@ void loop() {
     }
 
     // WiFi reconnect — walk multi-profile list every 30s while offline.
+    // Skipped while the user turned WiFi off from the menu (mesh-only test):
+    // they toggled it off, loop must not undo their choice.
     static unsigned long last_wifi = 0;
     static bool was_connected = false;
     bool now_connected = WiFi.status() == WL_CONNECTED;
-    if ((wifi_net_count > 0 || wifi_ssid.length() > 0) && !now_connected &&
-        millis() - last_wifi > 30000) {
+    if (!wifi_user_off && (wifi_net_count > 0 || wifi_ssid.length() > 0) &&
+        !now_connected && millis() - last_wifi > 30000) {
         last_wifi = millis();
         /* One profile attempt (~5s) so loop stays responsive. */
         if (wifi_net_count > 1) {
