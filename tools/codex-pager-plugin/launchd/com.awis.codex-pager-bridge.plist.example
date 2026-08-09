@@ -17,8 +17,6 @@
     <string>REPLACE_WITH_WORKSPACE</string>
     <key>CODEX_PAGER_CODEX_BIN</key>
     <string>REPLACE_WITH_CODEX_PATH</string>
-    <key>CODEX_PAGER_APP_SERVER_SOCKET</key>
-    <string>REPLACE_WITH_HOME/.codex/ipc/ipc.sock</string>
     <key>CODEX_PAGER_SECRETS</key>
     <string>REPLACE_WITH_HOME/.config/codex-pager/secrets.json</string>
   </dict>
