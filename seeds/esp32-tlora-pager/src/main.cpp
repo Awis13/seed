@@ -6,8 +6,9 @@
 // Bring-up seed, grown layer by layer. What is driven today:
 //   - I2C on SDA=3/SCL=2 + scan (XL9555, BQ*, TCA8418, …)
 //   - XL9555 power rails, ST7796 480x222 + AW9364, notify beeper,
-//     encoder UI, haptic, sound, keyboard reply, BQ27220 fuel gauge
-// Not driven yet: SX1262 MeshCore RX stack (keys+P1 path ready), GNSS, NFC, BQ25896.
+//     encoder UI, haptic, sound, keyboard reply, BQ27220 fuel gauge,
+//     GNSS MIA-M10Q
+// Not driven yet: SX1262 MeshCore RX stack (keys+P1 path ready), NFC, BQ25896.
 // SPIFFS still ships WiFi + token so a dark-panel brick cannot lock us out.
 // Endpoints:
 //   GET  /health            — alive check (no auth)
@@ -1278,6 +1279,7 @@ static void handle_wifi_networks_post(AsyncWebServerRequest *request) {
 #include "skills/meshcore.cpp"
 #include "skills/backlight.cpp"
 #include "skills/wg.cpp"
+#include "skills/gps.cpp"    // after notify: reuses notify_send_json; uses hw_ui_expand_ok
 
 static void skills_init() {
     skill_notify_init();
@@ -1286,6 +1288,7 @@ static void skills_init() {
     skill_meshcore_init();
     skill_backlight_init();
     skill_wg_init();
+    skill_gps_init();
 }
 
 // Build one second of the home clock face (tembed look, 480x222).
