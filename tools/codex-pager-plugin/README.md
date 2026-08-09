@@ -22,7 +22,7 @@ Home Rig. Only the Mac bridge and Home Rig gateway need LAN access.
 The bridge reads environment variables:
 
 - `CODEX_PAGER_GATEWAY` (default `http://192.168.1.138:8325`)
-- `CODEX_PAGER_GATEWAY_TOKEN` (or `gatewayToken` in the mode-0600 secrets file)
+- `CODEX_PAGER_GATEWAY_TOKEN` (Codex-scoped capability, or `gatewayToken` in the mode-0600 secrets file)
 - `CODEX_PAGER_SECRETS` (default `~/.config/codex-pager/secrets.json`)
 - `CODEX_PAGER_WORKSPACE` (default current directory)
 - `CODEX_PAGER_THREAD_ID` (optional explicit existing task)

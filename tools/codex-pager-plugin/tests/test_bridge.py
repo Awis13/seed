@@ -191,6 +191,29 @@ class BridgeTests(unittest.TestCase):
             self.assertEqual(bridge.sent, ["recovered answer"])
             self.assertNotIn("turn/start", [method for method, _ in bridge.rpc.calls])
 
+    def test_failed_turn_reports_error_and_releases_queue(self):
+        with tempfile.TemporaryDirectory() as directory:
+            bridge = self.make_bridge(directory)
+            bridge.thread_id = "pager-thread"
+            bridge.rpc.turns = [{
+                "id": "turn-failed",
+                "status": "failed",
+                "error": {"message": "model unavailable"},
+                "items": [],
+            }]
+            bridge.pending.append({
+                "id": "msg-1",
+                "text": "do once",
+                "gatewayAcked": True,
+                "state": "running",
+                "turnId": "turn-failed",
+            })
+            self.assertTrue(bridge.run_once())
+            self.assertEqual(len(bridge.pending), 0)
+            self.assertIn("failed", bridge.sent[0])
+            self.assertIn("please resend", bridge.sent[0])
+            self.assertNotIn("turn/start", [method for method, _ in bridge.rpc.calls])
+
 
 class JsonRpcTests(unittest.TestCase):
     def test_server_request_gets_immediate_error_response(self):

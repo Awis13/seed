@@ -324,6 +324,18 @@ class CodexPagerBridge:
                 final = str(item.get("text") or "").strip()
         return final
 
+    @staticmethod
+    def _failed_turn_reply(turn: dict[str, Any]) -> str:
+        status = str(turn.get("status") or "failed")
+        error = turn.get("error")
+        detail = ""
+        if isinstance(error, dict):
+            detail = str(error.get("message") or "").strip()
+        elif error:
+            detail = str(error).strip()
+        suffix = f" ({detail[:120]})" if detail else ""
+        return f"Codex turn {status}{suffix}; please resend the message."
+
     def _read_turn(self, turn_id: str) -> dict[str, Any] | None:
         assert self.thread_id
         result = self.rpc.request(
@@ -361,8 +373,7 @@ class CodexPagerBridge:
                     continue
                 status = turn.get("status")
                 if status != "completed":
-                    error = turn.get("error") or status or "unknown error"
-                    raise RpcError(f"Codex turn failed: {error}")
+                    return self._failed_turn_reply(turn)
                 if not final_text:
                     final_text = self._final_from_turn(turn)
                 if not final_text:
@@ -385,7 +396,7 @@ class CodexPagerBridge:
                     return final
                 raise RpcError("recovered Codex turn has no final answer")
             if status not in ("inProgress", "active"):
-                raise RpcError(f"recovered Codex turn is {status}")
+                return self._failed_turn_reply(recovered)
             return self._wait_for_turn(str(turn_id))
 
         if item.get("state") == "starting":
