@@ -20,6 +20,7 @@ import hmac
 import json
 import logging
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -49,6 +50,9 @@ inet_was_up = True
 
 # Uplink C1 reassembly (pager → home). Keyed by mid.
 _c1_uplink: dict[str, dict[str, Any]] = {}
+# Recently completed C1 IDs suppress a whole-message duplicate when the pager
+# retries a frame whose radio ACK was lost after the gateway received it.
+_c1_completed: dict[str, float] = {}
 # Dedicated agent channels. Each C1 uplink is queued only for the matching
 # bridge and each downlink must present the exact source/id pair. This keeps
 # OpenCode and Codex from consuming or spoofing one another's conversations.
@@ -118,15 +122,13 @@ def load_agent_inboxes() -> None:
 
 def enqueue_agent_message(agent: str, text: str, ts: int | None = None) -> bool:
     queue = _agent_inboxes.get(agent)
-    if queue is None:
+    if queue is None or len(queue) >= _AGENT_INBOX_MAX:
         return False
     queue.append({
         "id": uuid.uuid4().hex,
         "text": text,
         "ts": int(time.time()) if ts is None else ts,
     })
-    if len(queue) > _AGENT_INBOX_MAX:
-        del queue[: len(queue) - _AGENT_INBOX_MAX]
     _persist_agent_inboxes()
     return True
 
@@ -150,22 +152,44 @@ def ack_agent_messages(agent: str, message_ids: set[str]) -> int:
     return removed
 
 
-def gateway_api_token() -> str:
-    return str(
-        os.environ.get("MESHCORE_GATEWAY_TOKEN")
-        or (cfg.get("webhook") or {}).get("token")
-        or ""
-    )
+def gateway_api_tokens() -> dict[str, str]:
+    webhook = cfg.get("webhook") or {}
+    return {
+        "admin": str(os.environ.get("MESHCORE_GATEWAY_TOKEN") or webhook.get("token") or ""),
+        "opencode": str(os.environ.get("MESHCORE_OPENCODE_TOKEN") or webhook.get("opencode_token") or ""),
+        "codex": str(os.environ.get("MESHCORE_CODEX_TOKEN") or webhook.get("codex_token") or ""),
+    }
+
+
+def _token_matches(provided: str, expected: str) -> bool:
+    return bool(provided and expected and hmac.compare_digest(provided, expected))
+
+
+async def _request_agent_scope(request: web.Request) -> str | None:
+    if request.path.startswith("/opencode/"):
+        return "opencode"
+    if request.path.startswith("/codex/"):
+        return "codex"
+    if request.path == "/notify-out":
+        try:
+            data = await request.json()
+        except Exception:
+            return None
+        match = _agent_channel_for_payload(data if isinstance(data, dict) else {})
+        return match[0] if match else None
+    return None
 
 
 @web.middleware
 async def gateway_auth_middleware(request: web.Request, handler):
-    if request.path in ("/health", "/ping"):
+    if request.path == "/health":
         return await handler(request)
-    expected = gateway_api_token()
-    if not expected:
+    tokens = gateway_api_tokens()
+    scope = await _request_agent_scope(request)
+    expected = tokens.get(scope or "admin", "")
+    if not expected or not tokens["admin"]:
         return web.json_response(
-            {"ok": False, "error": "gateway API token is not configured"},
+            {"ok": False, "error": "gateway API tokens are not configured"},
             status=503,
         )
     provided = request.headers.get("Authorization", "")
@@ -173,7 +197,9 @@ async def gateway_auth_middleware(request: web.Request, handler):
         provided = provided[7:].strip()
     else:
         provided = request.headers.get("X-Gateway-Token", "").strip()
-    if not provided or not hmac.compare_digest(provided, expected):
+    # The admin capability may operate every route; agent bridges receive only
+    # their scoped token and cannot read, ack, or spoof the other agent.
+    if not (_token_matches(provided, expected) or _token_matches(provided, tokens["admin"])):
         return web.json_response({"ok": False, "error": "unauthorized"}, status=401)
     return await handler(request)
 
@@ -650,10 +676,20 @@ def cmd_reboot() -> str:
 
 
 def cmd_wol(mac: str) -> str:
+    if not re.fullmatch(r"(?:[0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}", mac or ""):
+        return "WOL error: invalid MAC"
     if shutil.which("wakeonlan"):
-        return run_shell(f"wakeonlan {mac}")
+        result = subprocess.run(
+            ["wakeonlan", mac], capture_output=True, text=True,
+            timeout=cfg.get("shell_timeout", 10), check=False,
+        )
+        return truncate((result.stdout or result.stderr).strip())
     if shutil.which("etherwake"):
-        return run_shell(f"sudo etherwake {mac}")
+        result = subprocess.run(
+            ["sudo", "etherwake", mac], capture_output=True, text=True,
+            timeout=cfg.get("shell_timeout", 10), check=False,
+        )
+        return truncate((result.stdout or result.stderr).strip())
     try:
         import socket
 
@@ -794,11 +830,18 @@ async def handle_c1_uplink(sender: str, text: str) -> None:
     agent = (agent or "hermes")[:12].lower()
     side = (side or "u")[:1]
     key = f"{agent}:{mid}"
+    completed_key = f"{sender}:{agent}:{mid}:{side}"
     now = time.time()
     # GC stale
     dead = [k for k, v in _c1_uplink.items() if now - v.get("t0", 0) > 60]
     for k in dead:
         _c1_uplink.pop(k, None)
+    completed_dead = [k for k, ts in _c1_completed.items() if now - ts > 300]
+    for k in completed_dead:
+        _c1_completed.pop(k, None)
+    if completed_key in _c1_completed:
+        log.info("C1 duplicate suppressed %s", completed_key)
+        return
 
     slot = _c1_uplink.get(key)
     if not slot:
@@ -816,12 +859,17 @@ async def handle_c1_uplink(sender: str, text: str) -> None:
 
     if side != "u":
         # Agent→pager frames should not hit the gateway as RX (they are TX from us)
+        _c1_completed[completed_key] = now
         return
 
     # Dedicated OpenCode/Codex channels go straight to their own LAN inbox.
     # The pager's WiFi may be off; only the always-on gateway needs LAN access.
-    if enqueue_agent_message(agent, full):
-        log.info("%s inbox +1 (%d pending)", agent, len(_agent_inboxes[agent]))
+    if agent in AGENT_CHANNELS:
+        if enqueue_agent_message(agent, full):
+            _c1_completed[completed_key] = now
+            log.info("%s inbox +1 (%d pending)", agent, len(_agent_inboxes[agent]))
+        else:
+            log.error("%s inbox full; refusing to drop an unacked item", agent)
         return
 
     # Forward to pager-agent-bridge (same contract as WiFi AGENTS skill)
@@ -839,6 +887,8 @@ async def handle_c1_uplink(sender: str, text: str) -> None:
         30.0,
     )
     log.info("agent bridge ← mesh chat %s → %s %s", agent, code, resp[:120])
+    if 200 <= code < 300:
+        _c1_completed[completed_key] = now
     # Bridge replies async via pager_push → notify-out mesh C1 downlink.
     # No mesh bot-reply here.
 
@@ -1148,8 +1198,9 @@ async def main():
         cfg.setdefault("pager", {})["token"] = os.environ["PAGER_TOKEN"]
     if os.environ.get("PAGER_URL"):
         cfg.setdefault("pager", {})["url"] = os.environ["PAGER_URL"]
-    if not gateway_api_token():
-        raise SystemExit("MESHCORE_GATEWAY_TOKEN is required")
+    missing_tokens = [name for name, token in gateway_api_tokens().items() if not token]
+    if missing_tokens:
+        raise SystemExit("missing gateway API tokens: " + ", ".join(missing_tokens))
     load_agent_inboxes()
 
     serial_cfg = cfg.get("serial", {})

@@ -25,16 +25,18 @@ That strict pair prevents one integration from opening the other room.
 1. Create a virtual environment and install `aiohttp`, `PyYAML`, and the
    MeshCore Python package used by the radio companion.
 2. Copy `config.yaml.example` to `config.yaml` and set the serial port, pager
-   URL, exact pager public key, and durable inbox path. Put `PAGER_TOKEN=...`
-   and `MESHCORE_GATEWAY_TOKEN=...` in a mode-0600 service environment file.
+   URL, exact pager public key, and durable inbox path. Put `PAGER_TOKEN=...`,
+   `MESHCORE_GATEWAY_TOKEN=...`, `MESHCORE_OPENCODE_TOKEN=...`, and
+   `MESHCORE_CODEX_TOKEN=...` in a mode-0600 service environment file.
 3. Adapt `meshcore-daemon.service.example`, install it with systemd, run
    `systemctl daemon-reload`, then restart the service.
 4. Verify `/health`; then send one message to each room and confirm only the
    corresponding inbox receives it.
 
-All HTTP endpoints except `/health` and `/ping` require the gateway bearer
-token. Every MeshCore command is restricted to the configured pager identity;
-`sh` and `reboot` additionally remain disabled unless explicitly enabled.
+Only `/health` is public. Agent endpoints and exact chat downlinks require that
+agent's scoped bearer; the admin bearer may operate every route. Every MeshCore
+command is restricted to the configured pager identity; `sh` and `reboot`
+additionally remain disabled unless explicitly enabled.
 
 Deploying this file or restarting the live service is a separate operational
 step; repository tests do not touch the radio or pager.

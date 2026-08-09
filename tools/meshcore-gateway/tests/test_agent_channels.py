@@ -128,6 +128,24 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
         )
         await daemon.on_mesh_message(event)
 
+    async def test_retried_completed_c1_is_enqueued_once(self):
+        daemon = load_daemon()
+        with tempfile.TemporaryDirectory() as directory:
+            daemon.cfg = {
+                "mesh": {"pager_pubkey": "abcdef1234567890"},
+                "agent_inbox": {"path": str(Path(directory) / "inboxes.json")},
+            }
+            event = types.SimpleNamespace(payload={
+                "pubkey_prefix": "abcdef123456",
+                "text": "C1|codex|abc1234|1|1|u|once",
+            })
+            await daemon.on_mesh_message(event)
+            await daemon.on_mesh_message(event)
+            self.assertEqual(
+                [row["text"] for row in daemon.list_agent_messages("codex")],
+                ["once"],
+            )
+
     async def test_sensitive_http_requires_bearer_token(self):
         daemon = load_daemon()
         daemon.cfg = {"webhook": {"token": "secret"}}
@@ -152,11 +170,78 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(allowed, "ok")
         self.assertEqual(reached, [True])
 
+    async def test_agent_tokens_cannot_cross_inboxes_or_spoof_downlink(self):
+        daemon = load_daemon()
+        daemon.cfg = {
+            "webhook": {
+                "token": "admin-secret",
+                "opencode_token": "open-secret",
+                "codex_token": "code-secret",
+            }
+        }
+        daemon.web.json_response = lambda body, status=200: (status, body)
+
+        async def handler(_request):
+            return "ok"
+
+        class Request:
+            def __init__(self, path, token, body=None):
+                self.path = path
+                self.headers = {"Authorization": f"Bearer {token}"}
+                self._body = body or {}
+
+            async def json(self):
+                return self._body
+
+        self.assertEqual(
+            await daemon.gateway_auth_middleware(
+                Request("/codex/inbox", "open-secret"), handler
+            ),
+            (401, {"ok": False, "error": "unauthorized"}),
+        )
+        self.assertEqual(
+            await daemon.gateway_auth_middleware(
+                Request("/opencode/inbox", "code-secret"), handler
+            ),
+            (401, {"ok": False, "error": "unauthorized"}),
+        )
+        self.assertEqual(
+            await daemon.gateway_auth_middleware(
+                Request(
+                    "/notify-out", "open-secret",
+                    {"source": "codex-pager", "id": "codex-chat"},
+                ),
+                handler,
+            ),
+            (401, {"ok": False, "error": "unauthorized"}),
+        )
+        self.assertEqual(
+            await daemon.gateway_auth_middleware(
+                Request(
+                    "/notify-out", "open-secret",
+                    {"source": "opencode-pager", "id": "opencode-chat"},
+                ),
+                handler,
+            ),
+            "ok",
+        )
+
+    def test_full_inbox_refuses_new_message_without_dropping_oldest(self):
+        daemon = load_daemon()
+        daemon.cfg = {"agent_inbox": {"path": "/dev/null"}}
+        original = [{"id": str(i), "text": str(i), "ts": i}
+                    for i in range(daemon._AGENT_INBOX_MAX)]
+        daemon._agent_inboxes["codex"] = list(original)
+        self.assertFalse(daemon.enqueue_agent_message("codex", "overflow"))
+        self.assertEqual(daemon._agent_inboxes["codex"], original)
+
     def test_shell_commands_are_disabled_by_default(self):
         daemon = load_daemon()
         daemon.cfg = {}
         self.assertEqual(daemon.handle_command("sh id"), "sh: disabled")
         self.assertEqual(daemon.handle_command("reboot"), "reboot: disabled")
+        self.assertEqual(daemon.cmd_wol("aa:bb:cc:dd:ee:ff; id"),
+                         "WOL error: invalid MAC")
 
     async def test_wifi_chat_still_sends_full_c1_history(self):
         daemon = load_daemon()

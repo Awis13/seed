@@ -5,9 +5,10 @@ serial:
 webhook:
   host: 0.0.0.0
   port: 8325
-  # Set MESHCORE_GATEWAY_TOKEN in the service environment. Sensitive endpoints
-  # refuse requests when this token is absent.
+  # Set independent admin/OpenCode/Codex tokens in the service environment.
   token: ""
+  opencode_token: ""
+  codex_token: ""
 
 pager:
   url: http://PAGER-IP:8080
