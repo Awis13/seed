@@ -34,7 +34,7 @@ class RpcError(RuntimeError):
 
 
 class JsonRpcProcess:
-    """Minimal line-delimited JSON-RPC client for `codex app-server`."""
+    """Minimal line-delimited JSON-RPC client for Codex App Server or its proxy."""
 
     def __init__(self, command: list[str] | None = None):
         self.command = command or ["codex", "app-server", "--stdio"]
@@ -511,11 +511,24 @@ def main(argv: list[str] | None = None) -> int:
             str(Path.home() / ".codex" / "codex-pager-bridge.json"),
         )
     ).expanduser()
+    codex_bin = os.environ.get("CODEX_PAGER_CODEX_BIN", "codex")
+    app_server_socket = Path(
+        os.environ.get(
+            "CODEX_PAGER_APP_SERVER_SOCKET",
+            str(Path.home() / ".codex" / "ipc" / "ipc.sock"),
+        )
+    ).expanduser()
+    if not app_server_socket.exists():
+        raise SystemExit(
+            f"Codex desktop app-server socket is unavailable: {app_server_socket}"
+        )
     rpc = JsonRpcProcess(
         [
-            os.environ.get("CODEX_PAGER_CODEX_BIN", "codex"),
+            codex_bin,
             "app-server",
-            "--stdio",
+            "proxy",
+            "--sock",
+            str(app_server_socket),
         ]
     )
     bridge = CodexPagerBridge(
