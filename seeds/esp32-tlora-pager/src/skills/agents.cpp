@@ -3,7 +3,8 @@
  *
  * Pager is the thin terminal. A bridge on the LAN does the real work:
  *   POST {bridge}/v1/chat  { "agent","session","text" }
- * Answers come back as ordinary /notify (source=grok|claude|hermes|opencode) or, when
+ * Answers come back as ordinary /notify
+ * (source=grok|claude|hermes|opencode|codex) or, when
  * the bridge is missing, as a local stub line in the thread.
  *
  * SPIFFS:
@@ -41,7 +42,7 @@
 #include <SD.h>
 #include <SPI.h>
 
-#define AGENTS_N            4
+#define AGENTS_N            5
 #define AGENT_ID_LEN        12
 #define AGENT_NAME_LEN      16
 /* One chat line / viewport cell. 512 stays: bridge + mesh multi-part chunks. */
@@ -68,7 +69,7 @@ struct AgentLine {
 };
 
 struct AgentSlot {
-    const char *id;     // "grok" / "claude" / "hermes" / "opencode"
+    const char *id;     // "grok" / "claude" / "hermes" / "opencode" / "codex"
     const char *name;   // UI label
     char sessions[AGENT_SESSIONS_MAX][AGENT_SESSION_LEN];
     uint8_t n_sessions;
@@ -86,6 +87,7 @@ static AgentSlot g_agents[AGENTS_N] = {
     { "claude",   "CLAUDE",   {}, 0, 0, {}, 0, 0, 0, 0, {} },
     { "hermes",   "HERMES",   {}, 0, 0, {}, 0, 0, 0, 0, {} },
     { "opencode", "OPENCODE", {}, 0, 0, {}, 0, 0, 0, 0, {} },
+    { "codex",    "CODEX",    {}, 0, 0, {}, 0, 0, 0, 0, {} },
 };
 
 static char g_bridge[AGENT_BRIDGE_LEN] = "";
@@ -1002,9 +1004,9 @@ static const char *agents_bridge_url() { return g_bridge; }
 static const char *agents_describe() {
     return
         "# agents\n\n"
-        "Pocket chat with Grok / Claude / Hermes / OpenCode.\n"
+        "Pocket chat with Grok / Claude / Hermes / OpenCode / Codex.\n"
         "Uplink: WiFi bridge /v1/chat, else MeshCore C1|agent|…|u|… private DM\n"
-        "  (agent = grok|claude|hermes|opencode).\n"
+        "  (agent = grok|claude|hermes|opencode|codex).\n"
         "Downlink: same C1 side=a (or WiFi /agents/inbound) — one loop.\n"
         "A \"where are you?\" / \"где ты\" message is answered locally with the\n"
         "GNSS fix (POST /gps/fix semantics) and never hits the bridge.\n\n"
@@ -1082,7 +1084,7 @@ static void agents_register_routes(AsyncWebServer &server) {
         const char *text   = input["text"]   | "";
         const char *sess   = input["session"] | "";
         int idx = agents_find(agent);
-        if (idx < 0) { notify_send_error(req, 400, "agent must be grok, claude, hermes or opencode"); return; }
+        if (idx < 0) { notify_send_error(req, 400, "agent must be grok, claude, hermes, opencode or codex"); return; }
         if (!text[0]) { notify_send_error(req, 400, "text required"); return; }
         if (sess[0]) {
             agents_lock();
@@ -1136,7 +1138,7 @@ static void agents_register_routes(AsyncWebServer &server) {
         free(body);
         const char *agent = input["agent"] | "";
         const char *text  = input["text"]  | "";
-        if (agents_find(agent) < 0) { notify_send_error(req, 400, "agent must be grok, claude, hermes or opencode"); return; }
+        if (agents_find(agent) < 0) { notify_send_error(req, 400, "agent must be grok, claude, hermes, opencode or codex"); return; }
         if (!text[0]) { notify_send_error(req, 400, "text required"); return; }
         agents_on_inbound(agent, text);
         event_add("agent %s >> %s", agent, text);
@@ -1181,7 +1183,7 @@ static void agents_register_routes(AsyncWebServer &server) {
         const char *agent = input["agent"] | "";
         const char *sess  = input["session"] | "";
         int idx = agents_find(agent);
-        if (idx < 0) { notify_send_error(req, 400, "agent must be grok, claude, hermes or opencode"); return; }
+        if (idx < 0) { notify_send_error(req, 400, "agent must be grok, claude, hermes, opencode or codex"); return; }
         if (!sess[0]) { notify_send_error(req, 400, "session required"); return; }
         agents_lock();
         bool ok = agents_session_select(idx, sess);
@@ -1209,7 +1211,7 @@ static void agents_register_routes(AsyncWebServer &server) {
         const char *agent = input["agent"] | "";
         const char *sess  = input["session"] | "";
         int idx = agents_find(agent);
-        if (idx < 0) { notify_send_error(req, 400, "agent must be grok, claude, hermes or opencode"); return; }
+        if (idx < 0) { notify_send_error(req, 400, "agent must be grok, claude, hermes, opencode or codex"); return; }
         agents_lock();
         bool created = false;
         int r = agents_session_create(idx, sess[0] ? sess : nullptr, created);
