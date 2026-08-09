@@ -12,14 +12,15 @@ Secrets are loaded from environment variables or a mode-0600 JSON file at
 ```json
 {
   "tloraToken": "pager-http-token",
-  "gatewayToken": "shared-home-rig-api-token"
+  "gatewayToken": "opencode-scoped-home-rig-token"
 }
 ```
 
-No token belongs in `pager-bridge.js`. The gateway inbox is non-destructive;
-the plugin acknowledges a message ID only after `promptAsync()` succeeds. A
-single T-Lora owner session replaces older subscriptions instead of fanning one
-pager message into multiple OpenCode tasks.
+No token belongs in `pager-bridge.js`. The OpenCode capability cannot access
+the Codex inbox or spoof a Codex downlink. The gateway inbox is non-destructive;
+the plugin uses a stable OpenCode message ID and acknowledges the gateway item
+only after the prompt exists. A single T-Lora owner session replaces older
+subscriptions instead of fanning one pager message into multiple tasks.
 
 Validate before installation:
 

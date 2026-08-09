@@ -1,4 +1,5 @@
 import { tool } from "@opencode-ai/plugin"
+import { createHash } from "node:crypto"
 import { readFileSync } from "node:fs"
 import { homedir } from "node:os"
 
@@ -165,16 +166,30 @@ export default async ({ client }) => {
     return null
   }
 
-  async function inject(sessionID, text) {
+  function stableMessageID(sessionID, sourceID) {
+    const digest = createHash("sha256").update(`${sessionID}\0${sourceID}`).digest("hex")
+    return `msg_pager_${digest.slice(0, 24)}`
+  }
+
+  async function inject(sessionID, text, messageID) {
     try {
       await client.session.promptAsync({
         path: { id: sessionID },
         body: {
+          ...(messageID ? { messageID } : {}),
           parts: [{ type: "text", text }],
         },
       })
       return true
     } catch (e) {
+      if (messageID) {
+        try {
+          const existing = responseData(await client.session.message({
+            path: { id: sessionID, messageID },
+          }))
+          if (existing && existing.info && existing.info.id === messageID) return true
+        } catch {}
+      }
       try {
         await client.app.log({ body: { service: "pager-bridge", level: "error", message: `inject failed: ${e.message}`, extra: { sessionID } } })
       } catch {}
@@ -212,20 +227,6 @@ export default async ({ client }) => {
   // несколько сессий (например, OpenCode и Hermes одновременно).
   function isForeignChannel(n) {
     return (n.source || "").trim().toLowerCase() !== source.trim().toLowerCase()
-  }
-
-  // Первичный снимок подписки: запомнить текущие ответы как baseline,
-  // чтобы НЕ инжектить старьё, а только новые сообщения.
-  // Door-карточка `opencode-chat`: по клику на пейджере открывается тред
-  // агента OPENCODE (тот же механизм, что у Hermes — `id=*-chat`).
-  // source остаётся наш (`opencode-pager`), чтобы reply на карточку ловил
-  // плагин; открытие треда резолвится прошивкой из префикса id.
-  async function ensureChatDoor(d) {
-    try {
-      await sendNotify(d, "OPENCODE", "tread ready - type to talk", "info", source, undefined, "opencode-chat")
-    } catch (e) {
-      try { await client.app.log({ body: { service: "pager-bridge", level: "warn", message: `door failed: ${e.message}` } }) } catch {}
-    }
   }
 
   // Дублируем текст ответа открыто-сессии в тред-историю на пейджере
@@ -266,15 +267,19 @@ export default async ({ client }) => {
           }
         }
 
-        // GET /opencode/inbox drains the queue. Never call it until there is a
-        // concrete destination, otherwise a mesh uplink is silently discarded.
+        // The inbox is non-destructive. Read it only with a concrete owner,
+        // then ACK after idempotent prompt injection succeeds.
         const gi = tloraSubs.length ? await gwGet("/opencode/inbox") : null
         if (gi && gi.ok && gi.json && Array.isArray(gi.json.items) && gi.json.items.length) {
           for (const item of gi.json.items) {
             const t = (item && item.text) || ""
             if (!t) continue
             const s = tloraSubs[0]
-            const delivered = s && await inject(s.sessionID, `[pager tlora thread] OPENCODE — ${t}`)
+            const delivered = s && await inject(
+              s.sessionID,
+              `[pager tlora thread] OPENCODE — ${t}`,
+              stableMessageID(s.sessionID, `gateway:${item.id}`),
+            )
             if (delivered && item.id) {
               const ack = await gwAck("opencode", [item.id])
               if (!ack.ok) throw new Error(`gateway ack failed (${ack.status}): ${ack.text}`)
@@ -303,9 +308,14 @@ export default async ({ client }) => {
           try { v = await answerValue(d, n) } catch (e) { continue }
           if (v === null) continue
           if (s.lastSeen.get(n.id) === v) continue
-          s.lastSeen.set(n.id, v)
           const label = n.title || n.id
-          await inject(s.sessionID, `[pager ${s.device}] ${label} — ${v}`)
+          const delivered = await inject(
+            s.sessionID,
+            `[pager ${s.device}] ${label} — ${v}`,
+            stableMessageID(s.sessionID, `notify:${n.id}:${v}`),
+          )
+          if (!delivered) continue
+          s.lastSeen.set(n.id, v)
           try {
             await client.app.log({ body: { service: "pager-bridge", level: "info", message: `poll ${key}: ${n.id} ${v}` } })
           } catch {}
@@ -314,26 +324,8 @@ export default async ({ client }) => {
         for (const id of [...s.lastSeen.keys()]) {
           if (!seen.has(id)) s.lastSeen.delete(id)
         }
-        // Тред OPENCODE: тот же механизм, что карточки — пулим /agents, и если
-        // Николай написал новое сообщение в тред (last_from_me=true, last изменился),
-        // инжектим его в ЭТУ сессию через promptAsync. Счётчик session_msgs на
-        // прошивке не всегда растёт для последней строки, поэтому сравниваем сам
-        // текст last (надёжнее).
-        try {
-          const ar = await api(d, "/agents")
-          const ag = ar.ok && ar.json && ar.json.agents
-            ? ar.json.agents.find((x) => (x.id || "").toLowerCase() === "opencode")
-            : null
-          if (ag && typeof ag.last === "string" && ag.last.trim() &&
-              ag.last_from_me === true && ag.last !== (s.treadLast || "")) {
-            s.treadLast = ag.last
-            await inject(s.sessionID, `[pager ${s.device} thread] OPENCODE — ${ag.last}`)
-          } else if (ag && ag.last === (s.treadLast || "")) {
-            // same — nothing new
-          }
-        } catch (e) {
-          try { await client.app.log({ body: { service: "pager-bridge", level: "warn", message: `tread poll ${key}: ${e.message}` } }) } catch {}
-        }
+        // OpenCode room text has one authoritative path: C1 → gateway inbox.
+        // Never poll /agents here; that legacy Wi-Fi route would double-inject.
       }
     } finally {
       polling = false
@@ -345,10 +337,9 @@ export default async ({ client }) => {
   // OpenCode's SDK client is not ready yet and can leave `polling` stuck true.
   setTimeout(() => void pollOnce(), 1000)
 
-  // Канал открывается обычным pager_ask/pager_tell (context.sessionID — правильная
-  // сессия, никакого угадывания). Поллинг ниже пуллит треда OPENCODE для КАЖДОЙ
-  // подписанной сессии и инжектит только новое от Николая — ровно одна
-  // подписка на ту сессию, что реально открыла канал.
+  // Канал открывается обычным pager_ask/pager_tell (context.sessionID —
+  // правильная сессия). Текст комнаты приходит только через durable C1 inbox;
+  // прямой /agents polling намеренно отсутствует.
 
   async function ensureSubscription(deviceName, sessionID, { primeDevice = true } = {}) {
     const key = `${deviceName}:${sessionID}`
@@ -358,21 +349,9 @@ export default async ({ client }) => {
         if (existing.device === "tlora") subs.delete(existingKey)
       }
     }
-    const s = { device: deviceName, sessionID, lastSeen: new Map(), treadLast: "" }
+    const s = { device: deviceName, sessionID, lastSeen: new Map() }
     subs.set(key, s)
     if (!primeDevice) return key
-    // Baseline треда: запомнить текущий last opencode, чтобы не инжектить
-    // старое, а только новые сообщения от Николая.
-    try {
-      const d0 = dev(deviceName)
-      const ar = await api(d0, "/agents")
-      const ag = ar.ok && ar.json && ar.json.agents
-        ? ar.json.agents.find((x) => (x.id || "").toLowerCase() === "opencode")
-        : null
-      if (ag && typeof ag.last === "string") s.treadLast = ag.last
-    } catch {}
-    // Прежде чем подписаться на tlora — показать дверь-тред OPENCODE на пейджере.
-    if (deviceName === "tlora") await ensureChatDoor(dev(deviceName))
     try { await seedSubscription(s, dev(deviceName)) } catch {}
     return key
   }
@@ -391,12 +370,25 @@ export default async ({ client }) => {
         async execute(args, context) {
           const deviceName = args.device ?? "tlora"
           const d = dev(deviceName)
-          const r = await sendNotify(d, args.title, args.body, args.level, source, args.options, args.key)
-          const id = r.id
-          if (!id) throw new Error("pager returned no id")
+          const key = args.key || "opencode-chat"
+          const g = await gwSend({
+            level: args.level || "warn",
+            source: "opencode-pager",
+            title: args.title,
+            body: args.body,
+            id: key,
+            mode: "prefer_wifi",
+          })
+          let id = key
+          if (!g.ok) {
+            const r = await sendNotify(
+              d, args.title, args.body, args.level, source, args.options, key,
+            )
+            id = r.id || key
+          }
           await ensureSubscription(deviceName, context.sessionID)
           const optsNote = " (keyboard reply)"
-          return `asked on ${d.label} id=${id}${optsNote}. Channel open: every reply arrives in this session automatically.`
+          return `asked on ${d.label} id=${id}${optsNote} via ${g.ok ? "gateway" : "direct"}. Channel open: every reply arrives in this session automatically.`
         },
       }),
 
