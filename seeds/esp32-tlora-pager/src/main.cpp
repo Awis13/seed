@@ -52,7 +52,7 @@
 #include "hw_kb.h"
 
 // ===== Configuration =====
-#define SEED_VERSION        "0.9.39"
+#define SEED_VERSION        "0.9.40"
 // Core clock: datasheet puts 240 vs 80 ~11.5mA apart on WAITI. Periph bus holds
 // at 80 for every PLL-fed core clock; go lower and RMT/I2S retimes. Same floor
 // as tembed idle policy (no light sleep — notify latency is the job).
@@ -291,6 +291,8 @@ static String wifi_ssid = "";
 static String wifi_pass = "";
 static bool wifi_user_off = false;
 static bool mdns_started = false;
+#define WIFI_RETRY_MS 1200000UL
+static unsigned long wifi_last_attempt_ms = 0;
 
 /* Multi-profile STA: try each known network in order on boot / reconnect. */
 #define WIFI_MAX_NETS 6
@@ -541,8 +543,18 @@ static bool wifi_save_config(const String &ssid, const String &pass) {
     return wifi_persist_profiles();
 }
 
+/* Every connection attempt goes through one owner so a manual connect cannot
+ * be followed by the periodic retry on the next loop pass. */
+static void wifi_begin_active_profile() {
+    wifi_last_attempt_ms = millis();
+    WiFi.begin(wifi_ssid.c_str(), wifi_pass.c_str());
+}
+
 static void wifi_setup() {
     WiFi.mode(WIFI_STA);
+    /* Arduino-ESP32 defaults this to true and otherwise retries underneath our
+     * scheduler, causing the same UI stalls the 20-minute cadence avoids. */
+    WiFi.setAutoReconnect(false);
     String suffix = get_mac_suffix();
     mdns_name = "seed-" + suffix;
     mdns_name.toLowerCase();
@@ -558,7 +570,7 @@ static void wifi_setup() {
         // Boot must never wait for infrastructure. Start one asynchronous STA
         // attempt; loop() rotates profiles later while UI and MeshCore are live.
         Serial.printf("[wifi] boot async try %s\n", wifi_ssid.c_str());
-        WiFi.begin(wifi_ssid.c_str(), wifi_pass.c_str());
+        wifi_begin_active_profile();
     } else {
         Serial.println("[wifi] no credentials — continuing mesh-only");
     }
@@ -1049,7 +1061,7 @@ static void handle_wifi_post(AsyncWebServerRequest *request) {
     delay(500);
     WiFi.disconnect(false, false);
     delay(100);
-    WiFi.begin(wifi_ssid.c_str(), wifi_pass.c_str());
+    wifi_begin_active_profile();
 }
 
 static void handle_wifi_status(AsyncWebServerRequest *request) {
@@ -1149,7 +1161,7 @@ static void handle_wifi_networks_post(AsyncWebServerRequest *request) {
     wifi_user_off = false;
     WiFi.mode(WIFI_STA);
     WiFi.disconnect(false, false);
-    WiFi.begin(wifi_ssid.c_str(), wifi_pass.c_str());
+    wifi_begin_active_profile();
 }
 
 // ===== Skills =====
@@ -1621,7 +1633,7 @@ static void ui_wifi_toggle() {
         wifi_user_off = false;
         WiFi.mode(WIFI_STA);
         if (wifi_net_count > 0 || wifi_ssid.length() > 0) {
-            WiFi.begin(wifi_ssid.c_str(), wifi_pass.c_str());
+            wifi_begin_active_profile();
             event_add("wifi on (async reconnect)");
             Serial.println("[wifi] user toggled ON — reconnecting");
         } else {
@@ -1725,7 +1737,7 @@ static void ui_wifi_connect_ssid(const char *ssid) {
             WiFi.mode(WIFI_STA);
             WiFi.disconnect(false, false);
             delay(80);
-            WiFi.begin(wifi_ssid.c_str(), wifi_pass.c_str());
+            wifi_begin_active_profile();
             snprintf(lines[0], sizeof(lines[0]), "CONNECTING");
             snprintf(lines[1], sizeof(lines[1]), "%s", ssid);
             snprintf(lines[2], sizeof(lines[2]), "async - UI stays live");
@@ -2853,15 +2865,13 @@ void loop() {
         if (err == ESP_OK) event_add("firmware auto-confirmed");
     }
 
-    // WiFi reconnect — walk multi-profile list every 30s while offline.
+    // WiFi reconnect — one non-blocking attempt every 20 minutes while offline.
     // Skipped while the user turned WiFi off from the menu (mesh-only test):
     // they toggled it off, loop must not undo their choice.
-    static unsigned long last_wifi = 0;
     static bool was_connected = false;
     bool now_connected = WiFi.status() == WL_CONNECTED;
     if (!wifi_user_off && (wifi_net_count > 0 || wifi_ssid.length() > 0) &&
-        !now_connected && millis() - last_wifi > 30000) {
-        last_wifi = millis();
+        !now_connected && millis() - wifi_last_attempt_ms >= WIFI_RETRY_MS) {
         /* One profile attempt (~5s) so loop stays responsive. */
         if (wifi_net_count > 1) {
             wifi_net_idx = (wifi_net_idx + 1) % wifi_net_count;
@@ -2870,7 +2880,7 @@ void loop() {
         Serial.printf("[wifi] reconnect try %s\n", wifi_ssid.c_str());
         WiFi.disconnect(false, false);
         delay(50);
-        WiFi.begin(wifi_ssid.c_str(), wifi_pass.c_str());
+        wifi_begin_active_profile();
     }
     if (now_connected != was_connected) {
         was_connected = now_connected;

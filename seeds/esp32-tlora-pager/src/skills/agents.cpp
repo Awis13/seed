@@ -148,6 +148,7 @@ bool gps_get_position(double *lat, double *lon, uint32_t *ts, bool *fix,
 long gps_fix_age_s(void);
 float gps_get_hdop(void);
 void gps_set_on_fix(void (*cb)(void));
+void gps_request_fix(void);
 
 /* Defined later in this file (used by the GPS interception below). */
 static void agents_on_inbound(const char *agent_id, const char *text);
@@ -875,6 +876,7 @@ static bool agents_gps_intercept(int idx, const char *text) {
     agents_push_line(idx, true, text);        /* keep the query in the thread */
     bool fresh = agents_loc_card(idx);
     g_agents_gps_pending[idx] = !fresh;
+    if (!fresh) gps_request_fix();
     return true;
 }
 
@@ -893,7 +895,10 @@ static void agents_gps_on_fix(void) {
  * next fix. */
 void agents_gps_pending(const char *agent_id) {
     int idx = agents_find(agent_id);
-    if (idx >= 0) g_agents_gps_pending[idx] = true;
+    if (idx >= 0) {
+        g_agents_gps_pending[idx] = true;
+        gps_request_fix();
+    }
 }
 
 /* Public: send a line as the user, into the agent's ACTIVE session.

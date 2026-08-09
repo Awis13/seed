@@ -26,10 +26,8 @@
 #define GPS_FILE        "/gps.json"
 #define GPS_FILE_TMP    "/gps.tmp"
 #define GPS_BAUD        38400
-#define GPS_POLL_MS     200UL
-/* Persist the last fix at most every 30s: SPIFFS writes block loop() and a
- * 2s cadence froze the UI for ~1s every few seconds on this S3. */
-#define GPS_SAVE_DELAY_MS 30000UL
+#define GPS_ACQUIRE_INTERVAL_MS 1200000UL  /* periodic fix every 20 minutes */
+#define GPS_ACQUIRE_TIMEOUT_MS   120000UL  /* cold TTFF is not a hard bound */
 #define GPS_LINE_MAX    96       /* NMEA sentences cap at ~82 chars */
 #define GPS_FIELDS_MAX  20
 /* Event log flood guard: log a live position heartbeat at most once a minute,
@@ -45,6 +43,7 @@ bool gps_get_position(double *lat, double *lon, uint32_t *ts, bool *fix,
 long gps_fix_age_s(void);
 float gps_get_hdop(void);
 void gps_set_on_fix(void (*cb)(void));
+void gps_request_fix(void);
 /* ---------------------------------------------------------------------------- */
 
 /* ---- state ---- */
@@ -61,7 +60,13 @@ static bool gps_hdop_valid = false;
 static uint32_t gps_last_event_s = 0; /* throttle stamp for live/heartbeat logs */
 
 static bool gps_dirty = false;
-static unsigned long gps_save_at = 0;
+static bool gps_acquiring = false;
+static bool gps_fix_this_acquisition = false;
+static bool gps_fix_received_this_boot = false;
+static volatile bool gps_wake_requested = false;
+static unsigned long gps_acquire_started_ms = 0;
+static unsigned long gps_last_cycle_ms = 0;
+static unsigned long gps_fix_received_ms = 0;
 static char gps_line[GPS_LINE_MAX];
 static size_t gps_line_len = 0;
 
@@ -73,14 +78,17 @@ static void (*gps_on_fix_cb)(void) = nullptr;
 static void gps_power(bool on) {
     if (!gps_ready) return;
     gps_powered = on;
-    hw_xl_pin(EXP_GPS_EN, on);
-    hw_xl_pin(EXP_GPS_RST, on);
+    if (on) {
+        hw_xl_pin(EXP_GPS_EN, true);
+        hw_xl_pin(EXP_GPS_RST, true);
+    } else {
+        hw_xl_pin(EXP_GPS_RST, false);
+        hw_xl_pin(EXP_GPS_EN, false);
+    }
 }
 
 /* ---- persist ---- */
 static void gps_mark_dirty() {
-    unsigned long at = millis() + GPS_SAVE_DELAY_MS;
-    if (!gps_dirty || (long)(at - gps_save_at) < 0) gps_save_at = at;
     gps_dirty = true;
 }
 
@@ -97,6 +105,31 @@ static void gps_save() {
     serializeJson(doc, out);
     if (!write_spiffs_file_atomic(GPS_FILE, GPS_FILE_TMP, out))
         event_add("gps: save failed");
+}
+
+static void gps_start_acquisition() {
+    if (!gps_ready || gps_acquiring) return;
+    gps_wake_requested = false;
+    gps_fix_this_acquisition = false;
+    gps_line_len = 0;
+    gps_power(true);
+    Serial1.begin(GPS_BAUD, SERIAL_8N1, PIN_GPS_RX, PIN_GPS_TX);
+    gps_acquire_started_ms = millis();
+    gps_acquiring = true;
+    event_add("gps: acquiring");
+}
+
+static void gps_stop_acquisition(bool fixed) {
+    if (!gps_acquiring) return;
+    if (fixed && gps_dirty) {
+        gps_dirty = false;
+        gps_save();             /* exactly one blocking write per successful cycle */
+    }
+    Serial1.end();
+    gps_power(false);
+    gps_acquiring = false;
+    gps_last_cycle_ms = millis();
+    event_add("gps: %s, power off", fixed ? "fixed" : "timeout");
 }
 
 static void gps_load() {
@@ -156,11 +189,7 @@ static double gps_nmea_to_deg(const char *field, int deg_digits) {
 
 static bool gps_parse_rmc(char **f, int n) {
     if (n < 7) return false;
-    if (f[2][0] != 'A') {               /* status 'V' = fix lost, keep last pos */
-        if (gps_fix) {
-            gps_fix = false;
-            event_add("gps: fix lost");
-        }
+    if (f[2][0] != 'A') {               /* status 'V': keep last-known fix */
         return false;
     }
     double lat = gps_nmea_to_deg(f[3], 2);
@@ -174,13 +203,16 @@ static bool gps_parse_rmc(char **f, int n) {
 
     time_t now = time(NULL);
     gps_fix_ts = (now > (time_t)TIME_VALID_EPOCH) ? (unsigned long)now : 0;
+    gps_fix_received_ms = millis();
+    gps_fix_received_this_boot = true;
+    gps_fix_this_acquisition = gps_acquiring;
     bool fresh = !gps_fix;
     bool moved = fabs(lat - gps_lat) > GPS_EVENT_MOVE_DEG ||
                  fabs(lon - gps_lon) > GPS_EVENT_MOVE_DEG;
 
     gps_lat = lat;
     gps_lon = lon;
-    uint32_t now_s = (uint32_t)gps_fix_ts;
+    uint32_t now_s = millis() / 1000UL;
     gps_fix = true;
 
     /* Not every fix hits the event ring (~1/s would drown boot/wifi/notify):
@@ -243,28 +275,27 @@ static void gps_feed_byte(uint8_t b) {
 }
 
 static void gps_drain() {
-    if (!gps_ready) return;
+    if (!gps_ready || !gps_acquiring) return;
     while (Serial1.available() > 0) gps_feed_byte((uint8_t)Serial1.read());
 }
 
-/* Blocking fresh-fix wait for callers who need coordinates now (agents).
- * Powers the module if it was off; the idle policy is C2's, so it is left
- * running and any new fix keeps the tick path happy. On timeout the last
- * known fix (if any) is still returned. */
+/* Compatibility helper for callers that truly need to wait. A restored fix
+ * cannot satisfy it: only an RMC received after this acquisition starts can. */
 bool gps_take_fix(unsigned long max_wait_ms, double *lat_out, double *lon_out) {
     if (!gps_ready) return false;
     unsigned long start = millis();
-    if (!gps_powered) gps_power(true);
+    gps_start_acquisition();
     while (millis() - start < max_wait_ms) {
         gps_drain();
-        if (gps_fix) {
+        if (gps_fix_this_acquisition) {
             if (lat_out) *lat_out = gps_lat;
             if (lon_out) *lon_out = gps_lon;
+            gps_stop_acquisition(true);
             return true;
         }
         delay(20);
     }
-    return gps_fix;
+    return false;
 }
 
 /* ---- public accessors (declared at the top; non-static on purpose) ------- */
@@ -282,9 +313,13 @@ bool gps_get_position(double *lat, double *lon, uint32_t *ts, bool *fix,
     return gps_ready;
 }
 
-/* Age of the last fix in seconds, or -1 when there is no usable fix / clock. */
+/* Age of the last fix. Monotonic receive time keeps fresh fixes usable during
+ * mesh-only/offline boots where SNTP has not supplied an epoch. */
 long gps_fix_age_s(void) {
-    if (!gps_fix || gps_fix_ts == 0) return -1;
+    if (!gps_fix) return -1;
+    if (gps_fix_received_this_boot)
+        return (long)((millis() - gps_fix_received_ms) / 1000UL);
+    if (gps_fix_ts == 0) return -1;
     time_t now = time(NULL);
     if (now <= (time_t)TIME_VALID_EPOCH) return -1;
     return (long)(now - (time_t)gps_fix_ts);
@@ -300,18 +335,31 @@ void gps_set_on_fix(void (*cb)(void)) {
     gps_on_fix_cb = cb;
 }
 
+/* Safe from HTTP callbacks: hardware transitions happen later in loop(). */
+void gps_request_fix(void) {
+    if (gps_ready && !gps_acquiring) gps_wake_requested = true;
+}
+
 static void gps_tick() {
-    gps_drain();
-    if (gps_dirty && (long)(millis() - gps_save_at) >= 0) {
-        gps_dirty = false;
-        gps_save();
+    if (!gps_ready) return;
+    if (!gps_acquiring) {
+        if (gps_wake_requested ||
+            millis() - gps_last_cycle_ms >= GPS_ACQUIRE_INTERVAL_MS)
+            gps_start_acquisition();
+        return;
     }
+    gps_drain();
+    if (gps_fix_this_acquisition) gps_stop_acquisition(true);
+    else if (millis() - gps_acquire_started_ms >= GPS_ACQUIRE_TIMEOUT_MS)
+        gps_stop_acquisition(false);
 }
 
 /* ---- HTTP ---- */
 static void gps_status_json(JsonDocument &doc) {
     doc["ready"] = gps_ready;
     if (!gps_ready) return;
+    doc["powered"] = gps_powered;
+    doc["acquiring"] = gps_acquiring;
     doc["fix"] = gps_fix;
     if (gps_fix || gps_fix_ts > 0) {
         doc["lat"] = gps_lat;
@@ -384,6 +432,7 @@ static void gps_register_routes(AsyncWebServer &server) {
         } else {
             doc["fix"] = false;
             if (agent[0]) agents_gps_pending(agent);   /* reply in thread on fix */
+            gps_request_fix();
         }
         notify_send_json(req, 200, doc);
     }, NULL, handle_body_collect);
@@ -391,7 +440,7 @@ static void gps_register_routes(AsyncWebServer &server) {
 
 static const Skill gps_skill = {
     .name = "gps",
-    .version = "0.2.0",
+    .version = "0.3.0",
     .describe = gps_describe,
     .endpoints = gps_endpoints,
     .register_routes = gps_register_routes,
@@ -401,6 +450,10 @@ static const Skill gps_skill = {
 static void skill_gps_init() {
     gps_line_len = 0;
     gps_powered = false;
+    gps_acquiring = false;
+    gps_fix_this_acquisition = false;
+    gps_fix_received_this_boot = false;
+    gps_wake_requested = false;
     gps_last_event_s = 0;
     gps_load();                 /* last position across reboots — RAM only */
 
@@ -409,9 +462,10 @@ static void skill_gps_init() {
         Serial.println("[gps] XL9555 missing — registered, ready=false");
     } else {
         gps_ready = true;
-        gps_power(true);        /* GPS_EN=1, GPS_RST=1 (rails were raised at boot) */
-        Serial1.begin(GPS_BAUD, SERIAL_8N1, PIN_GPS_RX, PIN_GPS_TX);
-        Serial.printf("[gps] UART1 %u 8N1 rx=%d tx=%d\n",
+        gps_start_acquisition(); /* immediate boot fix, then 20-minute cadence */
+        Serial.printf("[gps] duty cycle %lus/%lus UART1 %u rx=%d tx=%d\n",
+                      GPS_ACQUIRE_TIMEOUT_MS / 1000UL,
+                      GPS_ACQUIRE_INTERVAL_MS / 1000UL,
                       GPS_BAUD, PIN_GPS_RX, PIN_GPS_TX);
         if (gps_fix_ts > 0)
             Serial.printf("[gps] restored last fix ts=%lu\n",
