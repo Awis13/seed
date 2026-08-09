@@ -27,7 +27,9 @@
 #define GPS_FILE_TMP    "/gps.tmp"
 #define GPS_BAUD        38400
 #define GPS_POLL_MS     200UL
-#define GPS_SAVE_DELAY_MS 2000UL
+/* Persist the last fix at most every 30s: SPIFFS writes block loop() and a
+ * 2s cadence froze the UI for ~1s every few seconds on this S3. */
+#define GPS_SAVE_DELAY_MS 30000UL
 #define GPS_LINE_MAX    96       /* NMEA sentences cap at ~82 chars */
 #define GPS_FIELDS_MAX  20
 /* Event log flood guard: log a live position heartbeat at most once a minute,
