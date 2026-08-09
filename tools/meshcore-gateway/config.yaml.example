@@ -5,6 +5,9 @@ serial:
 webhook:
   host: 0.0.0.0
   port: 8325
+  # Set MESHCORE_GATEWAY_TOKEN in the service environment. Sensitive endpoints
+  # refuse requests when this token is absent.
+  token: ""
 
 pager:
   url: http://PAGER-IP:8080
@@ -26,6 +29,10 @@ monitor:
 
 mesh_msg_limit: 150
 shell_timeout: 10
+allow_shell_commands: false
+
+agent_inbox:
+  path: /var/lib/meshcore-gateway/agent-inboxes.json
 
 agent_bridge:
   url: http://127.0.0.1:8091

@@ -5,10 +5,11 @@ It sends only private MeshCore DMs to the configured pager public key.
 
 ## Agent routing
 
-The gateway owns two independent, bounded RAM queues:
+The gateway owns two independent, bounded durable queues:
 
-- `GET /opencode/inbox` drains only `C1|opencode|...|u|...` messages.
-- `GET /codex/inbox` drains only `C1|codex|...|u|...` messages.
+- `GET /opencode/inbox` lists only `C1|opencode|...|u|...` messages.
+- `GET /codex/inbox` lists only `C1|codex|...|u|...` messages.
+- `POST /<agent>/inbox/ack` removes explicitly acknowledged message IDs.
 
 Replies use the same `POST /notify-out` contract. A chat reply becomes both a
 complete C1 history entry and a short P1 door card only when its exact identity
@@ -24,12 +25,16 @@ That strict pair prevents one integration from opening the other room.
 1. Create a virtual environment and install `aiohttp`, `PyYAML`, and the
    MeshCore Python package used by the radio companion.
 2. Copy `config.yaml.example` to `config.yaml` and set the serial port, pager
-   URL, and exact pager public key. Put `PAGER_TOKEN=...` in a root-readable
-   environment file instead of committing it.
+   URL, exact pager public key, and durable inbox path. Put `PAGER_TOKEN=...`
+   and `MESHCORE_GATEWAY_TOKEN=...` in a mode-0600 service environment file.
 3. Adapt `meshcore-daemon.service.example`, install it with systemd, run
    `systemctl daemon-reload`, then restart the service.
 4. Verify `/health`; then send one message to each room and confirm only the
    corresponding inbox receives it.
+
+All HTTP endpoints except `/health` and `/ping` require the gateway bearer
+token. Every MeshCore command is restricted to the configured pager identity;
+`sh` and `reboot` additionally remain disabled unless explicitly enabled.
 
 Deploying this file or restarting the live service is a separate operational
 step; repository tests do not touch the radio or pager.

@@ -16,6 +16,7 @@ Payload (our layer on top of MeshCore text):
 from __future__ import annotations
 
 import asyncio
+import hmac
 import json
 import logging
 import os
@@ -23,6 +24,7 @@ import shutil
 import signal
 import subprocess
 import time
+import uuid
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -66,6 +68,7 @@ _agent_inboxes: dict[str, list[dict[str, Any]]] = {
     agent: [] for agent in AGENT_CHANNELS
 }
 _AGENT_INBOX_MAX = 200
+_MESH_BODY_MAX_BYTES = 1600
 
 
 def _agent_channel_for_payload(payload: dict) -> tuple[str, dict[str, str]] | None:
@@ -78,23 +81,101 @@ def _agent_channel_for_payload(payload: dict) -> tuple[str, dict[str, str]] | No
     return None
 
 
+def _agent_inbox_path() -> Path:
+    configured = (cfg.get("agent_inbox") or {}).get("path")
+    return Path(configured) if configured else Path(__file__).parent / "agent-inboxes.json"
+
+
+def _persist_agent_inboxes() -> None:
+    path = _agent_inbox_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as handle:
+        json.dump(_agent_inboxes, handle, ensure_ascii=False, separators=(",", ":"))
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+
+
+def load_agent_inboxes() -> None:
+    try:
+        saved = json.loads(_agent_inbox_path().read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return
+    except (OSError, json.JSONDecodeError) as exc:
+        log.error("cannot load agent inbox state: %s", exc)
+        return
+    for agent in AGENT_CHANNELS:
+        rows = saved.get(agent) if isinstance(saved, dict) else None
+        if isinstance(rows, list):
+            _agent_inboxes[agent] = [
+                row for row in rows[-_AGENT_INBOX_MAX:]
+                if isinstance(row, dict) and row.get("id") and row.get("text")
+            ]
+
+
 def enqueue_agent_message(agent: str, text: str, ts: int | None = None) -> bool:
     queue = _agent_inboxes.get(agent)
     if queue is None:
         return False
-    queue.append({"text": text, "ts": int(time.time()) if ts is None else ts})
+    queue.append({
+        "id": uuid.uuid4().hex,
+        "text": text,
+        "ts": int(time.time()) if ts is None else ts,
+    })
     if len(queue) > _AGENT_INBOX_MAX:
         del queue[: len(queue) - _AGENT_INBOX_MAX]
+    _persist_agent_inboxes()
     return True
 
 
-def drain_agent_messages(agent: str) -> list[dict[str, Any]]:
+def list_agent_messages(agent: str) -> list[dict[str, Any]]:
     queue = _agent_inboxes.get(agent)
     if queue is None:
         return []
-    items = list(queue)
-    queue.clear()
-    return items
+    return list(queue)
+
+
+def ack_agent_messages(agent: str, message_ids: set[str]) -> int:
+    queue = _agent_inboxes.get(agent)
+    if queue is None or not message_ids:
+        return 0
+    before = len(queue)
+    queue[:] = [row for row in queue if str(row.get("id")) not in message_ids]
+    removed = before - len(queue)
+    if removed:
+        _persist_agent_inboxes()
+    return removed
+
+
+def gateway_api_token() -> str:
+    return str(
+        os.environ.get("MESHCORE_GATEWAY_TOKEN")
+        or (cfg.get("webhook") or {}).get("token")
+        or ""
+    )
+
+
+@web.middleware
+async def gateway_auth_middleware(request: web.Request, handler):
+    if request.path in ("/health", "/ping"):
+        return await handler(request)
+    expected = gateway_api_token()
+    if not expected:
+        return web.json_response(
+            {"ok": False, "error": "gateway API token is not configured"},
+            status=503,
+        )
+    provided = request.headers.get("Authorization", "")
+    if provided.startswith("Bearer "):
+        provided = provided[7:].strip()
+    else:
+        provided = request.headers.get("X-Gateway-Token", "").strip()
+    if not provided or not hmac.compare_digest(provided, expected):
+        return web.json_response({"ok": False, "error": "unauthorized"}, status=401)
+    return await handler(request)
 
 
 def load_config() -> dict:
@@ -163,6 +244,19 @@ def _utf8_fit(text: str, max_bytes: int) -> str:
     return raw[:max_bytes].decode("utf-8", errors="ignore")
 
 
+def _utf8_ellipsize(text: str, max_bytes: int) -> str:
+    raw = (text or "").encode("utf-8")
+    if len(raw) <= max_bytes:
+        return text or ""
+    suffix = "…"
+    return _utf8_fit(text or "", max_bytes - len(suffix.encode("utf-8"))) + suffix
+
+
+def _new_mesh_mid() -> str:
+    """Seven hex chars fit the firmware's char mid[8] without collisions by second."""
+    return uuid.uuid4().hex[:7]
+
+
 def _utf8_chunks(raw: bytes, room: int) -> list[str]:
     """Split UTF-8 bytes without dropping a complete final multibyte char."""
     chunks: list[str] = []
@@ -208,7 +302,10 @@ def encode_mesh_frames(payload: dict) -> list[str]:
     key = payload.get("id") or ""
     force_p1 = bool(payload.get("_force_p1"))
     if not force_p1 and isinstance(key, str) and key.endswith("-chat"):
-        agent = key.replace("-chat", "")[:12] or source[:12]
+        channel_match = _agent_channel_for_payload(payload)
+        if not channel_match:
+            return []
+        agent, _channel = channel_match
         return _encode_c1(agent, body, side="a", limit=limit)
     if not force_p1 and (source in ("grok", "claude", "hermes") or
                          source.endswith("-chat")):
@@ -227,7 +324,7 @@ def encode_mesh_frames(payload: dict) -> list[str]:
         return [prefix + body + suffix]
 
     # Multi-part notify reassembly on pager
-    mid = f"{int(time.time()) & 0xFFFF:04x}"
+    mid = _new_mesh_mid()
     # header worst-case: M1|ffff|99|99|crit|src16|title60|
     parts: list[bytes] = []
     # provisional part count — iterate until stable
@@ -242,6 +339,8 @@ def encode_mesh_frames(payload: dict) -> list[str]:
         n_guess = len(chunks) or 1
     frames = []
     n = max(1, len(chunks))
+    if n > 64:
+        return []
     for i, ch in enumerate(chunks, 1):
         frames.append(f"M1|{mid}|{i}|{n}|{level}|{source}|{title}|{ch}")
     return frames or [prefix + _utf8_fit(body, room)]
@@ -251,8 +350,9 @@ def _encode_c1(agent: str, body: str, side: str = "a", limit: int = 150) -> list
     """Chat multi-part: C1|agent|mid|i|n|side|chunk"""
     agent = (agent or "chat")[:12]
     side = "u" if side == "u" else "a"
-    mid = f"{int(time.time()) & 0xFFFF:04x}"
-    raw = (body or "").encode("utf-8")
+    mid = _new_mesh_mid()
+    body = _utf8_ellipsize(body or "", _MESH_BODY_MAX_BYTES)
+    raw = body.encode("utf-8")
     if not raw:
         return [f"C1|{agent}|{mid}|1|1|{side}|"]
     n_guess = max(1, (len(raw) + 70) // 70)
@@ -264,6 +364,8 @@ def _encode_c1(agent: str, body: str, side: str = "a", limit: int = 150) -> list
             break
         n_guess = len(chunks) or 1
     n = max(1, len(chunks))
+    if n > 64:
+        return []
     return [f"C1|{agent}|{mid}|{i}|{n}|{side}|{ch}" for i, ch in enumerate(chunks, 1)]
 
 
@@ -275,7 +377,7 @@ def normalize_payload(data: dict) -> dict:
         "level": level,
         "source": (data.get("source") or "home")[:16],
         "title": (data.get("title") or "notify")[:60],
-        "body": (data.get("body") or "")[:2000],
+        "body": _utf8_ellipsize(str(data.get("body") or ""), _MESH_BODY_MAX_BYTES),
         "id": data.get("id"),  # optional client key (*-chat door)
     }
 
@@ -409,17 +511,34 @@ async def notify_out(payload: dict, mode: str | None = None) -> dict:
         "mesh_policy": "private_dm_only",
     }
 
+    channel_match = _agent_channel_for_payload(payload)
+    key = str(payload.get("id") or "")
+    if key.endswith("-chat") and not channel_match:
+        out["ok"] = False
+        out["error"] = "invalid agent source/id pair"
+        return out
+
     do_wifi = mode in ("both", "prefer_wifi", "wifi_only")
     do_mesh = mode in ("both", "mesh_only")
+    # Agent history is C1-backed. Even with pager Wi-Fi available, a direct
+    # /notify supplies only the door card, never the full room history.
+    if channel_match:
+        do_mesh = True
     wifi_ok = False
 
     if do_wifi:
-        code, resp = await asyncio.to_thread(pager_post_notify, payload)
+        wifi_payload = payload
+        if channel_match:
+            _agent, channel = channel_match
+            wifi_payload = dict(payload)
+            wifi_payload["title"] = channel["title"]
+            wifi_payload["body"] = _utf8_fit(str(payload.get("body") or ""), 80)
+        code, resp = await asyncio.to_thread(pager_post_notify, wifi_payload)
         wifi_ok = 200 <= code < 300
         out["wifi"] = {"http": code, "ok": wifi_ok, "resp": resp[:200]}
         log.info("notify-out wifi → %s %s", code, resp[:80])
 
-    if mode == "prefer_wifi":
+    if mode == "prefer_wifi" and not channel_match:
         do_mesh = not wifi_ok
 
     if do_mesh:
@@ -428,28 +547,35 @@ async def notify_out(payload: dict, mode: str | None = None) -> dict:
 
         # C1 is the persistent agent-thread transport. Mirror trusted agent
         # replies as a short P1 chat door so Enter opens the matching room.
-        channel_match = _agent_channel_for_payload(payload)
         if channel_match:
             agent, channel = channel_match
-            visible = dict(payload)
-            visible["_force_p1"] = True
-            visible["id"] = channel["id"]
-            visible["title"] = channel["title"]
-            visible["body"] = _utf8_fit(str(payload.get("body") or ""), 80)
-            visible_ok, visible_detail = await mesh_send_p1(visible)
             mesh_result["thread_ok"] = ok
+            # A successful direct /notify already created the door. Otherwise
+            # send a short P1 door over mesh after the complete C1 history.
+            if wifi_ok:
+                visible_ok, visible_detail = True, "wifi door delivered"
+            else:
+                visible = dict(payload)
+                visible["_force_p1"] = True
+                visible["id"] = channel["id"]
+                visible["title"] = channel["title"]
+                visible["body"] = _utf8_fit(str(payload.get("body") or ""), 80)
+                visible_ok, visible_detail = await mesh_send_p1(visible)
             mesh_result["visible_ok"] = visible_ok
             mesh_result["visible_detail"] = visible_detail[:200]
-            mesh_result["ok"] = bool(ok or visible_ok)
+            mesh_result["ok"] = bool(ok and visible_ok)
             log.info("notify-out %s visible → %s %s", agent, visible_ok,
                      visible_detail[:80])
 
         out["mesh"] = mesh_result
         log.info("notify-out mesh-dm → %s %s", mesh_result["ok"], detail[:80])
 
-    out["ok"] = bool(
-        (out.get("wifi") or {}).get("ok") or (out.get("mesh") or {}).get("ok")
-    )
+    if channel_match:
+        out["ok"] = bool((out.get("mesh") or {}).get("ok"))
+    else:
+        out["ok"] = bool(
+            (out.get("wifi") or {}).get("ok") or (out.get("mesh") or {}).get("ok")
+        )
     out["paired"] = bool(mesh_pager_dst())
     return out
 
@@ -563,6 +689,8 @@ def handle_command(text: str) -> str:
     parts = text.split(None, 1)
     cmd = parts[0].lower() if parts else ""
     args = parts[1] if len(parts) > 1 else ""
+    if cmd in ("sh", "reboot") and not bool(cfg.get("allow_shell_commands", False)):
+        return f"{cmd}: disabled"
     handler = COMMANDS.get(cmd)
     if handler:
         try:
@@ -583,6 +711,12 @@ async def on_mesh_message(event):
         sender = sender[:12]
     log.info("Mesh msg from %s: %r", sender, text[:120])
 
+    # Every private command path, not only C1, belongs to the paired pager.
+    # Channel traffic and unpaired DMs are never allowed to reach the bot.
+    if not is_paired_pager_sender(sender):
+        log.warning("ignored mesh message from unpaired sender %s", sender)
+        return
+
     # Sparse pager keepalive: "MC|k" (or bare "K").
     # No shell bot, but send tiny app-level pong "MC|a" so the pager can refresh
     # its alive counter even if the MeshCore protocol ACK is missed (shared SPI).
@@ -600,9 +734,6 @@ async def on_mesh_message(event):
 
     # Chat / multi-part notify frames — never shell-bot
     if text.startswith("C1|"):
-        if not is_paired_pager_sender(sender):
-            log.warning("ignored C1 from unpaired sender %s", sender)
-            return
         await handle_c1_uplink(sender, text)
         return
     if text.startswith("M1|") or text.startswith("P1|"):
@@ -876,7 +1007,8 @@ async def webhook_health(request: web.Request) -> web.Response:
             "notify_mode": (cfg.get("notify") or {}).get("mode", "both"),
             "endpoints": [
                 "/health", "/ping", "/send", "/pager", "/notify-out",
-                "/opencode/inbox", "/codex/inbox",
+                "/opencode/inbox", "/opencode/inbox/ack",
+                "/codex/inbox", "/codex/inbox/ack",
             ],
         }
     )
@@ -949,20 +1081,36 @@ async def webhook_ping(request: web.Request) -> web.Response:
 
 
 async def webhook_agent_inbox(request: web.Request) -> web.Response:
-    """Drain one agent's isolated uplink queue."""
+    """List one agent's durable queue; removal requires explicit ack."""
     agent = request.match_info["agent"]
     if agent not in AGENT_CHANNELS:
         return web.json_response({"ok": False, "error": "unknown agent"}, status=404)
-    items = drain_agent_messages(agent)
+    items = list_agent_messages(agent)
     return web.json_response({"ok": True, "count": len(items), "items": items})
 
 
+async def webhook_agent_inbox_ack(request: web.Request) -> web.Response:
+    agent = request.match_info["agent"]
+    if agent not in AGENT_CHANNELS:
+        return web.json_response({"ok": False, "error": "unknown agent"}, status=404)
+    try:
+        data = await request.json()
+    except Exception:
+        return web.json_response({"ok": False, "error": "JSON required"}, status=400)
+    raw_ids = data.get("ids") if isinstance(data, dict) else None
+    if not isinstance(raw_ids, list) or not all(isinstance(x, str) for x in raw_ids):
+        return web.json_response({"ok": False, "error": "ids[] required"}, status=400)
+    removed = ack_agent_messages(agent, set(raw_ids))
+    return web.json_response({"ok": True, "acked": removed})
+
+
 def create_webhook_app() -> web.Application:
-    app = web.Application()
+    app = web.Application(middlewares=[gateway_auth_middleware])
     app.router.add_post("/send", webhook_send)
     app.router.add_post("/pager", webhook_pager)
     app.router.add_post("/notify-out", webhook_notify_out)
     app.router.add_get("/{agent:opencode|codex}/inbox", webhook_agent_inbox)
+    app.router.add_post("/{agent:opencode|codex}/inbox/ack", webhook_agent_inbox_ack)
     app.router.add_get("/health", webhook_health)
     app.router.add_get("/ping", webhook_ping)
     return app
@@ -1000,6 +1148,9 @@ async def main():
         cfg.setdefault("pager", {})["token"] = os.environ["PAGER_TOKEN"]
     if os.environ.get("PAGER_URL"):
         cfg.setdefault("pager", {})["url"] = os.environ["PAGER_URL"]
+    if not gateway_api_token():
+        raise SystemExit("MESHCORE_GATEWAY_TOKEN is required")
+    load_agent_inboxes()
 
     serial_cfg = cfg.get("serial", {})
     port = serial_cfg.get("port", "/dev/ttyUSB0")
