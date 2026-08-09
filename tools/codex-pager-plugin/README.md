@@ -7,7 +7,7 @@ OpenCode queue.
 ## Data path
 
 1. T-Lora sends `C1|codex|...|u|...` over private MeshCore DM.
-2. Home Rig gateway stores it in the isolated `GET /codex/inbox` queue.
+2. Home Rig gateway stores it in the isolated durable `GET /codex/inbox` queue.
 3. The bridge submits it with `turn/start` to one explicit App Server task.
 4. The final assistant message is posted as `source=codex-pager` and
    `id=codex-chat` to `/notify-out`.
@@ -22,6 +22,8 @@ Home Rig. Only the Mac bridge and Home Rig gateway need LAN access.
 The bridge reads environment variables:
 
 - `CODEX_PAGER_GATEWAY` (default `http://192.168.1.138:8325`)
+- `CODEX_PAGER_GATEWAY_TOKEN` (or `gatewayToken` in the mode-0600 secrets file)
+- `CODEX_PAGER_SECRETS` (default `~/.config/codex-pager/secrets.json`)
 - `CODEX_PAGER_WORKSPACE` (default current directory)
 - `CODEX_PAGER_THREAD_ID` (optional explicit existing task)
 - `CODEX_PAGER_CODEX_BIN` (default `codex`; use an absolute path under launchd)
@@ -32,8 +34,9 @@ The bridge reads environment variables:
 - `CODEX_PAGER_APPROVAL_POLICY` (default `never`)
 
 Without an explicit task ID, the bridge creates and names a dedicated task once
-and persists its ID. Completed replies are also persisted until gateway
-delivery succeeds.
+and persists its ID. Gateway messages are acknowledged only after local state
+is durable. Completed replies remain persisted until full C1 history and its
+door are both delivered.
 
 ## Verify
 

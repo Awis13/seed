@@ -17,6 +17,8 @@ timers and Home Assistant data.
   `CODEX_PAGER_THREAD_ID`, resumes its persisted dedicated task, or creates a
   new dedicated task and saves that ID.
 - The default Codex sandbox is `read-only` with approval policy `never`.
+- Keep the shared gateway bearer token only in the mode-0600 secrets file or
+  process environment; never put it in the plugin source or launchd plist.
 
 ## Checks
 

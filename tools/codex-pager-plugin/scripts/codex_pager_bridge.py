@@ -23,6 +23,7 @@ import time
 from typing import Any
 import urllib.error
 import urllib.request
+import uuid
 
 
 log = logging.getLogger("codex-pager-bridge")
@@ -69,6 +70,21 @@ class JsonRpcProcess:
                 waiter = self._pending.get(request_id)
                 if waiter:
                     waiter.put(message)
+                continue
+            if request_id is not None and message.get("method"):
+                # This unattended bridge cannot satisfy approvals, elicitation,
+                # or request-user-input. Return a JSON-RPC error immediately so
+                # the turn fails deterministically instead of hanging for 30m.
+                try:
+                    self._send({
+                        "id": request_id,
+                        "error": {
+                            "code": -32601,
+                            "message": "server request unsupported by pager bridge",
+                        },
+                    })
+                except RpcError:
+                    pass
                 continue
             self.notifications.put(message)
 
@@ -120,12 +136,16 @@ class JsonRpcProcess:
             except subprocess.TimeoutExpired:
                 self.process.kill()
 
+    def is_alive(self) -> bool:
+        return bool(self.process and self.process.poll() is None)
+
 
 class CodexPagerBridge:
     def __init__(
         self,
         rpc: JsonRpcProcess,
         gateway: str,
+        gateway_token: str,
         state_path: Path,
         workspace: Path,
         thread_id: str | None = None,
@@ -135,6 +155,7 @@ class CodexPagerBridge:
     ):
         self.rpc = rpc
         self.gateway = gateway.rstrip("/")
+        self.gateway_token = gateway_token
         self.state_path = state_path
         self.workspace = workspace.resolve()
         self.requested_thread_id = thread_id
@@ -243,6 +264,8 @@ class CodexPagerBridge:
     ) -> dict[str, Any]:
         data = None
         headers: dict[str, str] = {}
+        if self.gateway_token:
+            headers["Authorization"] = f"Bearer {self.gateway_token}"
         if payload is not None:
             data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
             headers["Content-Type"] = "application/json"
@@ -250,7 +273,8 @@ class CodexPagerBridge:
             self.gateway + path, data=data, headers=headers, method=method
         )
         try:
-            with urllib.request.urlopen(request, timeout=15) as response:
+            timeout = 180 if path == "/notify-out" else 15
+            with urllib.request.urlopen(request, timeout=timeout) as response:
                 body = response.read().decode("utf-8")
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")[:300]
@@ -262,7 +286,17 @@ class CodexPagerBridge:
         if not result.get("ok"):
             raise RuntimeError(f"gateway inbox rejected request: {result}")
         items = result.get("items") or []
-        return [x for x in items if isinstance(x, dict) and str(x.get("text") or "").strip()]
+        return [
+            x for x in items
+            if isinstance(x, dict) and x.get("id") and str(x.get("text") or "").strip()
+        ]
+
+    def ack_inbox(self, message_id: str) -> None:
+        result = self._http_json(
+            "POST", "/codex/inbox/ack", {"ids": [message_id]}
+        )
+        if not result.get("ok"):
+            raise RuntimeError(f"gateway inbox ack failed: {result}")
 
     def send_reply(self, text: str) -> None:
         result = self._http_json(
@@ -280,32 +314,38 @@ class CodexPagerBridge:
         if not result.get("ok"):
             raise RuntimeError(f"gateway failed to deliver reply: {result}")
 
-    def run_turn(self, text: str) -> str:
+    @staticmethod
+    def _final_from_turn(turn: dict[str, Any]) -> str:
+        final = ""
+        for item in turn.get("items") or []:
+            if not isinstance(item, dict) or item.get("type") != "agentMessage":
+                continue
+            if item.get("phase") in (None, "final_answer"):
+                final = str(item.get("text") or "").strip()
+        return final
+
+    def _read_turn(self, turn_id: str) -> dict[str, Any] | None:
         assert self.thread_id
         result = self.rpc.request(
-            "turn/start",
-            {
-                "threadId": self.thread_id,
-                "input": [
-                    {
-                        "type": "text",
-                        "text": f"[pager tlora thread] CODEX — {text}",
-                    }
-                ],
-            },
+            "thread/read", {"threadId": self.thread_id, "includeTurns": True}
         )
-        turn_id = ((result or {}).get("turn") or {}).get("id")
-        if not isinstance(turn_id, str) or not turn_id:
-            raise RpcError("turn/start returned no turn id")
+        thread = (result or {}).get("thread") or {}
+        for turn in thread.get("turns") or []:
+            if isinstance(turn, dict) and turn.get("id") == turn_id:
+                return turn
+        return None
 
+    def _wait_for_turn(self, turn_id: str, final_text: str = "") -> str:
+        assert self.thread_id
         deadline = time.monotonic() + self.turn_timeout
-        final_text = ""
         while time.monotonic() < deadline:
             try:
                 event = self.rpc.notifications.get(
                     timeout=min(1.0, max(0.01, deadline - time.monotonic()))
                 )
             except queue.Empty:
+                if not self.rpc.is_alive():
+                    raise RpcError("Codex App Server exited during turn")
                 continue
             method = event.get("method")
             params = event.get("params") or {}
@@ -324,22 +364,81 @@ class CodexPagerBridge:
                     error = turn.get("error") or status or "unknown error"
                     raise RpcError(f"Codex turn failed: {error}")
                 if not final_text:
+                    final_text = self._final_from_turn(turn)
+                if not final_text:
                     raise RpcError("Codex turn completed without a final answer")
                 return final_text
         raise RpcError(f"Codex turn timed out after {self.turn_timeout:.0f}s")
+
+    def run_turn(self, item: dict[str, Any]) -> str:
+        assert self.thread_id
+        text = str(item["text"])
+        turn_id = item.get("turnId")
+        if turn_id:
+            recovered = self._read_turn(str(turn_id))
+            if not recovered:
+                return "Codex could not recover the interrupted turn; please resend the message."
+            status = recovered.get("status")
+            if status == "completed":
+                final = self._final_from_turn(recovered)
+                if final:
+                    return final
+                raise RpcError("recovered Codex turn has no final answer")
+            if status not in ("inProgress", "active"):
+                raise RpcError(f"recovered Codex turn is {status}")
+            return self._wait_for_turn(str(turn_id))
+
+        if item.get("state") == "starting":
+            # The process died in the only ambiguous window: after recording
+            # intent but before recording turnId. Never replay a possibly
+            # side-effecting request automatically.
+            return "Codex bridge restarted while submitting this message; please resend it."
+
+        item["state"] = "starting"
+        item["clientUserMessageId"] = str(item.get("id") or uuid.uuid4().hex)
+        self.save_state()
+        result = self.rpc.request(
+            "turn/start",
+            {
+                "threadId": self.thread_id,
+                "clientUserMessageId": item["clientUserMessageId"],
+                "input": [
+                    {
+                        "type": "text",
+                        "text": f"[pager tlora thread] CODEX — {text}",
+                    }
+                ],
+            },
+        )
+        turn_id = ((result or {}).get("turn") or {}).get("id")
+        if not isinstance(turn_id, str) or not turn_id:
+            raise RpcError("turn/start returned no turn id")
+        item["turnId"] = turn_id
+        item["state"] = "running"
+        self.save_state()
+        return self._wait_for_turn(turn_id)
 
     def run_once(self) -> bool:
         if not self.pending:
             fetched = self.fetch_inbox()
             if fetched:
-                self.pending.extend(fetched)
+                existing = {str(row.get("id")) for row in self.pending}
+                for row in fetched:
+                    if str(row["id"]) not in existing:
+                        row["gatewayAcked"] = False
+                        self.pending.append(row)
                 self.save_state()
         if not self.pending:
             return False
 
         item = self.pending[0]
+        if not item.get("gatewayAcked"):
+            self.ack_inbox(str(item["id"]))
+            item["gatewayAcked"] = True
+            self.save_state()
         if not item.get("reply"):
-            item["reply"] = self.run_turn(str(item["text"]))
+            item["reply"] = self.run_turn(item)
+            item["state"] = "completed"
             self.save_state()
         self.send_reply(str(item["reply"]))
         self.pending.popleft()
@@ -353,6 +452,8 @@ class CodexPagerBridge:
                 worked = self.run_once()
             except Exception:
                 log.exception("bridge cycle failed; state retained for retry")
+                if not self.rpc.is_alive():
+                    raise
                 time.sleep(max(2.0, poll_interval))
                 continue
             if not worked:
@@ -365,6 +466,20 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def load_bridge_secrets() -> dict[str, Any]:
+    path = Path(
+        os.environ.get(
+            "CODEX_PAGER_SECRETS",
+            str(Path.home() / ".config" / "codex-pager" / "secrets.json"),
+        )
+    ).expanduser()
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        return {}
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     logging.basicConfig(
@@ -372,6 +487,13 @@ def main(argv: list[str] | None = None) -> int:
         format="%(asctime)s [%(levelname)s] %(message)s",
     )
     workspace = Path(os.environ.get("CODEX_PAGER_WORKSPACE", os.getcwd()))
+    secrets = load_bridge_secrets()
+    gateway_token = (
+        os.environ.get("CODEX_PAGER_GATEWAY_TOKEN")
+        or str(secrets.get("gatewayToken") or "")
+    )
+    if not gateway_token:
+        raise SystemExit("CODEX pager gateway token is not configured")
     state_path = Path(
         os.environ.get(
             "CODEX_PAGER_STATE",
@@ -388,6 +510,7 @@ def main(argv: list[str] | None = None) -> int:
     bridge = CodexPagerBridge(
         rpc=rpc,
         gateway=os.environ.get("CODEX_PAGER_GATEWAY", "http://192.168.1.138:8325"),
+        gateway_token=gateway_token,
         state_path=state_path,
         workspace=workspace,
         thread_id=os.environ.get("CODEX_PAGER_THREAD_ID") or None,

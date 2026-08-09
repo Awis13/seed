@@ -17,6 +17,8 @@
     <string>REPLACE_WITH_WORKSPACE</string>
     <key>CODEX_PAGER_CODEX_BIN</key>
     <string>REPLACE_WITH_CODEX_PATH</string>
+    <key>CODEX_PAGER_SECRETS</key>
+    <string>REPLACE_WITH_HOME/.config/codex-pager/secrets.json</string>
   </dict>
   <key>RunAtLoad</key>
   <true/>
