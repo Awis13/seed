@@ -1834,6 +1834,8 @@ static void ui_mesh_ping_gateway() {
     if (!g_mesh.has_identity) push("no identity");
     else if (!g_mesh.radio_ready) push("radio not ready");
     else if (!g_mesh.heltec_pk_hex[0]) push("no GW pubkey");
+    else if (g_mesh_chat_tx.active || mesh_client_ack_pending())
+        push("radio busy - retry");
     else push("waiting ACK…");
     hw_ui_show_mesh_ping("MESH", ptrs, n);
     yield();
@@ -1841,7 +1843,8 @@ static void ui_mesh_ping_gateway() {
     uint32_t ok_before = g_mesh.last_ok_ms;
     uint32_t rtt_before = g_mesh.last_rtt_ms;
     bool tx = false;
-    if (g_mesh.has_identity && g_mesh.radio_ready && g_mesh.heltec_pk_hex[0]) {
+    if (g_mesh.has_identity && g_mesh.radio_ready && g_mesh.heltec_pk_hex[0] &&
+        !g_mesh_chat_tx.active && !mesh_client_ack_pending()) {
         tx = mesh_probe_gateway(nullptr);
         unsigned long t_wait = millis();
         /* ACK often ~0.5–2s on local path; multi-hop a bit more. */

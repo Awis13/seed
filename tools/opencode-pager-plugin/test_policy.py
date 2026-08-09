@@ -19,6 +19,7 @@ assert 'return gwRequest("/notify-out", "POST", body, 180000)' in source
 assert 'stableMessageID(s.sessionID, `gateway:${item.id}`)' in source
 assert 'messageID ? { messageID }' in source
 assert 'client.session.message' in source, "retry must recognize an accepted prompt"
+assert "throwOnError: true" in source, "SDK errors must not be ACKed as success"
 assert 'api(d, "/agents")' not in source, "OpenCode room must have one C1 owner"
 ask = source[source.index("pager_ask: tool") : source.index("pager_tell: tool")]
 assert "const g = await gwSend" in ask, "pager_ask must work with pager Wi-Fi OFF"

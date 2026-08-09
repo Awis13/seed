@@ -173,13 +173,15 @@ export default async ({ client }) => {
 
   async function inject(sessionID, text, messageID) {
     try {
-      await client.session.promptAsync({
+      const result = await client.session.promptAsync({
         path: { id: sessionID },
         body: {
           ...(messageID ? { messageID } : {}),
           parts: [{ type: "text", text }],
         },
+        throwOnError: true,
       })
+      if (result && result.error) throw new Error(String(result.error.message || result.error))
       return true
     } catch (e) {
       if (messageID) {
