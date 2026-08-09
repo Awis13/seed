@@ -15,6 +15,11 @@ assert "gps_fix = false;" not in gps[gps.index("static bool gps_parse_rmc"):
                                       gps.index("static bool gps_parse_gga")], (
     "a no-fix acquisition must not discard the persisted last-known position"
 )
+gga = gps[gps.index("static bool gps_parse_gga"):
+          gps.index("static void gps_parse_sentence")]
+assert "if (q <= 0 || q > 6) return false;" in gga, (
+    "a failed acquisition must not overwrite last-valid sats/HDOP metadata"
+)
 
 tick = gps[gps.index("static void gps_tick()") : gps.index("/* ---- HTTP ---- */")]
 assert "gps_wake_requested" in tick

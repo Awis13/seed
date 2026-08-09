@@ -233,7 +233,10 @@ static bool gps_parse_rmc(char **f, int n) {
 static bool gps_parse_gga(char **f, int n) {
     if (n < 9) return false;
     int q = atoi(f[6]);
-    if (q >= 0 && q <= 6) gps_quality = q;
+    /* Quality zero belongs to the current failed acquisition. Keep the last
+     * valid fix metadata together with its persisted coordinates. */
+    if (q <= 0 || q > 6) return false;
+    gps_quality = q;
     int sv = atoi(f[7]);
     if (sv >= 0) gps_sats = sv;
     double h = atof(f[8]);
