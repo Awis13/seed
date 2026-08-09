@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.awis.codex-pager-bridge</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>REPLACE_WITH_PYTHON3_PATH</string>
+    <string>REPLACE_WITH_PLUGIN_PATH/scripts/codex_pager_bridge.py</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>CODEX_PAGER_GATEWAY</key>
+    <string>http://192.168.1.138:8325</string>
+    <key>CODEX_PAGER_WORKSPACE</key>
+    <string>REPLACE_WITH_WORKSPACE</string>
+    <key>CODEX_PAGER_CODEX_BIN</key>
+    <string>REPLACE_WITH_CODEX_PATH</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>/tmp/codex-pager-bridge.log</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/codex-pager-bridge.err</string>
+</dict>
+</plist>

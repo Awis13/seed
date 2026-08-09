@@ -1,0 +1,18 @@
+{
+  "name": "codex-pager-plugin",
+  "version": "0.1.0",
+  "description": "Bridge a private T-Lora Pager room to a dedicated Codex task.",
+  "author": {
+    "name": "Nikolai Awis"
+  },
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Codex T-Lora Pager",
+    "shortDescription": "Talk to a dedicated Codex task over private MeshCore.",
+    "longDescription": "Runs a local bridge between the T-Lora Pager CODEX room, the Home Rig MeshCore gateway, and a dedicated Codex App Server task.",
+    "developerName": "Nikolai Awis",
+    "category": "Productivity",
+    "capabilities": ["skills", "scripts"],
+    "defaultPrompt": "Check the Codex T-Lora Pager bridge status and explain any problem without changing live services."
+  }
+}
