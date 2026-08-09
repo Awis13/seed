@@ -333,6 +333,15 @@ def mesh_pager_dst() -> str | None:
     return pk
 
 
+def is_paired_pager_sender(sender: str) -> bool:
+    """Accept C1 commands only from the configured pager identity."""
+    expected = mesh_pager_dst()
+    actual = str(sender or "").strip().lower()
+    if not expected or actual == "unknown" or len(expected) < 12 or len(actual) < 12:
+        return False
+    return expected[:12] == actual[:12]
+
+
 async def mesh_send_p1(payload: dict) -> tuple[bool, str]:
     """TX private DM frame(s) to the paired pager only. NEVER Public channel.
 
@@ -591,6 +600,9 @@ async def on_mesh_message(event):
 
     # Chat / multi-part notify frames — never shell-bot
     if text.startswith("C1|"):
+        if not is_paired_pager_sender(sender):
+            log.warning("ignored C1 from unpaired sender %s", sender)
+            return
         await handle_c1_uplink(sender, text)
         return
     if text.startswith("M1|") or text.startswith("P1|"):

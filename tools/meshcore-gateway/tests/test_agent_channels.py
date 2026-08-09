@@ -59,6 +59,13 @@ class AgentChannelTests(unittest.TestCase):
         self.assertIsNone(self.daemon._agent_channel_for_payload(wrong_source))
         self.assertIsNone(self.daemon._agent_channel_for_payload(wrong_id))
 
+    def test_only_paired_pager_can_submit_agent_chat(self):
+        self.daemon.cfg = {"mesh": {"pager_pubkey": "abcdef1234567890"}}
+        self.assertTrue(self.daemon.is_paired_pager_sender("abcdef123456"))
+        self.assertFalse(self.daemon.is_paired_pager_sender("deadbeef0000"))
+        self.assertFalse(self.daemon.is_paired_pager_sender("abcdef"))
+        self.assertFalse(self.daemon.is_paired_pager_sender("unknown"))
+
     def test_codex_reply_is_c1_and_utf8_safe(self):
         self.daemon.cfg = {"mesh_msg_limit": 42}
         body = "0123456789 " + (("тест " + chr(0x1F680) + " ") * 12)
