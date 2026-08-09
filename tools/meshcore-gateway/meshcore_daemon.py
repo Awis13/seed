@@ -16,6 +16,7 @@ Payload (our layer on top of MeshCore text):
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import hmac
 import json
 import logging
@@ -71,6 +72,11 @@ AGENT_CHANNELS: dict[str, dict[str, str]] = {
 _agent_inboxes: dict[str, list[dict[str, Any]]] = {
     agent: [] for agent in AGENT_CHANNELS
 }
+_notify_deliveries: dict[str, dict[str, Any]] = {}
+_notify_reservations: dict[str, dict[str, Any]] = {}
+_agent_dead_letters: dict[str, list[dict[str, Any]]] = {
+    agent: [] for agent in AGENT_CHANNELS
+}
 _AGENT_INBOX_MAX = 200
 _MESH_BODY_MAX_BYTES = 1600
 
@@ -85,9 +91,20 @@ def _agent_channel_for_payload(payload: dict) -> tuple[str, dict[str, str]] | No
     return None
 
 
+def _notify_delivery_key(payload: dict) -> str:
+    delivery_id = str(payload.get("deliveryId") or "")
+    if not delivery_id:
+        return ""
+    source = str(payload.get("source") or "")
+    item_id = str(payload.get("id") or "")
+    return f"{source}\x1f{item_id}\x1f{delivery_id}"
+
+
 def _agent_inbox_path() -> Path:
     configured = (cfg.get("agent_inbox") or {}).get("path")
-    return Path(configured) if configured else Path(__file__).parent / "agent-inboxes.json"
+    return (
+        Path(configured) if configured else Path(__file__).parent / "agent-inboxes.json"
+    )
 
 
 def _persist_agent_inboxes() -> None:
@@ -95,7 +112,11 @@ def _persist_agent_inboxes() -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + ".tmp")
     with open(tmp, "w", encoding="utf-8") as handle:
-        json.dump(_agent_inboxes, handle, ensure_ascii=False, separators=(",", ":"))
+        payload = dict(_agent_inboxes)
+        payload["_notifyDeliveries"] = _notify_deliveries
+        payload["_notifyReservations"] = _notify_reservations
+        payload["_agentDeadLetters"] = _agent_dead_letters
+        json.dump(payload, handle, ensure_ascii=False, separators=(",", ":"))
         handle.write("\n")
         handle.flush()
         os.fsync(handle.fileno())
@@ -104,6 +125,7 @@ def _persist_agent_inboxes() -> None:
 
 
 def load_agent_inboxes() -> None:
+    global _notify_deliveries, _notify_reservations
     try:
         saved = json.loads(_agent_inbox_path().read_text(encoding="utf-8"))
     except FileNotFoundError:
@@ -115,20 +137,45 @@ def load_agent_inboxes() -> None:
         rows = saved.get(agent) if isinstance(saved, dict) else None
         if isinstance(rows, list):
             _agent_inboxes[agent] = [
-                row for row in rows[-_AGENT_INBOX_MAX:]
+                row
+                for row in rows[-_AGENT_INBOX_MAX:]
                 if isinstance(row, dict) and row.get("id") and row.get("text")
             ]
+    deliveries = saved.get("_notifyDeliveries") if isinstance(saved, dict) else None
+    if isinstance(deliveries, dict):
+        _notify_deliveries = {
+            str(key): value
+            for key, value in list(deliveries.items())[-500:]
+            if key and isinstance(value, dict) and value.get("ok")
+        }
+    reservations = saved.get("_notifyReservations") if isinstance(saved, dict) else None
+    if isinstance(reservations, dict):
+        _notify_reservations = {
+            str(key): {**value, "state": "ambiguous"}
+            for key, value in list(reservations.items())[-500:]
+            if key and isinstance(value, dict)
+        }
+    dead_letters = saved.get("_agentDeadLetters") if isinstance(saved, dict) else None
+    if isinstance(dead_letters, dict):
+        for agent in AGENT_CHANNELS:
+            rows = dead_letters.get(agent)
+            if isinstance(rows, list):
+                _agent_dead_letters[agent] = [
+                    row for row in rows[-_AGENT_INBOX_MAX:] if isinstance(row, dict)
+                ]
 
 
 def enqueue_agent_message(agent: str, text: str, ts: int | None = None) -> bool:
     queue = _agent_inboxes.get(agent)
     if queue is None or len(queue) >= _AGENT_INBOX_MAX:
         return False
-    queue.append({
-        "id": uuid.uuid4().hex,
-        "text": text,
-        "ts": int(time.time()) if ts is None else ts,
-    })
+    queue.append(
+        {
+            "id": uuid.uuid4().hex,
+            "text": text,
+            "ts": int(time.time()) if ts is None else ts,
+        }
+    )
     _persist_agent_inboxes()
     return True
 
@@ -152,12 +199,36 @@ def ack_agent_messages(agent: str, message_ids: set[str]) -> int:
     return removed
 
 
+def reject_agent_messages(agent: str, message_ids: set[str], reason: str) -> int:
+    queue = _agent_inboxes.get(agent)
+    dead = _agent_dead_letters.get(agent)
+    if queue is None or dead is None or not message_ids:
+        return 0
+    rejected = [row for row in queue if str(row.get("id")) in message_ids]
+    if not rejected:
+        return 0
+    queue[:] = [row for row in queue if str(row.get("id")) not in message_ids]
+    now = int(time.time())
+    dead.extend({**row, "rejectedAt": now, "reason": reason[:160]} for row in rejected)
+    del dead[:-_AGENT_INBOX_MAX]
+    _persist_agent_inboxes()
+    return len(rejected)
+
+
 def gateway_api_tokens() -> dict[str, str]:
     webhook = cfg.get("webhook") or {}
     return {
-        "admin": str(os.environ.get("MESHCORE_GATEWAY_TOKEN") or webhook.get("token") or ""),
-        "opencode": str(os.environ.get("MESHCORE_OPENCODE_TOKEN") or webhook.get("opencode_token") or ""),
-        "codex": str(os.environ.get("MESHCORE_CODEX_TOKEN") or webhook.get("codex_token") or ""),
+        "admin": str(
+            os.environ.get("MESHCORE_GATEWAY_TOKEN") or webhook.get("token") or ""
+        ),
+        "opencode": str(
+            os.environ.get("MESHCORE_OPENCODE_TOKEN")
+            or webhook.get("opencode_token")
+            or ""
+        ),
+        "codex": str(
+            os.environ.get("MESHCORE_CODEX_TOKEN") or webhook.get("codex_token") or ""
+        ),
     }
 
 
@@ -199,7 +270,9 @@ async def gateway_auth_middleware(request: web.Request, handler):
         provided = request.headers.get("X-Gateway-Token", "").strip()
     # The admin capability may operate every route; agent bridges receive only
     # their scoped token and cannot read, ack, or spoof the other agent.
-    if not (_token_matches(provided, expected) or _token_matches(provided, tokens["admin"])):
+    if not (
+        _token_matches(provided, expected) or _token_matches(provided, tokens["admin"])
+    ):
         return web.json_response({"ok": False, "error": "unauthorized"}, status=401)
     return await handler(request)
 
@@ -244,6 +317,7 @@ def check_inet(host: str = "8.8.8.8") -> bool:
 
 # ── P1 payload ───────────────────────────────────────────────────────────────
 
+
 def parse_p1(text: str) -> dict | None:
     """Parse P1|level|source|title|body — body may contain |."""
     if not text.startswith("P1|"):
@@ -278,8 +352,10 @@ def _utf8_ellipsize(text: str, max_bytes: int) -> str:
     return _utf8_fit(text or "", max_bytes - len(suffix.encode("utf-8"))) + suffix
 
 
-def _new_mesh_mid() -> str:
+def _new_mesh_mid(delivery_id: str = "") -> str:
     """Seven hex chars fit the firmware's char mid[8] without collisions by second."""
+    if delivery_id:
+        return hashlib.sha256(delivery_id.encode("utf-8")).hexdigest()[:7]
     return uuid.uuid4().hex[:7]
 
 
@@ -332,27 +408,38 @@ def encode_mesh_frames(payload: dict) -> list[str]:
         if not channel_match:
             return []
         agent, _channel = channel_match
-        return _encode_c1(agent, body, side="a", limit=limit)
-    if not force_p1 and (source in ("grok", "claude", "hermes") or
-                         source.endswith("-chat")):
+        return _encode_c1(
+            agent,
+            body,
+            side="a",
+            limit=limit,
+            delivery_id=str(payload.get("deliveryId") or ""),
+        )
+    if not force_p1 and (
+        source in ("grok", "claude", "hermes") or source.endswith("-chat")
+    ):
         agent = source.replace("-chat", "")[:12]
-        return _encode_c1(agent, body, side="a", limit=limit)
+        return _encode_c1(
+            agent,
+            body,
+            side="a",
+            limit=limit,
+            delivery_id=str(payload.get("deliveryId") or ""),
+        )
 
     prefix = f"P1|{level}|{source}|{title}|"
     # A P1 may carry the client id as its final field.  The pager uses ids that
     # end in "-chat" as doors: Enter opens that agent room instead of the
     # ordinary Ack/Reply sheet.
     suffix = f"|{key}" if force_p1 and isinstance(key, str) and key else ""
-    room = max(0, limit - len(prefix.encode("utf-8")) -
-               len(suffix.encode("utf-8")))
+    room = max(0, limit - len(prefix.encode("utf-8")) - len(suffix.encode("utf-8")))
     raw = body.encode("utf-8")
     if len(raw) <= room:
         return [prefix + body + suffix]
 
     # Multi-part notify reassembly on pager
-    mid = _new_mesh_mid()
+    mid = _new_mesh_mid(str(payload.get("deliveryId") or ""))
     # header worst-case: M1|ffff|99|99|crit|src16|title60|
-    parts: list[bytes] = []
     # provisional part count — iterate until stable
     n_guess = max(1, (len(raw) + 80) // 80)
     while True:
@@ -372,11 +459,17 @@ def encode_mesh_frames(payload: dict) -> list[str]:
     return frames or [prefix + _utf8_fit(body, room)]
 
 
-def _encode_c1(agent: str, body: str, side: str = "a", limit: int = 150) -> list[str]:
+def _encode_c1(
+    agent: str,
+    body: str,
+    side: str = "a",
+    limit: int = 150,
+    delivery_id: str = "",
+) -> list[str]:
     """Chat multi-part: C1|agent|mid|i|n|side|chunk"""
     agent = (agent or "chat")[:12]
     side = "u" if side == "u" else "a"
-    mid = _new_mesh_mid()
+    mid = _new_mesh_mid(delivery_id)
     body = _utf8_ellipsize(body or "", _MESH_BODY_MAX_BYTES)
     raw = body.encode("utf-8")
     if not raw:
@@ -405,6 +498,7 @@ def normalize_payload(data: dict) -> dict:
         "title": (data.get("title") or "notify")[:60],
         "body": _utf8_ellipsize(str(data.get("body") or ""), _MESH_BODY_MAX_BYTES),
         "id": data.get("id"),  # optional client key (*-chat door)
+        "deliveryId": str(data.get("deliveryId") or "")[:200],
     }
 
 
@@ -501,9 +595,12 @@ async def mesh_send_p1(payload: dict) -> tuple[bool, str]:
                 min_timeout=1.5,
             )
             if result is None:
-                return False, f"part {i+1}/{len(frames)}: no delivery ACK after retries"
+                return (
+                    False,
+                    f"part {i + 1}/{len(frames)}: no delivery ACK after retries",
+                )
             if result.type == EventType.ERROR:
-                return False, f"part {i+1}/{len(frames)}: {result.payload}"
+                return False, f"part {i + 1}/{len(frames)}: {result.payload}"
             sent += 1
             if i + 1 < len(frames):
                 await asyncio.sleep(0.35)  # ~one SF8 airtime between parts
@@ -590,8 +687,9 @@ async def notify_out(payload: dict, mode: str | None = None) -> dict:
             mesh_result["visible_ok"] = visible_ok
             mesh_result["visible_detail"] = visible_detail[:200]
             mesh_result["ok"] = bool(ok and visible_ok)
-            log.info("notify-out %s visible → %s %s", agent, visible_ok,
-                     visible_detail[:80])
+            log.info(
+                "notify-out %s visible → %s %s", agent, visible_ok, visible_detail[:80]
+            )
 
         out["mesh"] = mesh_result
         log.info("notify-out mesh-dm → %s %s", mesh_result["ok"], detail[:80])
@@ -607,6 +705,7 @@ async def notify_out(payload: dict, mode: str | None = None) -> dict:
 
 
 # ── Commands ─────────────────────────────────────────────────────────────────
+
 
 def cmd_help() -> str:
     return (
@@ -640,11 +739,17 @@ def cmd_status() -> str:
         mem = psutil.virtual_memory()
         ram = f"{mem.used // (1024**2)}M/{mem.total // (1024**2)}M ({mem.percent}%)"
         disk = psutil.disk_usage("/")
-        disk_str = f"{disk.used // (1024**3)}G/{disk.total // (1024**3)}G ({disk.percent}%)"
+        disk_str = (
+            f"{disk.used // (1024**3)}G/{disk.total // (1024**3)}G ({disk.percent}%)"
+        )
     except ImportError:
         ram = run_shell("free -m | awk '/Mem:/{printf \"%sM/%sM\", $3, $2}'")
         disk_str = run_shell("df -h / | awk 'NR==2{printf \"%s/%s\", $3, $2}'")
-    inet = "up" if check_inet(cfg.get("monitor", {}).get("ping_host", "8.8.8.8")) else "DOWN"
+    inet = (
+        "up"
+        if check_inet(cfg.get("monitor", {}).get("ping_host", "8.8.8.8"))
+        else "DOWN"
+    )
     return truncate(
         f"Daemon: {daemon_up}\nLoad: {load_str}\nRAM: {ram}\nDisk: {disk_str}\nInet: {inet}"
     )
@@ -680,14 +785,20 @@ def cmd_wol(mac: str) -> str:
         return "WOL error: invalid MAC"
     if shutil.which("wakeonlan"):
         result = subprocess.run(
-            ["wakeonlan", mac], capture_output=True, text=True,
-            timeout=cfg.get("shell_timeout", 10), check=False,
+            ["wakeonlan", mac],
+            capture_output=True,
+            text=True,
+            timeout=cfg.get("shell_timeout", 10),
+            check=False,
         )
         return truncate((result.stdout or result.stderr).strip())
     if shutil.which("etherwake"):
         result = subprocess.run(
-            ["sudo", "etherwake", mac], capture_output=True, text=True,
-            timeout=cfg.get("shell_timeout", 10), check=False,
+            ["sudo", "etherwake", mac],
+            capture_output=True,
+            text=True,
+            timeout=cfg.get("shell_timeout", 10),
+            check=False,
         )
         return truncate((result.stdout or result.stderr).strip())
     try:
@@ -738,6 +849,7 @@ def handle_command(text: str) -> str:
 
 # ── Mesh handlers ────────────────────────────────────────────────────────────
 
+
 async def on_mesh_message(event):
     global target_contact
     data = event.payload if isinstance(event.payload, dict) else {}
@@ -758,7 +870,10 @@ async def on_mesh_message(event):
     # its alive counter even if the MeshCore protocol ACK is missed (shared SPI).
     if text in ("K", "MC|k") or text.startswith("MC|k"):
         log.info("mesh keepalive from %s — pong MC|a", sender)
-        if cfg.get("target_node", "CHANGE_ME") == "CHANGE_ME" and target_contact is None:
+        if (
+            cfg.get("target_node", "CHANGE_ME") == "CHANGE_ME"
+            and target_contact is None
+        ):
             await resolve_contact(str(sender))
         try:
             # Prefer full pager pubkey if configured
@@ -792,7 +907,7 @@ async def on_mesh_message(event):
 
 def _agent_bridge_url() -> str:
     ab = cfg.get("agent_bridge") or {}
-    url = (ab.get("url") or os.environ.get("AGENT_BRIDGE_URL") or "http://127.0.0.1:8091")
+    url = ab.get("url") or os.environ.get("AGENT_BRIDGE_URL") or "http://127.0.0.1:8091"
     return str(url).rstrip("/")
 
 
@@ -903,7 +1018,9 @@ async def reply_to(sender_prefix: str, text: str) -> None:
         log.warning("no contact for reply to %s", sender_prefix)
         return
     try:
-        await mc.commands.send_msg(contact, truncate(text, cfg.get("mesh_msg_limit", 200)))
+        await mc.commands.send_msg(
+            contact, truncate(text, cfg.get("mesh_msg_limit", 200))
+        )
     except Exception as e:
         log.error("send_msg failed: %s", e)
 
@@ -962,6 +1079,7 @@ async def resolve_contact(prefix: str | None = None):
 
 
 # ── HTTP ─────────────────────────────────────────────────────────────────────
+
 
 async def webhook_send(request: web.Request) -> web.Response:
     if target_contact is None:
@@ -1034,8 +1152,48 @@ async def webhook_notify_out(request: web.Request) -> web.Response:
             data = p1
     mode = data.pop("mode", None) if isinstance(data, dict) else None
     if not isinstance(data, dict):
-        return web.json_response({"ok": False, "error": "JSON object required"}, status=400)
+        return web.json_response(
+            {"ok": False, "error": "JSON object required"}, status=400
+        )
+    delivery_key = _notify_delivery_key(data)
+    if delivery_key and delivery_key in _notify_deliveries:
+        duplicate = dict(_notify_deliveries[delivery_key])
+        duplicate["duplicate"] = True
+        return web.json_response(duplicate)
+    if delivery_key and delivery_key in _notify_reservations:
+        return web.json_response(
+            {
+                "ok": False,
+                "ambiguous": True,
+                "error": "delivery outcome requires manual resolution",
+            },
+            status=409,
+        )
+    if delivery_key:
+        _notify_reservations[delivery_key] = {
+            "state": "inflight",
+            "reservedAt": int(time.time()),
+        }
+        _persist_agent_inboxes()
     result = await notify_out(data, mode=mode)
+    if delivery_key and result.get("ok"):
+        _notify_deliveries[delivery_key] = result
+        _notify_reservations.pop(delivery_key, None)
+        while len(_notify_deliveries) > 500:
+            _notify_deliveries.pop(next(iter(_notify_deliveries)))
+        _persist_agent_inboxes()
+    elif delivery_key:
+        _notify_reservations[delivery_key]["state"] = "ambiguous"
+        _persist_agent_inboxes()
+        return web.json_response(
+            {
+                "ok": False,
+                "ambiguous": True,
+                "error": "delivery failed after durable reservation",
+                "result": result,
+            },
+            status=409,
+        )
     status = 200 if result.get("ok") else 502
     return web.json_response(result, status=status)
 
@@ -1056,9 +1214,16 @@ async def webhook_health(request: web.Request) -> web.Response:
             "radio": info,
             "notify_mode": (cfg.get("notify") or {}).get("mode", "both"),
             "endpoints": [
-                "/health", "/ping", "/send", "/pager", "/notify-out",
-                "/opencode/inbox", "/opencode/inbox/ack",
-                "/codex/inbox", "/codex/inbox/ack",
+                "/health",
+                "/ping",
+                "/send",
+                "/pager",
+                "/notify-out",
+                "/opencode/inbox",
+                "/opencode/inbox/ack",
+                "/codex/inbox",
+                "/codex/inbox/ack",
+                "/codex/inbox/reject",
             ],
         }
     )
@@ -1154,6 +1319,22 @@ async def webhook_agent_inbox_ack(request: web.Request) -> web.Response:
     return web.json_response({"ok": True, "acked": removed})
 
 
+async def webhook_agent_inbox_reject(request: web.Request) -> web.Response:
+    agent = request.match_info["agent"]
+    if agent not in AGENT_CHANNELS:
+        return web.json_response({"ok": False, "error": "unknown agent"}, status=404)
+    try:
+        data = await request.json()
+    except Exception:
+        return web.json_response({"ok": False, "error": "JSON required"}, status=400)
+    raw_ids = data.get("ids") if isinstance(data, dict) else None
+    reason = str(data.get("reason") or "rejected") if isinstance(data, dict) else ""
+    if not isinstance(raw_ids, list) or not all(isinstance(x, str) for x in raw_ids):
+        return web.json_response({"ok": False, "error": "ids[] required"}, status=400)
+    rejected = reject_agent_messages(agent, set(raw_ids), reason)
+    return web.json_response({"ok": True, "rejected": rejected})
+
+
 def create_webhook_app() -> web.Application:
     app = web.Application(middlewares=[gateway_auth_middleware])
     app.router.add_post("/send", webhook_send)
@@ -1161,6 +1342,9 @@ def create_webhook_app() -> web.Application:
     app.router.add_post("/notify-out", webhook_notify_out)
     app.router.add_get("/{agent:opencode|codex}/inbox", webhook_agent_inbox)
     app.router.add_post("/{agent:opencode|codex}/inbox/ack", webhook_agent_inbox_ack)
+    app.router.add_post(
+        "/{agent:opencode|codex}/inbox/reject", webhook_agent_inbox_reject
+    )
     app.router.add_get("/health", webhook_health)
     app.router.add_get("/ping", webhook_ping)
     return app

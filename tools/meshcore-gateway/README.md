@@ -10,6 +10,8 @@ The gateway owns two independent, bounded durable queues:
 - `GET /opencode/inbox` lists only `C1|opencode|...|u|...` messages.
 - `GET /codex/inbox` lists only `C1|codex|...|u|...` messages.
 - `POST /<agent>/inbox/ack` removes explicitly acknowledged message IDs.
+- `POST /<agent>/inbox/reject` durably moves proven pre-submit failures into a
+  bounded dead-letter list instead of leaving them in the active queue.
 
 Replies use the same `POST /notify-out` contract. A chat reply becomes both a
 complete C1 history entry and a short P1 door card only when its exact identity
@@ -19,6 +21,13 @@ matches one of these pairs:
 - `source=codex-pager`, `id=codex-chat`
 
 That strict pair prevents one integration from opening the other room.
+
+Agent bridges should include a stable `deliveryId`. The gateway durably
+reserves the scoped source/id/delivery tuple before transport and stores
+successful results. Concurrent duplicates are suppressed. An unfinished
+reservation after restart returns HTTP 409 with `ambiguous=true` and is never
+resent automatically. This avoids duplicate chat history but requires manual
+resolution for the rare crash-after-radio window.
 
 ## Install or update
 

@@ -1,3 +1,4 @@
+import asyncio
 import importlib.util
 import sys
 import tempfile
@@ -13,7 +14,9 @@ def load_daemon():
 
     aiohttp = types.ModuleType("aiohttp")
     aiohttp.web = types.SimpleNamespace(
-        Request=object, Response=object, Application=object,
+        Request=object,
+        Response=object,
+        Application=object,
         middleware=lambda function: function,
     )
     sys.modules.setdefault("aiohttp", aiohttp)
@@ -112,10 +115,154 @@ class AgentChannelTests(unittest.TestCase):
         )
         self.assertLessEqual(len(frames), 64)
         body = "".join(frame.split("|", 6)[6] for frame in frames)
-        self.assertLessEqual(len(body.encode("utf-8")), self.daemon._MESH_BODY_MAX_BYTES)
+        self.assertLessEqual(
+            len(body.encode("utf-8")), self.daemon._MESH_BODY_MAX_BYTES
+        )
+
+    def test_delivery_id_makes_c1_message_id_stable(self):
+        payload = {
+            "source": "codex-pager",
+            "id": "codex-chat",
+            "body": "answer",
+            "deliveryId": "codex-reply:msg-1",
+        }
+        first = self.daemon.encode_mesh_frames(payload)
+        second = self.daemon.encode_mesh_frames(payload)
+        self.assertEqual(first, second)
+        changed = self.daemon.encode_mesh_frames(
+            {**payload, "deliveryId": "codex-reply:msg-2"}
+        )
+        self.assertNotEqual(first[0].split("|")[2], changed[0].split("|")[2])
 
 
 class DeliveryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_reject_moves_item_to_durable_dead_letter(self):
+        daemon = load_daemon()
+        with tempfile.TemporaryDirectory() as directory:
+            daemon.cfg = {"agent_inbox": {"path": str(Path(directory) / "state.json")}}
+            self.assertTrue(daemon.enqueue_agent_message("codex", "bad", 1))
+            message_id = daemon.list_agent_messages("codex")[0]["id"]
+            self.assertEqual(
+                daemon.reject_agent_messages("codex", {message_id}, "pre-submit"), 1
+            )
+            self.assertEqual(daemon.list_agent_messages("codex"), [])
+            self.assertTrue(daemon.enqueue_agent_message("codex", "next", 2))
+
+            reloaded = load_daemon()
+            reloaded.cfg = daemon.cfg
+            reloaded.load_agent_inboxes()
+            self.assertEqual(reloaded._agent_dead_letters["codex"][0]["id"], message_id)
+            self.assertEqual(
+                [row["text"] for row in reloaded.list_agent_messages("codex")],
+                ["next"],
+            )
+
+    async def test_concurrent_identical_delivery_is_reserved_once(self):
+        daemon = load_daemon()
+        with tempfile.TemporaryDirectory() as directory:
+            daemon.cfg = {"agent_inbox": {"path": str(Path(directory) / "state.json")}}
+            daemon.web.json_response = lambda body, status=200: (status, body)
+            started = asyncio.Event()
+            release = asyncio.Event()
+            calls = []
+
+            async def deliver(payload, mode=None):
+                calls.append((payload, mode))
+                started.set()
+                await release.wait()
+                return {"ok": True, "payload": payload}
+
+            daemon.notify_out = deliver
+
+            class Request:
+                async def json(self):
+                    return {
+                        "source": "codex-pager",
+                        "id": "codex-chat",
+                        "body": "answer",
+                        "deliveryId": "codex-reply:concurrent",
+                    }
+
+            first_task = asyncio.create_task(daemon.webhook_notify_out(Request()))
+            await started.wait()
+            second = await daemon.webhook_notify_out(Request())
+            self.assertEqual(second[0], 409)
+            self.assertTrue(second[1]["ambiguous"])
+            self.assertEqual(len(calls), 1)
+            release.set()
+            first = await first_task
+            self.assertEqual(first[0], 200)
+
+    async def test_restart_does_not_resend_ambiguous_reservation(self):
+        daemon = load_daemon()
+        with tempfile.TemporaryDirectory() as directory:
+            daemon.cfg = {"agent_inbox": {"path": str(Path(directory) / "state.json")}}
+            payload = {
+                "source": "codex-pager",
+                "id": "codex-chat",
+                "deliveryId": "codex-reply:crash",
+            }
+            key = daemon._notify_delivery_key(payload)
+            daemon._notify_reservations[key] = {"state": "inflight", "reservedAt": 1}
+            daemon._persist_agent_inboxes()
+
+            reloaded = load_daemon()
+            reloaded.cfg = daemon.cfg
+            reloaded.web.json_response = lambda body, status=200: (status, body)
+            reloaded.load_agent_inboxes()
+            calls = []
+
+            async def forbidden(*_args, **_kwargs):
+                calls.append(True)
+                return {"ok": True}
+
+            reloaded.notify_out = forbidden
+
+            class Request:
+                async def json(self):
+                    return {**payload, "body": "answer"}
+
+            result = await reloaded.webhook_notify_out(Request())
+            self.assertEqual(result[0], 409)
+            self.assertTrue(result[1]["ambiguous"])
+            self.assertEqual(calls, [])
+
+    async def test_notify_delivery_dedupe_survives_daemon_restart(self):
+        daemon = load_daemon()
+        with tempfile.TemporaryDirectory() as directory:
+            daemon.cfg = {"agent_inbox": {"path": str(Path(directory) / "state.json")}}
+            daemon.web.json_response = lambda body, status=200: (status, body)
+            calls = []
+
+            async def deliver(payload, mode=None):
+                calls.append((payload, mode))
+                return {"ok": True, "payload": payload}
+
+            daemon.notify_out = deliver
+
+            class Request:
+                async def json(self):
+                    return {
+                        "source": "codex-pager",
+                        "id": "codex-chat",
+                        "body": "answer",
+                        "deliveryId": "codex-reply:msg-1",
+                    }
+
+            first = await daemon.webhook_notify_out(Request())
+            self.assertTrue(first[1]["ok"])
+            self.assertEqual(len(calls), 1)
+
+            reloaded = load_daemon()
+            reloaded.cfg = daemon.cfg
+            reloaded.web.json_response = lambda body, status=200: (status, body)
+            reloaded.load_agent_inboxes()
+            reloaded.notify_out = lambda *_args, **_kwargs: self.fail(
+                "duplicate delivery reached transport"
+            )
+            duplicate = await reloaded.webhook_notify_out(Request())
+            self.assertTrue(duplicate[1]["duplicate"])
+
     async def test_unpaired_mesh_sender_never_reaches_command_bot(self):
         daemon = load_daemon()
         daemon.cfg = {
@@ -135,10 +282,12 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
                 "mesh": {"pager_pubkey": "abcdef1234567890"},
                 "agent_inbox": {"path": str(Path(directory) / "inboxes.json")},
             }
-            event = types.SimpleNamespace(payload={
-                "pubkey_prefix": "abcdef123456",
-                "text": "C1|codex|abc1234|1|1|u|once",
-            })
+            event = types.SimpleNamespace(
+                payload={
+                    "pubkey_prefix": "abcdef123456",
+                    "text": "C1|codex|abc1234|1|1|u|once",
+                }
+            )
             await daemon.on_mesh_message(event)
             await daemon.on_mesh_message(event)
             self.assertEqual(
@@ -208,7 +357,8 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             await daemon.gateway_auth_middleware(
                 Request(
-                    "/notify-out", "open-secret",
+                    "/notify-out",
+                    "open-secret",
                     {"source": "codex-pager", "id": "codex-chat"},
                 ),
                 handler,
@@ -218,7 +368,8 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             await daemon.gateway_auth_middleware(
                 Request(
-                    "/notify-out", "open-secret",
+                    "/notify-out",
+                    "open-secret",
                     {"source": "opencode-pager", "id": "opencode-chat"},
                 ),
                 handler,
@@ -229,8 +380,10 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
     def test_full_inbox_refuses_new_message_without_dropping_oldest(self):
         daemon = load_daemon()
         daemon.cfg = {"agent_inbox": {"path": "/dev/null"}}
-        original = [{"id": str(i), "text": str(i), "ts": i}
-                    for i in range(daemon._AGENT_INBOX_MAX)]
+        original = [
+            {"id": str(i), "text": str(i), "ts": i}
+            for i in range(daemon._AGENT_INBOX_MAX)
+        ]
         daemon._agent_inboxes["codex"] = list(original)
         self.assertFalse(daemon.enqueue_agent_message("codex", "overflow"))
         self.assertEqual(daemon._agent_inboxes["codex"], original)
@@ -240,8 +393,9 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
         daemon.cfg = {}
         self.assertEqual(daemon.handle_command("sh id"), "sh: disabled")
         self.assertEqual(daemon.handle_command("reboot"), "reboot: disabled")
-        self.assertEqual(daemon.cmd_wol("aa:bb:cc:dd:ee:ff; id"),
-                         "WOL error: invalid MAC")
+        self.assertEqual(
+            daemon.cmd_wol("aa:bb:cc:dd:ee:ff; id"), "WOL error: invalid MAC"
+        )
 
     async def test_wifi_chat_still_sends_full_c1_history(self):
         daemon = load_daemon()

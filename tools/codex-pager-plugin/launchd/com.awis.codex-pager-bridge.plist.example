@@ -13,10 +13,14 @@
   <dict>
     <key>CODEX_PAGER_GATEWAY</key>
     <string>http://192.168.1.138:8325</string>
-    <key>CODEX_PAGER_WORKSPACE</key>
-    <string>REPLACE_WITH_WORKSPACE</string>
-    <key>CODEX_PAGER_CODEX_BIN</key>
-    <string>REPLACE_WITH_CODEX_PATH</string>
+    <key>CODEX_PAGER_THREAD_ID</key>
+    <string>REPLACE_WITH_EXACT_CODEX_TASK_ID</string>
+    <key>CODEX_PAGER_TASK_TITLE</key>
+    <string>REPLACE_WITH_EXACT_UNIQUE_TASK_TITLE</string>
+    <key>CODEX_PAGER_COMPANION</key>
+    <string>REPLACE_WITH_PLUGIN_PATH/bin/codex-pager-companion</string>
+    <key>CODEX_PAGER_SESSIONS</key>
+    <string>REPLACE_WITH_HOME/.codex/sessions</string>
     <key>CODEX_PAGER_SECRETS</key>
     <string>REPLACE_WITH_HOME/.config/codex-pager/secrets.json</string>
   </dict>
