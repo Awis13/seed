@@ -31,6 +31,7 @@
 #include <string.h>
 #include <stdio.h>
 #include "mesh/mc_client.h"
+#include "mesh/utf8_chunk.h"
 
 #define MESH_ID_PATH       "/mesh_identity.id"
 #define MESH_PAIR_PATH     "/mesh_pair.json"
@@ -698,12 +699,10 @@ static bool mesh_chat_uplink(const char *agent_id, const char *text) {
     int n_parts = 0;
     size_t i = 0;
     while (i < raw_len) {
-        int take = room;
-        if (i + (size_t)take > raw_len) take = (int)(raw_len - i);
-        while (take > 0 && (raw[i + (size_t)take - 1] & 0xC0) == 0x80) take--;
-        if (take <= 0) take = 1;
+        size_t take = mesh_utf8_chunk_len(raw, raw_len, i, (size_t)room);
+        if (take == 0) return false;
         n_parts++;
-        i += (size_t)take;
+        i += take;
         if (n_parts > 32) break;
     }
     if (n_parts == 0) n_parts = 1;
@@ -711,22 +710,20 @@ static bool mesh_chat_uplink(const char *agent_id, const char *text) {
     i = 0;
     int part = 0;
     while (i < raw_len && part < n_parts) {
-        int take = room;
-        if (i + (size_t)take > raw_len) take = (int)(raw_len - i);
-        while (take > 0 && (raw[i + (size_t)take - 1] & 0xC0) == 0x80) take--;
-        if (take <= 0) take = 1;
+        size_t take = mesh_utf8_chunk_len(raw, raw_len, i, (size_t)room);
+        if (take == 0) return false;
         part++;
         char frame[160];
         int n = snprintf(frame, sizeof(frame), "C1|%s|%s|%d|%d|u|", agent, mid, part,
                          n_parts);
         if (n < 0 || n >= (int)sizeof(frame)) return false;
-        int room2 = (int)sizeof(frame) - 1 - n;
-        if (take > room2) take = room2;
-        memcpy(frame + n, text + i, (size_t)take);
+        size_t room2 = sizeof(frame) - 1U - (size_t)n;
+        if (take > room2) return false;
+        memcpy(frame + n, text + i, take);
         frame[n + take] = '\0';
         uint32_t ack = 0, est = 0;
         if (!mesh_client_send_to_gateway(frame, &ack, &est)) return false;
-        i += (size_t)take;
+        i += take;
         if (i < raw_len) delay(350);
     }
     return part > 0;
