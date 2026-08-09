@@ -13,8 +13,12 @@
  *
  * The last valid fix lives in RAM and is persisted to /gps.json so GET /gps
  * still answers after a reboot. Saves are debounced like /backlight.json.
- * Endpoint:
- *   GET /gps — {ready, lat, lon, fix, fix_quality, sats, hdop, ts, age_s}
+ * Endpoints:
+ *   GET  /gps     — {ready, lat, lon, fix, fix_quality, sats, hdop, ts, age_s}
+ *   POST /gps/fix — {agent?} fresh fix or {fix:false} (+ arm reply-on-fix)
+ *
+ * Also exposes a couple of public accessors + a weak on-fix hook so agents.cpp
+ * can answer a "where are you?" without polluting the agents contract.
  */
 
 #include <math.h>
@@ -30,6 +34,16 @@
  * and always when the fix moves past ~20 m (~0.0002 deg). */
 #define GPS_EVENT_MOVE_DEG   0.0002
 #define GPS_EVENT_INTERVAL_S 60
+/* A fix is "fresh" for the location door-card / /gps/fix answer. */
+#define GPS_FRESH_S          60
+
+/* ---- public accessors (prototypes here; agents.cpp reads them through these) - */
+bool gps_get_position(double *lat, double *lon, uint32_t *ts, bool *fix,
+                      int *sats);
+long gps_fix_age_s(void);
+float gps_get_hdop(void);
+void gps_set_on_fix(void (*cb)(void));
+/* ---------------------------------------------------------------------------- */
 
 /* ---- state ---- */
 static bool gps_ready = false;        /* XL9555 rail up + UART configured */
@@ -48,6 +62,10 @@ static bool gps_dirty = false;
 static unsigned long gps_save_at = 0;
 static char gps_line[GPS_LINE_MAX];
 static size_t gps_line_len = 0;
+
+/* Weak hook: fired on every fresh valid RMC 'A'. agents.cpp registers it to
+ * answer pending "where are you?" queries the moment a fix lands. */
+static void (*gps_on_fix_cb)(void) = nullptr;
 
 /* ---- power (XL9555) ---- */
 static void gps_power(bool on) {
@@ -174,6 +192,7 @@ static bool gps_parse_rmc(char **f, int n) {
         gps_last_event_s = now_s;
     }
     gps_mark_dirty();
+    if (gps_on_fix_cb) gps_on_fix_cb();   /* serve pending "where are you?" */
     return true;
 }
 
@@ -246,6 +265,39 @@ bool gps_take_fix(unsigned long max_wait_ms, double *lat_out, double *lon_out) {
     return gps_fix;
 }
 
+/* ---- public accessors (declared at the top; non-static on purpose) ------- */
+
+/* Copy the last known fix into the out-params (all optional). Returns false
+ * only when the whole GPS skill is down (XL9555 rail missing). agents.cpp and
+ * the /gps/fix route read position through this — never gps_take_fix(). */
+bool gps_get_position(double *lat, double *lon, uint32_t *ts, bool *fix,
+                      int *sats) {
+    if (lat)  *lat  = gps_lat;
+    if (lon)  *lon  = gps_lon;
+    if (ts)   *ts   = gps_fix_ts;
+    if (fix)  *fix  = gps_fix;
+    if (sats) *sats = gps_sats;
+    return gps_ready;
+}
+
+/* Age of the last fix in seconds, or -1 when there is no usable fix / clock. */
+long gps_fix_age_s(void) {
+    if (!gps_fix || gps_fix_ts == 0) return -1;
+    time_t now = time(NULL);
+    if (now <= (time_t)TIME_VALID_EPOCH) return -1;
+    return (long)(now - (time_t)gps_fix_ts);
+}
+
+/* Last HDOP, or -1 when not yet measured. */
+float gps_get_hdop(void) {
+    return gps_hdop_valid ? gps_hdop : -1.0f;
+}
+
+/* Install the "a fresh RMC 'A' arrived" callback (agents.cpp registers it). */
+void gps_set_on_fix(void (*cb)(void)) {
+    gps_on_fix_cb = cb;
+}
+
 static void gps_tick() {
     gps_drain();
     if (gps_dirty && (long)(millis() - gps_save_at) >= 0) {
@@ -275,7 +327,8 @@ static void gps_status_json(JsonDocument &doc) {
 }
 
 static const SkillEndpoint gps_endpoints[] = {
-    {"GET", "/gps", "Last GNSS fix (lat, lon, sats, hdop)"},
+    {"GET",  "/gps",     "Last GNSS fix (lat, lon, sats, hdop)"},
+    {"POST", "/gps/fix", "Freshest fix now, else {fix:false} (+ agent reply on first fix)"},
     {NULL, NULL, NULL}
 };
 
@@ -288,7 +341,8 @@ static const char *gps_describe() {
            "persisted across reboots in `/gps.json`. Also surfaces GGA\n"
            "`quality`, `sats` and `hdop`. Without the XL9555 rail the skill\n"
            "degrades to `ready:false` — the endpoint stays up.\n\n"
-           "| GET | /gps |\n";
+           "| GET | /gps |\n"
+           "| POST | /gps/fix |\n";
 }
 
 static void gps_register_routes(AsyncWebServer &server) {
@@ -299,11 +353,43 @@ static void gps_register_routes(AsyncWebServer &server) {
         gps_status_json(doc);
         notify_send_json(req, 200, doc);
     });
+
+    /* Freshest fix for an agent over the network. No blocking wait — if the
+     * saved fix is fresh (< GPS_FRESH_S) it answers coordinates, otherwise
+     * {fix:false} and optionally arms the pending agent (agents.cpp) so the
+     * reply lands in the thread the moment the first RMC 'A' arrives. */
+    server.on(AsyncURIMatcher::exact("/gps/fix"), HTTP_POST,
+              [](AsyncWebServerRequest *req) {
+        if (!require_auth(req)) return;
+        char *body = notify_take_body(req);
+        JsonDocument input;
+        if (body && deserializeJson(input, body) != DeserializationError::Ok) {
+            free(body);
+            notify_send_error(req, 400, "invalid JSON"); return;
+        }
+        free(body);
+        const char *agent = input["agent"] | "";
+        long age = gps_fix_age_s();
+        JsonDocument doc;
+        if (gps_fix && age >= 0 && age < GPS_FRESH_S) {
+            doc["fix"] = true;
+            doc["lat"] = gps_lat;
+            doc["lon"] = gps_lon;
+            doc["sats"] = gps_sats;
+            if (gps_hdop_valid) doc["hdop"] = gps_hdop;
+            doc["ts"] = gps_fix_ts;
+            doc["age_s"] = age;
+        } else {
+            doc["fix"] = false;
+            if (agent[0]) agents_gps_pending(agent);   /* reply in thread on fix */
+        }
+        notify_send_json(req, 200, doc);
+    }, NULL, handle_body_collect);
 }
 
 static const Skill gps_skill = {
     .name = "gps",
-    .version = "0.1.0",
+    .version = "0.2.0",
     .describe = gps_describe,
     .endpoints = gps_endpoints,
     .register_routes = gps_register_routes,

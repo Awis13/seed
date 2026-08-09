@@ -137,6 +137,19 @@ void   agents_thread_goto_page(int idx, uint32_t end_line);  // load older page
 int    agents_thread_view(int idx, char out[][AGENT_TEXT_LEN], bool *from_me,
                           uint32_t *ts_out, int max_lines);
 
+/* GPS location collaboration. gps.cpp is #include'd AFTER this file in the
+ * same TU, so these are prototypes resolved to the gps.cpp section below.
+ * agents.cpp answers a "where are you?" with the freshest fix instead of
+ * forwarding it to the bridge. */
+bool gps_get_position(double *lat, double *lon, uint32_t *ts, bool *fix,
+                      int *sats);
+long gps_fix_age_s(void);
+float gps_get_hdop(void);
+void gps_set_on_fix(void (*cb)(void));
+
+/* Defined later in this file (used by the GPS interception below). */
+static void agents_on_inbound(const char *agent_id, const char *text);
+
 /* ---- store ---------------------------------------------------------------- */
 
 static const char *agents_store_name() { return g_store_is_sd ? "sd" : "spiffs"; }
@@ -793,6 +806,94 @@ static void agents_set_mesh_uplink(AgentsMeshUplinkFn fn) {
     g_agents_mesh_uplink = fn;
 }
 
+/* ---- GPS location door-card ("where are you?" interception) ---------------
+ * Intercepted in agents_send() — NOT in inbound — so an agent that asks "где
+ * ты?" gets the pager's real position in its own thread and the query never
+ * hits the bridge. Fresh fix (< AGENT_GPS_FRESH_S) answers immediately; no
+ * fresh fix answers with a "no fix yet" card and arms g_agents_gps_pending,
+ * which gps.cpp's on-fix hook (registered in skill_agents_init) resolves the
+ * moment the first RMC 'A' lands. Non-blocking throughout — no gps_take_fix(). */
+
+#define AGENT_GPS_FRESH_S 60    /* mirror gps.cpp GPS_FRESH_S */
+
+static bool g_agents_gps_pending[AGENTS_N];
+
+/* Case-insensitive substring (lowercase only ASCII; needles are ASCII/Cyrillic). */
+static bool agents_ci_has(const char *hay, const char *needle) {
+    char lower[AGENT_TEXT_LEN];
+    size_t n = strlen(hay ? hay : "");
+    if (n >= sizeof(lower)) n = sizeof(lower) - 1;
+    for (size_t i = 0; i < n; i++)
+        lower[i] = (hay[i] >= 'A' && hay[i] <= 'Z') ? (char)(hay[i] + 32) : hay[i];
+    lower[n] = '\0';
+    return strstr(lower, needle) != NULL;
+}
+
+static bool agents_wants_gps(const char *text) {
+    if (!text || !text[0]) return false;
+    if (strncmp(text, "/gps", 4) == 0) return true;
+    static const char *kws[] = { "where are you", "where are u", "where r u",
+                                 "где ты", "где я" };
+    for (size_t i = 0; i < sizeof(kws) / sizeof(kws[0]); i++)
+        if (agents_ci_has(text, kws[i])) return true;
+    return false;
+}
+
+/* Post the reply line into the agent's thread, like an inbound agent message.
+ * Returns true when the position was fresh, false when it armed the pending. */
+static bool agents_loc_card(int idx) {
+    double lat = 0, lon = 0;
+    uint32_t ts = 0;
+    bool fix = false;
+    int sats = 0;
+    gps_get_position(&lat, &lon, &ts, &fix, &sats);
+    long age = gps_fix_age_s();
+    float hdop = gps_get_hdop();
+    bool fresh = fix && age >= 0 && age < AGENT_GPS_FRESH_S;
+    char line[AGENT_TEXT_LEN];
+    if (fresh) {
+        if (hdop >= 0)
+            snprintf(line, sizeof(line), "GPS: %.5f, %.5f | sats %d hdop %.1f | age %lds",
+                     lat, lon, sats, (double)hdop, age);
+        else
+            snprintf(line, sizeof(line), "GPS: %.5f, %.5f | sats %d | age %lds",
+                     lat, lon, sats, age);
+    } else {
+        snprintf(line, sizeof(line),
+                 "GPS: no fix yet - I will reply as soon as the first fix lands");
+    }
+    agents_on_inbound(g_agents[idx].id, line);
+    event_add("agent %s gps %s", g_agents[idx].id, fresh ? "located" : "pending");
+    return fresh;
+}
+
+/* Match in agents_send. Returns true when the message was consumed locally. */
+static bool agents_gps_intercept(int idx, const char *text) {
+    if (!agents_wants_gps(text)) return false;
+    agents_push_line(idx, true, text);        /* keep the query in the thread */
+    bool fresh = agents_loc_card(idx);
+    g_agents_gps_pending[idx] = !fresh;
+    return true;
+}
+
+/* gps.cpp on-fix hook: resolve every pending "where are you?" agent. Cheap
+ * no-op when nothing is pending (runs once per RMC 'A', ~1/s). */
+static void agents_gps_on_fix(void) {
+    for (int i = 0; i < AGENTS_N; i++) {
+        if (g_agents_gps_pending[i]) {
+            g_agents_gps_pending[i] = false;
+            agents_loc_card(i);
+        }
+    }
+}
+
+/* Public (used by POST /gps/fix in gps.cpp): arm a reply for the agent on the
+ * next fix. */
+void agents_gps_pending(const char *agent_id) {
+    int idx = agents_find(agent_id);
+    if (idx >= 0) g_agents_gps_pending[idx] = true;
+}
+
 /* Public: send a line as the user, into the agent's ACTIVE session.
  * Path: local thread/history → WiFi bridge if up → else MeshCore C1 uplink.
  * Downlink reply uses the same C1 (or WiFi /agents/inbound). One chat loop. */
@@ -803,6 +904,9 @@ static bool agents_send(const char *agent_id, const char *text) {
     char cleaned[AGENT_TEXT_LEN];
     agents_clean_text(text, cleaned, sizeof(cleaned));
     if (!cleaned[0]) return false;
+
+    /* "where are you?" never leaves the device: answer with the GPS fix. */
+    if (agents_gps_intercept(idx, cleaned)) return true;
 
     agents_push_line(idx, true, cleaned);   // persists + updates viewport
     agents_lock();
@@ -901,7 +1005,9 @@ static const char *agents_describe() {
         "Pocket chat with Grok / Claude / Hermes / OpenCode.\n"
         "Uplink: WiFi bridge /v1/chat, else MeshCore C1|agent|…|u|… private DM\n"
         "  (agent = grok|claude|hermes|opencode).\n"
-        "Downlink: same C1 side=a (or WiFi /agents/inbound) — one loop.\n\n"
+        "Downlink: same C1 side=a (or WiFi /agents/inbound) — one loop.\n"
+        "A \"where are you?\" / \"где ты\" message is answered locally with the\n"
+        "GNSS fix (POST /gps/fix semantics) and never hits the bridge.\n\n"
         "History: append-only JSONL on SD (fallback SPIFFS), keyed by\n"
         "(agent, session); only a 24-message viewport is kept in RAM.\n\n"
         "SPIFFS `/agent_bridge.txt` = base URL (http://host:port).\n";
@@ -1157,6 +1263,9 @@ static void skill_agents_init() {
     agents_mux = xSemaphoreCreateRecursiveMutex();
     agents_bridge_load();
     agents_store_init();
+
+    /* Answer pending "where are you?" cards the moment a GPS fix lands. */
+    gps_set_on_fix(agents_gps_on_fix);
 
     for (int i = 0; i < AGENTS_N; i++) {
         AgentSlot &a = g_agents[i];
