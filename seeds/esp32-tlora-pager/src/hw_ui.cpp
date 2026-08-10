@@ -377,6 +377,9 @@ static const uint8_t *font_glyph(uint32_t cp) {
     // En/em dash → ASCII -
     if (cp == 0x2013 || cp == 0x2014 || cp == 0x2212)
         return &FONT5X7[('-' - 0x20) * 5];
+    // Middle dot · (chat headers "GROK · s123") → ASCII .
+    if (cp == 0x00B7)
+        return &FONT5X7[('.' - 0x20) * 5];
     // Non-breaking space → space
     if (cp == 0x00A0)
         return &FONT5X7[(' ' - 0x20) * 5];
@@ -515,6 +518,7 @@ static bool clock_dirty   = true;
 static int menu_sel_drawn = -1;
 static int card_act_sel_drawn = -1;
 static int agents_sel_drawn = -1;
+static int agent_sess_sel_drawn = -1;
 static int agent_act_sel_drawn = -1;
 static int layout_sel_drawn = -1;
 static int layout_cur_drawn = -1;
@@ -618,6 +622,7 @@ void hw_ui_show_clock() {
     menu_sel_drawn = -1;
     card_act_sel_drawn = -1;
     agents_sel_drawn = -1;
+    agent_sess_sel_drawn = -1;
     agent_act_sel_drawn = -1;
     layout_sel_drawn = -1;
     layout_cur_drawn = -1;
@@ -956,12 +961,12 @@ static const char *const MENU_ITEMS[MENU_N] = {
 };
 
 // WiFi submenu
-static const int WIFI_MENU_N = 4;
+static const int WIFI_MENU_N = 5;
 static const int WIFI_MENU_ROW0_Y = 48;
 static const int WIFI_MENU_ROW_H = 32;
 static const int WIFI_MENU_BAR_H = 28;
 static const char *const WIFI_MENU_ITEMS[WIFI_MENU_N] = {
-    "STATUS", "SCAN", "PROFILES", "BACK"
+    "STATUS", "SCAN", "PROFILES", "TOGGLE WIFI", "BACK"
 };
 
 // MeshCore submenu
@@ -983,12 +988,12 @@ static const char *const LAYOUT_ITEMS[LAYOUT_N] = {
 };
 
 // Agents list (same geometry language as menu).
-static const int AGENTS_LIST_N = 4;
-static const int AGENTS_ROW0_Y = 48;
-static const int AGENTS_ROW_H = 34;
-static const int AGENTS_BAR_H = 28;
+static const int AGENTS_LIST_N = 6;
+static const int AGENTS_ROW0_Y = 42;
+static const int AGENTS_ROW_H = 30;
+static const int AGENTS_BAR_H = 25;
 static const char *const AGENTS_LIST_ITEMS[AGENTS_LIST_N] = {
-    "GROK", "CLAUDE", "HERMES", "BACK"
+    "GROK", "CLAUDE", "HERMES", "OPENCODE", "CODEX", "BACK"
 };
 
 // Card action sheet (after click/Enter on a notification).
@@ -1502,6 +1507,76 @@ void hw_ui_show_agents(int selected, bool bridge_ok) {
     for (int i = 0; i < AGENTS_LIST_N; i++)
         agents_list_draw_row(i, i == selected);
     agents_sel_drawn = selected;
+}
+
+// Session list for one agent — like AGENTS but rows are smaller (up to
+// N sessions + NEW + BACK = 10 rows fit on the 222px panel at scale 1).
+static const int SESS_ROW0_Y = 28;
+static const int SESS_ROW_H = 17;
+static const int SESS_BAR_H = 15;
+
+static void agent_sessions_draw_row(const char *title, int msgs, bool active,
+                                    int i, bool on) {
+    uint16_t y = (uint16_t)(SESS_ROW0_Y + i * SESS_ROW_H);
+    uint16_t bar_w = PANEL_W - 2 * MARGIN;
+    uint16_t fg = on ? COL_BG : COL_TIME;
+    uint16_t bg = on ? COL_ACCENT : COL_BG;
+    if (on)
+        tft_fill_rect(MARGIN, y - 2, bar_w, SESS_BAR_H, COL_ACCENT);
+    else
+        tft_fill_rect(MARGIN, y - 2, bar_w, SESS_BAR_H, COL_BG);
+
+    char left[32];               // "* " + session name (≤24) + NUL
+    // Active session gets a * marker (pager-inbox idiom).
+    snprintf(left, sizeof(left), "%s%s", active ? "* " : "  ",
+             title ? title : "");
+    tft_draw_text(MARGIN + 12, y, left, fg, bg, 1);
+    if (msgs >= 0) {
+        char cnt[20];   // "(%d)" — big enough for any uint32 count
+        snprintf(cnt, sizeof(cnt), "(%d)", msgs);
+        tft_draw_text_r(PANEL_W - MARGIN, y, cnt, fg, bg, 1);
+    }
+}
+
+void hw_ui_show_agent_sessions(const char *agent_name,
+                               const char *const *titles,
+                               const int *msgs,
+                               const bool *active,
+                               int count,
+                               int selected) {
+    if (!panel_ok) return;
+    if (count < 0) count = 0;
+    if (selected < 0) selected = 0;
+    if (selected >= count) selected = count > 0 ? count - 1 : 0;
+
+    if (screen == HW_UI_AGENT_SESSIONS && agent_sess_sel_drawn >= 0 &&
+        agent_sess_sel_drawn != selected) {
+        for (int i = 0; i < count; i++) {
+            bool on = (i == selected);
+            if (i == agent_sess_sel_drawn || on)
+                agent_sessions_draw_row(
+                    (titles && titles[i]) ? titles[i] : "",
+                    (msgs) ? msgs[i] : -1,
+                    (active) ? active[i] : false, i, on);
+        }
+        agent_sess_sel_drawn = selected;
+        return;
+    }
+    if (screen == HW_UI_AGENT_SESSIONS && agent_sess_sel_drawn == selected)
+        return;
+
+    screen = HW_UI_AGENT_SESSIONS;
+    tft_fill(COL_BG);
+    tft_fill_rect(0, 0, PANEL_W, 22, COL_ACCENT);
+    tft_draw_text(MARGIN, 4, "SESSIONS", COL_BG, COL_ACCENT, 2);
+    tft_draw_text_r(PANEL_W - MARGIN, 6,
+                    agent_name && agent_name[0] ? agent_name : "AGENT",
+                    COL_BG, COL_ACCENT, 1);
+    for (int i = 0; i < count; i++)
+        agent_sessions_draw_row((titles && titles[i]) ? titles[i] : "",
+                                (msgs) ? msgs[i] : -1,
+                                (active) ? active[i] : false, i, i == selected);
+    agent_sess_sel_drawn = selected;
 }
 
 // Row line buffer: max_cols glyphs × 4 UTF-8 bytes + "> " + NUL.

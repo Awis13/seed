@@ -47,6 +47,12 @@
 #define PIN_RTC_INT         1
 #define PIN_SENSOR_INT      8
 
+// GNSS u-blox MIA-M10Q — UART 38400 8N1 (factory default), PPS strobe.
+// Verified against TLora-Pager schematic + MIA-M10Q bring-up notes (2026-08-09).
+#define PIN_GPS_RX          4      // ESP32 RX <- module TX
+#define PIN_GPS_TX          12     // ESP32 TX -> module RX
+#define PIN_GPS_PPS         13     // 1 Hz fix strobe (not driven yet)
+
 // XL9555 @ 0x20 — expander GPIO indices (not ESP pins)
 #define XL9555_ADDR         0x20
 #define EXP_DRV_EN          0

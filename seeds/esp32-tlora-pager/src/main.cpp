@@ -6,8 +6,9 @@
 // Bring-up seed, grown layer by layer. What is driven today:
 //   - I2C on SDA=3/SCL=2 + scan (XL9555, BQ*, TCA8418, …)
 //   - XL9555 power rails, ST7796 480x222 + AW9364, notify beeper,
-//     encoder UI, haptic, sound, keyboard reply, BQ27220 fuel gauge
-// Not driven yet: SX1262 MeshCore RX stack (keys+P1 path ready), GNSS, NFC, BQ25896.
+//     encoder UI, haptic, sound, keyboard reply, BQ27220 fuel gauge,
+//     GNSS MIA-M10Q
+// Not driven yet: SX1262 MeshCore RX stack (keys+P1 path ready), NFC, BQ25896.
 // SPIFFS still ships WiFi + token so a dark-panel brick cannot lock us out.
 // Endpoints:
 //   GET  /health            — alive check (no auth)
@@ -51,7 +52,7 @@
 #include "hw_kb.h"
 
 // ===== Configuration =====
-#define SEED_VERSION        "0.9.37"
+#define SEED_VERSION        "0.9.40"
 // Core clock: datasheet puts 240 vs 80 ~11.5mA apart on WAITI. Periph bus holds
 // at 80 for every PLL-fed core clock; go lower and RMT/I2S retimes. Same floor
 // as tembed idle policy (no light sleep — notify latency is the job).
@@ -61,6 +62,10 @@
 #define WIFI_CONFIG_FILE    "/wifi.json"
 #define CONFIG_MD_FILE      "/config.md"
 #define TZ_FILE             "/tz.txt"
+// Max POST body collected into _tempObject by handle_body_collect (all routes
+// incl. /agents/*). Was 4 KB; fat chat posts (16 KB plan) need headroom for
+// JSON + escaping. 20 KB covers a 16 KB message with margin.
+#define HTTP_BODY_MAX       20480
 // Prague (CET/CEST). Overridable via POST /clock/tz or SPIFFS /tz.txt.
 #define TZ_DEFAULT          "CET-1CEST,M3.5.0,M10.5.0/3"
 // Anything older than this is the pre-NTP epoch, not a real wall clock.
@@ -279,19 +284,15 @@ static void hw_probe() {
 // ===== Globals =====
 static AsyncWebServer server(HTTP_PORT);
 static String auth_token = "";
-static String ap_ssid = "";
 static String mdns_name = "";
 static unsigned long boot_time = 0;
 
-// Provisioning AP state. The password is rolled on every raise and lives only
-// in this variable and on the device screen — never persisted, never sent over
-// the wire. ap_active is true only while the softAP is genuinely up; from_setup_ap()
-// keys off it so a gashed AP (softAPIP()==0.0.0.0) can never match a LAN client.
-static bool ap_active = false;
-static String ap_password = "";
-
 static String wifi_ssid = "";
 static String wifi_pass = "";
+static bool wifi_user_off = false;
+static bool mdns_started = false;
+#define WIFI_RETRY_MS 1200000UL
+static unsigned long wifi_last_attempt_ms = 0;
 
 /* Multi-profile STA: try each known network in order on boot / reconnect. */
 #define WIFI_MAX_NETS 6
@@ -542,117 +543,21 @@ static bool wifi_save_config(const String &ssid, const String &pass) {
     return wifi_persist_profiles();
 }
 
-/* Try each profile up to attempts_each * 500ms. Returns true on connect. */
-static bool wifi_try_profiles(int attempts_each) {
-    if (wifi_net_count == 0 && wifi_ssid.length() > 0) {
-        wifi_nets_upsert(wifi_ssid.c_str(), wifi_pass.c_str());
-    }
-    if (wifi_net_count == 0) return false;
-
-    for (int n = 0; n < wifi_net_count; n++) {
-        int idx = (wifi_net_idx + n) % wifi_net_count;
-        wifi_nets_set_active(idx);
-        Serial.printf("[wifi] try ssid=%s\n", wifi_ssid.c_str());
-        WiFi.disconnect(false, false);
-        delay(100);
-        WiFi.begin(wifi_ssid.c_str(), wifi_pass.c_str());
-        int attempts = 0;
-        while (WiFi.status() != WL_CONNECTED && attempts < attempts_each) {
-            delay(500);
-            attempts++;
-        }
-        if (WiFi.status() == WL_CONNECTED) {
-            wifi_persist_profiles(); /* remember last-good as primary */
-            Serial.printf("[wifi] STA up %s on %s\n",
-                          WiFi.localIP().toString().c_str(), wifi_ssid.c_str());
-            return true;
-        }
-        Serial.printf("[wifi] fail ssid=%s\n", wifi_ssid.c_str());
-    }
-    return false;
-}
-
-// ===== Provisioning AP =====
-//
-// The softAP is up only while somebody is actually provisioning the node, and
-// its password is random per raise. It used to run permanently in WIFI_AP_STA
-// with the password hardcoded as a #define in a public repo. Combined with
-// handle_wifi_page(), which handed the auth token to any client on the AP
-// subnet, that gave anyone within radio range of a seed sitting inside the
-// owner's LAN a token — and the token is POST /firmware/upload, i.e. arbitrary
-// code on a box behind the firewall.
-
-// The AP subnet is pinned rather than left on the ESP-IDF default of
-// 192.168.4.1/24. from_setup_ap() decides "this client came in over the setup
-// AP" by matching the first three octets, so an AP subnet that a STA network
-// might also use turns that test into a false positive reachable from the LAN.
-// 172.31.157.0/24 sits clear of the common consumer-router defaults and of the
-// 192.168.1.0/24 this node's owner runs at home.
-#define AP_IP_A 172
-#define AP_IP_B  31
-#define AP_IP_C 157
-#define AP_IP_D   1
-
-// One session's password. No lookalike glyphs — this gets typed off the device
-// screen; 12 chars out of a 32-symbol alphabet is 60 bits. Runs after RF is up
-// (wifi_setup() has switched WiFi on), which is what makes esp_random() a
-// hardware RNG rather than a seeded PRNG.
-static void ap_generate_password() {
-    static const char charset[] = "abcdefghijkmnpqrstuvwxyz23456789";
-    const uint32_t n = sizeof(charset) - 1;
-    ap_password = "";
-    for (int i = 0; i < 12; i++) {
-        ap_password += charset[esp_random() % n];
-    }
-}
-
-// Raise the provisioning softAP. `manual` is reserved for a future press-to-raise
-// gesture; today it is always false (called only from wifi_setup() when STA fails).
-static void ap_start(bool manual) {
-    if (ap_active) return;  // idempotent: a re-raise must not re-roll the password
-    (void)manual;
-    ap_generate_password();  // esp_random after RF is up
-    // Pin the subnet before the AP comes up, clear of the owner's LAN, so a LAN
-    // client can never land in it and pass from_setup_ap()'s /24 test. If the pin
-    // fails the AP would fall back to the default 192.168.4.1/24, where a LAN
-    // client could share that subnet and slip past from_setup_ap() — so refuse to
-    // raise the AP at all rather than expose the token-skipping path over the LAN.
-    if (!WiFi.softAPConfig(IPAddress(AP_IP_A, AP_IP_B, AP_IP_C, AP_IP_D),
-                           IPAddress(AP_IP_A, AP_IP_B, AP_IP_C, AP_IP_D),
-                           IPAddress(255, 255, 255, 0))) {
-        event_add("setup AP: subnet pin failed, not raising AP");
-        return;
-    }
-    WiFi.softAP(ap_ssid.c_str(), ap_password.c_str());
-    ap_active = true;
-    event_add("setup AP up: %s", ap_ssid.c_str());  // SSID only, never the password
-}
-
-// True only for a request that arrived over the provisioning AP while that AP is
-// actually up. Both halves matter: once the AP is down softAPIP() is 0.0.0.0 and
-// the subnet test is meaningless, and belonging to some subnet proves nothing on
-// its own. Reaching the node this way costs physical presence plus the per-boot
-// password shown on the screen, which is why this is the one path allowed to
-// skip the token.
-static bool from_setup_ap(AsyncWebServerRequest *request) {
-    if (!ap_active) return false;
-    IPAddress client_ip;
-    client_ip.fromString(request->client()->remoteIP().toString());
-    IPAddress ap_ip = WiFi.softAPIP();
-    return client_ip[0] == ap_ip[0] && client_ip[1] == ap_ip[1] &&
-           client_ip[2] == ap_ip[2];
+/* Every connection attempt goes through one owner so a manual connect cannot
+ * be followed by the periodic retry on the next loop pass. */
+static void wifi_begin_active_profile() {
+    wifi_last_attempt_ms = millis();
+    WiFi.begin(wifi_ssid.c_str(), wifi_pass.c_str());
 }
 
 static void wifi_setup() {
+    WiFi.mode(WIFI_STA);
+    /* Arduino-ESP32 defaults this to true and otherwise retries underneath our
+     * scheduler, causing the same UI stalls the 20-minute cadence avoids. */
+    WiFi.setAutoReconnect(false);
     String suffix = get_mac_suffix();
-    ap_ssid = "Seed-" + suffix;
     mdns_name = "seed-" + suffix;
     mdns_name.toLowerCase();
-
-    // STA-only: the AP is not started up-front. It comes up only if the stored
-    // credentials fail to get us on the network (see below), so a provisioned
-    // node running on WiFi never offers a way in.
-    WiFi.mode(WIFI_STA);
 
     // Start SNTP with the stored TZ before associating: the daemon is
     // non-blocking and keeps retrying on its own, so the clock also syncs after
@@ -662,21 +567,12 @@ static void wifi_setup() {
 
     wifi_load_config();
     if (wifi_net_count > 0 || wifi_ssid.length() > 0) {
-        /* ~15s per profile (30 * 500ms). Multi-profile walks the list. */
-        if (!wifi_try_profiles(30)) {
-            Serial.println("[wifi] all profiles failed, raising setup AP");
-        }
+        // Boot must never wait for infrastructure. Start one asynchronous STA
+        // attempt; loop() rotates profiles later while UI and MeshCore are live.
+        Serial.printf("[wifi] boot async try %s\n", wifi_ssid.c_str());
+        wifi_begin_active_profile();
     } else {
-        Serial.println("[wifi] no credentials in SPIFFS — setup AP only");
-    }
-
-    // Nothing to provision if the stored credentials already got us online: in
-    // that case the AP is never started at all.
-    if (WiFi.status() != WL_CONNECTED) ap_start(false);
-
-    if (MDNS.begin(mdns_name.c_str())) {
-        MDNS.addService("http", "tcp", HTTP_PORT);
-        MDNS.addService("seed", "tcp", HTTP_PORT);
+        Serial.println("[wifi] no credentials — continuing mesh-only");
     }
 }
 
@@ -763,8 +659,6 @@ static void handle_capabilities(AsyncWebServerRequest *request) {
         doc["wifi_ip"] = WiFi.localIP().toString();
         doc["wifi_rssi"] = WiFi.RSSI();
     }
-    doc["ap_ssid"] = ap_ssid;
-    doc["ap_ip"] = WiFi.softAPIP().toString();
 
     JsonArray ep = doc["endpoints"].to<JsonArray>();
     const char *eps[] = {
@@ -790,7 +684,7 @@ static void handle_capabilities(AsyncWebServerRequest *request) {
 static void handle_body_collect(AsyncWebServerRequest *request, uint8_t *data,
                                  size_t len, size_t index, size_t total) {
     if (index == 0) {
-        if (total > 4096) { request->send(413, "application/json", "{\"error\":\"too large\"}"); return; }
+        if (total > HTTP_BODY_MAX) { request->send(413, "application/json", "{\"error\":\"body too large\"}"); return; }
         char *buf = (char*)malloc(total + 1);
         if (!buf) { request->send(500, "application/json", "{\"error\":\"OOM\"}"); return; }
         request->_tempObject = buf;
@@ -1065,12 +959,12 @@ static void handle_skill(AsyncWebServerRequest *request) {
     if (!require_auth(request)) return;
 
     String ip = WiFi.status() == WL_CONNECTED
-        ? WiFi.localIP().toString() : WiFi.softAPIP().toString();
+        ? WiFi.localIP().toString() : String("offline");
 
     String s = "# ESP32 Seed - T-Lora Pager\n\n";
     s += "Host: " + ip + ":" + String(HTTP_PORT) + "\n";
     s += "mDNS: " + mdns_name + ".local\n";
-    s += "AP: " + ap_ssid + "\n\n";
+    s += "WiFi mode: STA only; no provisioning AP\n\n";
     s += "Auth: `Authorization: Bearer <token>` (except /health)\n\n";
     s += "## Grow cycle\n\n";
     s += "ESP32 has no compiler. Build on host, upload binary:\n\n";
@@ -1128,6 +1022,7 @@ static void handle_skill(AsyncWebServerRequest *request) {
 // --- WiFi config page ---
 
 static void handle_wifi_page(AsyncWebServerRequest *request) {
+    if (!require_auth(request)) return;
     String html = "<!DOCTYPE html><html><head><meta charset='utf-8'>"
         "<meta name='viewport' content='width=device-width,initial-scale=1'>"
         "<title>Seed WiFi</title>"
@@ -1144,20 +1039,12 @@ static void handle_wifi_page(AsyncWebServerRequest *request) {
         "<p><a href='/ui' style='color:#58a6ff'>Radio UI</a></p>";
     if (WiFi.status() == WL_CONNECTED)
         html += "<p>Connected: " + WiFi.SSID() + " (" + WiFi.localIP().toString() + ")</p>";
-    // The token is handed out only over the provisioning AP (initial setup) —
-    // never to a client on the LAN, even one that happens to share our subnet.
-    if (from_setup_ap(request)) {
-        html += "<p>Token: " + auth_token + "</p>";
-    }
     html += "</body></html>";
     request->send(200, "text/html", html);
 }
 
 static void handle_wifi_post(AsyncWebServerRequest *request) {
-    // Rewriting the credentials moves the node to a different network, so off the
-    // provisioning AP this needs the token like any other mutating call —
-    // otherwise anyone on the LAN could repoint the device at their own AP.
-    if (!from_setup_ap(request) && !require_auth(request)) return;
+    if (!require_auth(request)) return;
 
     String ssid = "", pass = "";
     if (request->hasParam("ssid", true)) ssid = request->getParam("ssid", true)->value();
@@ -1169,16 +1056,19 @@ static void handle_wifi_post(AsyncWebServerRequest *request) {
     wifi_save_config(ssid, pass);
     request->send(200, "text/html",
         "<h2>Saved. Connecting...</h2><p>" + ssid + "</p><a href='/'>Back</a>");
+    wifi_user_off = false;
+    WiFi.mode(WIFI_STA);
     delay(500);
     WiFi.disconnect(false, false);
     delay(100);
-    WiFi.begin(wifi_ssid.c_str(), wifi_pass.c_str());
+    wifi_begin_active_profile();
 }
 
 static void handle_wifi_status(AsyncWebServerRequest *request) {
     if (!require_auth(request)) return;
     JsonDocument doc;
     doc["connected"] = (WiFi.status() == WL_CONNECTED);
+    doc["user_off"] = wifi_user_off;
     doc["ssid"] = WiFi.status() == WL_CONNECTED ? WiFi.SSID() : wifi_ssid;
     doc["ip"] = WiFi.status() == WL_CONNECTED
         ? WiFi.localIP().toString() : "";
@@ -1199,7 +1089,10 @@ static void handle_wifi_status(AsyncWebServerRequest *request) {
 
 static void handle_wifi_scan(AsyncWebServerRequest *request) {
     if (!require_auth(request)) return;
-    /* Blocking scan — ok for rare field use; keeps UI free of softAP dance. */
+    /* Blocking scan — user-triggered only; firmware remains STA-only. */
+    if (wifi_user_off) {
+        WiFi.mode(WIFI_STA);
+    }
     int n = WiFi.scanNetworks(/*async=*/false, /*hidden=*/true);
     JsonDocument doc;
     doc["count"] = n < 0 ? 0 : n;
@@ -1211,6 +1104,10 @@ static void handle_wifi_scan(AsyncWebServerRequest *request) {
         o["secure"] = (WiFi.encryptionType(i) != WIFI_AUTH_OPEN);
     }
     WiFi.scanDelete();
+    if (wifi_user_off) {
+        WiFi.disconnect(true, false);
+        WiFi.mode(WIFI_OFF);
+    }
     String response;
     serializeJson(doc, response);
     request->send(200, "application/json", response);
@@ -1261,7 +1158,10 @@ static void handle_wifi_networks_post(AsyncWebServerRequest *request) {
     request->send(200, "application/json", response);
 
     /* Kick reconnect with new list. */
+    wifi_user_off = false;
+    WiFi.mode(WIFI_STA);
     WiFi.disconnect(false, false);
+    wifi_begin_active_profile();
 }
 
 // ===== Skills =====
@@ -1274,6 +1174,7 @@ static void handle_wifi_networks_post(AsyncWebServerRequest *request) {
 #include "skills/meshcore.cpp"
 #include "skills/backlight.cpp"
 #include "skills/wg.cpp"
+#include "skills/gps.cpp"    // after notify: reuses notify_send_json; uses hw_ui_expand_ok
 
 static void skills_init() {
     skill_notify_init();
@@ -1282,6 +1183,7 @@ static void skills_init() {
     skill_meshcore_init();
     skill_backlight_init();
     skill_wg_init();
+    skill_gps_init();
 }
 
 // Build one second of the home clock face (tembed look, 480x222).
@@ -1309,15 +1211,10 @@ static void ui_clock_paint(const char *note) {
         snprintf(addr, sizeof(addr), "%s", WiFi.localIP().toString().c_str());
         snprintf(row1l, sizeof(row1l), "RSSI %d dBm", (int)WiFi.RSSI());
         snprintf(row1r, sizeof(row1r), "%s.local", mdns_name.c_str());
-    } else if (ap_active) {
-        snprintf(addr, sizeof(addr), "AP %s", WiFi.softAPIP().toString().c_str());
-        snprintf(row1l, sizeof(row1l), "AP %s", ap_ssid.c_str());
-        snprintf(row1r, sizeof(row1r), "PW %s", ap_password.c_str());
-        snprintf(row2, sizeof(row2), "TOKEN %s", auth_token.c_str());
     } else {
         snprintf(addr, sizeof(addr), "offline");
         snprintf(row1l, sizeof(row1l), "WiFi offline");
-        snprintf(row2, sizeof(row2), "SPIFFS wifi.json or setup AP");
+        snprintf(row2, sizeof(row2), "mesh ready - STA retry async");
     }
     if (hw_kb_locked()) {
         /* LOCK takes the note row so pocket mode is obvious. */
@@ -1370,8 +1267,8 @@ enum {
 };
 // Card action sheet (click / Enter on a notification)
 enum { CARD_ACT_ACK = 0, CARD_ACT_REPLY, CARD_ACT_BACK, CARD_ACT_COUNT };
-// Agents list: 0..2 = agents, 3 = BACK
-enum { AGENTS_BACK = 3, AGENTS_LIST_COUNT = 4 };
+// Agents list: 0..4 = agents, 5 = BACK
+enum { AGENTS_BACK = 5, AGENTS_LIST_COUNT = 6 };
 // In-chat menu (click while in agent chat room)
 enum { AGENT_ACT_CLEAR = 0, AGENT_ACT_BACK, AGENT_ACT_COUNT };
 // Layout picker: 0=ABC 1=PHON 2=RU 3=BACK
@@ -1386,13 +1283,14 @@ enum {
 };
 // MeshCore menu: 0=STATUS 1=PING 2=BACK
 enum { MESH_ACT_STATUS = 0, MESH_ACT_PING = 1, MESH_ACT_BACK = 2, MESH_LIST_COUNT = 3 };
-// WiFi menu: 0=STATUS 1=SCAN 2=PROFILES 3=BACK
+// WiFi menu: 0=STATUS 1=SCAN 2=PROFILES 3=TOGGLE 4=BACK
 enum {
     WIFI_ACT_STATUS = 0,
     WIFI_ACT_SCAN = 1,
     WIFI_ACT_PROFILES = 2,
-    WIFI_ACT_BACK = 3,
-    WIFI_LIST_COUNT = 4
+    WIFI_ACT_TOGGLE = 3,
+    WIFI_ACT_BACK = 4,
+    WIFI_LIST_COUNT = 5
 };
 // WiFi list mode (scan results vs saved profiles)
 enum { WIFI_LIST_SCAN = 0, WIFI_LIST_PROFILES = 1 };
@@ -1404,6 +1302,8 @@ static int layout_sel = 0;
 static int settings_sel = 0;
 static int mesh_sel = 0;
 static int wifi_sel = 0;
+// User turned WiFi off from the menu: suppress the loop() auto-reconnect until
+// they toggle it back on (garden mesh-only testing).
 static int wifi_list_sel = 0;
 static int wifi_list_mode = WIFI_LIST_SCAN;
 static int wifi_list_count = 0;
@@ -1420,6 +1320,19 @@ static int agent_focus = 0;   // which agent chat is open (0..AGENTS_N-1)
 static bool agent_compose = false;  // REPLY screen is for agent, not notify
 static int agent_scroll = -1;       // visual row; -1 = pin to latest
 static int agent_scroll_total = 0;  // last known wrapped row count
+static int agent_sess_sel = 0;      // selected row on the agent SESSIONS list
+// Chat window copy: only the current viewport (AGENT_THREAD_MAX lines) — the
+// full history lives on SD, so no whole-thread RAM snapshot is held.
+static char ag_chat_lines[AGENT_THREAD_MAX][AGENT_TEXT_LEN];
+static bool ag_chat_from_me[AGENT_THREAD_MAX];
+static uint32_t ag_chat_ts[AGENT_THREAD_MAX];
+static const char *ag_chat_ptrs[AGENT_THREAD_MAX];
+// Session-list screen rows: N sessions + "NEW SESSION" + "BACK".
+// ag_sess_msgs[i] < 0 ⇒ no message-count badge on that row.
+static char ag_sess_titles[AGENT_SESSIONS_MAX + 2][AGENT_SESSION_LEN + 2];
+static int  ag_sess_msgs[AGENT_SESSIONS_MAX + 2];
+static bool ag_sess_active[AGENT_SESSIONS_MAX + 2];
+static const char *ag_sess_ptrs[AGENT_SESSIONS_MAX + 2];
 static int msglist_sel = 0;
 // Cached ids for the visible msglist rows (map row → notify id).
 static uint32_t msglist_ids[HW_UI_MSGLIST_MAX];
@@ -1562,6 +1475,7 @@ static bool reply_upstream_mesh(const char *key, const char *text) {
     if (!g_mesh.has_identity || !g_mesh.radio_ready) return false;
     if (!g_mesh.heltec_pk_hex[0]) return false;
     if (!mesh_client_ready()) return false;
+    if (mesh_client_ack_pending()) return false;
 
     char frame[REPLY_UP_FRAME_MAX + 1];
     int n = snprintf(frame, sizeof(frame), "R1|%s|", key);
@@ -1583,7 +1497,6 @@ static bool reply_upstream_mesh(const char *key, const char *text) {
 
 static void reply_upstream_poll() {
     if (!reply_up_pending) return;
-    reply_up_pending = false;
 
     char key[NOTIFY_KEY_LEN];
     char text[NOTIFY_REPLY_LEN];
@@ -1592,13 +1505,19 @@ static void reply_upstream_poll() {
     if (!key[0] || !text[0]) return;
 
     if (reply_upstream_http(key, text)) {
+        reply_up_pending = false;
         event_add("reply upstream wifi ok: %s", key);
         return;
     }
+    // C1/probe/R1 share one MeshCore ACK slot. Keep this reply pending until
+    // the current private frame completes instead of overwriting its CRC.
+    if (mesh_client_ack_pending()) return;
     if (reply_upstream_mesh(key, text)) {
+        reply_up_pending = false;
         event_add("reply upstream mesh R1: %s", key);
         return;
     }
+    reply_up_pending = false;
     event_add("reply upstream unreachable: %s (kept on device)", key);
 }
 
@@ -1683,12 +1602,8 @@ static void ui_wifi_show_status() {
         add("SSID %s", WiFi.SSID().c_str());
         add("IP   %s", WiFi.localIP().toString().c_str());
         add("RSSI %d dBm", (int)WiFi.RSSI());
-    } else if (ap_active) {
-        add("AP %s", ap_ssid.c_str());
-        add("IP %s", WiFi.softAPIP().toString().c_str());
-        add("offline STA");
     } else {
-        add("STA offline");
+        add("WiFi %s", wifi_user_off ? "OFF (mesh only)" : "STA offline");
     }
     add("profiles %d  idx %d", wifi_net_count, wifi_net_idx);
     for (int i = 0; i < wifi_net_count && n < 10; i++) {
@@ -1705,11 +1620,40 @@ static void ui_wifi_show_status() {
     ui_note_input();
 }
 
+// WiFi on/off switch for mesh-only testing in the garden: STA ON (reconnect via
+// saved profiles) or STA OFF (disconnect, leave mesh/WG path alone).
+static void ui_wifi_toggle() {
+    if (!wifi_user_off) {
+        wifi_user_off = true;
+        WiFi.disconnect(true, false);
+        WiFi.mode(WIFI_OFF);
+        event_add("wifi off (mesh only)");
+        Serial.println("[wifi] user toggled OFF");
+    } else {
+        wifi_user_off = false;
+        WiFi.mode(WIFI_STA);
+        if (wifi_net_count > 0 || wifi_ssid.length() > 0) {
+            wifi_begin_active_profile();
+            event_add("wifi on (async reconnect)");
+            Serial.println("[wifi] user toggled ON — reconnecting");
+        } else {
+            event_add("wifi on requested, no saved profile");
+            Serial.println("[wifi] user toggled ON — no saved profile");
+        }
+    }
+    ui_wifi_show_status();
+    ui_note_input();
+}
+
 static void ui_wifi_do_scan() {
     /* Blocking scan — paint "SCAN…" first so the panel is not frozen blank. */
     static const char *wait_lines[] = { "scanning…", "hold on" };
     hw_ui_show_wifi_info(wait_lines, 2);
     delay(50);
+
+    if (wifi_user_off) {
+        WiFi.mode(WIFI_STA);
+    }
 
     int found = WiFi.scanNetworks(/*async=*/false, /*hidden=*/false);
     wifi_list_mode = WIFI_LIST_SCAN;
@@ -1737,6 +1681,10 @@ static void ui_wifi_do_scan() {
         wifi_list_count++;
     }
     WiFi.scanDelete();
+    if (wifi_user_off) {
+        WiFi.disconnect(true, false);
+        WiFi.mode(WIFI_OFF);
+    }
     ui_wifi_paint_list();
 }
 
@@ -1785,27 +1733,17 @@ static void ui_wifi_connect_ssid(const char *ssid) {
             ptrs[1] = lines[1];
             hw_ui_show_wifi_info(ptrs, 2);
             delay(30);
+            wifi_user_off = false;
+            WiFi.mode(WIFI_STA);
             WiFi.disconnect(false, false);
             delay(80);
-            WiFi.begin(wifi_ssid.c_str(), wifi_pass.c_str());
-            int tries = 0;
-            while (WiFi.status() != WL_CONNECTED && tries < 20) {
-                delay(500);
-                tries++;
-            }
-            if (WiFi.status() == WL_CONNECTED) {
-                snprintf(lines[0], sizeof(lines[0]), "OK %s",
-                         WiFi.localIP().toString().c_str());
-                snprintf(lines[1], sizeof(lines[1]), "SSID %s", ssid);
-                snprintf(lines[2], sizeof(lines[2]), "RSSI %d", (int)WiFi.RSSI());
-                ptrs[2] = lines[2];
-                hw_ui_show_wifi_info(ptrs, 3);
-                event_add("wifi menu connect %s", ssid);
-            } else {
-                snprintf(lines[0], sizeof(lines[0]), "FAIL %s", ssid);
-                snprintf(lines[1], sizeof(lines[1]), "check password");
-                hw_ui_show_wifi_info(ptrs, 2);
-            }
+            wifi_begin_active_profile();
+            snprintf(lines[0], sizeof(lines[0]), "CONNECTING");
+            snprintf(lines[1], sizeof(lines[1]), "%s", ssid);
+            snprintf(lines[2], sizeof(lines[2]), "async - UI stays live");
+            ptrs[2] = lines[2];
+            hw_ui_show_wifi_info(ptrs, 3);
+            event_add("wifi menu async connect %s", ssid);
             ui_note_input();
             return;
         }
@@ -1908,6 +1846,8 @@ static void ui_mesh_ping_gateway() {
     if (!g_mesh.has_identity) push("no identity");
     else if (!g_mesh.radio_ready) push("radio not ready");
     else if (!g_mesh.heltec_pk_hex[0]) push("no GW pubkey");
+    else if (g_mesh_chat_tx.active || mesh_client_ack_pending())
+        push("radio busy - retry");
     else push("waiting ACK…");
     hw_ui_show_mesh_ping("MESH", ptrs, n);
     yield();
@@ -1915,7 +1855,8 @@ static void ui_mesh_ping_gateway() {
     uint32_t ok_before = g_mesh.last_ok_ms;
     uint32_t rtt_before = g_mesh.last_rtt_ms;
     bool tx = false;
-    if (g_mesh.has_identity && g_mesh.radio_ready && g_mesh.heltec_pk_hex[0]) {
+    if (g_mesh.has_identity && g_mesh.radio_ready && g_mesh.heltec_pk_hex[0] &&
+        !g_mesh_chat_tx.active && !mesh_client_ack_pending()) {
         tx = mesh_probe_gateway(nullptr);
         unsigned long t_wait = millis();
         /* ACK often ~0.5–2s on local path; multi-hop a bit more. */
@@ -2038,6 +1979,8 @@ static void ui_open_notify_id(uint32_t id);
 static void ui_open_card_act();
 static void ui_card_act_confirm();
 static void ui_open_agents();
+static void ui_open_agent_sessions(int idx);
+static void ui_agent_sessions_refresh();
 static void ui_open_agent_chat(int idx);
 static void ui_agent_chat_refresh();
 static void ui_open_agent_act();
@@ -2245,12 +2188,13 @@ static void ui_open_agents() {
 
 static int agents_index_from_source(const char *src) {
     if (!src || !src[0]) return -1;
-    // notify source is short: "hermes", "grok", "claude"
+    // notify source is short: "hermes", "grok", "claude", "opencode", "codex"
     return agents_find(src);
 }
 
 /* Chat-door vs real message:
- *   door  = client id ends with "-chat" (bridge posts "hermes-chat" etc.)
+ *   door  = client id ends with "-chat" (bridge posts "hermes-chat",
+ *           "opencode-chat", "codex-chat" etc.)
  *   page  = everything else — full severity card (info/warn/crit colours),
  *           from any service/agent; reply works as before.
  * Chat rooms (AGENTS menu) are separate from the message queue. */
@@ -2262,7 +2206,8 @@ static bool notify_is_chat_door(const NotifyView &v) {
 
 static int agents_index_from_door(const NotifyView &v) {
     if (!notify_is_chat_door(v)) return -1;
-    // Prefer source; fall back to key prefix "hermes-chat" → "hermes"
+    // Prefer source; fall back to key prefix "hermes-chat" → "hermes",
+    // "opencode-chat" → "opencode", "codex-chat" → "codex"
     int ax = agents_index_from_source(v.source);
     if (ax >= 0) return ax;
     char id[AGENT_ID_LEN];
@@ -2275,21 +2220,44 @@ static int agents_index_from_door(const NotifyView &v) {
     return agents_find(id);
 }
 
+static void agents_head_time(uint32_t ts, char *out, size_t out_n) {
+    out[0] = '\0';
+    if (!out || out_n < 4 || ts <= 1700000000u) return;  // no wall clock yet
+    time_t t = (time_t)ts;
+    struct tm tmv;
+    if (!localtime_r(&t, &tmv)) return;
+    strftime(out, out_n, "%H:%M", &tmv);
+}
+
 static void ui_agent_chat_refresh() {
-    static char lines[AGENT_THREAD_MAX][AGENT_TEXT_LEN];
-    static bool from_me[AGENT_THREAD_MAX];
-    static const char *line_ptrs[AGENT_THREAD_MAX];
     int n = 0;
-    portENTER_CRITICAL(&agents_mux);
-    n = agents_thread_view(agent_focus, lines, from_me, AGENT_THREAD_MAX);
-    portEXIT_CRITICAL(&agents_mux);
-    for (int i = 0; i < n; i++) line_ptrs[i] = lines[i];
-    char foot[48];
-    snprintf(foot, sizeof(foot), "wheel=scroll  type=msg");
+    agents_lock();
+    n = agents_thread_view(agent_focus, ag_chat_lines, ag_chat_from_me,
+                           ag_chat_ts, AGENT_THREAD_MAX);
+    agents_unlock();
+    for (int i = 0; i < n; i++) ag_chat_ptrs[i] = ag_chat_lines[i];
+
+    // Header: agent · active session (recency/identity at a glance).
+    char head[32];
+    const char *sess = agents_active_session(agent_focus);
+    if (sess && sess[0])
+        snprintf(head, sizeof(head), "%s · %s", agents_name(agent_focus), sess);
+    else
+        snprintf(head, sizeof(head), "%s", agents_name(agent_focus));
+
+    // Footer: local time of the bottommost message + scroll hint.
+    char foot[56];
+    char tbuf[8];
+    tbuf[0] = '\0';
+    if (n > 0) agents_head_time(ag_chat_ts[n - 1], tbuf, sizeof(tbuf));
+    if (tbuf[0])
+        snprintf(foot, sizeof(foot), "%s  wheel=scroll  type=msg", tbuf);
+    else
+        snprintf(foot, sizeof(foot), "wheel=scroll  type=msg");
+
     int total = 0;
-    agent_scroll = hw_ui_show_agent_chat(
-        agents_name(agent_focus), line_ptrs, from_me, n,
-        agent_scroll, &total, foot);
+    agent_scroll = hw_ui_show_agent_chat(head, ag_chat_ptrs, ag_chat_from_me,
+                                         n, agent_scroll, &total, foot);
     agent_scroll_total = total;
     ui_note_input();
 }
@@ -2300,7 +2268,55 @@ static void ui_open_agent_chat(int idx) {
     agent_focus = idx;
     agent_compose = false;
     agent_scroll = -1;  // pin to latest when entering the room
+    agents_thread_goto_tail(idx);  // load the session's history from the store
     ui_agent_chat_refresh();
+}
+
+/* Sessions screen for the focused agent: existing sessions (with honest
+ * message counts) + "NEW SESSION" + "BACK". Counts are refreshed on open.
+ * When the session registry is full the NEW row turns into a visible
+ * "MAX n SESSIONS" note and is not selectable — no silent refusal. */
+static void ui_agent_sessions_refresh() {
+    int n = agents_session_count(agent_focus);
+    bool full = (n >= AGENT_SESSIONS_MAX);
+    int total = n + 2;
+    for (int i = 0; i < n; i++) {
+        snprintf(ag_sess_titles[i], sizeof(ag_sess_titles[0]), "%s",
+                 agents_session_name(agent_focus, i));
+        ag_sess_msgs[i] = agents_session_msg_count(agent_focus, i);
+        ag_sess_active[i] = agents_session_is_active(agent_focus, i);
+        ag_sess_ptrs[i] = ag_sess_titles[i];
+    }
+    if (full)
+        snprintf(ag_sess_titles[n], sizeof(ag_sess_titles[0]),
+                 "MAX %d SESSIONS", AGENT_SESSIONS_MAX);
+    else
+        snprintf(ag_sess_titles[n], sizeof(ag_sess_titles[0]), "NEW SESSION");
+    ag_sess_msgs[n] = -1; ag_sess_active[n] = false;
+    ag_sess_ptrs[n] = ag_sess_titles[n];
+    snprintf(ag_sess_titles[n + 1], sizeof(ag_sess_titles[0]), "BACK");
+    ag_sess_msgs[n + 1] = -1; ag_sess_active[n + 1] = false;
+    ag_sess_ptrs[n + 1] = ag_sess_titles[n + 1];
+
+    if (agent_sess_sel >= total) agent_sess_sel = total - 1;
+    if (agent_sess_sel < 0) agent_sess_sel = 0;
+    if (full && agent_sess_sel == n)
+        agent_sess_sel = n + 1;   // never land on the disabled NEW row
+    hw_ui_show_agent_sessions(agents_name(agent_focus), ag_sess_ptrs,
+                              ag_sess_msgs, ag_sess_active, total,
+                              agent_sess_sel);
+    ui_note_input();
+}
+
+static void ui_open_agent_sessions(int idx) {
+    if (idx < 0) idx = 0;
+    if (idx >= agents_count()) idx = agents_count() - 1;
+    agent_focus = idx;
+    agents_session_refresh_counts(idx);
+    agent_sess_sel = 0;
+    for (int i = 0; i < agents_session_count(idx); i++)
+        if (agents_session_is_active(idx, i)) { agent_sess_sel = i; break; }
+    ui_agent_sessions_refresh();
 }
 
 static void ui_open_agent_act() {
@@ -2462,6 +2478,8 @@ static void ui_on_click() {
             ui_wifi_do_scan();
         } else if (wifi_sel == WIFI_ACT_PROFILES) {
             ui_wifi_show_profiles();
+        } else if (wifi_sel == WIFI_ACT_TOGGLE) {
+            ui_wifi_toggle();
         }
         break;
     case HW_UI_WIFI_LIST:
@@ -2518,9 +2536,35 @@ static void ui_on_click() {
         if (agents_sel == AGENTS_BACK) {
             ui_open_menu();
         } else {
-            ui_open_agent_chat(agents_sel);
+            ui_open_agent_sessions(agents_sel);
         }
         break;
+    case HW_UI_AGENT_SESSIONS: {
+        int n = agents_session_count(agent_focus);
+        if (agent_sess_sel < n) {  // existing session → open its chat
+            const char *nm = agents_session_name(agent_focus, agent_sess_sel);
+            if (nm && nm[0] && agents_session_select(agent_focus, nm)) {
+                hw_haptic_notify(0);
+                ui_open_agent_chat(agent_focus);
+            }
+        } else if (agent_sess_sel == n) {  // NEW SESSION
+            if (n >= AGENT_SESSIONS_MAX) {
+                break;   // row is disabled (shown as "MAX n SESSIONS")
+            }
+            bool created = false;
+            int r = agents_session_create(agent_focus, nullptr, created);
+            if (r >= 0) {
+                agents_push_line(agent_focus, false, "new session - type to talk");
+                hw_haptic_notify(0);
+                ui_open_agent_chat(agent_focus);
+            } else {
+                event_add("agent new session refused (full)");
+            }
+        } else {  // BACK
+            ui_open_agents();
+        }
+        break;
+    }
     case HW_UI_AGENT_CHAT:
         // Click → CLEAR CHAT / BACK sheet (chat room, not notify card)
         ui_open_agent_act();
@@ -2613,6 +2657,22 @@ static void ui_on_steps(int steps) {
         hw_ui_show_agents(agents_sel, agents_bridge_ok());
         break;
     }
+    case HW_UI_AGENT_SESSIONS: {
+        int n = agents_session_count(agent_focus);
+        int cnt = n + 2;
+        if (cnt <= 0) break;
+        agent_sess_sel += steps;
+        while (agent_sess_sel < 0) agent_sess_sel += cnt;
+        while (agent_sess_sel >= cnt) agent_sess_sel -= cnt;
+        if (n >= AGENT_SESSIONS_MAX && agent_sess_sel == n) {
+            // full registry — NEW row disabled: skip over it
+            agent_sess_sel += (steps > 0) ? 1 : -1;
+            if (agent_sess_sel < 0) agent_sess_sel = cnt - 1;
+            if (agent_sess_sel >= cnt) agent_sess_sel = 0;
+        }
+        ui_agent_sessions_refresh();
+        break;
+    }
     case HW_UI_AGENT_ACT: {
         agent_act_sel += steps;
         while (agent_act_sel < 0) agent_act_sel += AGENT_ACT_COUNT;
@@ -2670,15 +2730,40 @@ static void ui_on_steps(int steps) {
         break;
     }
     case HW_UI_AGENT_CHAT: {
-        // Wheel scrolls the wrapped transcript. steps>0 = toward older (up).
-        // Pin-bottom (-1) first materializes to the latest viewport.
+        // Wheel scrolls the wrapped transcript. steps>0 = newer (down the
+        // page, scroll decreases); steps<0 = older (scroll increases).
+        // The RAM window holds the newest messages; scrolling past its top
+        // loads the previous page from the store (long-history browsing).
         if (agent_scroll < 0) {
-            // compute max scroll via a dry refresh path
-            agent_scroll = agent_scroll_total;  // will clamp in paint
+            // pin-bottom (-1) first materializes to the latest viewport
+            agent_scroll = agent_scroll_total;
         }
-        // Invert: positive encoder "down the page" = newer = decrease scroll
-        agent_scroll -= steps;
-        if (agent_scroll < 0) agent_scroll = 0;
+        if (steps > 0) {  // toward newer
+            int ns = agent_scroll - steps;
+            if (ns < 0) {
+                if (!agents_thread_is_tail(agent_focus)) {
+                    agents_thread_goto_tail(agent_focus);  // back to live chat
+                    agent_scroll = -1;
+                    ui_agent_chat_refresh();
+                    break;
+                }
+                ns = 0;
+            }
+            agent_scroll = ns;
+        } else {          // toward older
+            int ns = agent_scroll + (-steps);
+            if (ns > agent_scroll_total) {
+                uint32_t start = agents_thread_start(agent_focus);
+                if (start > 0) {
+                    agents_thread_goto_page(agent_focus, start);  // older page
+                    agent_scroll = -1;  // pin to bottom of the loaded page
+                    ui_agent_chat_refresh();
+                    break;
+                }
+                ns = agent_scroll_total;
+            }
+            agent_scroll = ns;
+        }
         ui_agent_chat_refresh();
         break;
     }
@@ -2743,7 +2828,7 @@ void setup() {
     mesh_gw_load();   // SPIFFS /mesh_gw.txt → home Heltec daemon URL
     hw_probe();
     tz_load();        // before wifi_setup(): configTzTime() needs the TZ string
-    wifi_setup();     // RF up; raises the setup AP if STA fails
+    wifi_setup();     // non-blocking STA attempt; never raises an AP
     token_load();     // after wifi_setup(): needs RF up for a real hardware RNG
     skills_init();    // notify store load + route registration data
     ui_go_clock(WiFi.status() == WL_CONNECTED ? "ready" : "click = menu");
@@ -2756,8 +2841,6 @@ void setup() {
     // Token stays off Serial; it is on the panel now.
     if (WiFi.status() == WL_CONNECTED)
         Serial.printf("http://%s:%d/health\n", WiFi.localIP().toString().c_str(), HTTP_PORT);
-    if (ap_active)
-        Serial.printf("setup AP: %s\n", ap_ssid.c_str());
 
     event_add("seed started v%s", SEED_VERSION);
 }
@@ -2771,22 +2854,24 @@ void loop() {
         ESP.restart();
     }
 
-    // Auto-confirm after 60s
+    // Auto-confirm after 60s of healthy runtime. Confirmation is local flash
+    // metadata and must not depend on infrastructure Wi-Fi; otherwise a valid
+    // mesh-only boot can roll back merely because the router is absent.
     if (!firmware_confirmed && !firmware_confirm_attempted &&
-        (millis() - boot_time) > 60000 && WiFi.status() == WL_CONNECTED) {
+        (millis() - boot_time) > 60000) {
         firmware_confirm_attempted = true;
         esp_err_t err = esp_ota_mark_app_valid_cancel_rollback();
         firmware_confirmed = true;
         if (err == ESP_OK) event_add("firmware auto-confirmed");
     }
 
-    // WiFi reconnect — walk multi-profile list every 30s while offline.
-    static unsigned long last_wifi = 0;
+    // WiFi reconnect — one non-blocking attempt every 20 minutes while offline.
+    // Skipped while the user turned WiFi off from the menu (mesh-only test):
+    // they toggled it off, loop must not undo their choice.
     static bool was_connected = false;
     bool now_connected = WiFi.status() == WL_CONNECTED;
-    if ((wifi_net_count > 0 || wifi_ssid.length() > 0) && !now_connected &&
-        millis() - last_wifi > 30000) {
-        last_wifi = millis();
+    if (!wifi_user_off && (wifi_net_count > 0 || wifi_ssid.length() > 0) &&
+        !now_connected && millis() - wifi_last_attempt_ms >= WIFI_RETRY_MS) {
         /* One profile attempt (~5s) so loop stays responsive. */
         if (wifi_net_count > 1) {
             wifi_net_idx = (wifi_net_idx + 1) % wifi_net_count;
@@ -2795,11 +2880,21 @@ void loop() {
         Serial.printf("[wifi] reconnect try %s\n", wifi_ssid.c_str());
         WiFi.disconnect(false, false);
         delay(50);
-        WiFi.begin(wifi_ssid.c_str(), wifi_pass.c_str());
+        wifi_begin_active_profile();
     }
     if (now_connected != was_connected) {
         was_connected = now_connected;
-        if (now_connected) wifi_persist_profiles();
+        if (now_connected) {
+            wifi_persist_profiles();
+            if (!mdns_started && MDNS.begin(mdns_name.c_str())) {
+                MDNS.addService("http", "tcp", HTTP_PORT);
+                MDNS.addService("seed", "tcp", HTTP_PORT);
+                mdns_started = true;
+            }
+        } else if (mdns_started) {
+            MDNS.end();
+            mdns_started = false;
+        }
         if (hw_ui_screen() == HW_UI_CLOCK) {
             hw_ui_invalidate_clock();
             ui_clock_paint(now_connected ? "wifi up" : "wifi lost");

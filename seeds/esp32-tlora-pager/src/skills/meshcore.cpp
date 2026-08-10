@@ -31,6 +31,7 @@
 #include <string.h>
 #include <stdio.h>
 #include "mesh/mc_client.h"
+#include "mesh/utf8_chunk.h"
 
 #define MESH_ID_PATH       "/mesh_identity.id"
 #define MESH_PAIR_PATH     "/mesh_pair.json"
@@ -142,6 +143,104 @@ static int mesh_ui_state() {
 static bool mesh_probe_awaiting_ack = false;
 static uint32_t mesh_on_private_text(const char *text);  /* fwd */
 
+#define MESH_CHAT_TX_MAX_PARTS 32
+#define MESH_CHAT_TX_RETRIES   3
+struct MeshChatTx {
+    bool active;
+    bool waiting_ack;
+    bool ack_seen;
+    uint8_t count;
+    uint8_t next;
+    uint8_t attempts;
+    uint32_t sent_ms;
+    uint32_t ack_timeout_ms;
+    uint32_t retry_after_ms;
+    char agent[13];
+    char frames[MESH_CHAT_TX_MAX_PARTS][160];
+};
+static MeshChatTx g_mesh_chat_tx = {};
+
+static void mesh_chat_tx_fail(const char *reason) {
+    char agent[13];
+    snprintf(agent, sizeof(agent), "%s", g_mesh_chat_tx.agent);
+    event_add("mesh chat FAILED %s part %u/%u", reason,
+              (unsigned)(g_mesh_chat_tx.next + 1),
+              (unsigned)g_mesh_chat_tx.count);
+    memset(&g_mesh_chat_tx, 0, sizeof(g_mesh_chat_tx));
+    if (agent[0]) agents_on_inbound(agent, "(mesh delivery failed - resend)");
+}
+
+static void mesh_chat_tx_poll() {
+    if (!g_mesh_chat_tx.active || !g_mesh.radio_ready || !mesh_client_ready())
+        return;
+
+    unsigned long now = millis();
+    if (g_mesh_chat_tx.waiting_ack) {
+        if (g_mesh_chat_tx.ack_seen) {
+            g_mesh_chat_tx.ack_seen = false;
+            g_mesh_chat_tx.waiting_ack = false;
+            g_mesh_chat_tx.attempts = 0;
+            g_mesh_chat_tx.next++;
+            if (g_mesh_chat_tx.next >= g_mesh_chat_tx.count) {
+                event_add("mesh chat delivered %u parts",
+                          (unsigned)g_mesh_chat_tx.count);
+                memset(&g_mesh_chat_tx, 0, sizeof(g_mesh_chat_tx));
+                return;
+            }
+        } else if (now - g_mesh_chat_tx.sent_ms >= g_mesh_chat_tx.ack_timeout_ms) {
+            mesh_client_cancel_pending_ack();
+            g_mesh_chat_tx.waiting_ack = false;
+            if (g_mesh_chat_tx.attempts >= MESH_CHAT_TX_RETRIES) {
+                mesh_chat_tx_fail("ACK timeout");
+                return;
+            }
+            g_mesh_chat_tx.retry_after_ms = now + 250UL;
+            return;
+        } else {
+            return;
+        }
+    }
+
+    if (g_mesh_chat_tx.retry_after_ms &&
+        (int32_t)(now - g_mesh_chat_tx.retry_after_ms) < 0)
+        return;
+    g_mesh_chat_tx.retry_after_ms = 0;
+
+    // Do not overwrite a keepalive's single ACK expectation. A stale probe is
+    // cancelled after 12s so an interactive chat cannot wait a full interval.
+    if (mesh_client_ack_pending()) {
+        if (now - mesh_client_last_send_ms() >= 12000UL) {
+            mesh_client_cancel_pending_ack();
+            if (mesh_probe_awaiting_ack) {
+                mesh_probe_awaiting_ack = false;
+                g_mesh.fail_streak++;
+                g_mesh.probe_fail_count++;
+            }
+        } else {
+            return;
+        }
+    }
+
+    uint32_t ack = 0, estimate = 0;
+    if (!mesh_client_send_to_gateway(g_mesh_chat_tx.frames[g_mesh_chat_tx.next],
+                                     &ack, &estimate)) {
+        g_mesh_chat_tx.attempts++;
+        if (g_mesh_chat_tx.attempts >= MESH_CHAT_TX_RETRIES) {
+            mesh_chat_tx_fail("radio TX");
+        } else {
+            g_mesh_chat_tx.retry_after_ms = now + 1000UL;
+        }
+        return;
+    }
+    g_mesh_chat_tx.attempts++;
+    g_mesh_chat_tx.sent_ms = now;
+    uint32_t timeout = estimate + 1500UL;
+    if (timeout < 3000UL) timeout = 3000UL;
+    if (timeout > 12000UL) timeout = 12000UL;
+    g_mesh_chat_tx.ack_timeout_ms = timeout;
+    g_mesh_chat_tx.waiting_ack = true;
+}
+
 /*
  * One sparse private DM to Heltec. MeshCore path (incl. repeaters) is used
  * when the contact has out_path; protocol ACK is enough — no chatty reply.
@@ -174,7 +273,10 @@ static void mesh_cb_dm(const char *from_name, const char *text) {
 }
 
 static void mesh_cb_ack(uint32_t rtt_ms) {
-    mesh_probe_awaiting_ack = false;
+    if (g_mesh_chat_tx.active && g_mesh_chat_tx.waiting_ack)
+        g_mesh_chat_tx.ack_seen = true;
+    else
+        mesh_probe_awaiting_ack = false;
     mesh_link_mark_ok(rtt_ms ? rtt_ms : 1);
     event_add("mesh ACK rtt=%lu", (unsigned long)rtt_ms);
 }
@@ -274,11 +376,13 @@ static void mesh_reasm_gc() {
     }
 }
 
-static MeshReasm *mesh_reasm_get(char kind, const char *mid) {
+static MeshReasm *mesh_reasm_get(char kind, const char *mid,
+                                 const char *agent = NULL) {
     mesh_reasm_gc();
     for (int i = 0; i < MESH_REASM_SLOTS; i++) {
         if (g_reasm[i].used && g_reasm[i].kind == kind &&
-            strcmp(g_reasm[i].mid, mid) == 0)
+            strcmp(g_reasm[i].mid, mid) == 0 &&
+            (kind != 'C' || strcmp(g_reasm[i].agent, agent ? agent : "") == 0))
             return &g_reasm[i];
     }
     for (int i = 0; i < MESH_REASM_SLOTS; i++) {
@@ -287,6 +391,8 @@ static MeshReasm *mesh_reasm_get(char kind, const char *mid) {
             g_reasm[i].used = true;
             g_reasm[i].kind = kind;
             snprintf(g_reasm[i].mid, sizeof(g_reasm[i].mid), "%s", mid);
+            if (kind == 'C' && agent)
+                snprintf(g_reasm[i].agent, sizeof(g_reasm[i].agent), "%s", agent);
             g_reasm[i].started_ms = millis();
             return &g_reasm[i];
         }
@@ -299,6 +405,8 @@ static MeshReasm *mesh_reasm_get(char kind, const char *mid) {
     g_reasm[victim].used = true;
     g_reasm[victim].kind = kind;
     snprintf(g_reasm[victim].mid, sizeof(g_reasm[victim].mid), "%s", mid);
+    if (kind == 'C' && agent)
+        snprintf(g_reasm[victim].agent, sizeof(g_reasm[victim].agent), "%s", agent);
     g_reasm[victim].started_ms = millis();
     return &g_reasm[victim];
 }
@@ -414,7 +522,7 @@ static uint32_t mesh_on_private_text(const char *text) {
         if (!a) return 0;
         const char *chunk = a + 1;
 
-        MeshReasm *r = mesh_reasm_get('C', mid);
+        MeshReasm *r = mesh_reasm_get('C', mid, agent);
         if (r->got_count == 0) {
             snprintf(r->agent, sizeof(r->agent), "%s", agent);
             r->side = side;
@@ -565,10 +673,13 @@ static void skill_meshcore_poll() {
 
     /* MeshCore stack — same loop task as display (shared SPI). */
     if (g_mesh.radio_ready) mesh_client_loop();
+    mesh_chat_tx_poll();
 
     /* Sparse private keepalive — only when radio stack can TX. */
     if (!g_mesh.has_identity || !g_mesh.radio_ready) return;
     if (!g_mesh.heltec_pk_hex[0]) return;
+    if (g_mesh_chat_tx.active) return;
+    if (mesh_client_ack_pending()) return;
 
     unsigned long now = millis();
     unsigned long interval_ms = (unsigned long)g_mesh.probe_interval_s * 1000UL;
@@ -679,6 +790,7 @@ static const Skill meshcore_skill = {
 static bool mesh_chat_uplink(const char *agent_id, const char *text) {
     if (!agent_id || !text || !text[0]) return false;
     if (!g_mesh.radio_ready || !mesh_client_ready()) return false;
+    if (g_mesh_chat_tx.active) return false;
 
     char agent[13];
     snprintf(agent, sizeof(agent), "%.12s", agent_id);
@@ -698,38 +810,39 @@ static bool mesh_chat_uplink(const char *agent_id, const char *text) {
     int n_parts = 0;
     size_t i = 0;
     while (i < raw_len) {
-        int take = room;
-        if (i + (size_t)take > raw_len) take = (int)(raw_len - i);
-        while (take > 0 && (raw[i + (size_t)take - 1] & 0xC0) == 0x80) take--;
-        if (take <= 0) take = 1;
+        size_t take = mesh_utf8_chunk_len(raw, raw_len, i, (size_t)room);
+        if (take == 0) return false;
         n_parts++;
-        i += (size_t)take;
-        if (n_parts > 32) break;
+        i += take;
+        if (n_parts > MESH_CHAT_TX_MAX_PARTS) return false;
     }
     if (n_parts == 0) n_parts = 1;
 
     i = 0;
     int part = 0;
     while (i < raw_len && part < n_parts) {
-        int take = room;
-        if (i + (size_t)take > raw_len) take = (int)(raw_len - i);
-        while (take > 0 && (raw[i + (size_t)take - 1] & 0xC0) == 0x80) take--;
-        if (take <= 0) take = 1;
+        size_t take = mesh_utf8_chunk_len(raw, raw_len, i, (size_t)room);
+        if (take == 0) return false;
         part++;
-        char frame[160];
-        int n = snprintf(frame, sizeof(frame), "C1|%s|%s|%d|%d|u|", agent, mid, part,
-                         n_parts);
-        if (n < 0 || n >= (int)sizeof(frame)) return false;
-        int room2 = (int)sizeof(frame) - 1 - n;
-        if (take > room2) take = room2;
-        memcpy(frame + n, text + i, (size_t)take);
+        char *frame = g_mesh_chat_tx.frames[part - 1];
+        int n = snprintf(frame, sizeof(g_mesh_chat_tx.frames[0]),
+                         "C1|%s|%s|%d|%d|u|", agent, mid, part, n_parts);
+        if (n < 0 || n >= (int)sizeof(g_mesh_chat_tx.frames[0])) return false;
+        size_t room2 = sizeof(g_mesh_chat_tx.frames[0]) - 1U - (size_t)n;
+        if (take > room2) return false;
+        memcpy(frame + n, text + i, take);
         frame[n + take] = '\0';
-        uint32_t ack = 0, est = 0;
-        if (!mesh_client_send_to_gateway(frame, &ack, &est)) return false;
-        i += (size_t)take;
-        if (i < raw_len) delay(350);
+        i += take;
     }
-    return part > 0;
+    if (part <= 0 || part != n_parts || i != raw_len) {
+        memset(&g_mesh_chat_tx, 0, sizeof(g_mesh_chat_tx));
+        return false;
+    }
+    g_mesh_chat_tx.count = (uint8_t)n_parts;
+    snprintf(g_mesh_chat_tx.agent, sizeof(g_mesh_chat_tx.agent), "%s", agent);
+    g_mesh_chat_tx.active = true;
+    event_add("mesh chat queued %u parts", (unsigned)g_mesh_chat_tx.count);
+    return true;
 }
 
 static void skill_meshcore_init() {
