@@ -62,6 +62,17 @@
 #define AGENT_LOG_PREFIX    "agent" /* flat store files /agent.<id>.<s>.jsonl */
 /* JSONL line worst case: 2x escaped text + wrapper + newline. */
 #define AGENT_JSONL_MAX     (AGENT_TEXT_LEN * 2 + 64)
+/* Bus-hold budget for a whole-file session scan. A months-old session JSONL
+ * has no rotation cap, so a single unbroken scan under the shared SPI bus lock
+ * would freeze the SX1262 servicing and the clock tick for the whole read
+ * (~300 ms at ~350 KB/s for ~100 KB). Instead every scan below reads at most
+ * this many bytes under the bus lock, then releases it and yields so the loop
+ * task can drain the radio FIFO / repaint, then re-takes and continues. At
+ * ~350 KB/s effective SD throughput 4 KB ≈ 12 ms — well under the ~40 ms that
+ * would still hitch the radio. The scan holds agents_mux across the whole
+ * call, which keeps the file immutable between chunks (see agents_scan_chunked
+ * and the LOCK ORDER note below): only the *bus* is chunked, never the mux. */
+#define AGENT_SCAN_BUS_CHUNK  4096u
 
 struct AgentLine {
     bool from_me;
@@ -279,11 +290,13 @@ static void agents_view_append(AgentSlot &a, bool from_me, uint32_t ts,
  * one f.read() per byte — the long-history page load / delta-sync / tail read
  * paths run on the shared SPI bus and must not freeze the UI on long files. */
 struct AgentJScanner {
-    explicit AgentJScanner(File &file) : f(file), pos(0), len(0), eof(false) {}
+    explicit AgentJScanner(File &file)
+        : f(file), pos(0), len(0), total_read(0), eof(false) {}
     File f;
     uint8_t buf[512];
     size_t pos;      // next unconsumed byte in buf
     size_t len;      // valid bytes in buf (0 → refill)
+    size_t total_read;  // bytes pulled from f so far (bus-hold budgeting)
     bool eof;
 
     /* One line into [out, n-1]; false at end of file. Strips trailing \r. */
@@ -295,6 +308,7 @@ struct AgentJScanner {
                 if (eof) break;
                 len = f.read(buf, sizeof(buf));
                 pos = 0;
+                total_read += len;
                 if (len == 0) { eof = true; break; }
             }
             uint8_t c = buf[pos++];
@@ -305,6 +319,7 @@ struct AgentJScanner {
                         if (eof) break;
                         len = f.read(buf, sizeof(buf));
                         pos = 0;
+                        total_read += len;
                         if (len == 0) { eof = true; break; }
                     }
                     if (buf[pos++] == '\n') break;
@@ -331,6 +346,45 @@ static bool agents_jsonl_parse(char *buf, bool &from_me, uint32_t &ts,
     return true;
 }
 
+/* Scan an already-open JSONL file line by line while BOUNDING the SPI-bus
+ * hold: read at most AGENT_SCAN_BUS_CHUNK bytes under the bus lock, then
+ * release it and yield (so the loop task can drain the SX1262 FIFO / repaint),
+ * then re-take and continue. on_line(char*) is invoked per line with the bus
+ * held; it must do only CPU work (parse), never bus I/O. The File is NOT
+ * opened or closed here — the caller owns its lifetime.
+ *
+ * CONCURRENCY: the caller MUST hold agents_mux for the whole scan. That — and
+ * only that — is what keeps the file immutable across the release windows:
+ * every writer to a session file (agents_store_append via agents_push_line,
+ * agents_clear's remove, the window rebuilds in agents_session_select /
+ * _goto_tail / _goto_page / _sync_view) also takes agents_mux first, so while
+ * we hold it no append, truncate, remove or rewrite can land between chunks.
+ * The open File's cursor and size therefore stay valid; there is no
+ * "file shrank / changed under us" case to detect MID-scan — it is prevented,
+ * not merely handled. (agents_sync_view's size<file_sync full-rebuild guards
+ * EXTERNAL truncation ACROSS calls — reboot, manual SD edit — not a concurrent
+ * writer, which the mux excludes.) We release only the bus, never agents_mux:
+ * releasing the mux would let agents_clear remove the file under our open
+ * handle, and is impossible anyway for the callers that hold it recursively.
+ * LOCK ORDER stays intact — we never take agents_mux while holding the bus. */
+template <typename LineFn>
+static void agents_scan_chunked(AgentJScanner &sc, char *lbuf, size_t lbuf_n,
+                                LineFn on_line) {
+    for (;;) {
+        bool more = false;
+        {
+            HwSpiBusGuard bus;  /* one bounded chunk = one bus burst */
+            size_t chunk_start = sc.total_read;
+            while ((more = sc.next(lbuf, lbuf_n)) == true) {
+                on_line(lbuf);
+                if (sc.total_read - chunk_start >= AGENT_SCAN_BUS_CHUNK) break;
+            }
+        }  /* bus released here */
+        if (!more) break;   // scanner reached EOF inside this chunk
+        taskYIELD();        // let the loop task grab the freed bus
+    }
+}
+
 /* Bring the RAM index in line with the JSONL file: read only the bytes after
  * file_sync (delta), append them to the window. On external truncation/resync
  * the window is rebuilt from zero. Caller holds the lock. */
@@ -338,34 +392,42 @@ static void agents_sync_view(int idx) {
     AgentSlot &a = g_agents[idx];
     if (!agents_store_ready()) return;
     String path = agents_log_path(a.id, a.sessions[a.active_idx]);
-    HwSpiBusGuard bus;  /* one delta-sync = one bus burst (mux already held) */
-    if (!g_store->exists(path.c_str())) {
-        a.file_sync = 0; a.lines = 0; a.vn = 0; a.win_start = 0;
-        return;
+    /* Open + size/seek under one short bus burst; the line scan below bounds
+     * its own bus hold (mux held throughout — see agents_scan_chunked). */
+    File f;
+    uint32_t final_size = 0;
+    bool do_scan = false;
+    {
+        HwSpiBusGuard bus;
+        if (!g_store->exists(path.c_str())) {
+            a.file_sync = 0; a.lines = 0; a.vn = 0; a.win_start = 0;
+            return;
+        }
+        f = g_store->open(path.c_str(), "r");
+        if (!f) { a.file_sync = 0; a.lines = 0; a.vn = 0; a.win_start = 0; return; }
+        size_t sz = f.size();
+        if (sz < a.file_sync) {      // file shrank between calls → full rebuild
+            a.file_sync = 0; a.lines = 0; a.vn = 0; a.win_start = 0;
+        }
+        final_size = (uint32_t)sz;
+        do_scan = (a.file_sync < sz && f.seek(a.file_sync));
     }
-    File f = g_store->open(path.c_str(), "r");
-    if (!f) { a.file_sync = 0; a.lines = 0; a.vn = 0; a.win_start = 0; return; }
-
-    size_t sz = f.size();
-    if (sz < a.file_sync) {          // file shrank under us → full rebuild
-        a.file_sync = 0; a.lines = 0; a.vn = 0; a.win_start = 0;
-    }
-    if (a.file_sync < f.size() && f.seek(a.file_sync)) {
+    if (do_scan) {
         char lbuf[AGENT_JSONL_MAX];
         char text[AGENT_TEXT_LEN];
-        bool from_me;
-        uint32_t ts;
         AgentJScanner sc(f);
-        while (sc.next(lbuf, sizeof(lbuf))) {
-            if (lbuf[0] && agents_jsonl_parse(lbuf, from_me, ts, text, sizeof(text))) {
+        agents_scan_chunked(sc, lbuf, sizeof(lbuf), [&](char *line) {
+            bool from_me;
+            uint32_t ts;
+            if (line[0] && agents_jsonl_parse(line, from_me, ts, text, sizeof(text))) {
                 agents_view_append(a, from_me, ts, text);
                 a.lines++;
             }
-        }
+        });
     }
-    a.file_sync = (uint32_t)f.size();
+    a.file_sync = final_size;
     a.session_lines[a.active_idx] = a.lines;
-    f.close();
+    { HwSpiBusGuard bus; f.close(); }
 }
 
 /* Load the session registry from the store manifest (one agent\tsession/line). */
@@ -472,19 +534,33 @@ bool agents_session_refresh_counts(int idx) {
     for (int j = 0; j < a.n_sessions; j++) {
         String path = agents_log_path(a.id, a.sessions[j]);
         uint32_t cnt = 0;
-        {
-            HwSpiBusGuard bus;  /* per-file read burst (non-recursive: must
-                                 * release before agents_sync_view below) */
-            File f = g_store->open(path.c_str(), "r");
-            if (f) {
-                uint8_t chunk[256];
-                size_t r;
-                while ((r = f.read(chunk, sizeof(chunk))) > 0) {
-                    for (size_t k = 0; k < r; k++)
-                        if (chunk[k] == '\n') cnt++;
+        File f;
+        { HwSpiBusGuard bus; f = g_store->open(path.c_str(), "r"); }
+        if (f) {
+            /* Count newlines in bounded bus chunks so a large session file
+             * never freezes the radio here. mux is held across the whole
+             * refresh, so the file cannot change between chunks; the bus is
+             * released each chunk (non-recursive: also freed before the
+             * agents_sync_view re-anchor below). */
+            uint8_t chunk[256];
+            for (;;) {
+                bool eof = false;
+                {
+                    HwSpiBusGuard bus;
+                    size_t chunk_read = 0;
+                    size_t r = 0;
+                    while ((r = f.read(chunk, sizeof(chunk))) > 0) {
+                        for (size_t k = 0; k < r; k++)
+                            if (chunk[k] == '\n') cnt++;
+                        chunk_read += r;
+                        if (chunk_read >= AGENT_SCAN_BUS_CHUNK) break;
+                    }
+                    if (r == 0) eof = true;
                 }
-                f.close();
+                if (eof) break;
+                taskYIELD();
             }
+            { HwSpiBusGuard bus; f.close(); }
         }
         a.session_lines[j] = cnt;
         if (j == a.active_idx && a.lines != cnt)
@@ -556,25 +632,26 @@ static void agents_load_page(int idx, uint32_t end_line) {
     if (end_line > a.lines) end_line = a.lines;
     uint32_t keep_from = (end_line > AGENT_VIEW_MAX) ? (end_line - AGENT_VIEW_MAX) : 0;
     String path = agents_log_path(a.id, a.sessions[a.active_idx]);
-    HwSpiBusGuard bus;  /* one page scan = one bus burst */
-    File f = g_store->open(path.c_str(), "r");
+    /* Page scan runs from byte 0; bound its bus hold in chunks (mux held). */
+    File f;
+    { HwSpiBusGuard bus; f = g_store->open(path.c_str(), "r"); }
     if (!f) { a.vn = 0; a.win_start = 0; return; }
     char lbuf[AGENT_JSONL_MAX];
     char text[AGENT_TEXT_LEN];
-    bool from_me;
-    uint32_t ts;
     uint32_t line_idx = 0;
     a.vn = 0;
     a.win_start = keep_from;
     AgentJScanner sc(f);
-    while (sc.next(lbuf, sizeof(lbuf))) {
-        if (lbuf[0] && line_idx >= keep_from && line_idx < end_line &&
-            agents_jsonl_parse(lbuf, from_me, ts, text, sizeof(text))) {
+    agents_scan_chunked(sc, lbuf, sizeof(lbuf), [&](char *line) {
+        bool from_me;
+        uint32_t ts;
+        if (line[0] && line_idx >= keep_from && line_idx < end_line &&
+            agents_jsonl_parse(line, from_me, ts, text, sizeof(text))) {
             agents_view_append(a, from_me, ts, text);
         }
         line_idx++;
-    }
-    f.close();
+    });
+    { HwSpiBusGuard bus; f.close(); }
 }
 
 /* Re-pin the window to the newest messages of the active session. If the user
@@ -637,8 +714,10 @@ static bool agents_file_last(int idx, char *text, size_t text_n,
     AgentSlot &a = g_agents[idx];
     if (!agents_store_ready()) return false;
     String path = agents_log_path(a.id, a.sessions[a.active_idx]);
-    HwSpiBusGuard bus;  /* GET /agents runs on the AsyncTCP task */
-    File f = g_store->open(path.c_str(), "r");
+    /* GET /agents runs on the AsyncTCP task; scan the whole file for its last
+     * line in bounded bus chunks so it cannot freeze the radio (mux held). */
+    File f;
+    { HwSpiBusGuard bus; f = g_store->open(path.c_str(), "r"); }
     if (!f) return false;
     char lbuf[AGENT_JSONL_MAX];
     char t2[AGENT_TEXT_LEN];
@@ -646,10 +725,10 @@ static bool agents_file_last(int idx, char *text, size_t text_n,
     uint32_t t = 0;
     bool found = false;
     AgentJScanner sc(f);
-    while (sc.next(lbuf, sizeof(lbuf))) {
-        if (lbuf[0] && agents_jsonl_parse(lbuf, fm, t, t2, sizeof(t2))) found = true;
-    }
-    f.close();
+    agents_scan_chunked(sc, lbuf, sizeof(lbuf), [&](char *line) {
+        if (line[0] && agents_jsonl_parse(line, fm, t, t2, sizeof(t2))) found = true;
+    });
+    { HwSpiBusGuard bus; f.close(); }
     if (!found) return false;
     if (text) snprintf(text, text_n, "%s", t2);
     if (from_me) *from_me = fm;

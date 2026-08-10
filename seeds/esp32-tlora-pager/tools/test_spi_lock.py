@@ -92,6 +92,23 @@ for sig in PAINT_ENTRIES:
         f"{sig} must take the bus lock BEFORE its first paint call"
     )
 
+# Every hw_ui_show_* definition in the file MUST be listed as a paint entry
+# above, so it is subject to the bus-lock assertion. Regex-derived so a future
+# hw_ui_show_foo() added without landing in PAINT_ENTRIES fails HERE instead of
+# painting under no lock and passing silently (the C4-review gap).
+_paint_name = lambda s: s.split(None, 1)[1].split("(")[0]
+_paint_names = {_paint_name(s) for s in PAINT_ENTRIES}
+_show_defs = re.findall(r"^(?:void|int|bool) (hw_ui_show_\w+)\(", hw_ui, re.M)
+assert len(_show_defs) >= 15, (
+    f"regex found only {len(_show_defs)} hw_ui_show_* defs — pattern drifted, "
+    "the derived paint-entry guard would be toothless"
+)
+for _name in _show_defs:
+    assert _name in _paint_names, (
+        f"{_name}() is a hw_ui_show_* paint entry but is missing from "
+        "PAINT_ENTRIES — add it so it gets the bus-lock-before-paint assertion"
+    )
+
 # sleep pair: the SLPIN/SLPOUT command goes out under the lock, the panel
 # settle delays run with the bus released (they are not bus traffic)
 sleep_fn = fn_body(hw_ui, "void tft_sleep()")
@@ -132,6 +149,27 @@ for sig in CS_PRIMITIVES + ["static void tft_window(", "static void tft_fill_cir
     assert "HwSpiBusGuard" not in body and "hw_spi_bus_lock" not in body, (
         f"{sig} is an internal helper: it must ASSUME the lock, not take it "
         "(non-recursive mutex would deadlock)"
+    )
+
+# ...and so does EVERY paint helper: any *_draw_row / draw_field / ping_draw_* /
+# tft_draw_text* runs inside a public entry's already-held lock. Regex-derived
+# (C4-review widen): a new draw_row helper that grabs the guard itself would
+# re-enter the non-recursive bus mutex and deadlock — catch it statically.
+DRAW_HELPERS = []
+for _m in re.finditer(r"^(static (?:void|int|bool) (\w+)\()", hw_ui, re.M):
+    _sig, _name = _m.group(1), _m.group(2)
+    if (_name.endswith("_draw_row") or _name == "draw_field"
+            or _name.startswith("ping_draw_") or _name.startswith("tft_draw_text")):
+        DRAW_HELPERS.append(_sig)
+assert len(DRAW_HELPERS) >= 12, (
+    f"draw-helper regex found only {len(DRAW_HELPERS)} helpers — pattern "
+    "drifted, the lock-free assertion below would be toothless"
+)
+for sig in DRAW_HELPERS:
+    body = fn_body(hw_ui, sig)
+    assert "HwSpiBusGuard" not in body and "hw_spi_bus_lock" not in body, (
+        f"{sig} is a paint helper: it must ASSUME the caller's lock, not take "
+        "it (re-entering the non-recursive bus mutex deadlocks)"
     )
 
 # --- tft_fill_circle: spans per scanline, not a pixel matrix -----------------
@@ -181,6 +219,68 @@ for sig in ("static void agents_store_append(", "static void agents_sync_view(",
     assert "agents_lock()" not in body, (
         f"{sig}: taking agents_mux under the bus lock inverts the lock order"
     )
+
+# --- whole-file session scans bound the bus hold (chunked, Option A) ----------
+# Unbounded session JSONL (no rotation) scanned under one bus lock would freeze
+# the SX1262 servicing for the whole read (~300 ms for ~100 KB) and drop an
+# inbound LoRa packet sitting in the FIFO. Each scan must read a bounded number
+# of bytes under the bus lock, release it, yield, then re-take and continue.
+m = re.search(r"#define\s+AGENT_SCAN_BUS_CHUNK\s+(\d+)u?", agents)
+assert m, "AGENT_SCAN_BUS_CHUNK bus-hold budget constant is missing"
+_chunk = int(m.group(1))
+assert 0 < _chunk <= 16384, (
+    f"AGENT_SCAN_BUS_CHUNK={_chunk} is out of range; at ~350 KB/s a chunk must "
+    "stay well under the ~40 ms that would still hitch the radio (<= 16 KB)"
+)
+
+# The scanner tracks bytes read so the budget can be enforced.
+assert "size_t total_read;" in agents, (
+    "AgentJScanner must count bytes read (total_read) to budget the bus hold"
+)
+
+# The chunked-scan helper: releases the bus per bounded chunk and yields, and
+# NEVER releases agents_mux (that is what keeps the file immutable between
+# chunks — every writer also holds agents_mux, so no append/remove/rewrite can
+# land under the open File handle; the size-shrink case cannot occur mid-scan).
+scan = fn_body(agents, "static void agents_scan_chunked(")
+assert "HwSpiBusGuard" in scan, "agents_scan_chunked must take the bus per chunk"
+assert "AGENT_SCAN_BUS_CHUNK" in scan, "agents_scan_chunked must enforce the byte budget"
+assert "total_read" in scan, "agents_scan_chunked must budget on bytes read"
+assert "taskYIELD" in scan, "agents_scan_chunked must yield after releasing the bus"
+assert scan.index("HwSpiBusGuard") < scan.index("taskYIELD"), (
+    "the bus must be RELEASED (guard scope closed) before the yield"
+)
+assert "if (!more) break;" in scan, "agents_scan_chunked must stop at EOF"
+assert "agents_lock()" not in scan and "agents_unlock()" not in scan, (
+    "agents_scan_chunked must NOT touch agents_mux — the caller holds it across "
+    "the whole scan; releasing it mid-scan would let agents_clear remove the "
+    "file under the open handle"
+)
+
+# The three JSONL scanners route through the chunked helper (not one big burst).
+for sig in ("static void agents_sync_view(",
+            "static void agents_load_page(",
+            "static bool agents_file_last("):
+    body = fn_body(agents, sig)
+    assert "agents_scan_chunked" in body, (
+        f"{sig} must scan via agents_scan_chunked so the bus hold is bounded"
+    )
+
+# agents_sync_view keeps the size-shrink → full-rebuild guard (external
+# truncation across calls; a concurrent writer is excluded by agents_mux).
+sync = fn_body(agents, "static void agents_sync_view(")
+assert "sz < a.file_sync" in sync, (
+    "agents_sync_view must keep the shrink-detect full-rebuild path"
+)
+
+# agents_session_refresh_counts counts newlines in bounded bus chunks + yields.
+refresh = fn_body(agents, "bool agents_session_refresh_counts(")
+assert "AGENT_SCAN_BUS_CHUNK" in refresh, (
+    "agents_session_refresh_counts must bound its per-file read bus hold"
+)
+assert "taskYIELD" in refresh, (
+    "agents_session_refresh_counts must yield the bus between chunks"
+)
 
 # --- radio side: RadioLib hal transaction hooks carry the lock ---------------
 assert "class LockedArduinoHal : public ArduinoHal" in mc_target, (
