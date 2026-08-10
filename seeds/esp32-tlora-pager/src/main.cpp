@@ -52,7 +52,7 @@
 #include "hw_kb.h"
 
 // ===== Configuration =====
-#define SEED_VERSION        "0.9.41"
+#define SEED_VERSION        "0.9.42"
 // Core clock: datasheet puts 240 vs 80 ~11.5mA apart on WAITI. Periph bus holds
 // at 80 for every PLL-fed core clock; go lower and RMT/I2S retimes. Same floor
 // as tembed idle policy (no light sleep — notify latency is the job).
@@ -1364,6 +1364,10 @@ static_assert(BL_IDLE_DIM_MS > UI_IDLE_MS,
 
 static void ui_note_input() { ui_last_input_ms = millis(); }
 
+// SYSTEM events only (a message arriving): wake the panel and restart the
+// idle/dim countdown once per event; repaints and synthetic errors must not call this.
+static void ui_note_wake() { ui_last_input_ms = millis(); }
+
 // SETTINGS face: rebuild labels from backlight skill and paint.
 static void ui_open_settings() {
     char bl[BL_LABEL_MAX];
@@ -2292,7 +2296,6 @@ static void ui_agent_chat_refresh() {
     agent_scroll = hw_ui_show_agent_chat(head, ag_chat_ptrs, ag_chat_from_me,
                                          n, agent_scroll, &total, foot);
     agent_scroll_total = total;
-    ui_note_input();
 }
 
 static void ui_open_agent_chat(int idx) {
@@ -2414,7 +2417,8 @@ static void ui_show_agent_invite_from_view(const NotifyView &v, uint32_t id) {
     int ax = agents_index_from_door(v);
     const char *aname = (ax >= 0) ? agents_name(ax) : v.source;
     hw_ui_show_agent_invite(aname, v.body, notify_unread_count());
-    ui_note_input();
+    // Reachable from the loop() arrival path: a system wake, not user input.
+    ui_note_wake();
 }
 
 // Enter the chat room from a chat-door notify (ack + open).
@@ -3048,17 +3052,25 @@ void loop() {
     // Agent thread inbound (display_force) — refresh open chat room live.
     if (display_force && hw_ui_screen() == HW_UI_AGENT_CHAT) {
         display_force = false;
+        bool real_in = g_agents_real_inbound;
+        g_agents_real_inbound = false;
         // Stay pinned to latest if user was following the bottom.
         if (agent_scroll < 0 ||
             agent_scroll >= agent_scroll_total - 2) {
             agent_scroll = -1;
         }
         ui_agent_chat_refresh();
+        // A genuine arrival (mesh C1 or WiFi) in the open room wakes the
+        // panel once; a repaint alone (e.g. synthetic error line) does not.
+        if (real_in) ui_note_wake();
     }
 
     uint32_t arrived_id = 0;
     if (notify_take_arrival(&arrived_id) || display_force) {
         display_force = false;
+        // Room not on screen: the arrival flag must not survive to be claimed
+        // by a later, unrelated repaint of the room.
+        g_agents_real_inbound = false;
         NotifyView v;
         HwUiScreen scr = hw_ui_screen();
         bool on_clock = (scr == HW_UI_CLOCK);
@@ -3069,6 +3081,7 @@ void loop() {
                 if (ax >= 0 && scr == HW_UI_AGENT_CHAT && agent_focus == ax) {
                     notify_ack_id(arrived_id);
                     ui_agent_chat_refresh();
+                    ui_note_wake();  // real inbound message, not a repaint
                 } else if (ax >= 0 && scr == HW_UI_REPLY && agent_compose &&
                            agent_focus == ax) {
                     // Typing in that room — leave compose; thread updates later.
@@ -3083,7 +3096,7 @@ void loop() {
                 snprintf(reply_title, sizeof(reply_title), "%s", v.title);
                 hw_ui_show_notify(notify_level_name(v.level), v.source, v.title,
                                   v.body, notify_unread_count());
-                ui_note_input();
+                ui_note_wake();
             } else {
                 // In reply compose / sheets — badge only, don't yank the user.
                 hw_ui_invalidate_clock();

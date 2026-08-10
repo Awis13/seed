@@ -151,7 +151,15 @@ void gps_set_on_fix(void (*cb)(void));
 void gps_request_fix(void);
 
 /* Defined later in this file (used by the GPS interception below). */
-static void agents_on_inbound(const char *agent_id, const char *text);
+static void agents_on_inbound(const char *agent_id, const char *text,
+                              bool real_inbound);
+
+/* A genuine arrival (mesh C1 RX, HTTP /agents/inbound, a GPS answer landing)
+ * pushed a line into a room. loop() consumes it together with display_force:
+ * if the room is open on screen, the repaint wakes the panel once. Synthetic
+ * error lines never set this. Set BEFORE display_force so the loop cannot
+ * consume the repaint without seeing the arrival. */
+static volatile bool g_agents_real_inbound = false;
 
 /* ---- store ---------------------------------------------------------------- */
 
@@ -865,7 +873,9 @@ static bool agents_loc_card(int idx) {
         snprintf(line, sizeof(line),
                  "GPS: no fix yet - I will reply as soon as the first fix lands");
     }
-    agents_on_inbound(g_agents[idx].id, line);
+    /* real_inbound: the fix can land minutes after the question — from the
+     * user's side this is an answer arriving in the room, not an error line. */
+    agents_on_inbound(g_agents[idx].id, line, true);
     event_add("agent %s gps %s", g_agents[idx].id, fresh ? "located" : "pending");
     return fresh;
 }
@@ -948,14 +958,19 @@ static bool agents_send(const char *agent_id, const char *text) {
     return true;
 }
 
-/* Inject an agent reply into the active session of the agent (long texts split). */
-static void agents_on_inbound(const char *agent_id, const char *text) {
+/* Inject an agent reply into the active session of the agent (long texts split).
+ * real_inbound: true only for genuine arrivals (HTTP /agents/inbound, GPS
+ * answer) — they may wake the panel when the room is open on screen. Synthetic
+ * lines (mesh_chat_tx_fail) pass false and never restart the idle countdown. */
+static void agents_on_inbound(const char *agent_id, const char *text,
+                              bool real_inbound) {
     int idx = agents_find(agent_id);
     if (idx < 0 || !text || !text[0]) return;
     char cleaned[2048];
     agents_clean_text(text, cleaned, sizeof(cleaned));
     if (!cleaned[0]) return;
     agents_push_line(idx, false, cleaned);
+    if (real_inbound) g_agents_real_inbound = true;
     display_force = true;
 }
 
@@ -1151,7 +1166,7 @@ static void agents_register_routes(AsyncWebServer &server) {
         const char *text  = input["text"]  | "";
         if (agents_find(agent) < 0) { notify_send_error(req, 400, "agent must be grok, claude, hermes, opencode or codex"); return; }
         if (!text[0]) { notify_send_error(req, 400, "text required"); return; }
-        agents_on_inbound(agent, text);
+        agents_on_inbound(agent, text, true);
         event_add("agent %s >> %s", agent, text);
         JsonDocument doc;
         doc["ok"] = true;
