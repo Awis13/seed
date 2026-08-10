@@ -20,6 +20,13 @@ assert "#define WIFI_RETRY_MS 1200000UL" in main
 assert "WiFi.setAutoReconnect(false)" in main, (
     "the Arduino core must not retry underneath our own backoff ladder"
 )
+# C8: the active credentials are fixed char buffers, not Strings. WiFi.begin()
+# reads them on the loop task while HTTP handlers on the AsyncTCP task could
+# reassign a String's heap buffer under it — the arrays close that window.
+assert "static char wifi_ssid[33]" in main, "wifi_ssid must be a fixed char buffer"
+assert "static String wifi_ssid" not in main, "wifi_ssid must not regress to String"
+assert "static char wifi_pass[65]" in main, "wifi_pass must be a fixed char buffer"
+assert "static String wifi_pass" not in main, "wifi_pass must not regress to String"
 assert main.count("WiFi.begin(") == 1, (
     "all connect paths must use wifi_begin_active_profile() and stamp the timer"
 )

@@ -44,7 +44,9 @@ extern "C" {
 
 static WireGuard g_wg;
 static bool g_wg_running = false;
-static bool g_wg_want = false;
+/* Written by three HTTP handlers on the AsyncTCP task, read by skill_wg_poll
+ * on the loop task — volatile like the rest of the deferral cluster below. */
+static volatile bool g_wg_want = false;
 static bool g_wg_cfg_ok = false;
 static char g_wg_pub[48] = "";
 static char g_wg_addr[20] = "";
@@ -275,7 +277,7 @@ static void wg_status_json(JsonDocument &doc) {
     if (loaded) g_wg_cfg_ok = wg_config_complete(cfg);
 
     doc["configured"] = g_wg_cfg_ok;
-    doc["enabled"] = g_wg_want;
+    doc["enabled"] = (bool)g_wg_want;
     doc["up"] = g_wg_running;
     doc["initialized"] = g_wg_running && g_wg.is_initialized();
     doc["link"] = wg_ui_state();
@@ -453,7 +455,7 @@ static void wg_register_routes(AsyncWebServer &server) {
         out["ok"] = true;
         out["configured"] = g_wg_cfg_ok;
         out["public_key"] = g_wg_pub;
-        out["enabled"] = g_wg_want;
+        out["enabled"] = (bool)g_wg_want;
         notify_send_json(req, 200, out);
     }, NULL, handle_body_collect);
 

@@ -54,7 +54,7 @@
 #include "hw_kb.h"
 
 // ===== Configuration =====
-#define SEED_VERSION        "0.9.48"
+#define SEED_VERSION        "0.9.49"
 // Core clock: datasheet puts 240 vs 80 ~11.5mA apart on WAITI. Periph bus holds
 // at 80 for every PLL-fed core clock; go lower and RMT/I2S retimes. Same floor
 // as tembed idle policy (no light sleep — notify latency is the job).
@@ -148,7 +148,10 @@ static const char *reset_reason_str(esp_reset_reason_t r) {
 // Panic-class resets: real panics plus watchdogs (both fire the panic
 // handler), a CPU lockup (double exception) and a detected power glitch —
 // unexpected faults that must count as instability. USB and JTAG resets are
-// host-driven (flashing/debugging) and stay clean, like poweron.
+// host-driven (flashing/debugging) and stay clean, like poweron. An efuse
+// error reset is also clean: it means the eFuse controller re-read its
+// block, a one-shot hardware event with no firmware cause, so counting it
+// as instability would misdirect the crash counters.
 static bool reset_is_panic(esp_reset_reason_t r) {
     return r == ESP_RST_PANIC || r == ESP_RST_INT_WDT ||
            r == ESP_RST_TASK_WDT || r == ESP_RST_WDT ||
@@ -881,17 +884,57 @@ static void handle_capabilities(AsyncWebServerRequest *request) {
     request->send(200, "application/json", response);
 }
 
+// Collects a request body into a single NUL-terminated heap buffer for every
+// handler registered with it (POST /config.md, /clock/tz, /wifi/networks,
+// /gw/token, and the skills' JSON POSTs: /notify, /notify/ack, /wg/*,
+// /agents/*, /backlight, /progress, /mesh/inject, /gps/fix). Runs on the
+// AsyncTCP task, once per body chunk, BEFORE the
+// route handler — and therefore before any auth check on those routes.
+//
+// total is the declared body length. It is authoritative here and MUST be, for
+// two reasons handle_firmware_upload_body() below already learned:
+//
+//   - total == 0 means the client sent Transfer-Encoding: chunked with no
+//     Content-Length. The library never fills in a running total for a chunked
+//     body — _contentLength stays 0 — and it delivers chunks through this
+//     callback with a *growing* index and total fixed at 0. There is no length
+//     to size an allocation from, and the non-chunked path's clamp
+//     (len = min(len, _contentLength - _parsedLength)) does not run for a
+//     chunked body, so index and len are attacker-controlled and unbounded. A
+//     naive malloc(total+1) then returns a 1-byte block that every later chunk
+//     memcpys past. Unknown length cannot be served safely, so it is refused
+//     outright with 411. Do NOT "relax" this to treat 0 as "allocate on
+//     demand": the endpoints here have no streaming parser and the growing
+//     index is exactly the primitive that overflows the heap. This is the same
+//     total == 0 guard handle_firmware_upload_body() already carries.
+//
+//   - even with a known total, every chunk is bounds-checked against it before
+//     the memcpy, and the buffer is NUL-terminated on every chunk rather than
+//     only when index + len == total. A body that never delivers its final
+//     byte (a truncated chunked stream, or bytes past the declared length)
+//     would otherwise leave the buffer unterminated, and the handlers all read
+//     it as a C string.
 static void handle_body_collect(AsyncWebServerRequest *request, uint8_t *data,
                                  size_t len, size_t index, size_t total) {
     if (index == 0) {
+        // Unknown length (chunked): cannot size the allocation, refuse. See above.
+        if (total == 0) { request->send(411, "application/json", "{\"error\":\"length required\"}"); return; }
         if (total > HTTP_BODY_MAX) { request->send(413, "application/json", "{\"error\":\"body too large\"}"); return; }
-        char *buf = (char*)malloc(total + 1);
+        // calloc so a body that never completes still leaves a defined,
+        // NUL-filled buffer rather than uninitialised heap.
+        char *buf = (char*)calloc(total + 1, 1);
         if (!buf) { request->send(500, "application/json", "{\"error\":\"OOM\"}"); return; }
         request->_tempObject = buf;
     }
     char *buf = (char*)request->_tempObject;
-    if (buf) memcpy(buf + index, data, len);
-    if (index + len == total && buf) buf[total] = '\0';
+    if (!buf) return;
+    // Drop anything that would land outside the allocation. index + len can
+    // overflow past total on a chunked stream the library did not clamp, and a
+    // single byte past the end is the whole bug.
+    if (index > total || len > total - index) return;
+    memcpy(buf + index, data, len);
+    // Terminate on every chunk: the final chunk is not guaranteed to arrive.
+    buf[index + len] = '\0';
 }
 
 static void handle_config_get(AsyncWebServerRequest *request) {
