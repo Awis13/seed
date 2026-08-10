@@ -146,6 +146,32 @@ static void tft_data(const uint8_t *d, size_t n) {
     digitalWrite(PIN_DISP_CS, HIGH);
 }
 static void tft_data8(uint8_t v) { tft_data(&v, 1); }
+
+// ---- panel sleep (SLPIN/SLPOUT) --------------------------------------------
+// Same command path (CS + transaction) as every other tft_cmd; the shared SPI
+// bus is only held for one ordinary transaction, radio CS untouched.
+// Idempotence guard mirrors MeshCore's _isOn (LGFXDisplay.cpp); LilyGoLib
+// (LilyGoDispInterface.cpp) sends the same 0x10/0x11 pair for this panel.
+static bool panel_awake = false;
+
+void tft_sleep() {
+    if (!panel_ok || !panel_awake) return;
+    tft_cmd(0x10);  // SLPIN
+    delay(5);       // ST7796: allow 5 ms after SLPIN before other commands
+    panel_awake = false;
+}
+
+void tft_wake() {
+    if (!panel_ok || panel_awake) return;
+    tft_cmd(0x11);  // SLPOUT
+    // ST7796 SLPOUT wake time: the panel needs ~120 ms before it is fully
+    // operational again. Both reference stacks (LilyGoLib via LovyanGFX,
+    // MeshCore) honor it, so the delay sits here — BEFORE any repaint the
+    // caller does on return.
+    delay(120);
+    panel_awake = true;
+}
+
 static void tft_window(uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1) {
     x0 += PANEL_OFF_X; x1 += PANEL_OFF_X;
     y0 += PANEL_OFF_Y; y1 += PANEL_OFF_Y;
@@ -495,6 +521,7 @@ static bool panel_begin() {
     tft_cmd(0x36); tft_data8(MADCTL_LANDSCAPE);
     tft_fill(COL_BG);
     panel_ok = true;
+    panel_awake = true;  // init sequence ends with SLPOUT + display on
     return true;
 }
 

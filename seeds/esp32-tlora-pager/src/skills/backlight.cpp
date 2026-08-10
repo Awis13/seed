@@ -199,10 +199,30 @@ static void backlight_idle(unsigned long since_input_ms,
 /* Dark because of idle policy (not because level was set to 0 by hand). */
 static bool backlight_blanked() { return bl_shown == 0 && bl_wanted != 0; }
 
+/* Defined in main.cpp after the skill includes (same TU): full redraw of the
+ * current face after tft_wake(), before the backlight rises. */
+static void ui_blank_wake_repaint();
+
 static void backlight_poll() {
     if (!bl_ready) return;
     uint8_t shown = bl_shown;
-    if (shown != bl_applied) bl_drive(shown);
+    if (shown != bl_applied) {
+        if (shown == 0) {
+            /* Blank: backlight to 0 first, then sleep the ST7796 controller
+               (vendor setBrightness(0) auto-sleeps the panel the same way). */
+            bl_drive(0);
+            tft_sleep();
+        } else if (bl_applied == 0) {
+            /* Wake from blank, vendor order: panel out of sleep (SLPOUT +
+               120 ms inside tft_wake), repaint the face, and only then raise
+               the backlight — the lit panel never shows a stale frame. */
+            tft_wake();
+            ui_blank_wake_repaint();
+            bl_drive(shown);
+        } else {
+            bl_drive(shown);
+        }
+    }
     if (bl_cfg_dirty && (long)(millis() - bl_cfg_save_at) >= 0) {
         bl_cfg_dirty = false;
         bl_cfg_save();

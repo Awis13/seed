@@ -23,6 +23,13 @@ void hw_xl_pin(uint8_t exp_pin, bool high);
 void hw_ui_set_brightness(uint8_t level);
 uint8_t hw_ui_get_brightness();
 
+// ST7796 controller sleep (SLPIN 0x10) / wake (SLPOUT 0x11). Idempotent.
+// tft_wake blocks ~120 ms (ST7796 sleep-out settle) before returning, so a
+// caller may repaint immediately after it. Loop task only — same SPI + CS
+// discipline as the paint primitives.
+void tft_sleep();
+void tft_wake();
+
 // Which face is currently up.
 enum HwUiScreen : uint8_t {
     HW_UI_CLOCK = 0,

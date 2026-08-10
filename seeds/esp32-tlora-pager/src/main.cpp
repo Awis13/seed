@@ -52,7 +52,7 @@
 #include "hw_kb.h"
 
 // ===== Configuration =====
-#define SEED_VERSION        "0.9.42"
+#define SEED_VERSION        "0.9.43"
 // Core clock: datasheet puts 240 vs 80 ~11.5mA apart on WAITI. Periph bus holds
 // at 80 for every PLL-fed core clock; go lower and RMT/I2S retimes. Same floor
 // as tembed idle policy (no light sleep — notify latency is the job).
@@ -1252,6 +1252,17 @@ static void ui_clock_paint(const char *note) {
 static void ui_go_clock(const char *note) {
     hw_ui_show_clock();
     ui_clock_paint(note);
+}
+
+// Full redraw right after tft_wake(), called by backlight_poll BEFORE the
+// backlight rises (loop task only). Idle blanking always lands on the clock
+// (UI_IDLE_MS returns every face to it long before BL_IDLE_OFF_S); any other
+// face can only be dark via a manual level-0 set, and the ST7796 keeps its
+// frame memory in sleep-in, so those faces relight with their last frame.
+static void ui_blank_wake_repaint() {
+    if (hw_ui_screen() != HW_UI_CLOCK) return;
+    hw_ui_invalidate_clock();
+    ui_clock_paint(NULL);
 }
 
 // --- Front-panel state (encoder) --------------------------------------------
