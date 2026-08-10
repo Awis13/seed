@@ -12,6 +12,12 @@ bool hw_ui_begin();
 bool hw_ui_ready();
 bool hw_ui_expand_ok();
 
+// Boot-progress note under the "booting..." banner (guarded public paint
+// entry). Safe to call before storage is mounted; no-op until hw_ui_begin().
+// Returns with the bus lock released, so callers may follow with long
+// non-bus work (e.g. a storage format) without holding the bus.
+void hw_ui_boot_note(const char *line1, const char *line2);
+
 // Shared SPI bus (FSPI) used by the ST7796. MeshCore SX1262 must use THIS
 // instance — a second SPIClass on the same pins hangs radio init.
 class SPIClass;

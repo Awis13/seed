@@ -75,6 +75,9 @@ PAINT_ENTRIES = [
     "void hw_ui_show_msglist(",
     "void hw_ui_show_reply(",
     "void hw_ui_show_info(",
+    # Boot-progress note (storage format feedback) is a public paint entry
+    # like any other: guarded for the whole paint, releases before returning.
+    "void hw_ui_boot_note(",
 ]
 for sig in PAINT_ENTRIES:
     body = fn_body(hw_ui, sig)

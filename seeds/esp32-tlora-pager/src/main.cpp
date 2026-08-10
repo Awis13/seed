@@ -43,6 +43,8 @@
 #include <ArduinoJson.h>
 #include <Update.h>
 #include <esp_ota_ops.h>
+#include <esp_system.h>
+#include <esp_attr.h>
 #include <HTTPClient.h>
 #include "board_pins.h"
 #include "hw_ui.h"
@@ -52,7 +54,7 @@
 #include "hw_kb.h"
 
 // ===== Configuration =====
-#define SEED_VERSION        "0.9.45"
+#define SEED_VERSION        "0.9.46"
 // Core clock: datasheet puts 240 vs 80 ~11.5mA apart on WAITI. Periph bus holds
 // at 80 for every PLL-fed core clock; go lower and RMT/I2S retimes. Same floor
 // as tembed idle policy (no light sleep — notify latency is the job).
@@ -104,6 +106,92 @@ static void event_add(const char *fmt, ...) {
     events_head = (events_head + 1) % MAX_EVENTS;
     if (events_count < MAX_EVENTS) events_count++;
     va_end(ap);
+}
+
+// ===== Boot Diagnostics =====
+//
+// A live stack-canary panic on the ipc1 task (the ESP-IDF cross-core IPC task,
+// 1024-byte stack baked into the prebuilt Arduino core) reset the board with
+// no trace: no coredump space, second boot clean. These counters make any
+// recurrence measurable from the outside — the reset reason and crash counters
+// are printed at boot and served in GET /health. RTC_NOINIT memory survives
+// every reset except power-on; the magic word rejects power-on garbage.
+
+#define BOOT_DIAG_MAGIC 0x42d1a607
+RTC_NOINIT_ATTR static uint32_t boot_diag_magic;
+RTC_NOINIT_ATTR static uint32_t boots_since_panic;
+RTC_NOINIT_ATTR static uint32_t panic_count;
+static esp_reset_reason_t reset_reason = ESP_RST_UNKNOWN;
+static bool storage_ok = false;
+
+static const char *reset_reason_str(esp_reset_reason_t r) {
+    switch (r) {
+        case ESP_RST_POWERON:   return "poweron";
+        case ESP_RST_EXT:       return "external";
+        case ESP_RST_SW:        return "software";
+        case ESP_RST_PANIC:     return "panic";
+        case ESP_RST_INT_WDT:   return "int_wdt";
+        case ESP_RST_TASK_WDT:  return "task_wdt";
+        case ESP_RST_WDT:       return "wdt";
+        case ESP_RST_DEEPSLEEP: return "deepsleep";
+        case ESP_RST_BROWNOUT:  return "brownout";
+        case ESP_RST_SDIO:      return "sdio";
+        default:                return "unknown";
+    }
+}
+
+// Panic-class resets: real panics plus watchdogs (both fire the panic handler).
+static bool reset_is_panic(esp_reset_reason_t r) {
+    return r == ESP_RST_PANIC || r == ESP_RST_INT_WDT ||
+           r == ESP_RST_TASK_WDT || r == ESP_RST_WDT;
+}
+
+static void boot_diag_init() {
+    reset_reason = esp_reset_reason();
+    if (boot_diag_magic != BOOT_DIAG_MAGIC || reset_reason == ESP_RST_POWERON) {
+        boot_diag_magic = BOOT_DIAG_MAGIC;
+        boots_since_panic = 0;
+        panic_count = 0;
+    }
+    if (reset_is_panic(reset_reason)) {
+        panic_count++;
+        boots_since_panic = 0;
+    } else {
+        boots_since_panic++;
+    }
+    Serial.printf("[boot] reset: %s, boots since panic: %lu, panics: %lu\n",
+                  reset_reason_str(reset_reason),
+                  (unsigned long)boots_since_panic,
+                  (unsigned long)panic_count);
+}
+
+// ===== Storage bring-up =====
+//
+// Mount WITHOUT format-on-fail first. The device once arrived with foreign
+// firmware that had repartitioned flash; the old format-on-fail mount then
+// formatted the 8 MB partition silently — dark panel, mute serial,
+// indistinguishable from a brick for the whole format. Now the format is announced on serial and on the
+// panel (which is initialized before storage exactly for this), and a format
+// failure degrades instead of hanging: every consumer already treats a failed
+// open/read as "file missing" and falls back to defaults.
+static void storage_begin() {
+    if (SPIFFS.begin(false)) {
+        storage_ok = true;
+        return;
+    }
+    Serial.println("[boot] storage invalid, formatting (up to ~60 s)...");
+    hw_ui_boot_note("FORMATTING STORAGE", "takes up to a minute");
+    // The paint above released the SPI bus lock before returning; the format
+    // below runs on internal flash and must never hold the shared bus.
+    bool ok = SPIFFS.format() && SPIFFS.begin(false);
+    storage_ok = ok;
+    if (ok) {
+        Serial.println("[boot] storage formatted, starting with defaults");
+        hw_ui_boot_note("STORAGE READY", "settings reset to defaults");
+    } else {
+        Serial.println("[boot] STORAGE FAILED, continuing without saved settings");
+        hw_ui_boot_note("STORAGE FAILED", "running without saved settings");
+    }
 }
 
 // ===== Skill/plugin interface =====
@@ -495,6 +583,12 @@ static bool wifi_persist_profiles() {
     }
     String json;
     serializeJson(doc, json);
+    // Coalesce: loop() persists on every connect transition, which on a normal
+    // boot rewrites byte-identical content a few seconds in — exactly when
+    // WiFi and the mesh radio bring-up keep both cores busy. A flash write
+    // stalls the other core via a tiny fixed-stack IPC task, so skip the
+    // write entirely when nothing changed.
+    if (read_spiffs_file(WIFI_CONFIG_FILE) == json) return true;
     return write_spiffs_file(WIFI_CONFIG_FILE, json);
 }
 
@@ -602,6 +696,16 @@ static void wifi_reconnect_poll() {
 }
 
 static void wifi_setup() {
+    /* Keep the WiFi driver's own credential store in RAM. Credentials live in
+     * SPIFFS /wifi.json and every connect passes them explicitly, so the NVS
+     * copy the driver writes on each connect is pure redundancy — and those
+     * writes run on the WiFi task (pinned to core 0), where every flash
+     * program/erase stalls core 1 through the ipc1 task and its fixed
+     * 1024-byte stack (prebuilt core, not tunable). ipc1 is exactly the task
+     * that blew its stack canary once, right in the connect window; removing
+     * the recurring core-0 flash writes removes the prime suspect. Must be
+     * set before the first WiFi.mode() call to reach wifiLowLevelInit(). */
+    WiFi.persistent(false);
     WiFi.mode(WIFI_STA);
     /* Arduino-ESP32 defaults this to true and otherwise retries underneath our
      * scheduler, causing the same UI stalls the 20-minute cadence avoids. */
@@ -637,6 +741,12 @@ static void handle_health(AsyncWebServerRequest *request) {
     doc["version"] = SEED_VERSION;
     doc["seed"] = true;
     doc["arch"] = "xtensa-esp32s3";
+    // Panic visibility: why the last reset happened and how long the board
+    // has stayed clean since. Counters live in RTC_NOINIT (see boot_diag_init).
+    doc["reset_reason"] = reset_reason_str(reset_reason);
+    doc["boots_since_panic"] = (unsigned long)boots_since_panic;
+    doc["panic_count"] = (unsigned long)panic_count;
+    doc["storage_ok"] = storage_ok;
     String response;
     serializeJson(doc, response);
     request->send(200, "application/json", response);
@@ -1038,7 +1148,7 @@ static void handle_skill(AsyncWebServerRequest *request) {
     s += "## API\n\n";
     s += "| Method | Path | Description |\n";
     s += "|--------|------|-------------|\n";
-    s += "| GET | /health | Alive (no auth) |\n";
+    s += "| GET | /health | Alive (no auth); reset_reason, boots_since_panic, panic_count, storage_ok |\n";
     s += "| GET | /capabilities | Hardware info |\n";
     s += "| GET | /config.md | Node config |\n";
     s += "| POST | /config.md | Update config |\n";
@@ -3010,13 +3120,14 @@ void setup() {
     delay(500);
     boot_time = millis();
     setCpuFrequencyMhz(CPU_MHZ);
+    boot_diag_init();  // reset reason + crash counters, first serial line out
 
-    if (!SPIFFS.begin(true)) {
-        Serial.println("[!] SPIFFS failed");
-    }
-
-    // Panel + I2C first so the face can say "connecting..." while STA associates.
+    // Panel + I2C before storage: hw_ui_begin() touches no SPIFFS, and a
+    // storage format (foreign/blank partition) must be visible on the panel
+    // instead of a dead screen. The face can also say "connecting..." while
+    // STA associates.
     hw_ui_begin();
+    storage_begin();  // SPIFFS mount → announced format → degraded continue
     // Reclaim AW9364 from the boot pulse in hw_ui; load /backlight.json.
     backlight_begin();
     hw_input_begin();

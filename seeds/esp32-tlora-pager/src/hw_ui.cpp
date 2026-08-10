@@ -688,6 +688,18 @@ bool hw_ui_begin() {
     return true;
 }
 
+// Boot-progress note. Public guarded entry (see the INVARIANT at the bus
+// mutex): takes the lock for the whole paint, calls only internal helpers,
+// and releases it on return — a following storage format must never run
+// with the shared bus held.
+void hw_ui_boot_note(const char *line1, const char *line2) {
+    if (!panel_ok) return;
+    HwSpiBusGuard bus;
+    tft_fill_rect(0, 120, PANEL_W, 60, COL_BG);
+    if (line1) tft_draw_text(MARGIN, 120, line1, COL_ACCENT, COL_BG, 2);
+    if (line2) tft_draw_text(MARGIN, 150, line2, COL_DIM, COL_BG, 2);
+}
+
 bool hw_ui_ready() { return panel_ok; }
 bool hw_ui_expand_ok() { return xl_ok; }
 void hw_xl_pin(uint8_t exp_pin, bool high) {
