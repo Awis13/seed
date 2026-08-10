@@ -101,6 +101,40 @@ static void bl_set(uint8_t value) {
     bl_level = value;
 }
 
+// ---- shared SPI bus arbitration --------------------------------------------
+// One FSPI bus, three chip selects: ST7796 display (painted from the loop
+// task), SD history store (written from the AsyncTCP task by the agents HTTP
+// routes) and SX1262 radio (RadioLib hal, serviced from the loop task). The
+// real cross-task hazard is SD-vs-paint/radio: the per-SPIClass transaction
+// lock inside arduino-esp32 cannot help because painting toggles CS manually,
+// so an SD transaction could be granted the bus while the display CS was low.
+// Reference stacks disagree — vendor LilyGoLib (multi-task) uses exactly this
+// bus semaphore (lockSPI/unlockSPI), MeshCore (single-task) relies on strict
+// cooperation. We have two tasks on the bus, so: vendor-style mutex.
+//
+// INVARIANT (the mutex is NON-recursive — this must hold or we self-deadlock):
+//   * PUBLIC SPI-using entry points (hw_ui_show_*, hw_ui_clock_*, tft_sleep/
+//     tft_wake, panel_begin, the agents store I/O bursts, the RadioLib hal
+//     transaction hooks) take the lock for the whole logical operation.
+//   * INTERNAL helpers (tft_cmd/tft_data/tft_window/tft_fill*/tft_draw_*,
+//     the *_draw_row helpers, draw_field) assume the lock is HELD and never
+//     take it themselves. Public entries never call other public entries.
+// CS discipline: chip select is asserted only after beginTransaction AND with
+// the bus lock held, and released before endTransaction — no CS may be low
+// while the bus can be granted to another device.
+// LOCK ORDER (deadlock rule): agents_mux (store state) FIRST, bus lock
+// SECOND; release in reverse. Nothing may take agents_mux while holding the
+// bus lock.
+static SemaphoreHandle_t spi_bus_mux = nullptr;
+
+void hw_spi_bus_lock() {
+    if (spi_bus_mux) xSemaphoreTake(spi_bus_mux, portMAX_DELAY);
+}
+
+void hw_spi_bus_unlock() {
+    if (spi_bus_mux) xSemaphoreGive(spi_bus_mux);
+}
+
 // ---- ST7796 ----------------------------------------------------------------
 static SPIClass *disp_spi = nullptr;
 static bool panel_ok = false;
@@ -126,44 +160,58 @@ static const Cmd ST7796_INIT[] = {
 };
 static const uint8_t MADCTL_LANDSCAPE = 0xE8;
 
+// Park every shared-bus CS/control line HIGH before the first bus byte —
+// mirrors vendor LilyGoLib initShareSPIPins() (drives NFC/LORA/SD CS + LORA
+// RST high at boot). NFC reset is behind the XL9555 (EXP_NFC_EN), not a
+// direct GPIO on this board, so the direct-GPIO set below is complete.
 static void park_spi_cs() {
     const int cs[] = {PIN_LORA_CS, PIN_LORA_RST, PIN_NFC_CS, PIN_SD_CS, PIN_DISP_CS};
     for (int p : cs) { pinMode(p, OUTPUT); digitalWrite(p, HIGH); }
 }
+// Helpers below assume the caller holds the bus lock (see invariant above).
+// CS goes LOW only inside the transaction, HIGH before it ends.
 static void tft_cmd(uint8_t c) {
-    digitalWrite(PIN_DISP_CS, LOW); digitalWrite(PIN_DISP_DC, LOW);
     disp_spi->beginTransaction(SPISettings(DISP_SPI_HZ, MSBFIRST, SPI_MODE0));
+    digitalWrite(PIN_DISP_CS, LOW); digitalWrite(PIN_DISP_DC, LOW);
     disp_spi->write(c);
-    disp_spi->endTransaction();
     digitalWrite(PIN_DISP_CS, HIGH);
+    disp_spi->endTransaction();
 }
 static void tft_data(const uint8_t *d, size_t n) {
     if (!n) return;
-    digitalWrite(PIN_DISP_CS, LOW); digitalWrite(PIN_DISP_DC, HIGH);
     disp_spi->beginTransaction(SPISettings(DISP_SPI_HZ, MSBFIRST, SPI_MODE0));
+    digitalWrite(PIN_DISP_CS, LOW); digitalWrite(PIN_DISP_DC, HIGH);
     disp_spi->writeBytes(d, n);
-    disp_spi->endTransaction();
     digitalWrite(PIN_DISP_CS, HIGH);
+    disp_spi->endTransaction();
 }
 static void tft_data8(uint8_t v) { tft_data(&v, 1); }
 
 // ---- panel sleep (SLPIN/SLPOUT) --------------------------------------------
-// Same command path (CS + transaction) as every other tft_cmd; the shared SPI
-// bus is only held for one ordinary transaction, radio CS untouched.
+// Same command path (CS + transaction) as every other tft_cmd, under the bus
+// lock like every public entry. The settle delays run AFTER the lock is
+// released: they are panel-internal wait time, not bus traffic, so SD/radio
+// may use the bus while the controller settles.
 // Idempotence guard mirrors MeshCore's _isOn (LGFXDisplay.cpp); LilyGoLib
 // (LilyGoDispInterface.cpp) sends the same 0x10/0x11 pair for this panel.
 static bool panel_awake = false;
 
 void tft_sleep() {
     if (!panel_ok || !panel_awake) return;
-    tft_cmd(0x10);  // SLPIN
+    {
+        HwSpiBusGuard bus;
+        tft_cmd(0x10);  // SLPIN
+    }
     delay(5);       // ST7796: allow 5 ms after SLPIN before other commands
     panel_awake = false;
 }
 
 void tft_wake() {
     if (!panel_ok || panel_awake) return;
-    tft_cmd(0x11);  // SLPOUT
+    {
+        HwSpiBusGuard bus;
+        tft_cmd(0x11);  // SLPOUT
+    }
     // ST7796 SLPOUT wake time: the panel needs ~120 ms before it is fully
     // operational again. Both reference stacks (LilyGoLib via LovyanGFX,
     // MeshCore) honor it, so the delay sits here — BEFORE any repaint the
@@ -183,8 +231,8 @@ static void tft_window(uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1) {
 }
 static void tft_fill(uint16_t color) {
     tft_window(0, 0, PANEL_W - 1, PANEL_H - 1);
-    digitalWrite(PIN_DISP_CS, LOW); digitalWrite(PIN_DISP_DC, HIGH);
     disp_spi->beginTransaction(SPISettings(DISP_SPI_HZ, MSBFIRST, SPI_MODE0));
+    digitalWrite(PIN_DISP_CS, LOW); digitalWrite(PIN_DISP_DC, HIGH);
     uint8_t pix[2] = {(uint8_t)(color >> 8), (uint8_t)color};
     const size_t chunk = 64;
     uint8_t buf[chunk * 2];
@@ -192,16 +240,16 @@ static void tft_fill(uint16_t color) {
     uint32_t total = (uint32_t)PANEL_W * PANEL_H;
     while (total >= chunk) { disp_spi->writeBytes(buf, chunk * 2); total -= chunk; }
     if (total) disp_spi->writeBytes(buf, total * 2);
-    disp_spi->endTransaction();
     digitalWrite(PIN_DISP_CS, HIGH);
+    disp_spi->endTransaction();
 }
 static void tft_fill_rect(uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint16_t color) {
     if (!w || !h || x >= PANEL_W || y >= PANEL_H) return;
     if (x + w > PANEL_W) w = PANEL_W - x;
     if (y + h > PANEL_H) h = PANEL_H - y;
     tft_window(x, y, x + w - 1, y + h - 1);
-    digitalWrite(PIN_DISP_CS, LOW); digitalWrite(PIN_DISP_DC, HIGH);
     disp_spi->beginTransaction(SPISettings(DISP_SPI_HZ, MSBFIRST, SPI_MODE0));
+    digitalWrite(PIN_DISP_CS, LOW); digitalWrite(PIN_DISP_DC, HIGH);
     uint8_t pix[2] = {(uint8_t)(color >> 8), (uint8_t)color};
     uint32_t total = (uint32_t)w * h;
     // Faster: 32-pixel stripe
@@ -209,17 +257,30 @@ static void tft_fill_rect(uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint16
     for (int i = 0; i < 32; i++) { stripe[i*2] = pix[0]; stripe[i*2+1] = pix[1]; }
     while (total >= 32) { disp_spi->writeBytes(stripe, 64); total -= 32; }
     while (total--) disp_spi->writeBytes(pix, 2);
-    disp_spi->endTransaction();
     digitalWrite(PIN_DISP_CS, HIGH);
+    disp_spi->endTransaction();
 }
 static void tft_hline(uint16_t x, uint16_t y, uint16_t w, uint16_t color) {
     tft_fill_rect(x, y, w, 1, color);
 }
+// Row-extent circle fill: one horizontal span per scanline (2r+1 window+push
+// bundles) instead of the old one 1x1 tft_fill_rect per PIXEL, which cost
+// (2r+1)^2 full window setups + transactions. Same pixel set: for each dy the
+// span covers every dx with dx^2 + dy^2 <= r^2. Helper — caller holds the
+// bus lock for the whole circle.
 static void tft_fill_circle(int cx, int cy, int r, uint16_t color) {
+    if (r < 0) return;
     for (int dy = -r; dy <= r; dy++) {
-        for (int dx = -r; dx <= r; dx++) {
-            if (dx*dx + dy*dy <= r*r) tft_fill_rect(cx + dx, cy + dy, 1, 1, color);
-        }
+        int y = cy + dy;
+        if (y < 0 || y >= (int)PANEL_H) continue;
+        int span2 = r * r - dy * dy;
+        int dx = 0;
+        while ((dx + 1) * (dx + 1) <= span2) dx++;
+        int x0 = cx - dx;
+        int w = 2 * dx + 1;
+        if (x0 < 0) { w += x0; x0 = 0; }
+        if (w <= 0) continue;
+        tft_fill_rect((uint16_t)x0, (uint16_t)y, (uint16_t)w, 1, color);
     }
 }
 static uint16_t blend565(uint8_t a, uint16_t fg, uint16_t bg) {
@@ -431,8 +492,8 @@ static void tft_draw_glyph(uint16_t x, uint16_t y, uint32_t cp,
     if (gw * 2 > sizeof(rowbuf)) return;
 
     tft_window(x, y, x + gw - 1, y + gh - 1);
-    digitalWrite(PIN_DISP_CS, LOW); digitalWrite(PIN_DISP_DC, HIGH);
     disp_spi->beginTransaction(SPISettings(DISP_SPI_HZ, MSBFIRST, SPI_MODE0));
+    digitalWrite(PIN_DISP_CS, LOW); digitalWrite(PIN_DISP_DC, HIGH);
 
     for (uint8_t row = 0; row < 7; row++) {
         for (uint8_t col = 0; col < 5; col++) {
@@ -453,8 +514,8 @@ static void tft_draw_glyph(uint16_t x, uint16_t y, uint32_t cp,
             disp_spi->writeBytes(rowbuf, gw * 2);
         }
     }
-    disp_spi->endTransaction();
     digitalWrite(PIN_DISP_CS, HIGH);
+    disp_spi->endTransaction();
 }
 
 static void tft_draw_char(uint16_t x, uint16_t y, char c, uint16_t fg, uint16_t bg, uint8_t scale) {
@@ -506,12 +567,16 @@ static void tft_draw_text_r(uint16_t right, uint16_t y, const char *s, uint16_t 
 }
 
 static bool panel_begin() {
+    // The bus mutex must exist before the first bus byte; until it does the
+    // lock helpers are no-ops (boot is single-task up to here).
+    if (!spi_bus_mux) spi_bus_mux = xSemaphoreCreateMutex();
     park_spi_cs();
     pinMode(PIN_DISP_DC, OUTPUT); digitalWrite(PIN_DISP_DC, HIGH);
     pinMode(PIN_DISP_CS, OUTPUT); digitalWrite(PIN_DISP_CS, HIGH);
     static SPIClass spi(FSPI);
     disp_spi = &spi;
     disp_spi->begin(PIN_SPI_SCK, PIN_SPI_MISO, PIN_SPI_MOSI);
+    HwSpiBusGuard bus;  // whole init sequence is one logical bus operation
     for (const Cmd &c : ST7796_INIT) {
         tft_cmd(c.cmd);
         uint8_t n = c.len & 0x1F;
@@ -613,9 +678,12 @@ bool hw_ui_begin() {
     bl_set(12);
     clock_measure();
     screen = HW_UI_CLOCK;
-    tft_fill(COL_BG);
-    tft_draw_text(MARGIN, 40, "T-Lora Pager", COL_ACCENT, COL_BG, 2);
-    tft_draw_text(MARGIN, 80, "booting...", COL_DIM, COL_BG, 2);
+    {
+        HwSpiBusGuard bus;
+        tft_fill(COL_BG);
+        tft_draw_text(MARGIN, 40, "T-Lora Pager", COL_ACCENT, COL_BG, 2);
+        tft_draw_text(MARGIN, 80, "booting...", COL_DIM, COL_BG, 2);
+    }
     Serial.printf("[hw] panel %ux%u, clock face ready\n", PANEL_W, PANEL_H);
     return true;
 }
@@ -664,6 +732,7 @@ void hw_ui_show_clock() {
     msglist_top_drawn = -1;
     msglist_count_drawn = -1;
     msglist_unread_mask = 0;
+    HwSpiBusGuard bus;
     tft_fill(COL_BG);
     tft_hline(MARGIN, RULE_Y, PANEL_W - 2 * MARGIN, COL_RULE);
     hw_ui_invalidate_clock();
@@ -686,6 +755,7 @@ void hw_ui_clock_tick(const char *version,
                       int wg_ui) {
     if (!panel_ok || screen != HW_UI_CLOCK) return;
     (void)crit_unread;
+    HwSpiBusGuard bus;  // one tick = one logical paint operation
 
     // Header: version | badge | W | M+age | BAT | IP
     draw_field(fld_ver, sizeof(fld_ver), version ? version : "",
@@ -802,6 +872,7 @@ void hw_ui_clock_rule_tick(bool crit_unread) {
     static bool was_breathing = false;
     if (millis() - last_step < 80) return;
     last_step = millis();
+    HwSpiBusGuard bus;
 
     if (!crit_unread) {
         if (was_breathing) {
@@ -826,6 +897,7 @@ void hw_ui_clock_bar(int pct) {
     const uint16_t by = BAR_Y;
     const uint16_t bw = PANEL_W - 2 * MARGIN;
     const uint16_t bh = BAR_H;
+    HwSpiBusGuard bus;
 
     if (pct < 0) {
         if (clock_bar_drawn < 0) return;
@@ -863,6 +935,7 @@ void hw_ui_show_notify(const char *level,
     if (level && strcmp(level, "crit") == 0) accent = COL_CRIT;
     else if (level && strcmp(level, "warn") == 0) accent = COL_WARN;
 
+    HwSpiBusGuard bus;
     tft_fill(COL_BG);
     // Inverse header bar — Advisor vibe
     tft_fill_rect(0, 0, PANEL_W, 22, accent);
@@ -939,6 +1012,7 @@ void hw_ui_show_agent_invite(const char *agent_name,
     screen = HW_UI_NOTIFY;  // same input paths as notify card
 
     const uint16_t accent = COL_ACCENT;
+    HwSpiBusGuard bus;
     tft_fill(COL_BG);
 
     // Full-width amber header
@@ -1062,6 +1136,7 @@ void hw_ui_show_card_act(int selected, const char *title) {
     if (!panel_ok) return;
     if (selected < 0) selected = 0;
     if (selected >= CARD_ACT_N) selected = CARD_ACT_N - 1;
+    HwSpiBusGuard bus;
 
     if (screen == HW_UI_CARD_ACT && card_act_sel_drawn >= 0 &&
         card_act_sel_drawn != selected) {
@@ -1088,6 +1163,7 @@ void hw_ui_show_menu(int selected) {
     if (!panel_ok) return;
     if (selected < 0) selected = 0;
     if (selected >= MENU_N) selected = MENU_N - 1;
+    HwSpiBusGuard bus;
 
     // Same face, only the bar moved → repaint two rows, no fillScreen.
     if (screen == HW_UI_MENU && menu_sel_drawn >= 0 && menu_sel_drawn != selected) {
@@ -1135,6 +1211,7 @@ void hw_ui_show_layout(int selected, int current_layout) {
     if (selected >= LAYOUT_N) selected = LAYOUT_N - 1;
     if (current_layout < 0) current_layout = 0;
     if (current_layout > 2) current_layout = 2;
+    HwSpiBusGuard bus;
 
     if (screen == HW_UI_LAYOUT && layout_sel_drawn >= 0 &&
         layout_sel_drawn != selected &&
@@ -1199,6 +1276,7 @@ void hw_ui_show_settings(int selected,
     bool labels_same =
         (strncmp(settings_bl_cache, bl_label, sizeof(settings_bl_cache) - 1) == 0) &&
         (strncmp(settings_idle_cache, idle_word, sizeof(settings_idle_cache) - 1) == 0);
+    HwSpiBusGuard bus;
 
     if (screen == HW_UI_SETTINGS && settings_sel_drawn >= 0 &&
         settings_sel_drawn != selected && labels_same) {
@@ -1238,6 +1316,7 @@ void hw_ui_show_meshcore(int selected) {
     if (!panel_ok) return;
     if (selected < 0) selected = 0;
     if (selected >= MESH_N) selected = MESH_N - 1;
+    HwSpiBusGuard bus;
 
     if (screen == HW_UI_MESHCORE && mesh_sel_drawn >= 0 &&
         mesh_sel_drawn != selected) {
@@ -1266,6 +1345,7 @@ void hw_ui_show_mesh_ping(const char *phase,
     if (n_lines < 0) n_lines = 0;
     if (n_lines > HW_UI_MESH_PING_LINES) n_lines = HW_UI_MESH_PING_LINES;
 
+    HwSpiBusGuard bus;
     tft_fill(COL_BG);
     // Phase colour: OK=info teal, FAIL=crit, else amber
     uint16_t accent = COL_ACCENT;
@@ -1363,6 +1443,7 @@ void hw_ui_show_mesh_ping_result(bool wifi_ok, const char *wifi_sub1,
     if (!panel_ok) return;
     screen = HW_UI_MESH_PING;
 
+    HwSpiBusGuard bus;
     tft_fill(COL_BG);
     uint16_t accent = (wifi_ok || mesh_ok) ? COL_INFO : COL_CRIT;
     if (wifi_ok && mesh_ok) accent = COL_INFO;
@@ -1402,6 +1483,7 @@ void hw_ui_show_wifi(int selected) {
     if (!panel_ok) return;
     if (selected < 0) selected = 0;
     if (selected >= WIFI_MENU_N) selected = WIFI_MENU_N - 1;
+    HwSpiBusGuard bus;
 
     if (screen == HW_UI_WIFI && wifi_sel_drawn >= 0 &&
         wifi_sel_drawn != selected) {
@@ -1435,6 +1517,7 @@ void hw_ui_show_wifi_list(const char *header,
     const int ROW0 = 36;
     const int ROWH = 22;
     const int BARH = 20;
+    HwSpiBusGuard bus;
 
     auto draw_row = [&](int i, bool on) {
         uint16_t y = (uint16_t)(ROW0 + i * ROWH);
@@ -1483,6 +1566,7 @@ void hw_ui_show_wifi_info(const char *const *lines, int n_lines) {
     if (n_lines < 0) n_lines = 0;
     if (n_lines > 12) n_lines = 12;
 
+    HwSpiBusGuard bus;
     tft_fill(COL_BG);
     tft_fill_rect(0, 0, PANEL_W, 22, COL_ACCENT);
     tft_draw_text(MARGIN, 4, "WIFI STATUS", COL_BG, COL_ACCENT, 2);
@@ -1514,6 +1598,7 @@ void hw_ui_show_agents(int selected, bool bridge_ok) {
     if (!panel_ok) return;
     if (selected < 0) selected = 0;
     if (selected >= AGENTS_LIST_N) selected = AGENTS_LIST_N - 1;
+    HwSpiBusGuard bus;
 
     if (screen == HW_UI_AGENTS && agents_sel_drawn >= 0 &&
         agents_sel_drawn != selected) {
@@ -1575,6 +1660,7 @@ void hw_ui_show_agent_sessions(const char *agent_name,
     if (count < 0) count = 0;
     if (selected < 0) selected = 0;
     if (selected >= count) selected = count > 0 ? count - 1 : 0;
+    HwSpiBusGuard bus;
 
     if (screen == HW_UI_AGENT_SESSIONS && agent_sess_sel_drawn >= 0 &&
         agent_sess_sel_drawn != selected) {
@@ -1702,6 +1788,7 @@ int hw_ui_show_agent_chat(const char *agent_name,
                           int *total_rows_out,
                           const char *footer) {
     if (!panel_ok) return 0;
+    HwSpiBusGuard bus;  // whole chat repaint (wrap math + body redraw)
 
     const uint8_t sc = 2;
     const int max_cols = (int)((PANEL_W - 2 * MARGIN) / (6 * sc));
@@ -1816,6 +1903,7 @@ void hw_ui_show_agent_act(int selected, const char *agent_name) {
     if (!panel_ok) return;
     if (selected < 0) selected = 0;
     if (selected >= AGENT_ACT_N) selected = AGENT_ACT_N - 1;
+    HwSpiBusGuard bus;
 
     if (screen == HW_UI_AGENT_ACT && agent_act_sel_drawn >= 0 &&
         agent_act_sel_drawn != selected) {
@@ -1953,6 +2041,7 @@ void hw_ui_show_msglist(const char *const *titles,
 
     int top = (count > 0) ? msglist_top_for(selected, count) : 0;
     uint8_t mask = msglist_mask_of(unread, count);
+    HwSpiBusGuard bus;
 
     // Same list + unread set + scroll window → only move the selection bar.
     if (screen == HW_UI_MSGLIST &&
@@ -2048,6 +2137,7 @@ void hw_ui_show_reply(const char *title,
     if (!panel_ok) return;
     screen = HW_UI_REPLY;
 
+    HwSpiBusGuard bus;
     tft_fill(COL_BG);
     tft_fill_rect(0, 0, PANEL_W, 22, COL_ACCENT);
     tft_draw_text(MARGIN, 4, "REPLY", COL_BG, COL_ACCENT, 2);
@@ -2148,6 +2238,7 @@ void hw_ui_show_info(const char *version,
     if (!panel_ok) return;
     screen = HW_UI_INFO;
 
+    HwSpiBusGuard bus;
     tft_fill(COL_BG);
     tft_fill_rect(0, 0, PANEL_W, 22, COL_ACCENT);
     tft_draw_text(MARGIN, 4, "INFO", COL_BG, COL_ACCENT, 2);

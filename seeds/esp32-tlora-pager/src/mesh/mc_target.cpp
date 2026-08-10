@@ -29,7 +29,32 @@ public:
   const char *getManufacturerName() const override { return "LilyGo"; }
 };
 
+// Shared-bus arbitration for the radio (vendor LilyGoLib _lock_callback
+// shape, wired through RadioLib's hal instead of a patched lib): RadioLib
+// routes EVERY SX1262 SPI access through hal->spiBeginTransaction()/
+// spiEndTransaction(), with NSS asserted strictly inside that window
+// (Module.cpp: beginTransaction -> CS low -> transfer -> CS high ->
+// endTransaction). Taking the bus lock in those hooks bounds the hold to
+// exactly the SPI-touching part of radio servicing — mesh_client_loop()'s
+// packet processing and BUSY-pin waits run with the bus free, so SD writes
+// on the AsyncTCP task are never blocked by non-SPI radio work.
+// Lock order note: these hooks take ONLY the bus lock (never agents_mux), so
+// the agents_mux-first / bus-lock-second convention cannot invert here.
+class LockedArduinoHal : public ArduinoHal {
+public:
+  using ArduinoHal::ArduinoHal;
+  void spiBeginTransaction() override {
+    hw_spi_bus_lock();
+    ArduinoHal::spiBeginTransaction();
+  }
+  void spiEndTransaction() override {
+    ArduinoHal::spiEndTransaction();
+    hw_spi_bus_unlock();
+  }
+};
+
 static SeedTLoraBoard board;
+static LockedArduinoHal *s_hal = nullptr;
 static Module *s_mod = nullptr;
 static uint8_t s_radio_mem[sizeof(CustomSX1262)];
 static uint8_t s_driver_mem[sizeof(CustomSX1262Wrapper)];
@@ -75,7 +100,10 @@ bool mesh_radio_init() {
   digitalWrite(PIN_DISP_CS, HIGH);
   digitalWrite(PIN_LORA_CS, HIGH);
 
-  s_mod = new Module(P_LORA_NSS, P_LORA_DIO_1, P_LORA_RESET, P_LORA_BUSY, *spi);
+  // Same wiring as Module(cs, irq, rst, busy, spi) — that ctor builds a plain
+  // ArduinoHal(spi, RADIOLIB_DEFAULT_SPI_SETTINGS); ours adds the bus lock.
+  s_hal = new LockedArduinoHal(*spi);
+  s_mod = new Module(s_hal, P_LORA_NSS, P_LORA_DIO_1, P_LORA_RESET, P_LORA_BUSY);
   auto *radio = new (s_radio_mem) CustomSX1262(s_mod);
   auto *drv = new (s_driver_mem) CustomSX1262Wrapper(*radio, board);
 

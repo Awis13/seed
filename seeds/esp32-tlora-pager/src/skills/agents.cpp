@@ -97,7 +97,20 @@ static bool g_store_is_sd = false;
 
 /* Recursive mutex: agents_push_line() locks itself (mesh task calls it without
  * a lock) while send/inbound/view also take the same lock (nested). File IO
- * happens under the mutex, never under portENTER_CRITICAL — SD writes block. */
+ * happens under the mutex, never under portENTER_CRITICAL — SD writes block.
+ *
+ * TWO locks, two concerns: agents_mux guards store STATE (g_agents, view
+ * windows, session registry); the shared SPI bus lock (HwSpiBusGuard /
+ * hw_spi_bus_lock, hw_ui.h) guards the BUS the SD card shares with the
+ * ST7796 and SX1262. These routes run on the AsyncTCP task while the loop
+ * task paints and services the radio, so every g_store/SD I/O burst below is
+ * wrapped in the bus lock. (The SPIFFS fallback store is internal flash, not
+ * on the FSPI bus — wrapping it too is harmless and keeps one invariant:
+ * ALL g_store I/O holds the bus lock.)
+ * LOCK ORDER: agents_mux FIRST, bus lock SECOND, release in reverse. The bus
+ * lock is non-recursive, so the guarded regions never call anything that
+ * takes it again (pure FS calls + parsing only), and nothing anywhere takes
+ * agents_mux while holding the bus lock. */
 static SemaphoreHandle_t agents_mux = nullptr;
 
 static void agents_lock() {
@@ -203,6 +216,8 @@ static void agents_store_append(int idx, bool from_me, const char *text) {
     agents_view_append(a, from_me, ts, text);
     if (!agents_store_ready()) return;
     String path = agents_log_path(a.id, a.sessions[a.active_idx]);
+    /* Caller holds agents_mux (agents_push_line); bus lock second — order. */
+    HwSpiBusGuard bus;
     File f = g_store->open(path.c_str(), "a");
     if (!f) return;
     uint32_t written = 0;
@@ -322,6 +337,7 @@ static void agents_sync_view(int idx) {
     AgentSlot &a = g_agents[idx];
     if (!agents_store_ready()) return;
     String path = agents_log_path(a.id, a.sessions[a.active_idx]);
+    HwSpiBusGuard bus;  /* one delta-sync = one bus burst (mux already held) */
     if (!g_store->exists(path.c_str())) {
         a.file_sync = 0; a.lines = 0; a.vn = 0; a.win_start = 0;
         return;
@@ -353,6 +369,7 @@ static void agents_sync_view(int idx) {
 
 /* Load the session registry from the store manifest (one agent\tsession/line). */
 static void agents_manifest_load() {
+    HwSpiBusGuard bus;
     if (!g_store || !g_store->exists(AGENT_MANIFEST)) return;
     File f = g_store->open(AGENT_MANIFEST, "r");
     if (!f) return;
@@ -378,6 +395,7 @@ static void agents_manifest_persist() {
             out += a.id; out += '\t'; out += a.sessions[j]; out += '\n';
         }
     }
+    HwSpiBusGuard bus;  /* write burst only — manifest text built above */
     File f = g_store->open(AGENT_MANIFEST, "w");
     if (!f) return;
     f.print(out);
@@ -453,15 +471,19 @@ bool agents_session_refresh_counts(int idx) {
     for (int j = 0; j < a.n_sessions; j++) {
         String path = agents_log_path(a.id, a.sessions[j]);
         uint32_t cnt = 0;
-        File f = g_store->open(path.c_str(), "r");
-        if (f) {
-            uint8_t chunk[256];
-            size_t r;
-            while ((r = f.read(chunk, sizeof(chunk))) > 0) {
-                for (size_t k = 0; k < r; k++)
-                    if (chunk[k] == '\n') cnt++;
+        {
+            HwSpiBusGuard bus;  /* per-file read burst (non-recursive: must
+                                 * release before agents_sync_view below) */
+            File f = g_store->open(path.c_str(), "r");
+            if (f) {
+                uint8_t chunk[256];
+                size_t r;
+                while ((r = f.read(chunk, sizeof(chunk))) > 0) {
+                    for (size_t k = 0; k < r; k++)
+                        if (chunk[k] == '\n') cnt++;
+                }
+                f.close();
             }
-            f.close();
         }
         a.session_lines[j] = cnt;
         if (j == a.active_idx && a.lines != cnt)
@@ -533,6 +555,7 @@ static void agents_load_page(int idx, uint32_t end_line) {
     if (end_line > a.lines) end_line = a.lines;
     uint32_t keep_from = (end_line > AGENT_VIEW_MAX) ? (end_line - AGENT_VIEW_MAX) : 0;
     String path = agents_log_path(a.id, a.sessions[a.active_idx]);
+    HwSpiBusGuard bus;  /* one page scan = one bus burst */
     File f = g_store->open(path.c_str(), "r");
     if (!f) { a.vn = 0; a.win_start = 0; return; }
     char lbuf[AGENT_JSONL_MAX];
@@ -613,6 +636,7 @@ static bool agents_file_last(int idx, char *text, size_t text_n,
     AgentSlot &a = g_agents[idx];
     if (!agents_store_ready()) return false;
     String path = agents_log_path(a.id, a.sessions[a.active_idx]);
+    HwSpiBusGuard bus;  /* GET /agents runs on the AsyncTCP task */
     File f = g_store->open(path.c_str(), "r");
     if (!f) return false;
     char lbuf[AGENT_JSONL_MAX];
@@ -988,6 +1012,8 @@ static bool agents_clear(const char *agent_id) {
             for (int j = 0; j < a.n_sessions; j++) {
                 if (agents_store_ready()) {
                     String path = agents_log_path(a.id, a.sessions[j]);
+                    HwSpiBusGuard bus;  /* remove only — released before
+                                         * agents_push_line re-enters I/O */
                     g_store->remove(path.c_str());
                 }
                 a.session_lines[j] = 0;
@@ -997,6 +1023,7 @@ static bool agents_clear(const char *agent_id) {
         } else {
             if (agents_store_ready()) {
                 String path = agents_log_path(a.id, a.sessions[a.active_idx]);
+                HwSpiBusGuard bus;
                 g_store->remove(path.c_str());
             }
             a.file_sync = 0; a.lines = 0; a.vn = 0; a.win_start = 0;
@@ -1268,6 +1295,7 @@ static void agents_store_init() {
     if (hw_ui_spi()) {
         pinMode(PIN_SD_CS, OUTPUT);
         digitalWrite(PIN_SD_CS, HIGH);
+        HwSpiBusGuard bus;  /* card init probes the shared bus */
         if (SD.begin(PIN_SD_CS, *hw_ui_spi(), 4000000, "/sd", 5, false)) {
             g_store = &SD;
             g_store_is_sd = true;
