@@ -57,6 +57,11 @@ static uint32_t g_wg_fail_streak = 0;
 static volatile bool g_wg_restart_req = false;
 static bool g_wg_restart_armed = false;
 static uint32_t g_wg_restart_stop_ms = 0;
+/* Deferred start/stop requests — same shape as the restart deferral:
+ * wg_start_now()/wg_stop_now() block in the WG library and must never run on
+ * the AsyncTCP task. Handlers only save intent and raise a flag. */
+static volatile bool g_wg_start_req = false;
+static volatile bool g_wg_stop_req = false;
 
 /* Clock chrome uses HwWgUi from hw_ui.h (included by main before this skill). */
 
@@ -306,8 +311,8 @@ static const SkillEndpoint wg_endpoints[] = {
     {"POST", "/wg/setup",   "Atomic full /wg.json (address+key+peer)"},
     {"POST", "/wg/config",  "Set address + private_key (+enabled)"},
     {"POST", "/wg/peer",    "Set home peer endpoint/keys"},
-    {"POST", "/wg/start",   "Start tunnel now"},
-    {"POST", "/wg/stop",    "Stop tunnel"},
+    {"POST", "/wg/start",   "Start tunnel (deferred; poll /wg/status)"},
+    {"POST", "/wg/stop",    "Stop tunnel (deferred; poll /wg/status)"},
     {"POST", "/wg/restart", "Restart tunnel (deferred; poll /wg/status)"},
     {NULL, NULL, NULL}
 };
@@ -518,6 +523,9 @@ static void wg_register_routes(AsyncWebServer &server) {
         notify_send_json(req, 200, out);
     }, NULL, handle_body_collect);
 
+    /* Deferred like /wg/restart: the handler only saves intent and raises a
+     * flag; skill_wg_poll (loop task) starts the tunnel. Outcome is
+     * observable via GET /wg/status. */
     server.on(AsyncURIMatcher::exact("/wg/start"), HTTP_POST,
               [](AsyncWebServerRequest *req) {
         if (!require_auth(req)) return;
@@ -529,14 +537,15 @@ static void wg_register_routes(AsyncWebServer &server) {
                 wg_save_config(cfg);
             }
         }
-        bool ok = wg_start_now();
+        g_wg_start_req = true;
         JsonDocument out;
-        out["ok"] = ok;
+        out["ok"] = true;
+        out["starting"] = true;
         out["up"] = g_wg_running;
-        out["endpoint"] = g_wg_endpoint_used;
-        notify_send_json(req, ok ? 200 : 500, out);
+        notify_send_json(req, 200, out);
     });
 
+    /* Deferred like /wg/restart — same reason, same observation point. */
     server.on(AsyncURIMatcher::exact("/wg/stop"), HTTP_POST,
               [](AsyncWebServerRequest *req) {
         if (!require_auth(req)) return;
@@ -548,10 +557,11 @@ static void wg_register_routes(AsyncWebServer &server) {
                 wg_save_config(cfg);
             }
         }
-        wg_stop_now();
+        g_wg_stop_req = true;
         JsonDocument out;
         out["ok"] = true;
-        out["up"] = false;
+        out["stopping"] = true;
+        out["up"] = g_wg_running;
         notify_send_json(req, 200, out);
     });
 
@@ -574,6 +584,18 @@ static void wg_register_routes(AsyncWebServer &server) {
 }
 
 static void skill_wg_poll() {
+    /* Deferred /wg/stop and /wg/start — raised on the AsyncTCP task, run
+     * here on the loop task, ahead of the tick throttle. Stop first, so a
+     * stop+start pair racing one poll behaves like a restart. */
+    if (g_wg_stop_req) {
+        g_wg_stop_req = false;
+        wg_stop_now();
+    }
+    if (g_wg_start_req) {
+        g_wg_start_req = false;
+        if (g_wg_want) wg_start_now();
+    }
+
     /* Deferred /wg/restart — ahead of the tick throttle so the stop→start
      * gap is honoured promptly, and on millis() so nothing blocks. */
     if (g_wg_restart_req) {

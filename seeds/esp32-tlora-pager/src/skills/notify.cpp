@@ -1747,7 +1747,11 @@ static const Skill notify_skill = {
     .version = "0.2.0",
     .describe = notify_describe,
     .endpoints = notify_endpoints,
-    .register_routes = notify_register_routes
+    .register_routes = notify_register_routes,
+    // Order-free (C8): expiry and the coalesced snapshot only raise flags the
+    // loop consumes on its next pass; arrival/sound flags are produced by the
+    // HTTP handlers and mesh ingest, never by this poll.
+    .tick = notify_poll
 };
 
 static void skill_notify_init() {

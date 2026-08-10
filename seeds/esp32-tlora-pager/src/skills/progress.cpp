@@ -710,7 +710,11 @@ static const Skill progress_skill = {
     .version = "0.1.0",
     .describe = progress_describe,
     .endpoints = progress_endpoints,
-    .register_routes = progress_register_routes
+    .register_routes = progress_register_routes,
+    // Order-free (C8): reaping only updates the loop-owned snapshot; its
+    // consumers (1 Hz clock note row, 30/120 s idle policy) cannot tell a
+    // one-pass-old snapshot from a fresh one.
+    .tick = progress_poll
 };
 
 static void skill_progress_init() {

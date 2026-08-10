@@ -6,6 +6,7 @@
 
 #include "hw_ui.h"
 #include "board_pins.h"
+#include "hw_sound.h"   // tft_wake pumps the sound queue across its settle
 
 #include <SPI.h>
 #include <Wire.h>
@@ -214,9 +215,15 @@ void tft_wake() {
     }
     // ST7796 SLPOUT wake time: the panel needs ~120 ms before it is fully
     // operational again. Both reference stacks (LilyGoLib via LovyanGFX,
-    // MeshCore) honor it, so the delay sits here — BEFORE any repaint the
-    // caller does on return.
-    delay(120);
+    // MeshCore) honor it, so the wait sits here — BEFORE any repaint the
+    // caller does on return. It runs with the bus lock RELEASED (panel-
+    // internal settle, not bus traffic) and is sliced so the sound queue
+    // keeps its DMA fed: a notify cue that woke a blanked panel must not gap
+    // for the whole settle, and the pump must never run under the bus lock.
+    for (int waited = 0; waited < 120; waited += 10) {
+        delay(10);
+        hw_sound_poll();
+    }
     panel_awake = true;
 }
 

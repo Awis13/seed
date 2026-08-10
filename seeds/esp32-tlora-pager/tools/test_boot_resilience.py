@@ -110,6 +110,27 @@ for field in ("reset_reason", "boots_since_panic", "panic_count", "storage_ok"):
     assert f'doc["{field}"]' in health, f"/health must serve {field}"
 assert 'boot_diag_init()' in setup, "counters must be initialized in setup()"
 
+# --- 7b. s10 (C6): full S3 reset-reason coverage and its panic classing ------
+# The vendored IDF header (esp_system.h, ESP32-S3) also defines USB, JTAG,
+# EFUSE, PWR_GLITCH and CPU_LOCKUP; every one must map to a readable string.
+rr = fn_body(main, "static const char *reset_reason_str(")
+for enum, name in (("ESP_RST_USB", '"usb"'), ("ESP_RST_JTAG", '"jtag"'),
+                   ("ESP_RST_EFUSE", '"efuse"'),
+                   ("ESP_RST_PWR_GLITCH", '"pwr_glitch"'),
+                   ("ESP_RST_CPU_LOCKUP", '"cpu_lockup"')):
+    assert enum in rr and name in rr, f"{enum} must map to {name}"
+panic = fn_body(main, "static bool reset_is_panic(")
+assert "ESP_RST_CPU_LOCKUP" in panic, (
+    "a CPU lockup (double exception) is an unexpected fault: panic-class"
+)
+assert "ESP_RST_PWR_GLITCH" in panic, (
+    "a detected power glitch is an unexpected fault: panic-class"
+)
+for clean in ("ESP_RST_USB", "ESP_RST_JTAG", "ESP_RST_EFUSE"):
+    assert clean not in panic, (
+        f"{clean} must stay out of the panic classification"
+    )
+
 # --- 8. ipc1 prime-suspect mitigation stays pinned ---------------------------
 wifi_setup = fn_body(main, "static void wifi_setup()")
 assert "WiFi.persistent(false)" in wifi_setup, (

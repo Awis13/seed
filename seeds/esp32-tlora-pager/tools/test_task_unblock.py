@@ -9,7 +9,8 @@ Four sites, one rule each:
   - gps.cpp keeps no busy-wait at all (gps_take_fix had no callers and is
     removed; request+poll via gps_request_fix()/gps_tick() is the only path).
   - Every loop-task HTTPClient site bounds the connect phase to ~1 s, and the
-    /wg/restart handler no longer sits in delay(200) on the AsyncTCP task.
+    /wg/restart, /wg/start and /wg/stop handlers never touch the tunnel on the
+    AsyncTCP task — they raise flags consumed by skill_wg_poll.
 """
 
 from pathlib import Path
@@ -19,6 +20,7 @@ ROOT = Path(__file__).parents[1]
 main = (ROOT / "src" / "main.cpp").read_text(encoding="utf-8")
 gps = (ROOT / "src" / "skills" / "gps.cpp").read_text(encoding="utf-8")
 wg = (ROOT / "src" / "skills" / "wg.cpp").read_text(encoding="utf-8")
+agents = (ROOT / "src" / "skills" / "agents.cpp").read_text(encoding="utf-8")
 
 # --- 1. WiFi handlers (AsyncTCP task) defer to the loop task -----------------
 post = main[main.index("static void handle_wifi_post") :
@@ -73,9 +75,23 @@ assert "hw_ui_screen() != HW_UI_MESH_PING" in poll, (
 assert "mesh_ping_state = MESH_PING_IDLE;" in poll
 assert "ui_mesh_ping_poll();" in loop, "loop() must advance the PING sequence"
 
+# s8 (C5): the HTTP step must hand off to the mesh TX state — pin the exact
+# transition line inside the HTTP step slice so a refactor cannot silently
+# park the machine after the WiFi column.
+http_step = main[main.index("static void ui_mesh_ping_step_http()") :
+                 main.index("static void ui_mesh_ping_step_mesh_tx()")]
+assert "mesh_ping_state = MESH_PING_MESH_TX;" in http_step, (
+    "the HTTP step must always advance to MESH_PING_MESH_TX"
+)
+
 # --- 3. gps.cpp: request+poll only, no busy-wait anywhere --------------------
 assert "gps_take_fix" not in gps, (
     "the blocking compatibility helper must stay deleted (it had no callers)"
+)
+# s9 (C6): no ghost references to the deleted helper anywhere else either —
+# agents.cpp used to name it in a comment.
+assert "gps_take_fix" not in agents, (
+    "comments must not reference the deleted gps_take_fix()"
 )
 assert "delay(" not in gps, "no GPS code may wait in place on any task"
 assert "void gps_request_fix(void)" in gps
@@ -105,5 +121,31 @@ assert "wg_start_now()" not in restart and "wg_stop_now()" not in restart, (
 assert "g_wg_restart_req = true;" in restart
 assert "#define WG_RESTART_GAP_MS 200UL" in wg
 assert "millis() - g_wg_restart_stop_ms < WG_RESTART_GAP_MS" in probe
+
+# --- 4c. s7 (C5): /wg/start and /wg/stop defer exactly like /wg/restart ------
+for ep, flag in (("/wg/start", "g_wg_start_req"),
+                 ("/wg/stop", "g_wg_stop_req")):
+    handler = wg[wg.index(f'exact("{ep}")') :]
+    handler = handler[: handler.index("});")]
+    assert "wg_start_now()" not in handler and "wg_stop_now()" not in handler, (
+        f"{ep} must not run the tunnel inline on the AsyncTCP task"
+    )
+    assert "delay(" not in handler, f"{ep} must not block the AsyncTCP task"
+    assert f"{flag} = true;" in handler, f"{ep} must only raise its flag"
+    assert '"up"' in handler, (
+        f"{ep} must report the current (pre-deferral) tunnel state"
+    )
+assert '"starting"' in wg and '"stopping"' in wg, (
+    "the immediate responses must document that the action is deferred"
+)
+assert "if (g_wg_stop_req)" in probe and "if (g_wg_start_req)" in probe, (
+    "skill_wg_poll must consume both deferral flags"
+)
+assert probe.index("if (g_wg_stop_req)") < probe.index("if (g_wg_start_req)"), (
+    "stop must drain before start so a racing stop+start behaves like restart"
+)
+assert probe.index("if (g_wg_start_req)") < probe.index("WG_TICK_MS"), (
+    "the deferrals must run ahead of the tick throttle, like the restart"
+)
 
 print("Task unblock policy tests: OK")

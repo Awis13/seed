@@ -399,6 +399,9 @@ static void backlight_begin() {
     bl_cfg_load();
     bl_shown = bl_wanted;
     while (!bl_drive(bl_wanted)) delay(1);
+    /* A saved level 0 must not leave the panel controller awake under a dark
+       screen: sleep it at boot exactly as the idle blanker would. */
+    if (bl_wanted == 0) tft_sleep();
     char label[BL_LABEL_MAX];
     bl_level_label(bl_wanted, label, sizeof(label));
     event_add("backlight: %s (%u/%u, %lu mA), auto-dim %s", label,

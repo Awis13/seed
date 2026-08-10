@@ -30,13 +30,28 @@ wake_fn = wake_fn[: wake_fn.index("static void tft_window")]
 assert "tft_cmd(0x11)" in wake_fn, (
     "SLPOUT must go through tft_cmd like every other panel command"
 )
-assert "delay(120)" in wake_fn, (
-    "ST7796 SLPOUT wake time: ~120 ms before the panel is operational; "
-    "tft_wake must block so callers can repaint on return"
+# s4 (C3): the ~120 ms settle is sliced, pumping the sound queue between
+# slices, so a notify cue that woke a blanked panel does not gap for the
+# whole SLPOUT wait. The total stays 120 ms and the wait still runs with the
+# bus lock released (test_spi_lock.py pins the lock scope).
+assert "delay(120)" not in wake_fn, (
+    "the monolithic 120 ms settle starves the sound DMA — it must be sliced"
 )
-assert wake_fn.index("tft_cmd(0x11)") < wake_fn.index("delay(120)") < wake_fn.index(
-    "panel_awake = true;"
-), "wake order: SLPOUT, then the settle delay, then the state flip"
+assert "waited < 120" in wake_fn and "waited += 10" in wake_fn, (
+    "the sliced settle must still total the ST7796's 120 ms"
+)
+assert "delay(10);" in wake_fn and "hw_sound_poll();" in wake_fn, (
+    "each slice must pump the sound queue"
+)
+assert wake_fn.index("tft_cmd(0x11)") < wake_fn.index("delay(10);") < wake_fn.index(
+    "hw_sound_poll();"
+) < wake_fn.index("panel_awake = true;"), (
+    "wake order: SLPOUT, then the sliced settle with sound pumps, then the "
+    "state flip"
+)
+assert '#include "hw_sound.h"' in hw_ui, (
+    "the settle pump needs the sound module's public surface"
+)
 
 # --- the command path itself is the manual-CS transaction discipline ----------
 cmd_fn = hw_ui[hw_ui.index("static void tft_cmd(uint8_t c)") :]
@@ -90,6 +105,17 @@ assert (
     "wake order (vendor order): SLPOUT + settle, repaint, and only then raise "
     "the backlight — the lit panel must never show a stale frame"
 )
+
+# --- s5 (C3): boot with a saved level 0 sleeps the panel controller ----------
+begin = backlight[backlight.index("static void backlight_begin()") :]
+begin = begin[: begin.index("static void skill_backlight_init()")]
+assert "if (bl_wanted == 0) tft_sleep();" in begin, (
+    "a saved backlight level 0 must not leave the ST7796 awake under a dark "
+    "screen at boot"
+)
+assert begin.index("bl_drive(bl_wanted)") < begin.index(
+    "if (bl_wanted == 0) tft_sleep();"
+), "sleep only after the backlight drive settled at 0"
 
 # --- the pure host-tested region stays hardware-free --------------------------
 pure = backlight[: backlight.index("/* --- state --- */")]

@@ -55,6 +55,7 @@
 #define AGENT_THREAD_MAX    AGENT_VIEW_MAX
 #define AGENT_BRIDGE_LEN    96
 #define AGENT_BRIDGE_FILE   "/agent_bridge.txt"
+#define AGENT_BRIDGE_TMP    "/agent_bridge.tmp"
 #define AGENT_SESSION_LEN   24
 #define AGENT_SESSIONS_MAX  8       /* max sessions per agent (registry cap) */
 #define AGENT_MANIFEST      "/agents_sessions.txt"
@@ -757,10 +758,11 @@ static bool agents_bridge_save(const char *url) {
     }
     if (strncmp(url, "http://", 7) != 0) return false;
     if (strlen(url) >= AGENT_BRIDGE_LEN) return false;
-    File f = SPIFFS.open(AGENT_BRIDGE_FILE, "w");
-    if (!f) return false;
-    f.print(url);
-    f.close();
+    /* Atomic (C8): a power cut mid-write must never leave an empty bridge
+     * file — agents_bridge_load treats it as "no bridge configured". */
+    if (!write_spiffs_file_atomic(AGENT_BRIDGE_FILE, AGENT_BRIDGE_TMP,
+                                  String(url)))
+        return false;
     snprintf(g_bridge, sizeof(g_bridge), "%s", url);
     return true;
 }
@@ -847,7 +849,8 @@ static void agents_set_mesh_uplink(AgentsMeshUplinkFn fn) {
  * hits the bridge. Fresh fix (< AGENT_GPS_FRESH_S) answers immediately; no
  * fresh fix answers with a "no fix yet" card and arms g_agents_gps_pending,
  * which gps.cpp's on-fix hook (registered in skill_agents_init) resolves the
- * moment the first RMC 'A' lands. Non-blocking throughout — no gps_take_fix(). */
+ * moment the first RMC 'A' lands. Non-blocking throughout: every path here
+ * returns immediately and the late answer arrives via the hook. */
 
 #define AGENT_GPS_FRESH_S 60    /* mirror gps.cpp GPS_FRESH_S */
 

@@ -54,7 +54,7 @@
 #include "hw_kb.h"
 
 // ===== Configuration =====
-#define SEED_VERSION        "0.9.47"
+#define SEED_VERSION        "0.9.48"
 // Core clock: datasheet puts 240 vs 80 ~11.5mA apart on WAITI. Periph bus holds
 // at 80 for every PLL-fed core clock; go lower and RMT/I2S retimes. Same floor
 // as tembed idle policy (no light sleep — notify latency is the job).
@@ -136,14 +136,23 @@ static const char *reset_reason_str(esp_reset_reason_t r) {
         case ESP_RST_DEEPSLEEP: return "deepsleep";
         case ESP_RST_BROWNOUT:  return "brownout";
         case ESP_RST_SDIO:      return "sdio";
+        case ESP_RST_USB:       return "usb";
+        case ESP_RST_JTAG:      return "jtag";
+        case ESP_RST_EFUSE:     return "efuse";
+        case ESP_RST_PWR_GLITCH: return "pwr_glitch";
+        case ESP_RST_CPU_LOCKUP: return "cpu_lockup";
         default:                return "unknown";
     }
 }
 
-// Panic-class resets: real panics plus watchdogs (both fire the panic handler).
+// Panic-class resets: real panics plus watchdogs (both fire the panic
+// handler), a CPU lockup (double exception) and a detected power glitch —
+// unexpected faults that must count as instability. USB and JTAG resets are
+// host-driven (flashing/debugging) and stay clean, like poweron.
 static bool reset_is_panic(esp_reset_reason_t r) {
     return r == ESP_RST_PANIC || r == ESP_RST_INT_WDT ||
-           r == ESP_RST_TASK_WDT || r == ESP_RST_WDT;
+           r == ESP_RST_TASK_WDT || r == ESP_RST_WDT ||
+           r == ESP_RST_CPU_LOCKUP || r == ESP_RST_PWR_GLITCH;
 }
 
 static void boot_diag_init() {
@@ -170,10 +179,11 @@ static void boot_diag_init() {
 // Mount WITHOUT format-on-fail first. The device once arrived with foreign
 // firmware that had repartitioned flash; the old format-on-fail mount then
 // formatted the 8 MB partition silently — dark panel, mute serial,
-// indistinguishable from a brick for the whole format. Now the format is announced on serial and on the
-// panel (which is initialized before storage exactly for this), and a format
-// failure degrades instead of hanging: every consumer already treats a failed
-// open/read as "file missing" and falls back to defaults.
+// indistinguishable from a brick for the whole format. Now the format is
+// announced on serial and on the panel (which is initialized before storage
+// exactly for this), and a format failure degrades instead of hanging: every
+// consumer already treats a failed open/read as "file missing" and falls back
+// to defaults.
 static void storage_begin() {
     if (SPIFFS.begin(false)) {
         storage_ok = true;
@@ -375,8 +385,13 @@ static String auth_token = "";
 static String mdns_name = "";
 static unsigned long boot_time = 0;
 
-static String wifi_ssid = "";
-static String wifi_pass = "";
+/* Active credentials. Fixed buffers, not Arduino Strings: they are written on
+ * the AsyncTCP task (wifi_nets_set_active via the /wifi handlers) and read on
+ * the loop task (WiFi.begin), and a String reallocating under the reader
+ * dangles its c_str(). A torn text is the worst a fixed buffer can suffer —
+ * one failed join, which the retry ladder repairs. Sizes match WifiNet. */
+static char wifi_ssid[33] = "";
+static char wifi_pass[65] = "";
 static bool wifi_user_off = false;
 static bool mdns_started = false;
 /* Background retry backoff. After an association loss (or a failed attempt)
@@ -558,8 +573,8 @@ static void wifi_nets_clear() {
 static void wifi_nets_set_active(int idx) {
     if (idx < 0 || idx >= wifi_net_count) return;
     wifi_net_idx = idx;
-    wifi_ssid = wifi_nets[idx].ssid;
-    wifi_pass = wifi_nets[idx].pass;
+    snprintf(wifi_ssid, sizeof(wifi_ssid), "%s", wifi_nets[idx].ssid);
+    snprintf(wifi_pass, sizeof(wifi_pass), "%s", wifi_nets[idx].pass);
 }
 
 /* Upsert one profile; promotes it to active ssid/password fields. */
@@ -661,7 +676,7 @@ static bool wifi_save_config(const String &ssid, const String &pass) {
  * be followed by the periodic retry on the next loop pass. */
 static void wifi_begin_active_profile() {
     wifi_last_attempt_ms = millis();
-    WiFi.begin(wifi_ssid.c_str(), wifi_pass.c_str());
+    WiFi.begin(wifi_ssid, wifi_pass);
 }
 
 /* Deferred STA reconnect for HTTP handlers. They run on the AsyncTCP task,
@@ -745,10 +760,10 @@ static void wifi_setup() {
     configTzTime(tz_string.c_str(), "pool.ntp.org", "time.nist.gov");
 
     wifi_load_config();
-    if (wifi_net_count > 0 || wifi_ssid.length() > 0) {
+    if (wifi_net_count > 0 || wifi_ssid[0]) {
         // Boot must never wait for infrastructure. Start one asynchronous STA
         // attempt; loop() rotates profiles later while UI and MeshCore are live.
-        Serial.printf("[wifi] boot async try %s\n", wifi_ssid.c_str());
+        Serial.printf("[wifi] boot async try %s\n", wifi_ssid);
         wifi_begin_active_profile();
     } else {
         Serial.println("[wifi] no credentials — continuing mesh-only");
@@ -1184,7 +1199,7 @@ static void handle_skill(AsyncWebServerRequest *request) {
     s += "| POST | /firmware/apply | Apply + reboot |\n";
     s += "| POST | /firmware/confirm | Confirm |\n";
     s += "| POST | /firmware/rollback | Rollback |\n";
-    s += "| POST | /gw/token | Set gateway capability token (raw body or JSON token field; empty clears) |\n";
+    s += "| POST | /gw/token | Set gateway capability token (raw body or JSON string token; empty body clears) |\n";
     s += "| GET | /skill | This file |\n";
 
     // Skill endpoints
@@ -1253,7 +1268,8 @@ static void handle_wifi_status(AsyncWebServerRequest *request) {
     JsonDocument doc;
     doc["connected"] = (WiFi.status() == WL_CONNECTED);
     doc["user_off"] = wifi_user_off;
-    doc["ssid"] = WiFi.status() == WL_CONNECTED ? WiFi.SSID() : wifi_ssid;
+    if (WiFi.status() == WL_CONNECTED) doc["ssid"] = WiFi.SSID();
+    else doc["ssid"] = wifi_ssid;
     doc["ip"] = WiFi.status() == WL_CONNECTED
         ? WiFi.localIP().toString() : "";
     if (WiFi.status() == WL_CONNECTED) doc["rssi"] = WiFi.RSSI();
@@ -1331,7 +1347,7 @@ static void handle_wifi_networks_post(AsyncWebServerRequest *request) {
         return;
     }
     wifi_persist_profiles();
-    event_add("wifi profiles=%d primary=%s", wifi_net_count, wifi_ssid.c_str());
+    event_add("wifi profiles=%d primary=%s", wifi_net_count, wifi_ssid);
 
     JsonDocument out;
     out["ok"] = true;
@@ -1518,7 +1534,11 @@ static char mesh_gw_url[96] = MESH_GW_DEFAULT;
 #define GW_TOKEN_PATH "/gw_token.txt"
 #define GW_TOKEN_TMP  "/gw_token.tmp"
 #define GW_TOKEN_MAX  128
-static String gw_token = "";
+// Fixed buffer, mirroring mesh_gw_url: written on the AsyncTCP task
+// (POST /gw/token), read on the loop task (/ping, reply). An Arduino String
+// here can reallocate under the reader and dangle its c_str(); a torn char
+// buffer costs at worst one 401, which the caller can simply retry.
+static char gw_token[GW_TOKEN_MAX + 1] = "";
 static int agent_focus = 0;   // which agent chat is open (0..AGENTS_N-1)
 static bool agent_compose = false;  // REPLY screen is for agent, not notify
 static int agent_scroll = -1;       // visual row; -1 = pin to latest
@@ -1551,6 +1571,7 @@ static unsigned long ui_last_input_ms = 0;
 #define UI_IDLE_MS        15000
 #define UI_IDLE_REPLY_MS  60000
 #define KB_LAYOUT_PATH    "/kb_layout.txt"
+#define KB_LAYOUT_TMP     "/kb_layout.tmp"
 
 static_assert(BL_IDLE_DIM_MS > UI_IDLE_MS,
               "backlight must not dim while a message card can still be on screen");
@@ -1607,8 +1628,9 @@ static void mesh_gw_load() {
 }
 
 static void gw_token_load() {
-    gw_token = read_spiffs_file(GW_TOKEN_PATH);
-    gw_token.trim();
+    String stored = read_spiffs_file(GW_TOKEN_PATH);
+    stored.trim();
+    snprintf(gw_token, sizeof(gw_token), "%s", stored.c_str());
 }
 
 // ---- Reply upstream ---------------------------------------------------------
@@ -1678,7 +1700,7 @@ static bool reply_upstream_http(const char *key, const char *text) {
     http.setTimeout(5000);
     if (!http.begin(url)) return false;
     http.addHeader("Content-Type", "application/json");
-    if (gw_token.length() > 0) {
+    if (gw_token[0]) {
         http.addHeader("Authorization", String("Bearer ") + gw_token);
     }
     int code = http.POST(body);
@@ -1851,7 +1873,7 @@ static void ui_wifi_toggle() {
     } else {
         wifi_user_off = false;
         WiFi.mode(WIFI_STA);
-        if (wifi_net_count > 0 || wifi_ssid.length() > 0) {
+        if (wifi_net_count > 0 || wifi_ssid[0]) {
             wifi_retry_step = 0;  /* user intent = fresh ladder */
             wifi_begin_active_profile();
             event_add("wifi on (async reconnect)");
@@ -2074,7 +2096,7 @@ static void ui_mesh_ping_step_http() {
         http.setConnectTimeout(1000);
         http.setTimeout(4000);
         if (http.begin(url)) {
-            if (gw_token.length() > 0) {
+            if (gw_token[0]) {
                 http.addHeader("Authorization", String("Bearer ") + gw_token);
             }
             int code = http.GET();
@@ -2221,10 +2243,10 @@ static void ui_mesh_ping_poll() {
 }
 
 static void kb_layout_save() {
-    File f = SPIFFS.open(KB_LAYOUT_PATH, "w");
-    if (!f) return;
-    f.print(hw_kb_layout_id());
-    f.close();
+    // Atomic like every other small persisted setting: a power cut mid-write
+    // must never leave an empty layout file (empty reads as "no preference").
+    write_spiffs_file_atomic(KB_LAYOUT_PATH, KB_LAYOUT_TMP,
+                             String(hw_kb_layout_id()));
 }
 
 // UTF-8 helpers for the reply draft
@@ -3100,8 +3122,10 @@ static void setup_routes() {
               handle_body_collect);
 
     // Provision the gateway capability token remotely. Raw body or JSON
-    // {"token":"…"}; an empty token clears the file and returns the gateway
-    // calls to their legacy header-less form.
+    // {"token":"…"}; only a genuinely EMPTY body clears the file and returns
+    // the gateway calls to their legacy header-less form. A JSON body whose
+    // token field is missing, non-string, or empty is a 400 — a malformed
+    // provisioning call must never silently drop the stored token.
     server.on(AsyncURIMatcher::exact("/gw/token"), HTTP_POST,
               [](AsyncWebServerRequest *req) {
         if (!require_auth(req)) return;
@@ -3114,8 +3138,17 @@ static void setup_routes() {
             if (deserializeJson(input, tok) != DeserializationError::Ok) {
                 notify_send_error(req, 400, "invalid JSON"); return;
             }
-            tok = input["token"] | "";
+            if (!input["token"].is<const char *>()) {
+                notify_send_error(req, 400, "token must be a JSON string");
+                return;
+            }
+            tok = input["token"].as<const char *>();
             tok.trim();
+            if (tok.length() == 0) {
+                notify_send_error(req, 400,
+                    "empty token string - send an empty body to clear");
+                return;
+            }
         }
         if (tok.length() > GW_TOKEN_MAX) {
             notify_send_error(req, 400, "token too long"); return;
@@ -3125,8 +3158,8 @@ static void setup_routes() {
         } else if (!write_spiffs_file_atomic(GW_TOKEN_PATH, GW_TOKEN_TMP, tok)) {
             notify_send_error(req, 500, "failed to save token"); return;
         }
-        gw_token = tok;
-        event_add("gateway token %s", gw_token.length() ? "set" : "cleared");
+        snprintf(gw_token, sizeof(gw_token), "%s", tok.c_str());
+        event_add("gateway token %s", gw_token[0] ? "set" : "cleared");
         JsonDocument doc;
         doc["ok"] = true;
         notify_send_json(req, 200, doc);
@@ -3217,7 +3250,7 @@ void loop() {
     // background attempt cannot rotate the active profile out from under it.
     static bool was_connected = false;
     bool now_connected = WiFi.status() == WL_CONNECTED;
-    if (!wifi_user_off && (wifi_net_count > 0 || wifi_ssid.length() > 0) &&
+    if (!wifi_user_off && (wifi_net_count > 0 || wifi_ssid[0]) &&
         wifi_reconnect_state == WIFI_RECONNECT_IDLE && !now_connected &&
         millis() - wifi_last_attempt_ms >= wifi_retry_interval_ms()) {
         /* One profile attempt (~5s) so loop stays responsive. */
@@ -3226,8 +3259,8 @@ void loop() {
             wifi_nets_set_active(wifi_net_idx);
         }
         if (wifi_retry_step < WIFI_RETRY_LADDER_STEPS - 1) wifi_retry_step++;
-        Serial.printf("[wifi] reconnect try %s\n", wifi_ssid.c_str());
-        event_add("wifi retry %s, next in %lus (step %d)", wifi_ssid.c_str(),
+        Serial.printf("[wifi] reconnect try %s\n", wifi_ssid);
+        event_add("wifi retry %s, next in %lus (step %d)", wifi_ssid,
                   wifi_retry_interval_ms() / 1000UL, wifi_retry_step);
         WiFi.disconnect(false, false);
         delay(50);
@@ -3295,6 +3328,9 @@ void loop() {
     }
 
     // Idle policy owns brightness; drive pulses after the decision.
+    // ORDER: hand-placed — must follow ui_backlight_idle() (this pass's
+    // decision) and precede the notify-arrival block below, so a blanked
+    // panel is awake and repainted before an arriving card paints (C3).
     ui_backlight_idle();
     backlight_poll();
 
@@ -3309,13 +3345,14 @@ void loop() {
         }
     }
 
-    // Notify skill: expiry, coalesced SPIFFS snapshot, auto-card on arrival
-    // only when the user is on the clock (do not yank them out of a menu).
-    notify_poll();
+    // Notify expiry + coalesced SPIFFS snapshot run in the notify skill tick
+    // (order-free: the arrival/sound flags consumed below are produced by the
+    // HTTP handlers and mesh ingest, not by that poll). The consumption
+    // blocks below stay hand-placed — see the C3 ordering note above.
 
-    // Typed reply on its way to the gateway. After the keyboard drain above, so
-    // an Enter is carried on the pass that produced it, and after the card has
-    // already painted its way back to the clock.
+    // Typed reply on its way to the gateway. ORDER: hand-placed — after the
+    // keyboard drain above, so an Enter is carried on the pass that produced
+    // it, and after the card has already painted its way back to the clock.
     reply_upstream_poll();
 
     // Speaker + haptic FIRST — before any full-screen SPI paint can delay the
@@ -3388,10 +3425,12 @@ void loop() {
         }
     }
 
+    // ORDER: hand-placed — refill the sound DMA after the arrival paints and
+    // before the 1 Hz clock repaint below, so a long paint cannot starve an
+    // in-flight cue (hw_sound is a hardware module, not a Skill).
     hw_sound_poll();
 
-    // Progress job reaping (TTL).
-    progress_poll();
+    // Progress job reaping (TTL) runs in the progress skill tick.
 
     // Keep the fuel gauge current — probe_battery() only ran at boot.
     static unsigned long last_battery = 0;
@@ -3410,6 +3449,8 @@ void loop() {
         hw_ui_clock_rule_tick(notify_crit_unread());
     }
 
+    // Skill ticks: notify (expiry + snapshot), progress (reaping), meshcore
+    // (radio), wireguard, gps — registration order.
     for (int i = 0; i < g_skill_count; i++) {
         if (g_skills[i]->tick) g_skills[i]->tick();
     }
