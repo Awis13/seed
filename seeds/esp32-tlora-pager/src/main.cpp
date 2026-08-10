@@ -54,7 +54,7 @@
 #include "hw_kb.h"
 
 // ===== Configuration =====
-#define SEED_VERSION        "0.9.46"
+#define SEED_VERSION        "0.9.47"
 // Core clock: datasheet puts 240 vs 80 ~11.5mA apart on WAITI. Periph bus holds
 // at 80 for every PLL-fed core clock; go lower and RMT/I2S retimes. Same floor
 // as tembed idle policy (no light sleep — notify latency is the job).
@@ -379,8 +379,28 @@ static String wifi_ssid = "";
 static String wifi_pass = "";
 static bool wifi_user_off = false;
 static bool mdns_started = false;
+/* Background retry backoff. After an association loss (or a failed attempt)
+ * the next try comes quickly — a router reboot or a walk back into range is
+ * usually over in seconds — then the interval stretches until it reaches the
+ * 20-minute steady state, so a genuinely absent AP does not keep waking the
+ * radio. WIFI_RETRY_MS stays the steady-state cap (and the last rung). */
 #define WIFI_RETRY_MS 1200000UL
+static const unsigned long WIFI_RETRY_LADDER_MS[] = {
+    30000UL,        /* 30 s — AP likely just came back */
+    60000UL,        /* 1 min */
+    120000UL,       /* 2 min */
+    300000UL,       /* 5 min */
+    600000UL,       /* 10 min */
+    WIFI_RETRY_MS,  /* 20 min steady state */
+};
+#define WIFI_RETRY_LADDER_STEPS \
+    ((int)(sizeof(WIFI_RETRY_LADDER_MS) / sizeof(WIFI_RETRY_LADDER_MS[0])))
+static int wifi_retry_step = 0;
 static unsigned long wifi_last_attempt_ms = 0;
+
+static unsigned long wifi_retry_interval_ms() {
+    return WIFI_RETRY_LADDER_MS[wifi_retry_step];
+}
 
 /* Multi-profile STA: try each known network in order on boot / reconnect. */
 #define WIFI_MAX_NETS 6
@@ -662,6 +682,10 @@ static volatile int wifi_reconnect_state = WIFI_RECONNECT_IDLE;
 static unsigned long wifi_reconnect_step_ms = 0;
 
 static void wifi_reconnect_request() {
+    /* User intent (config apply / manual connect) starts a fresh ladder:
+     * without this, a saturated step would leave the next background retry
+     * 20 minutes away if this attempt fails on the wrong profile. */
+    wifi_retry_step = 0;
     wifi_reconnect_state = WIFI_RECONNECT_MODE;
 }
 
@@ -1828,6 +1852,7 @@ static void ui_wifi_toggle() {
         wifi_user_off = false;
         WiFi.mode(WIFI_STA);
         if (wifi_net_count > 0 || wifi_ssid.length() > 0) {
+            wifi_retry_step = 0;  /* user intent = fresh ladder */
             wifi_begin_active_profile();
             event_add("wifi on (async reconnect)");
             Serial.println("[wifi] user toggled ON — reconnecting");
@@ -1932,6 +1957,7 @@ static void ui_wifi_connect_ssid(const char *ssid) {
             WiFi.mode(WIFI_STA);
             WiFi.disconnect(false, false);
             delay(80);
+            wifi_retry_step = 0;  /* user intent = fresh ladder */
             wifi_begin_active_profile();
             snprintf(lines[0], sizeof(lines[0]), "CONNECTING");
             snprintf(lines[1], sizeof(lines[1]), "%s", ssid);
@@ -3180,19 +3206,29 @@ void loop() {
     // begin, millis() settle gaps) — the AsyncTCP task never touches WiFi.
     wifi_reconnect_poll();
 
-    // WiFi reconnect — one non-blocking attempt every 20 minutes while offline.
+    // WiFi reconnect — one non-blocking attempt per ladder rung while offline
+    // (the driver's own auto-reconnect stays off: its retries underneath the
+    // scheduler caused UI stalls). Every begin — boot included — stamps
+    // wifi_last_attempt_ms, so the first rung always gives the in-flight
+    // association its full 30 s before any retry can interrupt it.
     // Skipped while the user turned WiFi off from the menu (mesh-only test):
-    // they toggled it off, loop must not undo their choice.
+    // they toggled it off, loop must not undo their choice. Also skipped
+    // while the deferred reconnect machine above is mid-sequence, so a
+    // background attempt cannot rotate the active profile out from under it.
     static bool was_connected = false;
     bool now_connected = WiFi.status() == WL_CONNECTED;
     if (!wifi_user_off && (wifi_net_count > 0 || wifi_ssid.length() > 0) &&
-        !now_connected && millis() - wifi_last_attempt_ms >= WIFI_RETRY_MS) {
+        wifi_reconnect_state == WIFI_RECONNECT_IDLE && !now_connected &&
+        millis() - wifi_last_attempt_ms >= wifi_retry_interval_ms()) {
         /* One profile attempt (~5s) so loop stays responsive. */
         if (wifi_net_count > 1) {
             wifi_net_idx = (wifi_net_idx + 1) % wifi_net_count;
             wifi_nets_set_active(wifi_net_idx);
         }
+        if (wifi_retry_step < WIFI_RETRY_LADDER_STEPS - 1) wifi_retry_step++;
         Serial.printf("[wifi] reconnect try %s\n", wifi_ssid.c_str());
+        event_add("wifi retry %s, next in %lus (step %d)", wifi_ssid.c_str(),
+                  wifi_retry_interval_ms() / 1000UL, wifi_retry_step);
         WiFi.disconnect(false, false);
         delay(50);
         wifi_begin_active_profile();
@@ -3200,6 +3236,7 @@ void loop() {
     if (now_connected != was_connected) {
         was_connected = now_connected;
         if (now_connected) {
+            wifi_retry_step = 0;  /* next loss starts the ladder over */
             wifi_persist_profiles();
             if (!mdns_started && MDNS.begin(mdns_name.c_str())) {
                 MDNS.addService("http", "tcp", HTTP_PORT);
