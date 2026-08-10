@@ -1,18 +1,78 @@
 /*
- * skills/rns.cpp — Reticulum stack bring-up (microReticulum 0.5.0)
+ * skills/rns.cpp — Reticulum stack (microReticulum 0.5.0) + a TCP interface
  *
- * C1 is a cost measurement, not a feature: the stack is instantiated and an
- * identity is brought up on SPIFFS, but NO interface is registered, nothing is
- * announced and the SX1262 is never touched (MeshCore still owns the radio).
- * `Reticulum::start()` has no interface check, so a zero-interface stack is a
- * supported configuration.
+ * C1 brought the stack and the node identity up with no interface at all. C2
+ * gives it one: a Reticulum TCPClientInterface written here, because
+ * microReticulum 0.5.0 ships exactly one interface source file — the
+ * Interface.h/.cpp base — and the udp_interface under examples/ is not even
+ * exported by the library's PlatformIO manifest.
  *
- * NO tick: with zero interfaces `Reticulum::loop()` has nothing useful to do
- * (empty interface list, no-op filesystem loop, jobs over empty tables) and two
- * things it should not do on our loop task — it catches std::bad_alloc itself
- * and calls ESP.restart() unconditionally (no caller can intercept that), and
- * RNG.loop() does a synchronous NVS erase+write of the entropy seed on an hour
- * timer. The tick gets wired in by the commit that registers a real interface.
+ * Where the pieces live:
+ *   rns/hdlc.h            framing codec, no Arduino deps, host-tested by
+ *                         tools/test_rns_hdlc.sh
+ *   RnsTcpInterface       RNS::InterfaceImpl subclass; drain, framing and the
+ *                         reconnect state machine all run on the loop task
+ *   /rns.json (SPIFFS)    {enabled, host, port} — gitignored, it names a host
+ *                         behind the tunnel
+ *   GET  /rns/status      stack + interface state, counters, last error
+ *   POST /rns/config      upsert of the three fields above
+ *
+ * THE TICK IS NOW ON, and it brings four library behaviours with it that no
+ * caller can switch off. They are accepted, not worked around:
+ *   - Reticulum::loop() catches std::bad_alloc itself and calls ESP.restart()
+ *     unconditionally;
+ *   - Interface::send_outgoing() does the same around our send path;
+ *   - RNG.loop() writes the entropy seed to NVS on an hourly timer;
+ *   - Reticulum::jobs() runs clean_caches() on a 15 min timer (CLEAN_INTERVAL)
+ *     and persist_data() on an hourly one (PERSIST_INTERVAL). Both reach the
+ *     filesystem, and persist_data() -> Transport::write_path_table() opens
+ *     with `while (_saving_path_table) { OS::sleep(0.2); }` under a 5 s
+ *     timeout. Our own no-blocking discipline cannot see any of that: it is
+ *     third-party code on the far side of one rns_stack.loop() call, with no
+ *     hook to gate it on. -DRNS_PERSIST_PATHS=0 compiles the path-table half
+ *     of it out (see below); what is left is a directory walk on a long timer.
+ *
+ * "The data path never allocates" would be a comfortable claim and it is not a
+ * true one, so it is not the mitigation. What is true: every buffer in THIS
+ * file is a fixed-size static, and one pending TX frame is the most that is
+ * ever held. What is also true: the receive path allocates. RNS::Bytes(
+ * g_rns_rx.buf, g_rns_rx.len) below copies each frame into a std::vector before
+ * handle_incoming() is entered, and Transport::inbound() allocates a good deal
+ * more behind that. The bound on the exposure is therefore the drain budget —
+ * bytes, frames and milliseconds per tick — and not an absence of allocation.
+ *
+ * Persistence: -DRNS_PERSIST_PATHS=0 in platformio.ini is likewise a
+ * requirement of the drain rather than a preference. At the library default the
+ * path store is a microStore::BasicFileStore, so every announce Transport
+ * accepts writes SPIFFS from inside the drain loop; at 0 it is a BasicHeapStore
+ * and the announce path never touches flash. The reasoning is spelled out at
+ * the flag itself. The identity below is the one thing that must survive a
+ * reboot, and this file persists it without the library's help.
+ *
+ * Blocking is the central hazard, because arduino-esp32 3.3.9's NetworkClient
+ * is only partly non-blocking:
+ *   - connect()   blocks up to _timeout (3 s default) plus DNS  -> moved onto a
+ *                 one-shot FreeRTOS task, with the connection state as the
+ *                 baton; loop() returns immediately while the task owns it
+ *   - write()     up to 10 retries around a 1 s select(), i.e. ~10 s worst case
+ *                 -> not used at all; we call lwip_send(MSG_DONTWAIT) on the
+ *                 socket ourselves and park the unsent tail
+ *   - readBytes() loops on a 2 ms sleep until getTimeout() -> never called
+ *                 (and the string this sentence avoids spelling is what
+ *                 tools/test_task_unblock.py greps this file for)
+ *   - available() (FIONREAD ioctl) and read(buf, n) (MSG_DONTWAIT) are safe and
+ *     are the only read calls used here.
+ *
+ * Threading: microReticulum has no locks anywhere, so Transport::inbound must
+ * only ever be entered from one task. handle_incoming() is therefore called
+ * exclusively from RnsTcpInterface::loop(), which Reticulum::loop() drives from
+ * our skill tick on the loop task. The connect task calls nothing in the
+ * library — it touches the client socket and one atomic, and exits.
+ *
+ * WireGuard: the tunnel installs a default netif, so 10.66.0.0/24 needs no
+ * bind. Tearing the tunnel down removes that netif and silently kills open
+ * sockets, so the state of wg_is_up() is sampled when the link comes up and any
+ * change to it drops the link for a clean reconnect.
  *
  * Filesystem: microStore's UniversalFileSystem resolves to the POSIX adapter on
  * ESP32 and would mount LittleFS; this board is SPIFFS, so the SPIFFS adapter
@@ -30,18 +90,74 @@
  * try/catch (an escaping exception is a panic, not a degraded skill).
  *
  * Identity (X25519 + Ed25519, 64 private bytes) is stored as hex text at
- * /rns_identity.id through main.cpp's atomic tmp+rename writer, matching how
- * meshcore.cpp keeps /mesh_identity.id. Generation is gated on SPIFFS.exists():
+ * /rns_identity.id through main.cpp's shared write_spiffs_file_atomic(),
+ * matching how meshcore.cpp keeps /mesh_identity.id. The helper's name promises
+ * more than it delivers and is not corrected here: it is write(tmp) ->
+ * remove(path) -> rename(tmp, path), so a power cut between the remove and the
+ * rename leaves the file missing rather than half-written. Missing is the safe
+ * failure for both files this skill writes — a missing identity is regenerated
+ * and a missing /rns.json leaves the interface configured off — but the word
+ * "atomic" should not be read as a guarantee anywhere in this file.
+ * Generation is gated on SPIFFS.exists():
  * a file that is present but unreadable or malformed is reported, never
  * overwritten.
- *
- * Endpoint:
- *   GET /rns/status — {ready, identity, hash, mem:{...}}; degrades to
- *                     ready:false with a reason instead of disappearing.
  */
 
 #include <microStore/Adapters/SPIFFSFileSystem.h>
 #include <microReticulum.h>
+
+#include <atomic>
+#include <errno.h>
+
+/* Raw socket send, because NetworkClient::write() can sit for ~10 s.
+ *
+ * The #undef block below is a guard, not a fix: on this framework all 22 of
+ * them are no-ops, and the comment they used to carry — that lwIP
+ * macro-renames the BSD names onto lwip_* and would break the two-argument
+ * NetworkClient::connect() call further down — was simply wrong. ESP-IDF builds
+ * lwIP with LWIP_COMPAT_SOCKETS 0 and LWIP_POSIX_SOCKETS_IO_NAMES 0
+ * (framework-arduinoespressif32-libs/esp32s3/include/lwip/port/include/
+ * lwipopts.h), which compiles the whole `#define connect(s,name,namelen)
+ * lwip_connect(...)` block out of lwip/sockets.h. The BSD names arrive instead
+ * from Espressif's wrapper header of the same path
+ * (.../include/lwip/include/lwip/sockets.h) as `static inline` FUNCTIONS, and a
+ * free function never collides with the two-argument NetworkClient::connect()
+ * member call in rns_connect_task() below. So nothing needs undoing, and
+ * lwip_send() is called under its own name because that is its name.
+ *
+ * The block is kept because arduino-esp32's own NetworkClient.cpp carries it
+ * and because the cost is zero. It would, however, be an INCOMPLETE guard if
+ * LWIP_COMPAT_SOCKETS were ever flipped to 1: the same header also defines
+ * read, write, close, fcntl, ioctl, readv and writev as macros under
+ * LWIP_POSIX_SOCKETS_IO_NAMES, and none of those seven is listed here.
+ *
+ * The include sits here rather than at the top of main.cpp so the blast radius
+ * is this file and whatever main.cpp defines after it. */
+#include <lwip/sockets.h>
+#undef accept
+#undef bind
+#undef closesocket
+#undef connect
+#undef getpeername
+#undef getsockname
+#undef getsockopt
+#undef inet_ntop
+#undef inet_pton
+#undef ioctlsocket
+#undef listen
+#undef poll
+#undef recv
+#undef recvfrom
+#undef recvmsg
+#undef select
+#undef send
+#undef sendmsg
+#undef sendto
+#undef setsockopt
+#undef shutdown
+#undef socket
+
+#include "rns/hdlc.h"
 
 #define RNS_ID_PATH  "/rns_identity.id"
 #define RNS_ID_TMP   "/rns_identity.tmp"
@@ -49,6 +165,60 @@
 #define RNS_PRV_KEY_BYTES  (RNS::Type::Identity::KEYSIZE / 8)
 /* Truncated hash is 16 bytes today; the buffer holds a full 32-byte hex too. */
 #define RNS_HEXHASH_MAX    65
+
+/* ---- TCP interface tunables ---- */
+
+#define RNS_CFG_FILE  "/rns.json"
+#define RNS_CFG_TMP   "/rns.tmp"
+#define RNS_TCP_HOST_MAX 64
+/* rnsd's default TCPServerInterface listen port. */
+#define RNS_TCP_PORT_DEFAULT 4242
+/* Interface name. It feeds toString(), which feeds get_hash(), which is the
+ * key Transport dedupes and looks interfaces up by — so it is a compile-time
+ * constant and must never grow the endpoint into it. */
+#define RNS_TCP_IFACE_NAME "rns-tcp"
+/* Largest frame accepted or emitted. Twice the RNS MTU (500) leaves room for
+ * IFAC overhead and any future link-MTU growth without buffering a peer's
+ * garbage: 1 KiB of RX frame + 2 KiB of TX scratch + 256 B of read chunk is
+ * the whole memory cost of this interface. */
+#define RNS_TCP_HW_MTU 1024
+/* Frames at or below the RNS minimum header cannot be packets. */
+#define RNS_TCP_FRAME_MIN RNS::Type::Reticulum::HEADER_MINSIZE
+/* Announce pacing only; nothing measures the link. WiFi-order guess, same as
+ * the reference TCP interface uses. */
+#define RNS_TCP_BITRATE 10000000UL
+
+#define RNS_TCP_CONNECT_TIMEOUT_MS 3000
+#define RNS_TCP_CONNECT_TASK_STACK 4096
+#define RNS_TCP_CONNECT_TASK_PRIO  1
+#define RNS_TCP_BACKOFF_MIN_MS 3000UL
+#define RNS_TCP_BACKOFF_MAX_MS 60000UL
+
+/* Drain budget — three independent caps, all checked between reads. A single
+ * read chunk is always parsed to the end (leftover bytes have nowhere to live),
+ * so the frame cap is a floor, not a ceiling: one 256-byte chunk can carry a
+ * few more short frames than RNS_TCP_DRAIN_FRAMES_MAX. */
+#define RNS_TCP_READ_CHUNK       256
+#define RNS_TCP_DRAIN_BYTES_MAX  1024
+#define RNS_TCP_DRAIN_FRAMES_MAX 8
+#define RNS_TCP_DRAIN_BUDGET_MS  8UL
+
+/* lwip_send() attempts per flush before the tail waits for the next tick. */
+#define RNS_TCP_TX_FLUSH_TRIES 4
+/* A half-written frame leaves the peer's decoder mid-frame, so a tail that
+ * will not drain cannot simply be dropped — the socket goes instead. */
+#define RNS_TCP_TX_STALL_MS 2000UL
+
+/* Skill tick period. Everything the stack does on its own is interval-gated
+ * (Transport jobs 60 s, RNG hourly); only the drain wants to be prompt. */
+#define RNS_TICK_MS 20UL
+
+enum RnsConnState {
+    RNS_CS_IDLE = 0,   /* no socket, nobody owns the client */
+    RNS_CS_CONNECTING, /* the connect task owns the client — do not touch it */
+    RNS_CS_CONNECTED,
+    RNS_CS_FAILED      /* the connect task finished and lost */
+};
 
 /* ---- state ---- */
 static bool rns_started = false;         /* Reticulum::start() returned */
@@ -65,6 +235,581 @@ static char rns_hexhash[RNS_HEXHASH_MAX] = {0};
 static microStore::FileSystem rns_filesystem{microStore::Adapters::SPIFFSFileSystem()};
 static RNS::Reticulum rns_stack{RNS::Type::NONE};
 static RNS::Identity rns_identity{RNS::Type::NONE};
+
+/* ---- TCP interface state ----
+ *
+ * All of it is file scope so the ownership rules can be stated in one place.
+ *
+ * g_rns_cs is the baton between the loop task and the one-shot connect task.
+ * While it reads RNS_CS_CONNECTING the connect task owns g_rns_client and the
+ * loop task must not read or write the socket; every other value means the
+ * loop task owns it and no connect task exists. It is a std::atomic rather
+ * than a volatile int for the ordering, not the atomicity: the connect task
+ * fills in the client's internals and g_rns_last_error before publishing the
+ * new state, and the loop task must not see the state without them.
+ *
+ * g_rns_host/g_rns_port are written ONLY by the loop task, and only while no
+ * connect task exists, so the task always reads a stable endpoint. POST
+ * /rns/config runs on the AsyncTCP task and therefore only writes SPIFFS and
+ * raises g_rns_cfg_dirty; the loop task re-reads the file. */
+static NetworkClient g_rns_client;
+static std::atomic<int> g_rns_cs{RNS_CS_IDLE};
+
+static bool g_rns_cfg_ok = false;      /* a usable host is configured */
+static bool g_rns_cfg_enabled = false; /* ...and the operator wants it up */
+static volatile bool g_rns_cfg_dirty = false; /* raised by POST /rns/config */
+static char g_rns_host[RNS_TCP_HOST_MAX] = "";
+static uint16_t g_rns_port = RNS_TCP_PORT_DEFAULT;
+
+static char g_rns_last_error[64] = "";
+static uint32_t g_rns_attempts = 0;    /* connect attempts since boot */
+static uint32_t g_rns_downs = 0;       /* established links subsequently lost */
+static uint32_t g_rns_backoff_ms = RNS_TCP_BACKOFF_MIN_MS;
+static uint32_t g_rns_next_try_ms = 0;
+static uint32_t g_rns_up_ms = 0;
+static uint32_t g_rns_frames_in = 0;
+static uint32_t g_rns_tx_dropped = 0;
+static uint32_t g_rns_rx_errors = 0;   /* frames Transport::inbound threw on */
+static bool g_rns_wg_seen = false;     /* wg_is_up() when the link came up */
+static bool g_rns_mtu_warned = false;  /* the over-MTU event is emitted once */
+
+/* Fixed buffers, sized once. Nothing in the data path allocates. */
+static uint8_t g_rns_rdbuf[RNS_TCP_READ_CHUNK];
+static uint8_t g_rns_framebuf[RNS_TCP_HW_MTU];
+static uint8_t g_rns_txbuf[RNS_TCP_HW_MTU * 2 + 2];
+static rns_hdlc_rx g_rns_rx;
+/* One frame deep: bytes [g_rns_tx_sent, g_rns_tx_len) still owe the socket. */
+static size_t g_rns_tx_len = 0;
+static size_t g_rns_tx_sent = 0;
+static uint32_t g_rns_tx_pending_ms = 0;
+
+static RNS::Interface g_rns_iface{RNS::Type::NONE};
+
+/* ---- status snapshot ----
+ *
+ * GET /rns/status answers on the AsyncTCP task, and every interesting number it
+ * wants is mutated by the loop task: Transport's path table is an std::map that
+ * Transport::inbound() inserts into (sizing it under a concurrent insert is
+ * undefined, not merely stale), the base-class rx/tx counters are non-atomic
+ * increments, and g_rns_last_error is a char array that snprintf rewrites in
+ * place — a reader crossing that write can see it without a terminator.
+ *
+ * Nothing is locked. The loop task publishes this snapshot once per tick and
+ * the handler serves only the snapshot, so the worst case is RNS_TICK_MS of
+ * staleness, which is nothing next to an HTTP poll. The strings are copied with
+ * a memcpy that stops one byte short of the end, and that last byte is never
+ * written after this initialiser: a reader that crosses the copy can therefore
+ * see a mix of old and new characters, but never an unterminated array.
+ *
+ * The remaining direct reads in rns_status_json() — g_rns_attempts, g_rns_downs
+ * and friends — are naturally aligned 32-bit scalars, single-copy atomic on
+ * this core, and carry no such hazard. */
+struct RnsStatusSnap {
+    const char *state;
+    bool online;
+    uint32_t interfaces;
+    uint32_t paths;
+    uint32_t up_age_s;
+    uint32_t rx, tx, rxbytes, txbytes;
+    uint16_t port;
+    char host[RNS_TCP_HOST_MAX];
+    char last_error[64];
+};
+static RnsStatusSnap g_rns_snap = {"off", false, 0, 0, 0, 0, 0, 0, 0,
+                                   RNS_TCP_PORT_DEFAULT, {0}, {0}};
+
+/* ---- configuration ---- */
+
+/* Hostname or dotted quad; the same conservative charset /wg/peer accepts. */
+static bool rns_valid_host(const char *host) {
+    if (!host || !host[0]) return false;
+    size_t n = strlen(host);
+    if (n >= RNS_TCP_HOST_MAX) return false;
+    for (size_t i = 0; i < n; i++) {
+        char c = host[i];
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+              (c >= '0' && c <= '9') || c == '.' || c == '-'))
+            return false;
+    }
+    return true;
+}
+
+/* Re-read /rns.json into the endpoint the connect task will use. Returns true
+ * when the endpoint or the enable flag changed, which is the caller's cue to
+ * drop an established link. Loop task only. */
+static bool rns_cfg_load() {
+    char prev_host[RNS_TCP_HOST_MAX];
+    snprintf(prev_host, sizeof(prev_host), "%s", g_rns_host);
+    uint16_t prev_port = g_rns_port;
+    bool prev_enabled = g_rns_cfg_enabled;
+
+    g_rns_cfg_ok = false;
+    g_rns_cfg_enabled = false;
+    g_rns_host[0] = '\0';
+    g_rns_port = RNS_TCP_PORT_DEFAULT;
+
+    String json = read_spiffs_file(RNS_CFG_FILE);
+    JsonDocument doc;
+    if (json.length() > 0 &&
+        deserializeJson(doc, json) == DeserializationError::Ok) {
+        String host = doc["host"] | "";
+        long port = doc["port"] | (long)RNS_TCP_PORT_DEFAULT;
+        if (rns_valid_host(host.c_str()) && port > 0 && port <= 65535) {
+            snprintf(g_rns_host, sizeof(g_rns_host), "%s", host.c_str());
+            g_rns_port = (uint16_t)port;
+            g_rns_cfg_ok = true;
+            /* Absent "enabled" means yes, matching /wg.json: a file that names
+             * an endpoint was written to be used. */
+            g_rns_cfg_enabled = doc["enabled"] | true;
+        }
+    }
+
+    return (g_rns_cfg_enabled != prev_enabled) || (g_rns_port != prev_port) ||
+           (strcmp(g_rns_host, prev_host) != 0);
+}
+
+/* ---- connect task ----
+ *
+ * The whole reason this task exists: NetworkClient::connect() resolves DNS and
+ * then blocks in the connect handshake for up to _timeout. On the loop task
+ * that is a visible UI stall and a missed keyboard scan; here it costs one
+ * short-lived 4 KB stack. The task calls nothing in microReticulum and touches
+ * no shared state beyond the client, the error string and the baton. */
+static void rns_connect_task(void *arg) {
+    (void)arg;
+    g_rns_client.setConnectionTimeout(RNS_TCP_CONNECT_TIMEOUT_MS);
+    int ok = g_rns_client.connect(g_rns_host, g_rns_port);
+    if (ok == 1) {
+        /* RNS packets are small and latency-sensitive; Nagle would sit on
+         * them waiting for company that is not coming. */
+        g_rns_client.setNoDelay(true);
+        g_rns_last_error[0] = '\0';
+        g_rns_cs.store(RNS_CS_CONNECTED);
+    } else {
+        g_rns_client.stop();
+        /* No endpoint in the text: a 63-character host would not fit and
+         * iface.host / iface.port already carry it in /rns/status. */
+        snprintf(g_rns_last_error, sizeof(g_rns_last_error),
+                 "connect refused or unreachable");
+        g_rns_cs.store(RNS_CS_FAILED);
+    }
+    vTaskDelete(NULL);
+}
+
+/* ---- the interface ---- */
+
+class RnsTcpInterface : public RNS::InterfaceImpl {
+public:
+    RnsTcpInterface() : RNS::InterfaceImpl(RNS_TCP_IFACE_NAME) {
+        _IN = true;
+        _OUT = true;
+        _bitrate = RNS_TCP_BITRATE;
+        _HW_MTU = RNS_TCP_HW_MTU;
+        _online = false;
+    }
+
+protected:
+    /* No socket is opened here. WiFi is not necessarily up when skills
+     * register, and a failed dial at boot would be a blocking wait in setup().
+     * Bring-up is decided in loop(), the same deferral meshcore.cpp uses for
+     * the radio. */
+    virtual bool start() override {
+        _online = false;
+        rns_hdlc_rx_init(&g_rns_rx, g_rns_framebuf, sizeof(g_rns_framebuf),
+                         RNS_TCP_FRAME_MIN);
+        return true;
+    }
+
+    virtual void stop() override { link_down("stopped"); }
+
+    /* Transport::detach_interfaces() on shutdown. Same teardown; idempotent
+     * because link_down() only logs when the link was actually up. */
+    virtual void detach() override { link_down("detached"); }
+
+    virtual void loop() override;
+    virtual bool send_outgoing(const RNS::Bytes &data) override;
+
+    /* Deliberately constant. get_hash() is Identity::full_hash({toString()}),
+     * and that hash is what Transport dedupes on registration and looks up by
+     * later — an endpoint in this string would change the interface's identity
+     * every time /rns.json is edited.
+     *
+     * The flip side, and the reason this class is a singleton in practice: a
+     * SECOND instance would produce the same string and therefore the same
+     * hash, and Transport::register_interface() silently skips an interface
+     * whose hash is already in the table — no error, no return value, the
+     * interface simply never carries traffic. Worse, deregister_interface()
+     * erases by hash with remove_if, so tearing one down would remove both.
+     * Anything that ever wants two of these has to make the name distinct
+     * first, and accept that the hash then changes with it. */
+    virtual std::string toString() const override {
+        return "TCPInterface[" RNS_TCP_IFACE_NAME "]";
+    }
+
+private:
+    void link_down(const char *why);
+    void begin_connect();
+    void drain();
+    void tx_flush();
+};
+
+void RnsTcpInterface::link_down(const char *why) {
+    /* The connect task owns the socket. Let it finish and publish; the next
+     * tick tears down from RNS_CS_FAILED or reconnects. This guard is what
+     * makes link_down() safe to call from stop() and detach() too. */
+    if (g_rns_cs.load() == RNS_CS_CONNECTING) return;
+
+    if (_online) {
+        g_rns_downs++;
+        event_add("rns tcp down: %s", why);
+    }
+    _online = false;
+    snprintf(g_rns_last_error, sizeof(g_rns_last_error), "%s", why);
+    /* Safe from the loop task only because every caller has already checked
+     * that no connect task owns the client. */
+    g_rns_client.stop();
+    rns_hdlc_rx_reset(&g_rns_rx);
+    g_rns_tx_len = 0;
+    g_rns_tx_sent = 0;
+    g_rns_tx_pending_ms = 0;
+    g_rns_cs.store(RNS_CS_IDLE);
+    g_rns_next_try_ms = millis() + g_rns_backoff_ms;
+    if (g_rns_backoff_ms < RNS_TCP_BACKOFF_MAX_MS)
+        g_rns_backoff_ms *= 2;
+    if (g_rns_backoff_ms > RNS_TCP_BACKOFF_MAX_MS)
+        g_rns_backoff_ms = RNS_TCP_BACKOFF_MAX_MS;
+}
+
+void RnsTcpInterface::begin_connect() {
+    g_rns_attempts++;
+    /* Publish the baton BEFORE the task exists, so there is no window in which
+     * a running task is not visible as the owner. */
+    g_rns_cs.store(RNS_CS_CONNECTING);
+    if (xTaskCreate(rns_connect_task, "rns_conn", RNS_TCP_CONNECT_TASK_STACK,
+                    nullptr, RNS_TCP_CONNECT_TASK_PRIO, nullptr) != pdPASS) {
+        /* Nothing ran, so taking the baton back is unambiguous. */
+        snprintf(g_rns_last_error, sizeof(g_rns_last_error),
+                 "connect task could not be created");
+        g_rns_cs.store(RNS_CS_FAILED);
+    }
+}
+
+/* Push whatever the socket will take right now. lwip_send with MSG_DONTWAIT
+ * either moves bytes or returns EAGAIN immediately — no select, no retry loop,
+ * no 10 s stall. A short write parks the tail for the next tick. */
+void RnsTcpInterface::tx_flush() {
+    if (g_rns_tx_sent >= g_rns_tx_len) return;
+
+    int sock = g_rns_client.fd();
+    if (sock < 0) {
+        /* Reachable without any error surfacing on our side:
+         * NetworkClient::available() and read() both call stop() internally
+         * when the rxBuffer faults (NetworkClient.cpp), which closes the fd
+         * under a parked tail. Clearing the tail quietly here would lose a
+         * frame that send_outgoing() already reported as sent, so it counts as
+         * a drop and the link goes down for a clean redial — link_down() clears
+         * the tail on the way. */
+        g_rns_tx_dropped++;
+        link_down("socket disappeared");
+        return;
+    }
+
+    for (int i = 0; i < RNS_TCP_TX_FLUSH_TRIES && g_rns_tx_sent < g_rns_tx_len;
+         i++) {
+        int n = lwip_send(sock, g_rns_txbuf + g_rns_tx_sent,
+                          g_rns_tx_len - g_rns_tx_sent, MSG_DONTWAIT);
+        if (n > 0) {
+            g_rns_tx_sent += (size_t)n;
+            continue;
+        }
+        /* lwIP defines EWOULDBLOCK as EAGAIN, so one test covers both. */
+        if (n < 0 && errno == EAGAIN) break;
+        /* Both failure exits count the tail they are about to discard, and both
+         * count it exactly once regardless of who called tx_flush() — which is
+         * why send_outgoing() only reports the link state and does not count a
+         * drop of its own. */
+        g_rns_tx_dropped++;
+        link_down("socket refused the write");
+        return;
+    }
+
+    if (g_rns_tx_sent >= g_rns_tx_len) {
+        g_rns_tx_len = 0;
+        g_rns_tx_sent = 0;
+        g_rns_tx_pending_ms = 0;
+    } else if (g_rns_tx_pending_ms == 0) {
+        g_rns_tx_pending_ms = millis();
+    }
+}
+
+/* Read at most RNS_TCP_READ_CHUNK bytes at a time and hand every complete
+ * frame straight to Transport. available() is a FIONREAD ioctl and read() uses
+ * MSG_DONTWAIT, so neither can wait; the three budgets bound how much work one
+ * tick may do with the data they return. */
+void RnsTcpInterface::drain() {
+    uint32_t started = millis();
+    size_t bytes = 0;
+    int frames = 0;
+
+    /* Reported for the previous pass rather than at the point of rejection, so
+     * a link_down() partway through this one cannot swallow it.
+     *
+     * Nothing this stack generates can exceed _HW_MTU today: Type::Reticulum::
+     * MTU is 500, and neither AUTOCONFIGURE_MTU nor FIXED_MTU is set on this
+     * interface, so Transport applies no link-MTU upgrade to it. But
+     * Link::validate_request() takes a peer's signalled MTU without clamping it
+     * to the receiving interface's HW_MTU, so the condition is not structurally
+     * impossible — and a dropped frame is otherwise visible only as a counter
+     * nobody is watching. Say it out loud, once.
+     * TODO: clamp an inbound link MTU to RNS_TCP_HW_MTU once this node owns
+     * destinations and can actually terminate a link. */
+    if (g_rns_rx.rejected_long != 0 && !g_rns_mtu_warned) {
+        g_rns_mtu_warned = true;
+        event_add("rns frame over mtu");
+    }
+
+    /* _online is re-tested every pass: handle_incoming() below can re-enter the
+     * stack and come back out through link_down(). */
+    while (_online &&
+           bytes < RNS_TCP_DRAIN_BYTES_MAX &&
+           frames < RNS_TCP_DRAIN_FRAMES_MAX &&
+           (millis() - started) < RNS_TCP_DRAIN_BUDGET_MS) {
+        int avail = g_rns_client.available();
+        if (avail <= 0) break;
+
+        size_t want = (size_t)avail;
+        if (want > RNS_TCP_READ_CHUNK) want = RNS_TCP_READ_CHUNK;
+        int n = g_rns_client.read(g_rns_rdbuf, want);
+        if (n <= 0) break;
+        bytes += (size_t)n;
+
+        /* The chunk is parsed to the end regardless of the frame budget: the
+         * decoder keeps reassembly state, but bytes we hand back have nowhere
+         * to be stored. */
+        size_t off = 0;
+        while (off < (size_t)n) {
+            size_t used = 0;
+            int got = rns_hdlc_rx_feed(&g_rns_rx, g_rns_rdbuf + off,
+                                       (size_t)n - off, &used);
+            off += used;
+            if (!got) break;
+            frames++;
+            g_rns_frames_in++;
+            try {
+                handle_incoming(RNS::Bytes(g_rns_rx.buf, g_rns_rx.len));
+            } catch (const std::bad_alloc &) {
+                /* Genuine OOM: let it reach Reticulum::loop(), which restarts
+                 * the board. Swallowing it here would only hide the cause. */
+                throw;
+            } catch (const std::exception &) {
+                g_rns_rx_errors++;
+            } catch (...) {
+                g_rns_rx_errors++;
+            }
+            /* handle_incoming() re-enters the stack, and the stack can come
+             * back out through our send_outgoing() -> tx_flush() -> link_down():
+             * the client is stopped, the decoder is reset and the backoff is
+             * armed. Feeding the remainder of this chunk into that reset decoder
+             * would hand Transport frames from an interface it has just been
+             * told is down, so the drain stops here and the next tick starts
+             * from the reconnect. */
+            if (!_online) return;
+        }
+    }
+}
+
+/* Called by Transport on the loop task. Never blocks, never allocates, and
+ * refuses rather than corrupting the stream when a tail is still owed. */
+bool RnsTcpInterface::send_outgoing(const RNS::Bytes &data) {
+    if (g_rns_cs.load() != RNS_CS_CONNECTED || !_online) {
+        g_rns_tx_dropped++;
+        return false;
+    }
+    if (data.size() == 0 || data.size() > (size_t)_HW_MTU) {
+        g_rns_tx_dropped++;
+        return false;
+    }
+
+    /* One frame of TX depth. If the previous frame is still half on the wire,
+     * give it one more push and then drop this one — HDLC has no way to
+     * interleave, and dropping a packet is what a Reticulum interface is
+     * allowed to do. */
+    if (g_rns_tx_sent < g_rns_tx_len) {
+        tx_flush();
+        /* tx_flush() can take the link down on a write error, which clears the
+         * tail — re-read the baton rather than reading "tail gone" as "ready". */
+        if (g_rns_tx_sent < g_rns_tx_len ||
+            g_rns_cs.load() != RNS_CS_CONNECTED) {
+            g_rns_tx_dropped++;
+            return false;
+        }
+    }
+
+    size_t n = rns_hdlc_encode(data.data(), data.size(), g_rns_txbuf,
+                               sizeof(g_rns_txbuf));
+    if (n == 0) {
+        g_rns_tx_dropped++;
+        return false;
+    }
+    g_rns_tx_len = n;
+    g_rns_tx_sent = 0;
+    g_rns_tx_pending_ms = 0;
+
+    tx_flush();
+
+    /* The flush comes first because it can fail: a first lwip_send() that
+     * errors, or an fd that has already vanished, takes the link down and
+     * clears the tail. Returning true there would be a lie with consequences —
+     * Transport::transmit() would report sent = true and Transport::outbound()
+     * would go on to call interface.sent_announce() for an announce that never
+     * left the board. So the answer is the link state after the attempt, and
+     * the base class's counters (ours to maintain; nothing else touches them)
+     * are only credited when that answer is yes. A short write is still a yes:
+     * the tail is parked and the socket is up, so the frame is committed. */
+    bool sent = (g_rns_cs.load() == RNS_CS_CONNECTED) && _online;
+    if (sent) handle_outgoing(data);
+    return sent;
+}
+
+/* Driven by Reticulum::loop() from the skill tick, i.e. always the loop task.
+ * Every branch returns promptly; the only work with any duration is drain(),
+ * which carries its own budget. */
+void RnsTcpInterface::loop() {
+    int cs = g_rns_cs.load();
+
+    /* The connect task owns the client. Nothing else is safe to do. */
+    if (cs == RNS_CS_CONNECTING) {
+        _online = false;
+        return;
+    }
+
+    /* Config edits land here, never in the HTTP handler. */
+    if (g_rns_cfg_dirty) {
+        g_rns_cfg_dirty = false;
+        bool changed = rns_cfg_load();
+        /* An operator who has just pointed the interface at a working host
+         * should not sit out a backoff that grew to a minute against the
+         * previous one. Any POST that leaves a usable endpoint behind rearms
+         * the ladder at its minimum and clears the wait. */
+        if (g_rns_cfg_ok) {
+            g_rns_backoff_ms = RNS_TCP_BACKOFF_MIN_MS;
+            g_rns_next_try_ms = millis();
+        }
+        if (changed && cs == RNS_CS_CONNECTED) {
+            link_down("configuration changed");
+            return;
+        }
+    }
+
+    if (cs == RNS_CS_FAILED) {
+        _online = false;
+        g_rns_client.stop();
+        g_rns_cs.store(RNS_CS_IDLE);
+        g_rns_next_try_ms = millis() + g_rns_backoff_ms;
+        /* Announce the delay that was just armed, not the one after it: the
+         * event used to print the already-doubled value and was a whole step
+         * ahead of the timer an operator was actually waiting on. */
+        event_add("rns tcp connect failed, retry in %lus",
+                  (unsigned long)(g_rns_backoff_ms / 1000UL));
+        if (g_rns_backoff_ms < RNS_TCP_BACKOFF_MAX_MS)
+            g_rns_backoff_ms *= 2;
+        if (g_rns_backoff_ms > RNS_TCP_BACKOFF_MAX_MS)
+            g_rns_backoff_ms = RNS_TCP_BACKOFF_MAX_MS;
+        return;
+    }
+
+    if (cs == RNS_CS_CONNECTED) {
+        if (!_online) {
+            /* First tick after the connect task won. */
+            _online = true;
+            g_rns_up_ms = millis();
+            g_rns_backoff_ms = RNS_TCP_BACKOFF_MIN_MS;
+            g_rns_wg_seen = wg_is_up();
+            rns_hdlc_rx_reset(&g_rns_rx);
+            g_rns_tx_len = 0;
+            g_rns_tx_sent = 0;
+            g_rns_tx_pending_ms = 0;
+            event_add("rns tcp up %s:%u", g_rns_host, (unsigned)g_rns_port);
+        }
+
+        if (!g_rns_cfg_enabled) {
+            link_down("disabled");
+            return;
+        }
+        if (WiFi.status() != WL_CONNECTED) {
+            link_down("wifi lost");
+            return;
+        }
+        /* A tunnel restart pulls the netif out from under an open socket
+         * without any error surfacing on it. The transition is the signal. */
+        if (wg_is_up() != g_rns_wg_seen) {
+            link_down("wireguard state changed");
+            return;
+        }
+        if (!g_rns_client.connected()) {
+            link_down("peer closed the socket");
+            return;
+        }
+
+        tx_flush();
+        if (g_rns_tx_pending_ms != 0 &&
+            (millis() - g_rns_tx_pending_ms) > RNS_TCP_TX_STALL_MS) {
+            link_down("outbound frame stalled");
+            return;
+        }
+        drain();
+        return;
+    }
+
+    /* RNS_CS_IDLE — the cheap path, and the one taken on every tick when the
+     * interface is switched off. */
+    _online = false;
+    if (!g_rns_cfg_enabled || !g_rns_cfg_ok) return;
+    if (WiFi.status() != WL_CONNECTED) return;
+    if ((int32_t)(millis() - g_rns_next_try_ms) < 0) return;
+    begin_connect();
+}
+
+static const char *rns_link_state_name() {
+    if (!g_rns_cfg_ok || !g_rns_cfg_enabled) return "off";
+    int cs = g_rns_cs.load();
+    if (cs == RNS_CS_CONNECTING) return "connecting";
+    if (cs == RNS_CS_CONNECTED) return "connected";
+    /* RNS_CS_FAILED lives for a single tick before the poll converts it into
+     * an armed backoff, so what an operator would actually catch here is
+     * RNS_CS_IDLE. Report the honest thing: idle before the first attempt,
+     * failed once something has gone wrong and we are waiting to retry. */
+    if (g_rns_last_error[0]) return "failed";
+    return "idle";
+}
+
+/* Publish everything GET /rns/status must not read live. Loop task only, once
+ * per tick — see the RnsStatusSnap comment for why each of these cannot be
+ * touched from the AsyncTCP task. The two string copies deliberately stop one
+ * byte short of their destination, leaving the terminator this file wrote at
+ * startup permanently in place. */
+static void rns_status_publish() {
+    g_rns_snap.state = rns_link_state_name();
+    g_rns_snap.interfaces = (uint32_t)RNS::Transport::get_interfaces().size();
+    g_rns_snap.paths = (uint32_t)RNS::Transport::new_path_table().size();
+
+    bool up = (g_rns_cs.load() == RNS_CS_CONNECTED);
+    g_rns_snap.online = up && g_rns_iface && g_rns_iface.online();
+    g_rns_snap.up_age_s =
+        (up && g_rns_up_ms) ? (uint32_t)((millis() - g_rns_up_ms) / 1000UL) : 0UL;
+
+    if (g_rns_iface) {
+        g_rns_snap.rx = (uint32_t)g_rns_iface.rx();
+        g_rns_snap.tx = (uint32_t)g_rns_iface.tx();
+        g_rns_snap.rxbytes = (uint32_t)g_rns_iface.rxbytes();
+        g_rns_snap.txbytes = (uint32_t)g_rns_iface.txbytes();
+    }
+
+    g_rns_snap.port = g_rns_port;
+    memcpy(g_rns_snap.host, g_rns_host, sizeof(g_rns_snap.host) - 1);
+    memcpy(g_rns_snap.last_error, g_rns_last_error,
+           sizeof(g_rns_snap.last_error) - 1);
+}
 
 /* ---- identity ---- */
 
@@ -140,8 +885,43 @@ static void rns_status_json(JsonDocument &doc) {
         doc["hash"] = (const char *)nullptr;
     }
     doc["transport"] = RNS::Reticulum::transport_enabled();
-    doc["interfaces"] = 0;                 /* C1 registers none, by design */
+    doc["interfaces"] = (unsigned long)g_rns_snap.interfaces;
+    /* The number that proves the peer's announces landed: it stays 0 until a
+     * real RNS node is on the other end of the socket. It is an std::map size
+     * that Transport::inbound() inserts into on the loop task, so it is read
+     * from the snapshot and never from the table itself. */
+    doc["paths"] = (unsigned long)g_rns_snap.paths;
     if (rns_error) doc["error"] = rns_error;
+
+    JsonObject iface = doc["iface"].to<JsonObject>();
+    iface["name"] = RNS_TCP_IFACE_NAME;
+    iface["state"] = g_rns_snap.state;
+    iface["configured"] = g_rns_cfg_ok;
+    iface["enabled"] = g_rns_cfg_enabled;
+    iface["host"] = g_rns_snap.host;
+    iface["port"] = g_rns_snap.port;
+    iface["hw_mtu"] = RNS_TCP_HW_MTU;
+    iface["bitrate"] = (unsigned long)RNS_TCP_BITRATE;
+    iface["attempts"] = g_rns_attempts;
+    iface["drops"] = g_rns_downs;
+    iface["backoff_ms"] = g_rns_backoff_ms;
+    if (g_rns_snap.last_error[0]) iface["last_error"] = g_rns_snap.last_error;
+
+    iface["online"] = g_rns_snap.online;
+    iface["up_age_s"] = (unsigned long)g_rns_snap.up_age_s;
+
+    /* Base-class counters (packets handed to and taken from Transport) next to
+     * ours (wire frames and what never made it), so a mismatch points at the
+     * framing rather than at the stack. */
+    iface["rx"] = (unsigned long)g_rns_snap.rx;
+    iface["tx"] = (unsigned long)g_rns_snap.tx;
+    iface["rxbytes"] = (unsigned long)g_rns_snap.rxbytes;
+    iface["txbytes"] = (unsigned long)g_rns_snap.txbytes;
+    iface["frames_in"] = g_rns_frames_in;
+    iface["tx_dropped"] = g_rns_tx_dropped;
+    iface["rx_errors"] = g_rns_rx_errors;
+    iface["frames_short"] = g_rns_rx.rejected_short;
+    iface["frames_long"] = g_rns_rx.rejected_long;
 
     /* The library's own counters next to the platform's, so /rns/status can be
      * diffed against /capabilities when the stack starts carrying traffic.
@@ -157,26 +937,38 @@ static void rns_status_json(JsonDocument &doc) {
 }
 
 static const SkillEndpoint rns_endpoints[] = {
-    {"GET", "/rns/status", "Reticulum stack state, identity hash and memory cost"},
+    {"GET", "/rns/status", "Reticulum stack, identity, TCP interface and counters"},
+    {"POST", "/rns/config", "Set TCP interface {host, port, enabled}"},
     {NULL, NULL, NULL}
 };
 
 static const char *rns_describe() {
     return "## Skill: rns\n\n"
-           "Reticulum (microReticulum 0.5.0) brought up alongside MeshCore.\n"
-           "This is the measurement stage: the stack runs with **no interface\n"
-           "registered**, transport and probe destinations disabled, and it\n"
-           "never touches the SX1262 — MeshCore still owns the radio.\n"
+           "Reticulum (microReticulum 0.5.0) running alongside MeshCore, with\n"
+           "one interface: a TCP client that dials an RNS node over WiFi or\n"
+           "the WireGuard tunnel. The SX1262 is still never touched — MeshCore\n"
+           "owns the radio.\n"
            "The node identity (X25519 + Ed25519) lives in SPIFFS at\n"
            "`/rns_identity.id` as hex and is generated once on first boot.\n"
-           "`GET /rns/status` reports the stack state, the identity hash and\n"
-           "both the library's allocator counters and the ESP heap/PSRAM\n"
-           "figures. `mem.alloc_count` and `mem.free_count` are expected to\n"
-           "read 0: the build uses the library's heap allocator, which leaves\n"
-           "the global `operator new` — and therefore the counters — alone.\n"
+           "The endpoint lives in SPIFFS at `/rns.json` (not in git) as\n"
+           "`{enabled, host, port}`, port defaulting to 4242.\n"
+           "Framing is HDLC, matching what a Python `TCPServerInterface`\n"
+           "speaks to a spawned client; there is no handshake or banner.\n"
+           "The dial runs on a one-shot task so the loop never waits on it,\n"
+           "reconnects back off from 3 s to 60 s, and the link is dropped and\n"
+           "redialled when WiFi drops, when the peer closes, or when the\n"
+           "WireGuard tunnel is restarted underneath the socket.\n"
+           "`GET /rns/status` reports the stack, `iface.state`\n"
+           "(off/idle/connecting/connected/failed), the endpoint, rx/tx\n"
+           "counters, the last error and `paths` — the path-table size, which\n"
+           "is what shows the peer's announces arriving.\n"
+           "`mem.alloc_count` and `mem.free_count` are expected to read 0: the\n"
+           "build uses the library's heap allocator, which leaves the global\n"
+           "`operator new` — and therefore the counters — alone.\n"
            "If bring-up fails the endpoint stays up and answers `ready:false`\n"
            "with a reason.\n\n"
-           "| GET | /rns/status |\n";
+           "| GET | /rns/status |\n"
+           "| POST | /rns/config |\n";
 }
 
 static void rns_register_routes(AsyncWebServer &server) {
@@ -187,17 +979,104 @@ static void rns_register_routes(AsyncWebServer &server) {
         rns_status_json(doc);
         notify_send_json(req, 200, doc);
     });
+
+    /* Upsert of /rns.json. This handler runs on the AsyncTCP task, so it
+     * validates and writes the file and stops there — applying the endpoint
+     * (and dropping a live link for it) belongs to the loop task, which picks
+     * the change up through g_rns_cfg_dirty. Poll GET /rns/status for the
+     * outcome. */
+    server.on(AsyncURIMatcher::exact("/rns/config"), HTTP_POST,
+              [](AsyncWebServerRequest *req) {
+        if (!require_auth(req)) return;
+        char *body = notify_take_body(req);
+        if (!body || !body[0]) {
+            free(body);
+            notify_send_error(req, 400, "body required");
+            return;
+        }
+        JsonDocument input;
+        DeserializationError err = deserializeJson(input, body);
+        free(body);
+        if (err) {
+            notify_send_error(req, 400, "bad json");
+            return;
+        }
+
+        /* Merge onto whatever is stored, so a caller can flip `enabled`
+         * without restating the endpoint. */
+        JsonDocument cfg;
+        String stored = read_spiffs_file(RNS_CFG_FILE);
+        if (stored.length() > 0) deserializeJson(cfg, stored);
+
+        if (!input["host"].isNull()) {
+            String host = input["host"].as<String>();
+            if (!rns_valid_host(host.c_str())) {
+                notify_send_error(req, 400, "invalid host");
+                return;
+            }
+            cfg["host"] = host;
+        }
+        if (!input["port"].isNull()) {
+            long port = input["port"] | 0L;
+            if (port < 1 || port > 65535) {
+                notify_send_error(req, 400, "bad port");
+                return;
+            }
+            cfg["port"] = port;
+        } else if (cfg["port"].isNull()) {
+            cfg["port"] = RNS_TCP_PORT_DEFAULT;
+        }
+        if (input["enabled"].is<bool>()) {
+            cfg["enabled"] = input["enabled"].as<bool>();
+        } else if (!cfg["enabled"].is<bool>()) {
+            cfg["enabled"] = true;
+        }
+        if (cfg["host"].as<String>().length() == 0) {
+            notify_send_error(req, 400, "host required");
+            return;
+        }
+
+        String out;
+        serializeJson(cfg, out);
+        if (!write_spiffs_file_atomic(RNS_CFG_FILE, RNS_CFG_TMP, out)) {
+            notify_send_error(req, 500, "save failed");
+            return;
+        }
+        g_rns_cfg_dirty = true;
+        event_add("rns config saved");
+
+        JsonDocument resp;
+        resp["ok"] = true;
+        resp["applying"] = true;
+        resp["host"] = cfg["host"].as<String>();
+        resp["port"] = cfg["port"].as<long>();
+        resp["enabled"] = cfg["enabled"].as<bool>();
+        notify_send_json(req, 200, resp);
+    }, NULL, handle_body_collect);
+}
+
+/* The tick Reticulum finally gets. Gated on rns_started because
+ * Reticulum::loop() opens with assert(_object) — a no-op under NDEBUG, so an
+ * unstarted stack would dereference null rather than trip the assert. */
+static void skill_rns_poll() {
+    if (!rns_started) return;
+    static uint32_t last = 0;
+    uint32_t now = millis();
+    if (now - last < RNS_TICK_MS) return;
+    last = now;
+    rns_stack.loop();
+    /* Loop task, right after the stack has run: everything GET /rns/status is
+     * not allowed to read live is republished here. */
+    rns_status_publish();
 }
 
 static const Skill rns_skill = {
     .name = "rns",
-    .version = "0.1.0",
+    .version = "0.2.0",
     .describe = rns_describe,
     .endpoints = rns_endpoints,
     .register_routes = rns_register_routes,
-    /* No tick — see the header comment: an empty-interface Reticulum::loop()
-     * only costs us an ESP.restart() path and an NVS write on the loop task. */
-    .tick = nullptr
+    .tick = skill_rns_poll
 };
 
 static void skill_rns_init() {
@@ -248,11 +1127,38 @@ static void skill_rns_init() {
         }
     }
 
-    Serial.printf("[rns] started=%d identity=%d hash=%s%s%s\n",
+    /* Interface: construct -> mode -> register -> start, the order the
+     * upstream example uses. It runs AFTER Reticulum::start() rather than
+     * before, which is safe because Transport::start() never touches the
+     * interface table, and it keeps a half-started stack from acquiring an
+     * interface it cannot service.
+     *
+     * start() opens no socket — see the class comment. The dial is decided by
+     * the tick once WiFi is up, so an interface is registered even when
+     * /rns.json is missing or disabled: that is what lets POST /rns/config
+     * bring the link up later without a reboot. */
+    if (rns_started) {
+        try {
+            rns_cfg_load();
+            g_rns_iface = new RnsTcpInterface();
+            g_rns_iface.mode(RNS::Type::Interface::MODE_FULL);
+            RNS::Transport::register_interface(g_rns_iface);
+            if (!g_rns_iface.start()) rns_error = "TCP interface refused to start";
+        } catch (const std::exception &e) {
+            rns_error = "exception registering the TCP interface";
+            Serial.printf("[rns] interface failed: %s\n", e.what());
+        } catch (...) {
+            rns_error = "unknown exception registering the TCP interface";
+        }
+    }
+
+    Serial.printf("[rns] started=%d identity=%d hash=%s iface=%s:%u en=%d%s%s\n",
                   (int)rns_started, (int)rns_identity_ok,
                   rns_hexhash[0] ? rns_hexhash : "-",
+                  g_rns_host[0] ? g_rns_host : "-", (unsigned)g_rns_port,
+                  (int)g_rns_cfg_enabled,
                   rns_error ? " err=" : "", rns_error ? rns_error : "");
     skill_register(&rns_skill);
-    event_add("rns skill started=%d id=%d", (int)rns_started,
-              (int)rns_identity_ok);
+    event_add("rns skill started=%d id=%d iface=%d", (int)rns_started,
+              (int)rns_identity_ok, (int)g_rns_cfg_enabled);
 }

@@ -4,6 +4,8 @@ data/mesh_pair.json
 data/mesh_probe_s.txt
 # Reticulum node identity, X25519 + Ed25519 private keys (never commit)
 data/rns_identity.id
+# Reticulum TCP endpoint: names a host behind the WireGuard tunnel
+data/rns.json
 # Atomic-writer scratch files: the secret is written to .tmp BEFORE the rename,
 # so a failed rename leaves a private key (rns_identity, gw_token) sitting here.
 data/*.tmp
