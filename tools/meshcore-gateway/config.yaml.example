@@ -5,10 +5,11 @@ serial:
 webhook:
   host: 0.0.0.0
   port: 8325
-  # Set independent admin/OpenCode/Codex tokens in the service environment.
+  # Set independent admin/OpenCode/Codex/Hermes tokens in the service environment.
   token: ""
   opencode_token: ""
   codex_token: ""
+  hermes_notify_token: ""
 
 pager:
   url: http://PAGER-IP:8080

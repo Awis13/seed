@@ -229,6 +229,11 @@ def gateway_api_tokens() -> dict[str, str]:
         "codex": str(
             os.environ.get("MESHCORE_CODEX_TOKEN") or webhook.get("codex_token") or ""
         ),
+        "hermes_notify": str(
+            os.environ.get("MESHCORE_HERMES_NOTIFY_TOKEN")
+            or webhook.get("hermes_notify_token")
+            or ""
+        ),
     }
 
 
@@ -246,6 +251,13 @@ async def _request_agent_scope(request: web.Request) -> str | None:
             data = await request.json()
         except Exception:
             return None
+        if (
+            request.method == "POST"
+            and isinstance(data, dict)
+            and str(data.get("source") or "") == "hermes"
+            and str(data.get("id") or "") == "hermes-note"
+        ):
+            return "hermes_notify"
         match = _agent_channel_for_payload(data if isinstance(data, dict) else {})
         return match[0] if match else None
     return None

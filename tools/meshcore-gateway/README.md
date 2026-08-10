@@ -35,8 +35,10 @@ resolution for the rare crash-after-radio window.
    MeshCore Python package used by the radio companion.
 2. Copy `config.yaml.example` to `config.yaml` and set the serial port, pager
    URL, exact pager public key, and durable inbox path. Put `PAGER_TOKEN=...`,
-   `MESHCORE_GATEWAY_TOKEN=...`, `MESHCORE_OPENCODE_TOKEN=...`, and
-   `MESHCORE_CODEX_TOKEN=...` in a mode-0600 service environment file.
+   `MESHCORE_GATEWAY_TOKEN=...`, `MESHCORE_OPENCODE_TOKEN=...`,
+   `MESHCORE_CODEX_TOKEN=...`, and `MESHCORE_HERMES_NOTIFY_TOKEN=...` in a
+   mode-0600 service environment file. All four API tokens are required; the
+   daemon refuses to start if any of them is empty.
 3. Adapt `meshcore-daemon.service.example`, install it with systemd, run
    `systemctl daemon-reload`, then restart the service.
 4. Verify `/health`; then send one message to each room and confirm only the
