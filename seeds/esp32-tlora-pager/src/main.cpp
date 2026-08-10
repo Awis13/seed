@@ -52,7 +52,7 @@
 #include "hw_kb.h"
 
 // ===== Configuration =====
-#define SEED_VERSION        "0.9.40"
+#define SEED_VERSION        "0.9.41"
 // Core clock: datasheet puts 240 vs 80 ~11.5mA apart on WAITI. Periph bus holds
 // at 80 for every PLL-fed core clock; go lower and RMT/I2S retimes. Same floor
 // as tembed idle policy (no light sleep — notify latency is the job).
@@ -999,6 +999,7 @@ static void handle_skill(AsyncWebServerRequest *request) {
     s += "| POST | /firmware/apply | Apply + reboot |\n";
     s += "| POST | /firmware/confirm | Confirm |\n";
     s += "| POST | /firmware/rollback | Rollback |\n";
+    s += "| POST | /gw/token | Set gateway capability token (raw body or JSON token field; empty clears) |\n";
     s += "| GET | /skill | This file |\n";
 
     // Skill endpoints
@@ -1316,6 +1317,15 @@ static char wifi_pending_ssid[33] = "";
 #define MESH_GW_PATH "/mesh_gw.txt"
 #define MESH_GW_DEFAULT "http://192.168.1.138:8325"
 static char mesh_gw_url[96] = MESH_GW_DEFAULT;
+// Gateway capability token: the gateway authenticates every route except
+// /health, so gateway HTTP calls (/ping, /reply) carry it as
+// `Authorization: Bearer <token>` when it is set. Optional — an empty or
+// missing file means the requests go out header-less, exactly as before the
+// gateway grew auth. Provisioned via POST /gw/token or SPIFFS /gw_token.txt.
+#define GW_TOKEN_PATH "/gw_token.txt"
+#define GW_TOKEN_TMP  "/gw_token.tmp"
+#define GW_TOKEN_MAX  128
+static String gw_token = "";
 static int agent_focus = 0;   // which agent chat is open (0..AGENTS_N-1)
 static bool agent_compose = false;  // REPLY screen is for agent, not notify
 static int agent_scroll = -1;       // visual row; -1 = pin to latest
@@ -1399,6 +1409,11 @@ static void mesh_gw_load() {
         snprintf(mesh_gw_url, sizeof(mesh_gw_url), "%s", s.c_str());
 }
 
+static void gw_token_load() {
+    gw_token = read_spiffs_file(GW_TOKEN_PATH);
+    gw_token.trim();
+}
+
 // ---- Reply upstream ---------------------------------------------------------
 //
 // A reply typed on a card is stored on the device and read back by whoever is
@@ -1408,8 +1423,9 @@ static void mesh_gw_load() {
 // asked the question.
 //
 // Two paths, same order the rest of this firmware uses. WiFi is
-// POST {gw}/reply, unauthenticated because the gateway is reachable only over
-// the home LAN or the WireGuard tunnel. When that does not land — no STA, no
+// POST {gw}/reply, carrying the gateway capability token as a Bearer header
+// when one is provisioned (the gateway rejects tokenless requests with 401
+// since it grew auth middleware). When that does not land — no STA, no
 // route, anything but a 2xx — one private mesh DM carries R1|key|reply instead,
 // which is the C1 uplink mechanism with a single frame and no reassembly.
 //
@@ -1462,6 +1478,9 @@ static bool reply_upstream_http(const char *key, const char *text) {
     http.setTimeout(5000);
     if (!http.begin(url)) return false;
     http.addHeader("Content-Type", "application/json");
+    if (gw_token.length() > 0) {
+        http.addHeader("Authorization", String("Bearer ") + gw_token);
+    }
     int code = http.POST(body);
     http.end();
     return code >= 200 && code < 300;
@@ -1822,16 +1841,30 @@ static void ui_mesh_ping_gateway() {
         HTTPClient http;
         http.setTimeout(4000);
         if (http.begin(url)) {
+            if (gw_token.length() > 0) {
+                http.addHeader("Authorization", String("Bearer ") + gw_token);
+            }
             int code = http.GET();
             wifi_rtt = millis() - t0;
             http.end();
-            if (code > 0 && code < 400) {
+            // Any HTTP status proves the link to the gateway is up — a 401/403
+            // is the gateway refusing the token, not a dead WiFi path, so it
+            // must not paint the WiFi column red.
+            if (code > 0) {
                 wifi_ok = true;
-                snprintf(wifi_s1, sizeof(wifi_s1), "%d dBm", wifi_rssi);
-                snprintf(wifi_s2, sizeof(wifi_s2), "%lu ms", wifi_rtt);
+                if (code < 400) {
+                    snprintf(wifi_s1, sizeof(wifi_s1), "%d dBm", wifi_rssi);
+                    snprintf(wifi_s2, sizeof(wifi_s2), "%lu ms", wifi_rtt);
+                } else if (code == 401 || code == 403) {
+                    snprintf(wifi_s1, sizeof(wifi_s1), "HTTP %d", code);
+                    snprintf(wifi_s2, sizeof(wifi_s2), "no auth");
+                } else {
+                    snprintf(wifi_s1, sizeof(wifi_s1), "HTTP %d", code);
+                    snprintf(wifi_s2, sizeof(wifi_s2), "%lu ms", wifi_rtt);
+                }
             } else {
-                snprintf(wifi_s1, sizeof(wifi_s1), "HTTP %d", code);
-                snprintf(wifi_s2, sizeof(wifi_s2), "%lu ms", wifi_rtt);
+                snprintf(wifi_s1, sizeof(wifi_s1), "no reply");
+                snprintf(wifi_s2, sizeof(wifi_s2), "err %d", code);
             }
         } else {
             snprintf(wifi_s1, sizeof(wifi_s1), "begin fail");
@@ -2797,6 +2830,39 @@ static void setup_routes() {
     server.on("/wifi/networks", HTTP_POST, handle_wifi_networks_post, NULL,
               handle_body_collect);
 
+    // Provision the gateway capability token remotely. Raw body or JSON
+    // {"token":"…"}; an empty token clears the file and returns the gateway
+    // calls to their legacy header-less form.
+    server.on(AsyncURIMatcher::exact("/gw/token"), HTTP_POST,
+              [](AsyncWebServerRequest *req) {
+        if (!require_auth(req)) return;
+        char *body = notify_take_body(req);
+        String tok = body ? String(body) : String("");
+        free(body);
+        tok.trim();
+        if (tok.startsWith("{")) {
+            JsonDocument input;
+            if (deserializeJson(input, tok) != DeserializationError::Ok) {
+                notify_send_error(req, 400, "invalid JSON"); return;
+            }
+            tok = input["token"] | "";
+            tok.trim();
+        }
+        if (tok.length() > GW_TOKEN_MAX) {
+            notify_send_error(req, 400, "token too long"); return;
+        }
+        if (tok.length() == 0) {
+            SPIFFS.remove(GW_TOKEN_PATH);
+        } else if (!write_spiffs_file_atomic(GW_TOKEN_PATH, GW_TOKEN_TMP, tok)) {
+            notify_send_error(req, 500, "failed to save token"); return;
+        }
+        gw_token = tok;
+        event_add("gateway token %s", gw_token.length() ? "set" : "cleared");
+        JsonDocument doc;
+        doc["ok"] = true;
+        notify_send_json(req, 200, doc);
+    }, NULL, handle_body_collect);
+
     // Register skill routes (notify uses AsyncURIMatcher::exact)
     for (int i = 0; i < g_skill_count; i++) {
         g_skills[i]->register_routes(server);
@@ -2826,6 +2892,7 @@ void setup() {
     hw_kb_begin();
     kb_layout_load(); // SPIFFS /kb_layout.txt → EN / RU PHON / RU
     mesh_gw_load();   // SPIFFS /mesh_gw.txt → home Heltec daemon URL
+    gw_token_load();  // SPIFFS /gw_token.txt → gateway capability token
     hw_probe();
     tz_load();        // before wifi_setup(): configTzTime() needs the TZ string
     wifi_setup();     // non-blocking STA attempt; never raises an AP
