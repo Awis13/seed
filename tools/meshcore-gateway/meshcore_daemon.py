@@ -11,6 +11,7 @@ Payload (our layer on top of MeshCore text):
   P1|<info|warn|crit>|<source>|<title>|<body>
   M1|mid|i|n|level|source|title|chunk   — long notify
   C1|agent|mid|i|n|side|chunk           — chat (side u=uplink user, a=agent)
+  R1|key|reply                          — typed pager reply (mesh fallback)
 """
 
 from __future__ import annotations
@@ -79,6 +80,10 @@ _agent_dead_letters: dict[str, list[dict[str, Any]]] = {
 }
 _AGENT_INBOX_MAX = 200
 _MESH_BODY_MAX_BYTES = 1600
+# Typed replies from the pager device (WiFi POST /reply or mesh R1 fallback).
+_replies: list[dict[str, Any]] = []
+_REPLIES_MAX = 200
+_REPLY_KEY_MAX = 64
 
 
 def _agent_channel_for_payload(payload: dict) -> tuple[str, dict[str, str]] | None:
@@ -215,6 +220,78 @@ def reject_agent_messages(agent: str, message_ids: set[str], reason: str) -> int
     return len(rejected)
 
 
+def _replies_path() -> Path:
+    configured = (cfg.get("replies") or {}).get("path")
+    return Path(configured) if configured else Path(__file__).parent / "replies.json"
+
+
+def _persist_replies() -> None:
+    path = _replies_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as handle:
+        json.dump(_replies, handle, ensure_ascii=False, separators=(",", ":"))
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+
+
+def load_replies() -> None:
+    try:
+        saved = json.loads(_replies_path().read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return
+    except (OSError, json.JSONDecodeError) as exc:
+        log.error("cannot load replies state: %s", exc)
+        return
+    if isinstance(saved, list):
+        _replies[:] = [
+            row
+            for row in saved[-_REPLIES_MAX:]
+            if isinstance(row, dict) and row.get("key") and row.get("reply")
+        ]
+
+
+def _clean_reply_fields(key: Any, reply: Any) -> tuple[str, str] | None:
+    """Validate and normalize a (key, reply) pair from either transport."""
+    if not isinstance(key, str) or not isinstance(reply, str):
+        return None
+    key = key.strip()
+    reply = reply.strip()
+    if not key or len(key) > _REPLY_KEY_MAX or not reply:
+        return None
+    return key, _utf8_ellipsize(reply, _MESH_BODY_MAX_BYTES)
+
+
+def store_reply(key: str, reply: str, transport: str) -> tuple[bool, dict[str, Any]]:
+    """Record one logical typed reply per (key, reply) pair.
+
+    The firmware may deliver the same reply twice — WiFi POST /reply plus a
+    mesh R1 fallback when the HTTP path looked failed. The second arrival must
+    not create a duplicate entry: it only bumps the duplicate counter.
+    """
+    for row in _replies:
+        if row.get("key") == key and row.get("reply") == reply:
+            row["duplicates"] = int(row.get("duplicates") or 0) + 1
+            row["lastTransport"] = transport
+            _persist_replies()
+            return False, row
+    entry: dict[str, Any] = {
+        "id": uuid.uuid4().hex,
+        "key": key,
+        "reply": reply,
+        "transport": transport,
+        "ts": int(time.time()),
+        "duplicates": 0,
+    }
+    _replies.append(entry)
+    del _replies[:-_REPLIES_MAX]
+    _persist_replies()
+    return True, entry
+
+
 def gateway_api_tokens() -> dict[str, str]:
     webhook = cfg.get("webhook") or {}
     return {
@@ -234,6 +311,9 @@ def gateway_api_tokens() -> dict[str, str]:
             or webhook.get("hermes_notify_token")
             or ""
         ),
+        "device": str(
+            os.environ.get("MESHCORE_DEVICE_TOKEN") or webhook.get("device_token") or ""
+        ),
     }
 
 
@@ -242,6 +322,14 @@ def _token_matches(provided: str, expected: str) -> bool:
 
 
 async def _request_agent_scope(request: web.Request) -> str | None:
+    # The pager device holds its own low-privilege token: it may probe the
+    # gateway and submit typed replies, nothing else. Every other route falls
+    # through to another scope or to admin, so the device token never
+    # authorizes /notify-out, /send, /pager, or any agent inbox.
+    if request.path == "/ping" and request.method == "GET":
+        return "device"
+    if request.path == "/reply" and request.method == "POST":
+        return "device"
     if request.path.startswith("/opencode/"):
         return "opencode"
     if request.path.startswith("/codex/"):
@@ -899,6 +987,10 @@ async def on_mesh_message(event):
     if text.startswith("C1|"):
         await handle_c1_uplink(sender, text)
         return
+    # Typed reply fallback frame — never shell-bot, malformed frames drop here.
+    if text.startswith("R1|"):
+        handle_r1_reply(sender, text)
+        return
     if text.startswith("M1|") or text.startswith("P1|"):
         # Inbound P1/M1 from pager is unusual; ignore bot, optional LAN mirror
         if text.startswith("P1|"):
@@ -1018,6 +1110,25 @@ async def handle_c1_uplink(sender: str, text: str) -> None:
         _c1_completed[completed_key] = now
     # Bridge replies async via pager_push → notify-out mesh C1 downlink.
     # No mesh bot-reply here.
+
+
+def handle_r1_reply(sender: str, text: str) -> None:
+    """R1|key|reply — single-frame mesh fallback for a typed pager reply.
+
+    The reply text may itself contain "|". Shares the store and dedup path
+    with POST /reply, so a WiFi/mesh double delivery stays one logical reply.
+    """
+    parts = text.split("|", 2)
+    if len(parts) < 3:
+        log.warning("bad R1 from %s: %r", sender, text[:80])
+        return
+    cleaned = _clean_reply_fields(parts[1], parts[2])
+    if cleaned is None:
+        log.warning("invalid R1 fields from %s: %r", sender, text[:80])
+        return
+    key, reply = cleaned
+    created, _entry = store_reply(key, reply, "mesh")
+    log.info("reply (mesh R1) key=%s stored=%s", key[:32], created)
 
 
 async def reply_to(sender_prefix: str, text: str) -> None:
@@ -1231,6 +1342,8 @@ async def webhook_health(request: web.Request) -> web.Response:
                 "/send",
                 "/pager",
                 "/notify-out",
+                "/reply",
+                "/replies",
                 "/opencode/inbox",
                 "/opencode/inbox/ack",
                 "/codex/inbox",
@@ -1307,6 +1420,44 @@ async def webhook_ping(request: web.Request) -> web.Response:
     return web.json_response(body)
 
 
+async def webhook_reply(request: web.Request) -> web.Response:
+    """Typed reply intake from the pager device (device scope).
+
+    POST JSON: {"key": "<card key>", "reply": "<typed text>"}
+    """
+    try:
+        data = await request.json()
+    except ValueError:
+        return web.json_response({"ok": False, "error": "JSON required"}, status=400)
+    if not isinstance(data, dict):
+        return web.json_response(
+            {"ok": False, "error": "JSON object required"}, status=400
+        )
+    cleaned = _clean_reply_fields(data.get("key"), data.get("reply"))
+    if cleaned is None:
+        return web.json_response(
+            {"ok": False, "error": "key and reply must be non-empty strings"},
+            status=400,
+        )
+    key, reply = cleaned
+    created, entry = store_reply(key, reply, "http")
+    log.info("reply (http) key=%s stored=%s", key[:32], created)
+    return web.json_response(
+        {"ok": True, "stored": created, "duplicate": not created, "id": entry["id"]}
+    )
+
+
+async def webhook_replies(request: web.Request) -> web.Response:
+    """Admin-only list of stored device replies, newest first.
+
+    Query: ?key=<card key> narrows to one card's replies.
+    """
+    wanted = request.rel_url.query.get("key")
+    rows = [row for row in _replies if not wanted or row.get("key") == wanted]
+    rows.reverse()
+    return web.json_response({"ok": True, "count": len(rows), "items": rows})
+
+
 async def webhook_agent_inbox(request: web.Request) -> web.Response:
     """List one agent's durable queue; removal requires explicit ack."""
     agent = request.match_info["agent"]
@@ -1352,6 +1503,8 @@ def create_webhook_app() -> web.Application:
     app.router.add_post("/send", webhook_send)
     app.router.add_post("/pager", webhook_pager)
     app.router.add_post("/notify-out", webhook_notify_out)
+    app.router.add_post("/reply", webhook_reply)
+    app.router.add_get("/replies", webhook_replies)
     app.router.add_get("/{agent:opencode|codex}/inbox", webhook_agent_inbox)
     app.router.add_post("/{agent:opencode|codex}/inbox/ack", webhook_agent_inbox_ack)
     app.router.add_post(
@@ -1398,6 +1551,7 @@ async def main():
     if missing_tokens:
         raise SystemExit("missing gateway API tokens: " + ", ".join(missing_tokens))
     load_agent_inboxes()
+    load_replies()
 
     serial_cfg = cfg.get("serial", {})
     port = serial_cfg.get("port", "/dev/ttyUSB0")

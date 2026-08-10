@@ -515,15 +515,11 @@ class HermesNotifyScopeTests(unittest.IsolatedAsyncioTestCase):
             )
         )
 
-    async def test_generic_notify_out_and_ping_fall_back_to_admin(self):
+    async def test_generic_notify_out_falls_back_to_admin(self):
+        # GET /ping is device-scoped now; see test_device_replies.py.
         self.assertIsNone(
             await self.daemon._request_agent_scope(
                 _ScopeRequest("/notify-out", body={"source": "watcher", "id": "x"})
-            )
-        )
-        self.assertIsNone(
-            await self.daemon._request_agent_scope(
-                _ScopeRequest("/ping", method="GET")
             )
         )
 
