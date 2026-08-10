@@ -12,16 +12,47 @@ bool hw_ui_begin();
 bool hw_ui_ready();
 bool hw_ui_expand_ok();
 
+// Boot-progress note under the "booting..." banner (guarded public paint
+// entry). Safe to call before storage is mounted; no-op until hw_ui_begin().
+// Returns with the bus lock released, so callers may follow with long
+// non-bus work (e.g. a storage format) without holding the bus.
+void hw_ui_boot_note(const char *line1, const char *line2);
+
 // Shared SPI bus (FSPI) used by the ST7796. MeshCore SX1262 must use THIS
 // instance — a second SPIClass on the same pins hangs radio init.
 class SPIClass;
 SPIClass *hw_ui_spi();
+
+// Shared-bus arbitration (vendor LilyGoLib lockSPI/unlockSPI shape). One FSPI
+// bus serves the ST7796 (loop task), the SD history store (AsyncTCP task via
+// the agents HTTP routes) and the SX1262 (RadioLib hal). Every complete bus
+// operation — a logical paint, one SD file I/O burst, one radio SPI
+// transaction — must hold this lock. NON-recursive: see the invariant at the
+// mutex definition in hw_ui.cpp. Blocking take; no-op before hw_ui_begin().
+void hw_spi_bus_lock();
+void hw_spi_bus_unlock();
+
+// RAII guard so early returns cannot leak the bus lock.
+struct HwSpiBusGuard {
+    HwSpiBusGuard() { hw_spi_bus_lock(); }
+    ~HwSpiBusGuard() { hw_spi_bus_unlock(); }
+    HwSpiBusGuard(const HwSpiBusGuard &) = delete;
+    HwSpiBusGuard &operator=(const HwSpiBusGuard &) = delete;
+};
 
 // Drive one XL9555 pin (e.g. EXP_AMP_EN). No-op if expander missing.
 void hw_xl_pin(uint8_t exp_pin, bool high);
 
 void hw_ui_set_brightness(uint8_t level);
 uint8_t hw_ui_get_brightness();
+
+// ST7796 controller sleep (SLPIN 0x10) / wake (SLPOUT 0x11). Idempotent.
+// tft_wake blocks ~120 ms (ST7796 sleep-out settle, sliced and pumping the
+// sound queue, bus lock released) before returning, so a caller may repaint
+// immediately after it. Loop task only — same SPI + CS discipline as the
+// paint primitives.
+void tft_sleep();
+void tft_wake();
 
 // Which face is currently up.
 enum HwUiScreen : uint8_t {

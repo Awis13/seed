@@ -25,7 +25,7 @@ assert "mesh_client_send_to_gateway" not in uplink, (
 assert "delay(350)" not in uplink, "multi-part chat must not freeze the UI"
 assert "g_mesh_chat_tx.active = true" in uplink
 assert "expected_ack_crc = 0" in client
-assert 'agents_on_inbound(agent, "(mesh delivery failed - resend)")' in mesh
+assert 'agents_on_inbound(agent, "(mesh delivery failed - resend)", false)' in mesh
 manual_ping = main[main.index("// ---- Mesh path: sparse private probe"):
                    main.index("static void kb_layout_save", main.index("// ---- Mesh path: sparse private probe"))]
 assert "!g_mesh_chat_tx.active && !mesh_client_ack_pending()" in manual_ping

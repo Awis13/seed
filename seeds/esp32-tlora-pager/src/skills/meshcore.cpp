@@ -105,12 +105,24 @@ static void mesh_load_probe_interval() {
     g_mesh.probe_interval_s = (uint32_t)v;
 }
 
+/* Per-agent success->fail edge: the synthetic "(mesh delivery failed - resend)"
+ * chat line is injected once per outage per agent room. Repeated failures while
+ * that room already got the line stay silent (its user has been told); the flag
+ * clears on the next chat ACK for that agent, and ANY proof the link is alive
+ * (mesh_link_mark_ok: probe/keepalive ACK, inbound DM) re-arms every room, so
+ * the next outage after a probe-proven recovery is reported again. Lives
+ * outside MeshChatTx, which is zeroed per send. AGENTS_N / agents_find come
+ * from agents.cpp (included before this file). */
+static bool g_mesh_chat_tx_failed[AGENTS_N] = {};
+
 /* Mark private path alive (MeshCore ACK or inbound DM from gateway). */
 static void mesh_link_mark_ok(uint32_t rtt_ms) {
     g_mesh.last_ok_ms = millis();
     g_mesh.last_rtt_ms = rtt_ms;
     g_mesh.fail_streak = 0;
     if (rtt_ms) g_mesh.probe_ok_count++;
+    /* Link proven alive: re-arm failure reporting in every agent room. */
+    for (int i = 0; i < AGENTS_N; i++) g_mesh_chat_tx_failed[i] = false;
 }
 
 /* Seconds since last private-path alive; -1 if never. For clock "M12m". */
@@ -167,7 +179,12 @@ static void mesh_chat_tx_fail(const char *reason) {
               (unsigned)(g_mesh_chat_tx.next + 1),
               (unsigned)g_mesh_chat_tx.count);
     memset(&g_mesh_chat_tx, 0, sizeof(g_mesh_chat_tx));
-    if (agent[0]) agents_on_inbound(agent, "(mesh delivery failed - resend)");
+    int aidx = agents_find(agent);
+    if (aidx < 0) return;  /* empty/unknown agent: no room to warn, no flag */
+    if (g_mesh_chat_tx_failed[aidx]) return;  /* room already told: silent */
+    /* Set only together with the injected line, so silence never == success. */
+    g_mesh_chat_tx_failed[aidx] = true;
+    agents_on_inbound(agent, "(mesh delivery failed - resend)", false);
 }
 
 static void mesh_chat_tx_poll() {
@@ -178,6 +195,10 @@ static void mesh_chat_tx_poll() {
     if (g_mesh_chat_tx.waiting_ack) {
         if (g_mesh_chat_tx.ack_seen) {
             g_mesh_chat_tx.ack_seen = false;
+            {   /* delivery to this room works again */
+                int aidx = agents_find(g_mesh_chat_tx.agent);
+                if (aidx >= 0) g_mesh_chat_tx_failed[aidx] = false;
+            }
             g_mesh_chat_tx.waiting_ack = false;
             g_mesh_chat_tx.attempts = 0;
             g_mesh_chat_tx.next++;
@@ -533,6 +554,9 @@ static uint32_t mesh_on_private_text(const char *text) {
             if (idx >= 0) {
                 bool from_me = (r->side == 'u');
                 agents_push_line(idx, from_me, r->buf);
+                /* Genuine mesh chat arrival: same wake as the WiFi door path.
+                 * Set before display_force (loop consumes them together). */
+                g_agents_real_inbound = true;
                 display_force = true;
                 id = 1;  /* non-zero = handled */
             } else {

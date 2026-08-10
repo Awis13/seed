@@ -1747,7 +1747,12 @@ static const Skill notify_skill = {
     .version = "0.2.0",
     .describe = notify_describe,
     .endpoints = notify_endpoints,
-    .register_routes = notify_register_routes
+    .register_routes = notify_register_routes,
+    // Order-free (C8): expiry raises display_force (and the coalesced save
+    // flag), which the loop consumes on its next pass — a one-pass repaint
+    // deferral, benign. Arrival/sound flags are produced by the HTTP handlers
+    // and mesh ingest, not by this poll.
+    .tick = notify_poll
 };
 
 static void skill_notify_init() {

@@ -6,3 +6,6 @@ data/mesh_probe_s.txt
 data/wg.json
 data/wifi.json
 data/auth_token.txt
+# Gateway capability token + agent bridge URL (never commit)
+data/gw_token.txt
+data/agent_bridge.txt

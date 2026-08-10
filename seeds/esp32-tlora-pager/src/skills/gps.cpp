@@ -282,30 +282,16 @@ static void gps_drain() {
     while (Serial1.available() > 0) gps_feed_byte((uint8_t)Serial1.read());
 }
 
-/* Compatibility helper for callers that truly need to wait. A restored fix
- * cannot satisfy it: only an RMC received after this acquisition starts can. */
-bool gps_take_fix(unsigned long max_wait_ms, double *lat_out, double *lon_out) {
-    if (!gps_ready) return false;
-    unsigned long start = millis();
-    gps_start_acquisition();
-    while (millis() - start < max_wait_ms) {
-        gps_drain();
-        if (gps_fix_this_acquisition) {
-            if (lat_out) *lat_out = gps_lat;
-            if (lon_out) *lon_out = gps_lon;
-            gps_stop_acquisition(true);
-            return true;
-        }
-        delay(20);
-    }
-    return false;
-}
+/* No blocking wait exists here anymore. Anyone needing a fresh fix calls
+ * gps_request_fix() (the tick starts an acquisition) and receives the result
+ * through the on-fix callback or by re-reading gps_get_position(); the old
+ * take-a-fix busy-wait helper had no callers left and is gone. */
 
 /* ---- public accessors (declared at the top; non-static on purpose) ------- */
 
 /* Copy the last known fix into the out-params (all optional). Returns false
  * only when the whole GPS skill is down (XL9555 rail missing). agents.cpp and
- * the /gps/fix route read position through this — never gps_take_fix(). */
+ * the /gps/fix route read position through this — never a blocking wait. */
 bool gps_get_position(double *lat, double *lon, uint32_t *ts, bool *fix,
                       int *sats) {
     if (lat)  *lat  = gps_lat;

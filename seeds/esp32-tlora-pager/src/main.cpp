@@ -43,6 +43,8 @@
 #include <ArduinoJson.h>
 #include <Update.h>
 #include <esp_ota_ops.h>
+#include <esp_system.h>
+#include <esp_attr.h>
 #include <HTTPClient.h>
 #include "board_pins.h"
 #include "hw_ui.h"
@@ -52,7 +54,7 @@
 #include "hw_kb.h"
 
 // ===== Configuration =====
-#define SEED_VERSION        "0.9.40"
+#define SEED_VERSION        "0.9.50"
 // Core clock: datasheet puts 240 vs 80 ~11.5mA apart on WAITI. Periph bus holds
 // at 80 for every PLL-fed core clock; go lower and RMT/I2S retimes. Same floor
 // as tembed idle policy (no light sleep — notify latency is the job).
@@ -104,6 +106,105 @@ static void event_add(const char *fmt, ...) {
     events_head = (events_head + 1) % MAX_EVENTS;
     if (events_count < MAX_EVENTS) events_count++;
     va_end(ap);
+}
+
+// ===== Boot Diagnostics =====
+//
+// A live stack-canary panic on the ipc1 task (the ESP-IDF cross-core IPC task,
+// 1024-byte stack baked into the prebuilt Arduino core) reset the board with
+// no trace: no coredump space, second boot clean. These counters make any
+// recurrence measurable from the outside — the reset reason and crash counters
+// are printed at boot and served in GET /health. RTC_NOINIT memory survives
+// every reset except power-on; the magic word rejects power-on garbage.
+
+#define BOOT_DIAG_MAGIC 0x42d1a607
+RTC_NOINIT_ATTR static uint32_t boot_diag_magic;
+RTC_NOINIT_ATTR static uint32_t boots_since_panic;
+RTC_NOINIT_ATTR static uint32_t panic_count;
+static esp_reset_reason_t reset_reason = ESP_RST_UNKNOWN;
+static bool storage_ok = false;
+
+static const char *reset_reason_str(esp_reset_reason_t r) {
+    switch (r) {
+        case ESP_RST_POWERON:   return "poweron";
+        case ESP_RST_EXT:       return "external";
+        case ESP_RST_SW:        return "software";
+        case ESP_RST_PANIC:     return "panic";
+        case ESP_RST_INT_WDT:   return "int_wdt";
+        case ESP_RST_TASK_WDT:  return "task_wdt";
+        case ESP_RST_WDT:       return "wdt";
+        case ESP_RST_DEEPSLEEP: return "deepsleep";
+        case ESP_RST_BROWNOUT:  return "brownout";
+        case ESP_RST_SDIO:      return "sdio";
+        case ESP_RST_USB:       return "usb";
+        case ESP_RST_JTAG:      return "jtag";
+        case ESP_RST_EFUSE:     return "efuse";
+        case ESP_RST_PWR_GLITCH: return "pwr_glitch";
+        case ESP_RST_CPU_LOCKUP: return "cpu_lockup";
+        default:                return "unknown";
+    }
+}
+
+// Panic-class resets: real panics plus watchdogs (both fire the panic
+// handler), a CPU lockup (double exception) and a detected power glitch —
+// unexpected faults that must count as instability. USB and JTAG resets are
+// host-driven (flashing/debugging) and stay clean, like poweron. An efuse
+// error reset is also clean: it means the eFuse controller re-read its
+// block, a one-shot hardware event with no firmware cause, so counting it
+// as instability would misdirect the crash counters.
+static bool reset_is_panic(esp_reset_reason_t r) {
+    return r == ESP_RST_PANIC || r == ESP_RST_INT_WDT ||
+           r == ESP_RST_TASK_WDT || r == ESP_RST_WDT ||
+           r == ESP_RST_CPU_LOCKUP || r == ESP_RST_PWR_GLITCH;
+}
+
+static void boot_diag_init() {
+    reset_reason = esp_reset_reason();
+    if (boot_diag_magic != BOOT_DIAG_MAGIC || reset_reason == ESP_RST_POWERON) {
+        boot_diag_magic = BOOT_DIAG_MAGIC;
+        boots_since_panic = 0;
+        panic_count = 0;
+    }
+    if (reset_is_panic(reset_reason)) {
+        panic_count++;
+        boots_since_panic = 0;
+    } else {
+        boots_since_panic++;
+    }
+    Serial.printf("[boot] reset: %s, boots since panic: %lu, panics: %lu\n",
+                  reset_reason_str(reset_reason),
+                  (unsigned long)boots_since_panic,
+                  (unsigned long)panic_count);
+}
+
+// ===== Storage bring-up =====
+//
+// Mount WITHOUT format-on-fail first. The device once arrived with foreign
+// firmware that had repartitioned flash; the old format-on-fail mount then
+// formatted the 8 MB partition silently — dark panel, mute serial,
+// indistinguishable from a brick for the whole format. Now the format is
+// announced on serial and on the panel (which is initialized before storage
+// exactly for this), and a format failure degrades instead of hanging: every
+// consumer already treats a failed open/read as "file missing" and falls back
+// to defaults.
+static void storage_begin() {
+    if (SPIFFS.begin(false)) {
+        storage_ok = true;
+        return;
+    }
+    Serial.println("[boot] storage invalid, formatting (up to ~60 s)...");
+    hw_ui_boot_note("FORMATTING STORAGE", "takes up to a minute");
+    // The paint above released the SPI bus lock before returning; the format
+    // below runs on internal flash and must never hold the shared bus.
+    bool ok = SPIFFS.format() && SPIFFS.begin(false);
+    storage_ok = ok;
+    if (ok) {
+        Serial.println("[boot] storage formatted, starting with defaults");
+        hw_ui_boot_note("STORAGE READY", "settings reset to defaults");
+    } else {
+        Serial.println("[boot] STORAGE FAILED, continuing without saved settings");
+        hw_ui_boot_note("STORAGE FAILED", "running without saved settings");
+    }
 }
 
 // ===== Skill/plugin interface =====
@@ -287,12 +388,37 @@ static String auth_token = "";
 static String mdns_name = "";
 static unsigned long boot_time = 0;
 
-static String wifi_ssid = "";
-static String wifi_pass = "";
+/* Active credentials. Fixed buffers, not Arduino Strings: they are written on
+ * the AsyncTCP task (wifi_nets_set_active via the /wifi handlers) and read on
+ * the loop task (WiFi.begin), and a String reallocating under the reader
+ * dangles its c_str(). A torn text is the worst a fixed buffer can suffer —
+ * one failed join, which the retry ladder repairs. Sizes match WifiNet. */
+static char wifi_ssid[33] = "";
+static char wifi_pass[65] = "";
 static bool wifi_user_off = false;
 static bool mdns_started = false;
+/* Background retry backoff. After an association loss (or a failed attempt)
+ * the next try comes quickly — a router reboot or a walk back into range is
+ * usually over in seconds — then the interval stretches until it reaches the
+ * 20-minute steady state, so a genuinely absent AP does not keep waking the
+ * radio. WIFI_RETRY_MS stays the steady-state cap (and the last rung). */
 #define WIFI_RETRY_MS 1200000UL
+static const unsigned long WIFI_RETRY_LADDER_MS[] = {
+    30000UL,        /* 30 s — AP likely just came back */
+    60000UL,        /* 1 min */
+    120000UL,       /* 2 min */
+    300000UL,       /* 5 min */
+    600000UL,       /* 10 min */
+    WIFI_RETRY_MS,  /* 20 min steady state */
+};
+#define WIFI_RETRY_LADDER_STEPS \
+    ((int)(sizeof(WIFI_RETRY_LADDER_MS) / sizeof(WIFI_RETRY_LADDER_MS[0])))
+static int wifi_retry_step = 0;
 static unsigned long wifi_last_attempt_ms = 0;
+
+static unsigned long wifi_retry_interval_ms() {
+    return WIFI_RETRY_LADDER_MS[wifi_retry_step];
+}
 
 /* Multi-profile STA: try each known network in order on boot / reconnect. */
 #define WIFI_MAX_NETS 6
@@ -450,8 +576,8 @@ static void wifi_nets_clear() {
 static void wifi_nets_set_active(int idx) {
     if (idx < 0 || idx >= wifi_net_count) return;
     wifi_net_idx = idx;
-    wifi_ssid = wifi_nets[idx].ssid;
-    wifi_pass = wifi_nets[idx].pass;
+    snprintf(wifi_ssid, sizeof(wifi_ssid), "%s", wifi_nets[idx].ssid);
+    snprintf(wifi_pass, sizeof(wifi_pass), "%s", wifi_nets[idx].pass);
 }
 
 /* Upsert one profile; promotes it to active ssid/password fields. */
@@ -495,6 +621,12 @@ static bool wifi_persist_profiles() {
     }
     String json;
     serializeJson(doc, json);
+    // Coalesce: loop() persists on every connect transition, which on a normal
+    // boot rewrites byte-identical content a few seconds in — exactly when
+    // WiFi and the mesh radio bring-up keep both cores busy. A flash write
+    // stalls the other core via a tiny fixed-stack IPC task, so skip the
+    // write entirely when nothing changed.
+    if (read_spiffs_file(WIFI_CONFIG_FILE) == json) return true;
     return write_spiffs_file(WIFI_CONFIG_FILE, json);
 }
 
@@ -547,10 +679,75 @@ static bool wifi_save_config(const String &ssid, const String &pass) {
  * be followed by the periodic retry on the next loop pass. */
 static void wifi_begin_active_profile() {
     wifi_last_attempt_ms = millis();
-    WiFi.begin(wifi_ssid.c_str(), wifi_pass.c_str());
+    WiFi.begin(wifi_ssid, wifi_pass);
+}
+
+/* Deferred STA reconnect for HTTP handlers. They run on the AsyncTCP task,
+ * which must never sit in delay() or in a blocking WiFi driver call — that
+ * stalls every socket on the box (and, since the bus lock landed, can widen
+ * SD-vs-panel arbitration windows). A handler only raises the request; the
+ * loop task walks mode → disconnect → begin with millis() settle gaps
+ * (the same 500/100 ms the old inline sequence used). */
+enum {
+    WIFI_RECONNECT_IDLE = 0,
+    WIFI_RECONNECT_MODE,        /* set STA mode, then let RF settle */
+    WIFI_RECONNECT_DISCONNECT,  /* drop the old association, then settle */
+    WIFI_RECONNECT_BEGIN        /* start the asynchronous join */
+};
+#define WIFI_RECONNECT_MODE_SETTLE_MS 500UL
+#define WIFI_RECONNECT_DISC_SETTLE_MS 100UL
+static volatile int wifi_reconnect_state = WIFI_RECONNECT_IDLE;
+static unsigned long wifi_reconnect_step_ms = 0;
+
+static void wifi_reconnect_request() {
+    /* User intent (config apply / manual connect) starts a fresh ladder:
+     * without this, a saturated step would leave the next background retry
+     * 20 minutes away if this attempt fails on the wrong profile. */
+    wifi_retry_step = 0;
+    wifi_reconnect_state = WIFI_RECONNECT_MODE;
+}
+
+/* Loop task only: one bounded step per pass, nothing ever waits in place. */
+static void wifi_reconnect_poll() {
+    if (wifi_reconnect_state == WIFI_RECONNECT_IDLE) return;
+    if (wifi_user_off) {
+        /* User toggled WiFi off after the request landed: their choice wins. */
+        wifi_reconnect_state = WIFI_RECONNECT_IDLE;
+        return;
+    }
+    switch (wifi_reconnect_state) {
+    case WIFI_RECONNECT_MODE:
+        WiFi.mode(WIFI_STA);
+        wifi_reconnect_step_ms = millis();
+        wifi_reconnect_state = WIFI_RECONNECT_DISCONNECT;
+        break;
+    case WIFI_RECONNECT_DISCONNECT:
+        if (millis() - wifi_reconnect_step_ms < WIFI_RECONNECT_MODE_SETTLE_MS)
+            return;
+        WiFi.disconnect(false, false);
+        wifi_reconnect_step_ms = millis();
+        wifi_reconnect_state = WIFI_RECONNECT_BEGIN;
+        break;
+    case WIFI_RECONNECT_BEGIN:
+        if (millis() - wifi_reconnect_step_ms < WIFI_RECONNECT_DISC_SETTLE_MS)
+            return;
+        wifi_reconnect_state = WIFI_RECONNECT_IDLE;
+        wifi_begin_active_profile();
+        break;
+    }
 }
 
 static void wifi_setup() {
+    /* Keep the WiFi driver's own credential store in RAM. Credentials live in
+     * SPIFFS /wifi.json and every connect passes them explicitly, so the NVS
+     * copy the driver writes on each connect is pure redundancy — and those
+     * writes run on the WiFi task (pinned to core 0), where every flash
+     * program/erase stalls core 1 through the ipc1 task and its fixed
+     * 1024-byte stack (prebuilt core, not tunable). ipc1 is exactly the task
+     * that blew its stack canary once, right in the connect window; removing
+     * the recurring core-0 flash writes removes the prime suspect. Must be
+     * set before the first WiFi.mode() call to reach wifiLowLevelInit(). */
+    WiFi.persistent(false);
     WiFi.mode(WIFI_STA);
     /* Arduino-ESP32 defaults this to true and otherwise retries underneath our
      * scheduler, causing the same UI stalls the 20-minute cadence avoids. */
@@ -566,10 +763,10 @@ static void wifi_setup() {
     configTzTime(tz_string.c_str(), "pool.ntp.org", "time.nist.gov");
 
     wifi_load_config();
-    if (wifi_net_count > 0 || wifi_ssid.length() > 0) {
+    if (wifi_net_count > 0 || wifi_ssid[0]) {
         // Boot must never wait for infrastructure. Start one asynchronous STA
         // attempt; loop() rotates profiles later while UI and MeshCore are live.
-        Serial.printf("[wifi] boot async try %s\n", wifi_ssid.c_str());
+        Serial.printf("[wifi] boot async try %s\n", wifi_ssid);
         wifi_begin_active_profile();
     } else {
         Serial.println("[wifi] no credentials — continuing mesh-only");
@@ -586,6 +783,12 @@ static void handle_health(AsyncWebServerRequest *request) {
     doc["version"] = SEED_VERSION;
     doc["seed"] = true;
     doc["arch"] = "xtensa-esp32s3";
+    // Panic visibility: why the last reset happened and how long the board
+    // has stayed clean since. Counters live in RTC_NOINIT (see boot_diag_init).
+    doc["reset_reason"] = reset_reason_str(reset_reason);
+    doc["boots_since_panic"] = (unsigned long)boots_since_panic;
+    doc["panic_count"] = (unsigned long)panic_count;
+    doc["storage_ok"] = storage_ok;
     String response;
     serializeJson(doc, response);
     request->send(200, "application/json", response);
@@ -681,17 +884,57 @@ static void handle_capabilities(AsyncWebServerRequest *request) {
     request->send(200, "application/json", response);
 }
 
+// Collects a request body into a single NUL-terminated heap buffer for every
+// handler registered with it (POST /config.md, /clock/tz, /wifi/networks,
+// /gw/token, and the skills' JSON POSTs: /notify, /notify/ack, /wg/*,
+// /agents/*, /backlight, /progress, /mesh/inject, /gps/fix). Runs on the
+// AsyncTCP task, once per body chunk, BEFORE the
+// route handler — and therefore before any auth check on those routes.
+//
+// total is the declared body length. It is authoritative here and MUST be, for
+// two reasons handle_firmware_upload_body() below already learned:
+//
+//   - total == 0 means the client sent Transfer-Encoding: chunked with no
+//     Content-Length. The library never fills in a running total for a chunked
+//     body — _contentLength stays 0 — and it delivers chunks through this
+//     callback with a *growing* index and total fixed at 0. There is no length
+//     to size an allocation from, and the non-chunked path's clamp
+//     (len = min(len, _contentLength - _parsedLength)) does not run for a
+//     chunked body, so index and len are attacker-controlled and unbounded. A
+//     naive malloc(total+1) then returns a 1-byte block that every later chunk
+//     memcpys past. Unknown length cannot be served safely, so it is refused
+//     outright with 411. Do NOT "relax" this to treat 0 as "allocate on
+//     demand": the endpoints here have no streaming parser and the growing
+//     index is exactly the primitive that overflows the heap. This is the same
+//     total == 0 guard handle_firmware_upload_body() already carries.
+//
+//   - even with a known total, every chunk is bounds-checked against it before
+//     the memcpy, and the buffer is NUL-terminated on every chunk rather than
+//     only when index + len == total. A body that never delivers its final
+//     byte (a truncated chunked stream, or bytes past the declared length)
+//     would otherwise leave the buffer unterminated, and the handlers all read
+//     it as a C string.
 static void handle_body_collect(AsyncWebServerRequest *request, uint8_t *data,
                                  size_t len, size_t index, size_t total) {
     if (index == 0) {
+        // Unknown length (chunked): cannot size the allocation, refuse. See above.
+        if (total == 0) { request->send(411, "application/json", "{\"error\":\"length required\"}"); return; }
         if (total > HTTP_BODY_MAX) { request->send(413, "application/json", "{\"error\":\"body too large\"}"); return; }
-        char *buf = (char*)malloc(total + 1);
+        // calloc so a body that never completes still leaves a defined,
+        // NUL-filled buffer rather than uninitialised heap.
+        char *buf = (char*)calloc(total + 1, 1);
         if (!buf) { request->send(500, "application/json", "{\"error\":\"OOM\"}"); return; }
         request->_tempObject = buf;
     }
     char *buf = (char*)request->_tempObject;
-    if (buf) memcpy(buf + index, data, len);
-    if (index + len == total && buf) buf[total] = '\0';
+    if (!buf) return;
+    // Drop anything that would land outside the allocation. index + len can
+    // overflow past total on a chunked stream the library did not clamp, and a
+    // single byte past the end is the whole bug.
+    if (index > total || len > total - index) return;
+    memcpy(buf + index, data, len);
+    // Terminate on every chunk: the final chunk is not guaranteed to arrive.
+    buf[index + len] = '\0';
 }
 
 static void handle_config_get(AsyncWebServerRequest *request) {
@@ -987,7 +1230,7 @@ static void handle_skill(AsyncWebServerRequest *request) {
     s += "## API\n\n";
     s += "| Method | Path | Description |\n";
     s += "|--------|------|-------------|\n";
-    s += "| GET | /health | Alive (no auth) |\n";
+    s += "| GET | /health | Alive (no auth); reset_reason, boots_since_panic, panic_count, storage_ok |\n";
     s += "| GET | /capabilities | Hardware info |\n";
     s += "| GET | /config.md | Node config |\n";
     s += "| POST | /config.md | Update config |\n";
@@ -999,6 +1242,7 @@ static void handle_skill(AsyncWebServerRequest *request) {
     s += "| POST | /firmware/apply | Apply + reboot |\n";
     s += "| POST | /firmware/confirm | Confirm |\n";
     s += "| POST | /firmware/rollback | Rollback |\n";
+    s += "| POST | /gw/token | Set gateway capability token (raw body or JSON string token; empty body clears) |\n";
     s += "| GET | /skill | This file |\n";
 
     // Skill endpoints
@@ -1056,12 +1300,10 @@ static void handle_wifi_post(AsyncWebServerRequest *request) {
     wifi_save_config(ssid, pass);
     request->send(200, "text/html",
         "<h2>Saved. Connecting...</h2><p>" + ssid + "</p><a href='/'>Back</a>");
+    /* AsyncTCP task: never wait here, never call into the WiFi driver. The
+     * loop task applies mode → disconnect → begin with millis() settle gaps. */
     wifi_user_off = false;
-    WiFi.mode(WIFI_STA);
-    delay(500);
-    WiFi.disconnect(false, false);
-    delay(100);
-    wifi_begin_active_profile();
+    wifi_reconnect_request();
 }
 
 static void handle_wifi_status(AsyncWebServerRequest *request) {
@@ -1069,7 +1311,8 @@ static void handle_wifi_status(AsyncWebServerRequest *request) {
     JsonDocument doc;
     doc["connected"] = (WiFi.status() == WL_CONNECTED);
     doc["user_off"] = wifi_user_off;
-    doc["ssid"] = WiFi.status() == WL_CONNECTED ? WiFi.SSID() : wifi_ssid;
+    if (WiFi.status() == WL_CONNECTED) doc["ssid"] = WiFi.SSID();
+    else doc["ssid"] = wifi_ssid;
     doc["ip"] = WiFi.status() == WL_CONNECTED
         ? WiFi.localIP().toString() : "";
     if (WiFi.status() == WL_CONNECTED) doc["rssi"] = WiFi.RSSI();
@@ -1147,7 +1390,7 @@ static void handle_wifi_networks_post(AsyncWebServerRequest *request) {
         return;
     }
     wifi_persist_profiles();
-    event_add("wifi profiles=%d primary=%s", wifi_net_count, wifi_ssid.c_str());
+    event_add("wifi profiles=%d primary=%s", wifi_net_count, wifi_ssid);
 
     JsonDocument out;
     out["ok"] = true;
@@ -1157,11 +1400,10 @@ static void handle_wifi_networks_post(AsyncWebServerRequest *request) {
     serializeJson(out, response);
     request->send(200, "application/json", response);
 
-    /* Kick reconnect with new list. */
+    /* Kick reconnect with the new list — deferred to the loop task; WiFi
+     * driver calls can block and this handler runs on the AsyncTCP task. */
     wifi_user_off = false;
-    WiFi.mode(WIFI_STA);
-    WiFi.disconnect(false, false);
-    wifi_begin_active_profile();
+    wifi_reconnect_request();
 }
 
 // ===== Skills =====
@@ -1253,6 +1495,17 @@ static void ui_go_clock(const char *note) {
     ui_clock_paint(note);
 }
 
+// Full redraw right after tft_wake(), called by backlight_poll BEFORE the
+// backlight rises (loop task only). Idle blanking always lands on the clock
+// (UI_IDLE_MS returns every face to it long before BL_IDLE_OFF_S); any other
+// face can only be dark via a manual level-0 set, and the ST7796 keeps its
+// frame memory in sleep-in, so those faces relight with their last frame.
+static void ui_blank_wake_repaint() {
+    if (hw_ui_screen() != HW_UI_CLOCK) return;
+    hw_ui_invalidate_clock();
+    ui_clock_paint(NULL);
+}
+
 // --- Front-panel state (encoder) --------------------------------------------
 // MENU items
 enum {
@@ -1316,6 +1569,19 @@ static char wifi_pending_ssid[33] = "";
 #define MESH_GW_PATH "/mesh_gw.txt"
 #define MESH_GW_DEFAULT "http://192.168.1.138:8325"
 static char mesh_gw_url[96] = MESH_GW_DEFAULT;
+// Gateway capability token: the gateway authenticates every route except
+// /health, so gateway HTTP calls (/ping, /reply) carry it as
+// `Authorization: Bearer <token>` when it is set. Optional — an empty or
+// missing file means the requests go out header-less, exactly as before the
+// gateway grew auth. Provisioned via POST /gw/token or SPIFFS /gw_token.txt.
+#define GW_TOKEN_PATH "/gw_token.txt"
+#define GW_TOKEN_TMP  "/gw_token.tmp"
+#define GW_TOKEN_MAX  128
+// Fixed buffer, mirroring mesh_gw_url: written on the AsyncTCP task
+// (POST /gw/token), read on the loop task (/ping, reply). An Arduino String
+// here can reallocate under the reader and dangle its c_str(); a torn char
+// buffer costs at worst one 401, which the caller can simply retry.
+static char gw_token[GW_TOKEN_MAX + 1] = "";
 static int agent_focus = 0;   // which agent chat is open (0..AGENTS_N-1)
 static bool agent_compose = false;  // REPLY screen is for agent, not notify
 static int agent_scroll = -1;       // visual row; -1 = pin to latest
@@ -1348,11 +1614,16 @@ static unsigned long ui_last_input_ms = 0;
 #define UI_IDLE_MS        15000
 #define UI_IDLE_REPLY_MS  60000
 #define KB_LAYOUT_PATH    "/kb_layout.txt"
+#define KB_LAYOUT_TMP     "/kb_layout.tmp"
 
 static_assert(BL_IDLE_DIM_MS > UI_IDLE_MS,
               "backlight must not dim while a message card can still be on screen");
 
 static void ui_note_input() { ui_last_input_ms = millis(); }
+
+// SYSTEM events only (a message arriving): wake the panel and restart the
+// idle/dim countdown once per event; repaints and synthetic errors must not call this.
+static void ui_note_wake() { ui_last_input_ms = millis(); }
 
 // SETTINGS face: rebuild labels from backlight skill and paint.
 static void ui_open_settings() {
@@ -1399,6 +1670,12 @@ static void mesh_gw_load() {
         snprintf(mesh_gw_url, sizeof(mesh_gw_url), "%s", s.c_str());
 }
 
+static void gw_token_load() {
+    String stored = read_spiffs_file(GW_TOKEN_PATH);
+    stored.trim();
+    snprintf(gw_token, sizeof(gw_token), "%s", stored.c_str());
+}
+
 // ---- Reply upstream ---------------------------------------------------------
 //
 // A reply typed on a card is stored on the device and read back by whoever is
@@ -1408,8 +1685,9 @@ static void mesh_gw_load() {
 // asked the question.
 //
 // Two paths, same order the rest of this firmware uses. WiFi is
-// POST {gw}/reply, unauthenticated because the gateway is reachable only over
-// the home LAN or the WireGuard tunnel. When that does not land — no STA, no
+// POST {gw}/reply, carrying the gateway capability token as a Bearer header
+// when one is provisioned (the gateway rejects tokenless requests with 401
+// since it grew auth middleware). When that does not land — no STA, no
 // route, anything but a 2xx — one private mesh DM carries R1|key|reply instead,
 // which is the C1 uplink mechanism with a single frame and no reassembly.
 //
@@ -1459,9 +1737,15 @@ static bool reply_upstream_http(const char *key, const char *text) {
     serializeJson(doc, body);
 
     HTTPClient http;
+    // Runs on the loop task: a black-holed gateway must cost ~1 s to connect,
+    // not the whole 5 s read window, or the panel freezes for the difference.
+    http.setConnectTimeout(1000);
     http.setTimeout(5000);
     if (!http.begin(url)) return false;
     http.addHeader("Content-Type", "application/json");
+    if (gw_token[0]) {
+        http.addHeader("Authorization", String("Bearer ") + gw_token);
+    }
     int code = http.POST(body);
     http.end();
     return code >= 200 && code < 300;
@@ -1632,7 +1916,8 @@ static void ui_wifi_toggle() {
     } else {
         wifi_user_off = false;
         WiFi.mode(WIFI_STA);
-        if (wifi_net_count > 0 || wifi_ssid.length() > 0) {
+        if (wifi_net_count > 0 || wifi_ssid[0]) {
+            wifi_retry_step = 0;  /* user intent = fresh ladder */
             wifi_begin_active_profile();
             event_add("wifi on (async reconnect)");
             Serial.println("[wifi] user toggled ON — reconnecting");
@@ -1737,6 +2022,7 @@ static void ui_wifi_connect_ssid(const char *ssid) {
             WiFi.mode(WIFI_STA);
             WiFi.disconnect(false, false);
             delay(80);
+            wifi_retry_step = 0;  /* user intent = fresh ladder */
             wifi_begin_active_profile();
             snprintf(lines[0], sizeof(lines[0]), "CONNECTING");
             snprintf(lines[1], sizeof(lines[1]), "%s", ssid);
@@ -1769,116 +2055,180 @@ static void ui_mesh_show_status() {
 
 // MESHCORE → PING GATEWAY: dual-path glance (WiFi HTTP + Mesh private DM).
 // Final face = two big icons (who is up) + strength under each.
-static void ui_mesh_ping_gateway() {
-    static char lines[HW_UI_MESH_PING_LINES][48];
-    static const char *ptrs[HW_UI_MESH_PING_LINES];
-    int n = 0;
-    auto push = [&](const char *fmt, ...) {
-        if (n >= HW_UI_MESH_PING_LINES) return;
-        va_list ap;
-        va_start(ap, fmt);
-        vsnprintf(lines[n], sizeof(lines[0]), fmt, ap);
-        va_end(ap);
-        ptrs[n] = lines[n];
-        n++;
-    };
+//
+// Non-blocking: opening the PING face arms a small state machine that loop()
+// advances one bounded step per pass via ui_mesh_ping_poll(). The WiFi HTTP
+// GET stays synchronous but is bounded (1 s connect + 4 s read); the mesh
+// pong wait is a millis() deadline checked once per pass while the meshcore
+// skill tick keeps the radio polled — the old skill_meshcore_poll()+delay(25)
+// spin froze the UI for up to 2.8 s. Leaving the PING face mid-sequence
+// (click, HOME, idle-to-clock) cancels the run: the poll bails the moment the
+// screen is no longer HW_UI_MESH_PING, so no stale result can paint into
+// another face.
+enum {
+    MESH_PING_IDLE = 0,
+    MESH_PING_HTTP,       // WiFi column: one bounded GET {gw}/ping
+    MESH_PING_MESH_TX,    // mesh column: fire one sparse private probe
+    MESH_PING_MESH_WAIT   // wait for the pong until the deadline
+};
+/* ACK often ~0.5–2s on local path; multi-hop a bit more. */
+#define MESH_PING_WAIT_MS 2800UL
+static int mesh_ping_state = MESH_PING_IDLE;
+static unsigned long mesh_ping_deadline_ms = 0;
+static uint32_t mesh_ping_ok_before = 0;
+static uint32_t mesh_ping_rtt_before = 0;
+static bool mesh_ping_tx = false;
+static bool mesh_ping_wifi_ok = false;
+static char mesh_ping_wifi_s1[24] = "";
+static char mesh_ping_wifi_s2[24] = "";
+static char mesh_ping_lines[HW_UI_MESH_PING_LINES][48];
+static const char *mesh_ping_ptrs[HW_UI_MESH_PING_LINES];
+static int mesh_ping_nlines = 0;
 
-    char wifi_s1[24] = "", wifi_s2[24] = "";
-    char mesh_s1[24] = "", mesh_s2[24] = "";
-    bool wifi_ok = false;
-    bool mesh_ok = false;
+static void mesh_ping_push(const char *fmt, ...) {
+    if (mesh_ping_nlines >= HW_UI_MESH_PING_LINES) return;
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(mesh_ping_lines[mesh_ping_nlines], sizeof(mesh_ping_lines[0]),
+              fmt, ap);
+    va_end(ap);
+    mesh_ping_ptrs[mesh_ping_nlines] = mesh_ping_lines[mesh_ping_nlines];
+    mesh_ping_nlines++;
+}
+
+// Entry (encoder click on PING): paint the start face and arm the sequence.
+static void ui_mesh_ping_gateway() {
+    mesh_ping_wifi_ok = false;
+    mesh_ping_wifi_s1[0] = mesh_ping_wifi_s2[0] = '\0';
+    mesh_ping_tx = false;
 
     // --- phase: start ---
-    n = 0;
-    push("probing WiFi + Mesh…");
-    push("gw: %s", mesh_gw_url);
-    push("wifi: %s",
-         WiFi.status() == WL_CONNECTED
-             ? WiFi.localIP().toString().c_str()
-             : "OFFLINE");
-    hw_ui_show_mesh_ping("PING…", ptrs, n);
+    mesh_ping_nlines = 0;
+    mesh_ping_push("probing WiFi + Mesh…");
+    mesh_ping_push("gw: %s", mesh_gw_url);
+    mesh_ping_push("wifi: %s",
+                   WiFi.status() == WL_CONNECTED
+                       ? WiFi.localIP().toString().c_str()
+                       : "OFFLINE");
+    hw_ui_show_mesh_ping("PING…", mesh_ping_ptrs, mesh_ping_nlines);
     ui_note_input();
-    yield();
+    mesh_ping_state = MESH_PING_HTTP;
+}
 
-    // ---- WiFi path: GET gateway /ping ----
+// ---- WiFi path: GET gateway /ping (one bounded synchronous GET) ----
+static void ui_mesh_ping_step_http() {
     unsigned long wifi_rtt = 0;
     int wifi_rssi = 0;
     if (WiFi.status() != WL_CONNECTED) {
-        snprintf(wifi_s1, sizeof(wifi_s1), "offline");
-        snprintf(wifi_s2, sizeof(wifi_s2), "no STA");
+        snprintf(mesh_ping_wifi_s1, sizeof(mesh_ping_wifi_s1), "offline");
+        snprintf(mesh_ping_wifi_s2, sizeof(mesh_ping_wifi_s2), "no STA");
     } else {
         wifi_rssi = WiFi.RSSI();
         char url[128];
         unsigned long t0 = millis();
         snprintf(url, sizeof(url), "%s/ping?t=%lu", mesh_gw_url, t0);
 
-        n = 0;
-        push("WiFi GET /ping …");
-        push("%s", mesh_gw_url);
-        push("RSSI %d dBm", wifi_rssi);
-        hw_ui_show_mesh_ping("WIFI", ptrs, n);
-        yield();
+        mesh_ping_nlines = 0;
+        mesh_ping_push("WiFi GET /ping …");
+        mesh_ping_push("%s", mesh_gw_url);
+        mesh_ping_push("RSSI %d dBm", wifi_rssi);
+        hw_ui_show_mesh_ping("WIFI", mesh_ping_ptrs, mesh_ping_nlines);
 
         HTTPClient http;
+        // A black-holed gateway must cost ~1 s here, not the full read window.
+        http.setConnectTimeout(1000);
         http.setTimeout(4000);
         if (http.begin(url)) {
+            if (gw_token[0]) {
+                http.addHeader("Authorization", String("Bearer ") + gw_token);
+            }
             int code = http.GET();
             wifi_rtt = millis() - t0;
             http.end();
-            if (code > 0 && code < 400) {
-                wifi_ok = true;
-                snprintf(wifi_s1, sizeof(wifi_s1), "%d dBm", wifi_rssi);
-                snprintf(wifi_s2, sizeof(wifi_s2), "%lu ms", wifi_rtt);
+            // Any HTTP status proves the link to the gateway is up — a 401/403
+            // is the gateway refusing the token, not a dead WiFi path, so it
+            // must not paint the WiFi column red.
+            if (code > 0) {
+                mesh_ping_wifi_ok = true;
+                if (code < 400) {
+                    snprintf(mesh_ping_wifi_s1, sizeof(mesh_ping_wifi_s1),
+                             "%d dBm", wifi_rssi);
+                    snprintf(mesh_ping_wifi_s2, sizeof(mesh_ping_wifi_s2),
+                             "%lu ms", wifi_rtt);
+                } else if (code == 401 || code == 403) {
+                    snprintf(mesh_ping_wifi_s1, sizeof(mesh_ping_wifi_s1),
+                             "HTTP %d", code);
+                    snprintf(mesh_ping_wifi_s2, sizeof(mesh_ping_wifi_s2),
+                             "no auth");
+                } else {
+                    snprintf(mesh_ping_wifi_s1, sizeof(mesh_ping_wifi_s1),
+                             "HTTP %d", code);
+                    snprintf(mesh_ping_wifi_s2, sizeof(mesh_ping_wifi_s2),
+                             "%lu ms", wifi_rtt);
+                }
             } else {
-                snprintf(wifi_s1, sizeof(wifi_s1), "HTTP %d", code);
-                snprintf(wifi_s2, sizeof(wifi_s2), "%lu ms", wifi_rtt);
+                snprintf(mesh_ping_wifi_s1, sizeof(mesh_ping_wifi_s1),
+                         "no reply");
+                snprintf(mesh_ping_wifi_s2, sizeof(mesh_ping_wifi_s2),
+                         "err %d", code);
             }
         } else {
-            snprintf(wifi_s1, sizeof(wifi_s1), "begin fail");
-            snprintf(wifi_s2, sizeof(wifi_s2), "bad URL");
+            snprintf(mesh_ping_wifi_s1, sizeof(mesh_ping_wifi_s1), "begin fail");
+            snprintf(mesh_ping_wifi_s2, sizeof(mesh_ping_wifi_s2), "bad URL");
         }
     }
+    mesh_ping_state = MESH_PING_MESH_TX;
+}
 
-    // ---- Mesh path: sparse private probe, wait ACK ----
-    n = 0;
-    push("Mesh private DM …");
-    push("MC|k → Heltec");
-    if (!g_mesh.has_identity) push("no identity");
-    else if (!g_mesh.radio_ready) push("radio not ready");
-    else if (!g_mesh.heltec_pk_hex[0]) push("no GW pubkey");
+// ---- Mesh path: sparse private probe, wait ACK ----
+static void ui_mesh_ping_step_mesh_tx() {
+    mesh_ping_nlines = 0;
+    mesh_ping_push("Mesh private DM …");
+    mesh_ping_push("MC|k → Heltec");
+    if (!g_mesh.has_identity) mesh_ping_push("no identity");
+    else if (!g_mesh.radio_ready) mesh_ping_push("radio not ready");
+    else if (!g_mesh.heltec_pk_hex[0]) mesh_ping_push("no GW pubkey");
     else if (g_mesh_chat_tx.active || mesh_client_ack_pending())
-        push("radio busy - retry");
-    else push("waiting ACK…");
-    hw_ui_show_mesh_ping("MESH", ptrs, n);
-    yield();
+        mesh_ping_push("radio busy - retry");
+    else mesh_ping_push("waiting ACK…");
+    hw_ui_show_mesh_ping("MESH", mesh_ping_ptrs, mesh_ping_nlines);
 
-    uint32_t ok_before = g_mesh.last_ok_ms;
-    uint32_t rtt_before = g_mesh.last_rtt_ms;
-    bool tx = false;
+    mesh_ping_ok_before = g_mesh.last_ok_ms;
+    mesh_ping_rtt_before = g_mesh.last_rtt_ms;
+    mesh_ping_tx = false;
     if (g_mesh.has_identity && g_mesh.radio_ready && g_mesh.heltec_pk_hex[0] &&
         !g_mesh_chat_tx.active && !mesh_client_ack_pending()) {
-        tx = mesh_probe_gateway(nullptr);
-        unsigned long t_wait = millis();
-        /* ACK often ~0.5–2s on local path; multi-hop a bit more. */
-        while (millis() - t_wait < 2800UL) {
-            skill_meshcore_poll();
-            if (g_mesh.last_ok_ms != ok_before && g_mesh.last_ok_ms != 0)
-                break;
-            delay(25);
-            yield();
-        }
+        mesh_ping_tx = mesh_probe_gateway(nullptr);
+        // The meshcore skill tick polls the radio every loop pass; this state
+        // machine only watches for the pong until the deadline.
+        mesh_ping_deadline_ms = millis() + MESH_PING_WAIT_MS;
+    } else {
+        mesh_ping_deadline_ms = millis();   // nothing in flight: no wait
     }
+    mesh_ping_state = MESH_PING_MESH_WAIT;
+}
 
-    if (g_mesh.last_ok_ms != ok_before && g_mesh.last_ok_ms != 0) {
+// ---- Mesh wait + verdict: identical classification to the blocking version.
+static void ui_mesh_ping_step_wait() {
+    bool pong = (g_mesh.last_ok_ms != mesh_ping_ok_before &&
+                 g_mesh.last_ok_ms != 0);
+    if (!pong && (long)(millis() - mesh_ping_deadline_ms) < 0)
+        return;   // keep waiting — one check per loop pass, nothing blocks
+
+    char mesh_s1[24] = "", mesh_s2[24] = "";
+    bool mesh_ok = false;
+
+    if (pong) {
         mesh_ok = true;
-        uint32_t rtt = g_mesh.last_rtt_ms ? g_mesh.last_rtt_ms
-                                          : (rtt_before ? rtt_before : 0);
+        uint32_t rtt = g_mesh.last_rtt_ms
+                           ? g_mesh.last_rtt_ms
+                           : (mesh_ping_rtt_before ? mesh_ping_rtt_before : 0);
         if (rtt)
             snprintf(mesh_s1, sizeof(mesh_s1), "%lu ms", (unsigned long)rtt);
         else
             snprintf(mesh_s1, sizeof(mesh_s1), "ACK");
         snprintf(mesh_s2, sizeof(mesh_s2), "live");
-    } else if (tx) {
+    } else if (mesh_ping_tx) {
         /* TX accepted but no ACK in window — still show last-known if fresh. */
         int age = mesh_alive_age_s();
         if (age >= 0 && age < 120) {
@@ -1911,18 +2261,35 @@ static void ui_mesh_ping_gateway() {
             snprintf(mesh_s2, sizeof(mesh_s2), "never");
     }
 
-    hw_ui_show_mesh_ping_result(wifi_ok, wifi_s1, wifi_s2,
+    hw_ui_show_mesh_ping_result(mesh_ping_wifi_ok, mesh_ping_wifi_s1,
+                                mesh_ping_wifi_s2,
                                 mesh_ok, mesh_s1, mesh_s2);
-    if (wifi_ok || mesh_ok) hw_haptic_notify(0);
+    if (mesh_ping_wifi_ok || mesh_ok) hw_haptic_notify(0);
     else hw_haptic_notify(1);
     ui_note_input();
+    mesh_ping_state = MESH_PING_IDLE;
+}
+
+// Loop task: advance the PING sequence. Any exit from the PING face cancels
+// the run before it can paint a stale result into another screen.
+static void ui_mesh_ping_poll() {
+    if (mesh_ping_state == MESH_PING_IDLE) return;
+    if (hw_ui_screen() != HW_UI_MESH_PING) {
+        mesh_ping_state = MESH_PING_IDLE;
+        return;
+    }
+    switch (mesh_ping_state) {
+    case MESH_PING_HTTP:      ui_mesh_ping_step_http(); break;
+    case MESH_PING_MESH_TX:   ui_mesh_ping_step_mesh_tx(); break;
+    case MESH_PING_MESH_WAIT: ui_mesh_ping_step_wait(); break;
+    }
 }
 
 static void kb_layout_save() {
-    File f = SPIFFS.open(KB_LAYOUT_PATH, "w");
-    if (!f) return;
-    f.print(hw_kb_layout_id());
-    f.close();
+    // Atomic like every other small persisted setting: a power cut mid-write
+    // must never leave an empty layout file (empty reads as "no preference").
+    write_spiffs_file_atomic(KB_LAYOUT_PATH, KB_LAYOUT_TMP,
+                             String(hw_kb_layout_id()));
 }
 
 // UTF-8 helpers for the reply draft
@@ -2259,7 +2626,6 @@ static void ui_agent_chat_refresh() {
     agent_scroll = hw_ui_show_agent_chat(head, ag_chat_ptrs, ag_chat_from_me,
                                          n, agent_scroll, &total, foot);
     agent_scroll_total = total;
-    ui_note_input();
 }
 
 static void ui_open_agent_chat(int idx) {
@@ -2381,7 +2747,8 @@ static void ui_show_agent_invite_from_view(const NotifyView &v, uint32_t id) {
     int ax = agents_index_from_door(v);
     const char *aname = (ax >= 0) ? agents_name(ax) : v.source;
     hw_ui_show_agent_invite(aname, v.body, notify_unread_count());
-    ui_note_input();
+    // Reachable from the loop() arrival path: a system wake, not user input.
+    ui_note_wake();
 }
 
 // Enter the chat room from a chat-door notify (ack + open).
@@ -2797,6 +3164,50 @@ static void setup_routes() {
     server.on("/wifi/networks", HTTP_POST, handle_wifi_networks_post, NULL,
               handle_body_collect);
 
+    // Provision the gateway capability token remotely. Raw body or JSON
+    // {"token":"…"}; only a genuinely EMPTY body clears the file and returns
+    // the gateway calls to their legacy header-less form. A JSON body whose
+    // token field is missing, non-string, or empty is a 400 — a malformed
+    // provisioning call must never silently drop the stored token.
+    server.on(AsyncURIMatcher::exact("/gw/token"), HTTP_POST,
+              [](AsyncWebServerRequest *req) {
+        if (!require_auth(req)) return;
+        char *body = notify_take_body(req);
+        String tok = body ? String(body) : String("");
+        free(body);
+        tok.trim();
+        if (tok.startsWith("{")) {
+            JsonDocument input;
+            if (deserializeJson(input, tok) != DeserializationError::Ok) {
+                notify_send_error(req, 400, "invalid JSON"); return;
+            }
+            if (!input["token"].is<const char *>()) {
+                notify_send_error(req, 400, "token must be a JSON string");
+                return;
+            }
+            tok = input["token"].as<const char *>();
+            tok.trim();
+            if (tok.length() == 0) {
+                notify_send_error(req, 400,
+                    "empty token string - send an empty body to clear");
+                return;
+            }
+        }
+        if (tok.length() > GW_TOKEN_MAX) {
+            notify_send_error(req, 400, "token too long"); return;
+        }
+        if (tok.length() == 0) {
+            SPIFFS.remove(GW_TOKEN_PATH);
+        } else if (!write_spiffs_file_atomic(GW_TOKEN_PATH, GW_TOKEN_TMP, tok)) {
+            notify_send_error(req, 500, "failed to save token"); return;
+        }
+        snprintf(gw_token, sizeof(gw_token), "%s", tok.c_str());
+        event_add("gateway token %s", gw_token[0] ? "set" : "cleared");
+        JsonDocument doc;
+        doc["ok"] = true;
+        notify_send_json(req, 200, doc);
+    }, NULL, handle_body_collect);
+
     // Register skill routes (notify uses AsyncURIMatcher::exact)
     for (int i = 0; i < g_skill_count; i++) {
         g_skills[i]->register_routes(server);
@@ -2811,13 +3222,14 @@ void setup() {
     delay(500);
     boot_time = millis();
     setCpuFrequencyMhz(CPU_MHZ);
+    boot_diag_init();  // reset reason + crash counters, first serial line out
 
-    if (!SPIFFS.begin(true)) {
-        Serial.println("[!] SPIFFS failed");
-    }
-
-    // Panel + I2C first so the face can say "connecting..." while STA associates.
+    // Panel + I2C before storage: hw_ui_begin() touches no SPIFFS, and a
+    // storage format (foreign/blank partition) must be visible on the panel
+    // instead of a dead screen. The face can also say "connecting..." while
+    // STA associates.
     hw_ui_begin();
+    storage_begin();  // SPIFFS mount → announced format → degraded continue
     // Reclaim AW9364 from the boot pulse in hw_ui; load /backlight.json.
     backlight_begin();
     hw_input_begin();
@@ -2826,6 +3238,7 @@ void setup() {
     hw_kb_begin();
     kb_layout_load(); // SPIFFS /kb_layout.txt → EN / RU PHON / RU
     mesh_gw_load();   // SPIFFS /mesh_gw.txt → home Heltec daemon URL
+    gw_token_load();  // SPIFFS /gw_token.txt → gateway capability token
     hw_probe();
     tz_load();        // before wifi_setup(): configTzTime() needs the TZ string
     wifi_setup();     // non-blocking STA attempt; never raises an AP
@@ -2865,19 +3278,33 @@ void loop() {
         if (err == ESP_OK) event_add("firmware auto-confirmed");
     }
 
-    // WiFi reconnect — one non-blocking attempt every 20 minutes while offline.
+    // Deferred STA sequence raised by HTTP handlers (mode → disconnect →
+    // begin, millis() settle gaps) — the AsyncTCP task never touches WiFi.
+    wifi_reconnect_poll();
+
+    // WiFi reconnect — one non-blocking attempt per ladder rung while offline
+    // (the driver's own auto-reconnect stays off: its retries underneath the
+    // scheduler caused UI stalls). Every begin — boot included — stamps
+    // wifi_last_attempt_ms, so the first rung always gives the in-flight
+    // association its full 30 s before any retry can interrupt it.
     // Skipped while the user turned WiFi off from the menu (mesh-only test):
-    // they toggled it off, loop must not undo their choice.
+    // they toggled it off, loop must not undo their choice. Also skipped
+    // while the deferred reconnect machine above is mid-sequence, so a
+    // background attempt cannot rotate the active profile out from under it.
     static bool was_connected = false;
     bool now_connected = WiFi.status() == WL_CONNECTED;
-    if (!wifi_user_off && (wifi_net_count > 0 || wifi_ssid.length() > 0) &&
-        !now_connected && millis() - wifi_last_attempt_ms >= WIFI_RETRY_MS) {
+    if (!wifi_user_off && (wifi_net_count > 0 || wifi_ssid[0]) &&
+        wifi_reconnect_state == WIFI_RECONNECT_IDLE && !now_connected &&
+        millis() - wifi_last_attempt_ms >= wifi_retry_interval_ms()) {
         /* One profile attempt (~5s) so loop stays responsive. */
         if (wifi_net_count > 1) {
             wifi_net_idx = (wifi_net_idx + 1) % wifi_net_count;
             wifi_nets_set_active(wifi_net_idx);
         }
-        Serial.printf("[wifi] reconnect try %s\n", wifi_ssid.c_str());
+        if (wifi_retry_step < WIFI_RETRY_LADDER_STEPS - 1) wifi_retry_step++;
+        Serial.printf("[wifi] reconnect try %s\n", wifi_ssid);
+        event_add("wifi retry %s, next in %lus (step %d)", wifi_ssid,
+                  wifi_retry_interval_ms() / 1000UL, wifi_retry_step);
         WiFi.disconnect(false, false);
         delay(50);
         wifi_begin_active_profile();
@@ -2885,6 +3312,7 @@ void loop() {
     if (now_connected != was_connected) {
         was_connected = now_connected;
         if (now_connected) {
+            wifi_retry_step = 0;  /* next loss starts the ladder over */
             wifi_persist_profiles();
             if (!mdns_started && MDNS.begin(mdns_name.c_str())) {
                 MDNS.addService("http", "tcp", HTTP_PORT);
@@ -2943,6 +3371,9 @@ void loop() {
     }
 
     // Idle policy owns brightness; drive pulses after the decision.
+    // ORDER: hand-placed — must follow ui_backlight_idle() (this pass's
+    // decision) and precede the notify-arrival block below, so a blanked
+    // panel is awake and repainted before an arriving card paints (C3).
     ui_backlight_idle();
     backlight_poll();
 
@@ -2957,13 +3388,14 @@ void loop() {
         }
     }
 
-    // Notify skill: expiry, coalesced SPIFFS snapshot, auto-card on arrival
-    // only when the user is on the clock (do not yank them out of a menu).
-    notify_poll();
+    // Notify expiry + coalesced SPIFFS snapshot run in the notify skill tick
+    // (order-free: the arrival/sound flags consumed below are produced by the
+    // HTTP handlers and mesh ingest, not by that poll). The consumption
+    // blocks below stay hand-placed — see the C3 ordering note above.
 
-    // Typed reply on its way to the gateway. After the keyboard drain above, so
-    // an Enter is carried on the pass that produced it, and after the card has
-    // already painted its way back to the clock.
+    // Typed reply on its way to the gateway. ORDER: hand-placed — after the
+    // keyboard drain above, so an Enter is carried on the pass that produced
+    // it, and after the card has already painted its way back to the clock.
     reply_upstream_poll();
 
     // Speaker + haptic FIRST — before any full-screen SPI paint can delay the
@@ -2981,17 +3413,25 @@ void loop() {
     // Agent thread inbound (display_force) — refresh open chat room live.
     if (display_force && hw_ui_screen() == HW_UI_AGENT_CHAT) {
         display_force = false;
+        bool real_in = g_agents_real_inbound;
+        g_agents_real_inbound = false;
         // Stay pinned to latest if user was following the bottom.
         if (agent_scroll < 0 ||
             agent_scroll >= agent_scroll_total - 2) {
             agent_scroll = -1;
         }
         ui_agent_chat_refresh();
+        // A genuine arrival (mesh C1 or WiFi) in the open room wakes the
+        // panel once; a repaint alone (e.g. synthetic error line) does not.
+        if (real_in) ui_note_wake();
     }
 
     uint32_t arrived_id = 0;
     if (notify_take_arrival(&arrived_id) || display_force) {
         display_force = false;
+        // Room not on screen: the arrival flag must not survive to be claimed
+        // by a later, unrelated repaint of the room.
+        g_agents_real_inbound = false;
         NotifyView v;
         HwUiScreen scr = hw_ui_screen();
         bool on_clock = (scr == HW_UI_CLOCK);
@@ -3002,6 +3442,7 @@ void loop() {
                 if (ax >= 0 && scr == HW_UI_AGENT_CHAT && agent_focus == ax) {
                     notify_ack_id(arrived_id);
                     ui_agent_chat_refresh();
+                    ui_note_wake();  // real inbound message, not a repaint
                 } else if (ax >= 0 && scr == HW_UI_REPLY && agent_compose &&
                            agent_focus == ax) {
                     // Typing in that room — leave compose; thread updates later.
@@ -3016,7 +3457,7 @@ void loop() {
                 snprintf(reply_title, sizeof(reply_title), "%s", v.title);
                 hw_ui_show_notify(notify_level_name(v.level), v.source, v.title,
                                   v.body, notify_unread_count());
-                ui_note_input();
+                ui_note_wake();
             } else {
                 // In reply compose / sheets — badge only, don't yank the user.
                 hw_ui_invalidate_clock();
@@ -3027,10 +3468,12 @@ void loop() {
         }
     }
 
+    // ORDER: hand-placed — refill the sound DMA after the arrival paints and
+    // before the 1 Hz clock repaint below, so a long paint cannot starve an
+    // in-flight cue (hw_sound is a hardware module, not a Skill).
     hw_sound_poll();
 
-    // Progress job reaping (TTL).
-    progress_poll();
+    // Progress job reaping (TTL) runs in the progress skill tick.
 
     // Keep the fuel gauge current — probe_battery() only ran at boot.
     static unsigned long last_battery = 0;
@@ -3049,9 +3492,15 @@ void loop() {
         hw_ui_clock_rule_tick(notify_crit_unread());
     }
 
+    // Skill ticks: notify (expiry + snapshot), progress (reaping), meshcore
+    // (radio), wireguard, gps — registration order.
     for (int i = 0; i < g_skill_count; i++) {
         if (g_skills[i]->tick) g_skills[i]->tick();
     }
+
+    // PING screen sequence — after the skill ticks so the meshcore poll above
+    // has already had its chance to receive the pong this pass.
+    ui_mesh_ping_poll();
 
     delay(10);
 }
