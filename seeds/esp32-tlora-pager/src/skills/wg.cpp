@@ -37,6 +37,10 @@ extern "C" {
 #define WG_PORT_DEFAULT 51821
 #define WG_TICK_MS 5000UL
 #define WG_HANDSHAKE_PROBE_MS 30000UL
+/* Settle gap between stop and start of a deferred /wg/restart. It used to be
+ * an inline 200 ms wait on the AsyncTCP task; now the loop task defers on
+ * millis() instead. */
+#define WG_RESTART_GAP_MS 200UL
 
 static WireGuard g_wg;
 static bool g_wg_running = false;
@@ -49,6 +53,10 @@ static uint32_t g_wg_up_ms = 0;
 static uint32_t g_wg_last_ok_ms = 0;
 static uint32_t g_wg_last_try_ms = 0;
 static uint32_t g_wg_fail_streak = 0;
+/* Deferred restart request (raised on the AsyncTCP task, served by the poll). */
+static volatile bool g_wg_restart_req = false;
+static bool g_wg_restart_armed = false;
+static uint32_t g_wg_restart_stop_ms = 0;
 
 /* Clock chrome uses HwWgUi from hw_ui.h (included by main before this skill). */
 
@@ -300,7 +308,7 @@ static const SkillEndpoint wg_endpoints[] = {
     {"POST", "/wg/peer",    "Set home peer endpoint/keys"},
     {"POST", "/wg/start",   "Start tunnel now"},
     {"POST", "/wg/stop",    "Stop tunnel"},
-    {"POST", "/wg/restart", "Restart tunnel"},
+    {"POST", "/wg/restart", "Restart tunnel (deferred; poll /wg/status)"},
     {NULL, NULL, NULL}
 };
 
@@ -547,22 +555,39 @@ static void wg_register_routes(AsyncWebServer &server) {
         notify_send_json(req, 200, out);
     });
 
+    /* Deferred: this handler runs on the AsyncTCP task, where the old
+     * stop → 200 ms wait → start sequence stalled every socket on the box.
+     * It now only raises a request; the poll (loop task) stops the tunnel,
+     * waits WG_RESTART_GAP_MS on millis(), and starts it again. Outcome is
+     * observable via GET /wg/status. */
     server.on(AsyncURIMatcher::exact("/wg/restart"), HTTP_POST,
               [](AsyncWebServerRequest *req) {
         if (!require_auth(req)) return;
-        wg_stop_now();
-        delay(200);
         g_wg_want = true;
-        bool ok = wg_start_now();
+        g_wg_restart_req = true;
         JsonDocument out;
-        out["ok"] = ok;
+        out["ok"] = true;
+        out["restarting"] = true;
         out["up"] = g_wg_running;
-        out["endpoint"] = g_wg_endpoint_used;
-        notify_send_json(req, ok ? 200 : 500, out);
+        notify_send_json(req, 200, out);
     });
 }
 
 static void skill_wg_poll() {
+    /* Deferred /wg/restart — ahead of the tick throttle so the stop→start
+     * gap is honoured promptly, and on millis() so nothing blocks. */
+    if (g_wg_restart_req) {
+        g_wg_restart_req = false;
+        wg_stop_now();
+        g_wg_restart_stop_ms = millis();
+        g_wg_restart_armed = true;
+    }
+    if (g_wg_restart_armed) {
+        if (millis() - g_wg_restart_stop_ms < WG_RESTART_GAP_MS) return;
+        g_wg_restart_armed = false;
+        if (g_wg_want) wg_start_now();
+    }
+
     static uint32_t last = 0;
     uint32_t now = millis();
     if (now - last < WG_TICK_MS) return;
@@ -590,6 +615,8 @@ static void skill_wg_poll() {
 
     HTTPClient http;
     String url = String("http://") + wg_gateway_ip() + ":8325/health";
+    /* Loop task: a dead tunnel must cost ~1 s to notice, not the read window. */
+    http.setConnectTimeout(1000);
     http.setTimeout(3000);
     if (!http.begin(url)) return;
     int code = http.GET();

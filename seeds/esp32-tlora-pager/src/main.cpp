@@ -52,7 +52,7 @@
 #include "hw_kb.h"
 
 // ===== Configuration =====
-#define SEED_VERSION        "0.9.44"
+#define SEED_VERSION        "0.9.45"
 // Core clock: datasheet puts 240 vs 80 ~11.5mA apart on WAITI. Periph bus holds
 // at 80 for every PLL-fed core clock; go lower and RMT/I2S retimes. Same floor
 // as tembed idle policy (no light sleep — notify latency is the job).
@@ -548,6 +548,57 @@ static bool wifi_save_config(const String &ssid, const String &pass) {
 static void wifi_begin_active_profile() {
     wifi_last_attempt_ms = millis();
     WiFi.begin(wifi_ssid.c_str(), wifi_pass.c_str());
+}
+
+/* Deferred STA reconnect for HTTP handlers. They run on the AsyncTCP task,
+ * which must never sit in delay() or in a blocking WiFi driver call — that
+ * stalls every socket on the box (and, since the bus lock landed, can widen
+ * SD-vs-panel arbitration windows). A handler only raises the request; the
+ * loop task walks mode → disconnect → begin with millis() settle gaps
+ * (the same 500/100 ms the old inline sequence used). */
+enum {
+    WIFI_RECONNECT_IDLE = 0,
+    WIFI_RECONNECT_MODE,        /* set STA mode, then let RF settle */
+    WIFI_RECONNECT_DISCONNECT,  /* drop the old association, then settle */
+    WIFI_RECONNECT_BEGIN        /* start the asynchronous join */
+};
+#define WIFI_RECONNECT_MODE_SETTLE_MS 500UL
+#define WIFI_RECONNECT_DISC_SETTLE_MS 100UL
+static volatile int wifi_reconnect_state = WIFI_RECONNECT_IDLE;
+static unsigned long wifi_reconnect_step_ms = 0;
+
+static void wifi_reconnect_request() {
+    wifi_reconnect_state = WIFI_RECONNECT_MODE;
+}
+
+/* Loop task only: one bounded step per pass, nothing ever waits in place. */
+static void wifi_reconnect_poll() {
+    if (wifi_reconnect_state == WIFI_RECONNECT_IDLE) return;
+    if (wifi_user_off) {
+        /* User toggled WiFi off after the request landed: their choice wins. */
+        wifi_reconnect_state = WIFI_RECONNECT_IDLE;
+        return;
+    }
+    switch (wifi_reconnect_state) {
+    case WIFI_RECONNECT_MODE:
+        WiFi.mode(WIFI_STA);
+        wifi_reconnect_step_ms = millis();
+        wifi_reconnect_state = WIFI_RECONNECT_DISCONNECT;
+        break;
+    case WIFI_RECONNECT_DISCONNECT:
+        if (millis() - wifi_reconnect_step_ms < WIFI_RECONNECT_MODE_SETTLE_MS)
+            return;
+        WiFi.disconnect(false, false);
+        wifi_reconnect_step_ms = millis();
+        wifi_reconnect_state = WIFI_RECONNECT_BEGIN;
+        break;
+    case WIFI_RECONNECT_BEGIN:
+        if (millis() - wifi_reconnect_step_ms < WIFI_RECONNECT_DISC_SETTLE_MS)
+            return;
+        wifi_reconnect_state = WIFI_RECONNECT_IDLE;
+        wifi_begin_active_profile();
+        break;
+    }
 }
 
 static void wifi_setup() {
@@ -1057,12 +1108,10 @@ static void handle_wifi_post(AsyncWebServerRequest *request) {
     wifi_save_config(ssid, pass);
     request->send(200, "text/html",
         "<h2>Saved. Connecting...</h2><p>" + ssid + "</p><a href='/'>Back</a>");
+    /* AsyncTCP task: never wait here, never call into the WiFi driver. The
+     * loop task applies mode → disconnect → begin with millis() settle gaps. */
     wifi_user_off = false;
-    WiFi.mode(WIFI_STA);
-    delay(500);
-    WiFi.disconnect(false, false);
-    delay(100);
-    wifi_begin_active_profile();
+    wifi_reconnect_request();
 }
 
 static void handle_wifi_status(AsyncWebServerRequest *request) {
@@ -1158,11 +1207,10 @@ static void handle_wifi_networks_post(AsyncWebServerRequest *request) {
     serializeJson(out, response);
     request->send(200, "application/json", response);
 
-    /* Kick reconnect with new list. */
+    /* Kick reconnect with the new list — deferred to the loop task; WiFi
+     * driver calls can block and this handler runs on the AsyncTCP task. */
     wifi_user_off = false;
-    WiFi.mode(WIFI_STA);
-    WiFi.disconnect(false, false);
-    wifi_begin_active_profile();
+    wifi_reconnect_request();
 }
 
 // ===== Skills =====
@@ -1490,6 +1538,9 @@ static bool reply_upstream_http(const char *key, const char *text) {
     serializeJson(doc, body);
 
     HTTPClient http;
+    // Runs on the loop task: a black-holed gateway must cost ~1 s to connect,
+    // not the whole 5 s read window, or the panel freezes for the difference.
+    http.setConnectTimeout(1000);
     http.setTimeout(5000);
     if (!http.begin(url)) return false;
     http.addHeader("Content-Type", "application/json");
@@ -1803,57 +1854,88 @@ static void ui_mesh_show_status() {
 
 // MESHCORE → PING GATEWAY: dual-path glance (WiFi HTTP + Mesh private DM).
 // Final face = two big icons (who is up) + strength under each.
-static void ui_mesh_ping_gateway() {
-    static char lines[HW_UI_MESH_PING_LINES][48];
-    static const char *ptrs[HW_UI_MESH_PING_LINES];
-    int n = 0;
-    auto push = [&](const char *fmt, ...) {
-        if (n >= HW_UI_MESH_PING_LINES) return;
-        va_list ap;
-        va_start(ap, fmt);
-        vsnprintf(lines[n], sizeof(lines[0]), fmt, ap);
-        va_end(ap);
-        ptrs[n] = lines[n];
-        n++;
-    };
+//
+// Non-blocking: opening the PING face arms a small state machine that loop()
+// advances one bounded step per pass via ui_mesh_ping_poll(). The WiFi HTTP
+// GET stays synchronous but is bounded (1 s connect + 4 s read); the mesh
+// pong wait is a millis() deadline checked once per pass while the meshcore
+// skill tick keeps the radio polled — the old skill_meshcore_poll()+delay(25)
+// spin froze the UI for up to 2.8 s. Leaving the PING face mid-sequence
+// (click, HOME, idle-to-clock) cancels the run: the poll bails the moment the
+// screen is no longer HW_UI_MESH_PING, so no stale result can paint into
+// another face.
+enum {
+    MESH_PING_IDLE = 0,
+    MESH_PING_HTTP,       // WiFi column: one bounded GET {gw}/ping
+    MESH_PING_MESH_TX,    // mesh column: fire one sparse private probe
+    MESH_PING_MESH_WAIT   // wait for the pong until the deadline
+};
+/* ACK often ~0.5–2s on local path; multi-hop a bit more. */
+#define MESH_PING_WAIT_MS 2800UL
+static int mesh_ping_state = MESH_PING_IDLE;
+static unsigned long mesh_ping_deadline_ms = 0;
+static uint32_t mesh_ping_ok_before = 0;
+static uint32_t mesh_ping_rtt_before = 0;
+static bool mesh_ping_tx = false;
+static bool mesh_ping_wifi_ok = false;
+static char mesh_ping_wifi_s1[24] = "";
+static char mesh_ping_wifi_s2[24] = "";
+static char mesh_ping_lines[HW_UI_MESH_PING_LINES][48];
+static const char *mesh_ping_ptrs[HW_UI_MESH_PING_LINES];
+static int mesh_ping_nlines = 0;
 
-    char wifi_s1[24] = "", wifi_s2[24] = "";
-    char mesh_s1[24] = "", mesh_s2[24] = "";
-    bool wifi_ok = false;
-    bool mesh_ok = false;
+static void mesh_ping_push(const char *fmt, ...) {
+    if (mesh_ping_nlines >= HW_UI_MESH_PING_LINES) return;
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(mesh_ping_lines[mesh_ping_nlines], sizeof(mesh_ping_lines[0]),
+              fmt, ap);
+    va_end(ap);
+    mesh_ping_ptrs[mesh_ping_nlines] = mesh_ping_lines[mesh_ping_nlines];
+    mesh_ping_nlines++;
+}
+
+// Entry (encoder click on PING): paint the start face and arm the sequence.
+static void ui_mesh_ping_gateway() {
+    mesh_ping_wifi_ok = false;
+    mesh_ping_wifi_s1[0] = mesh_ping_wifi_s2[0] = '\0';
+    mesh_ping_tx = false;
 
     // --- phase: start ---
-    n = 0;
-    push("probing WiFi + Mesh…");
-    push("gw: %s", mesh_gw_url);
-    push("wifi: %s",
-         WiFi.status() == WL_CONNECTED
-             ? WiFi.localIP().toString().c_str()
-             : "OFFLINE");
-    hw_ui_show_mesh_ping("PING…", ptrs, n);
+    mesh_ping_nlines = 0;
+    mesh_ping_push("probing WiFi + Mesh…");
+    mesh_ping_push("gw: %s", mesh_gw_url);
+    mesh_ping_push("wifi: %s",
+                   WiFi.status() == WL_CONNECTED
+                       ? WiFi.localIP().toString().c_str()
+                       : "OFFLINE");
+    hw_ui_show_mesh_ping("PING…", mesh_ping_ptrs, mesh_ping_nlines);
     ui_note_input();
-    yield();
+    mesh_ping_state = MESH_PING_HTTP;
+}
 
-    // ---- WiFi path: GET gateway /ping ----
+// ---- WiFi path: GET gateway /ping (one bounded synchronous GET) ----
+static void ui_mesh_ping_step_http() {
     unsigned long wifi_rtt = 0;
     int wifi_rssi = 0;
     if (WiFi.status() != WL_CONNECTED) {
-        snprintf(wifi_s1, sizeof(wifi_s1), "offline");
-        snprintf(wifi_s2, sizeof(wifi_s2), "no STA");
+        snprintf(mesh_ping_wifi_s1, sizeof(mesh_ping_wifi_s1), "offline");
+        snprintf(mesh_ping_wifi_s2, sizeof(mesh_ping_wifi_s2), "no STA");
     } else {
         wifi_rssi = WiFi.RSSI();
         char url[128];
         unsigned long t0 = millis();
         snprintf(url, sizeof(url), "%s/ping?t=%lu", mesh_gw_url, t0);
 
-        n = 0;
-        push("WiFi GET /ping …");
-        push("%s", mesh_gw_url);
-        push("RSSI %d dBm", wifi_rssi);
-        hw_ui_show_mesh_ping("WIFI", ptrs, n);
-        yield();
+        mesh_ping_nlines = 0;
+        mesh_ping_push("WiFi GET /ping …");
+        mesh_ping_push("%s", mesh_gw_url);
+        mesh_ping_push("RSSI %d dBm", wifi_rssi);
+        hw_ui_show_mesh_ping("WIFI", mesh_ping_ptrs, mesh_ping_nlines);
 
         HTTPClient http;
+        // A black-holed gateway must cost ~1 s here, not the full read window.
+        http.setConnectTimeout(1000);
         http.setTimeout(4000);
         if (http.begin(url)) {
             if (gw_token.length() > 0) {
@@ -1866,67 +1948,86 @@ static void ui_mesh_ping_gateway() {
             // is the gateway refusing the token, not a dead WiFi path, so it
             // must not paint the WiFi column red.
             if (code > 0) {
-                wifi_ok = true;
+                mesh_ping_wifi_ok = true;
                 if (code < 400) {
-                    snprintf(wifi_s1, sizeof(wifi_s1), "%d dBm", wifi_rssi);
-                    snprintf(wifi_s2, sizeof(wifi_s2), "%lu ms", wifi_rtt);
+                    snprintf(mesh_ping_wifi_s1, sizeof(mesh_ping_wifi_s1),
+                             "%d dBm", wifi_rssi);
+                    snprintf(mesh_ping_wifi_s2, sizeof(mesh_ping_wifi_s2),
+                             "%lu ms", wifi_rtt);
                 } else if (code == 401 || code == 403) {
-                    snprintf(wifi_s1, sizeof(wifi_s1), "HTTP %d", code);
-                    snprintf(wifi_s2, sizeof(wifi_s2), "no auth");
+                    snprintf(mesh_ping_wifi_s1, sizeof(mesh_ping_wifi_s1),
+                             "HTTP %d", code);
+                    snprintf(mesh_ping_wifi_s2, sizeof(mesh_ping_wifi_s2),
+                             "no auth");
                 } else {
-                    snprintf(wifi_s1, sizeof(wifi_s1), "HTTP %d", code);
-                    snprintf(wifi_s2, sizeof(wifi_s2), "%lu ms", wifi_rtt);
+                    snprintf(mesh_ping_wifi_s1, sizeof(mesh_ping_wifi_s1),
+                             "HTTP %d", code);
+                    snprintf(mesh_ping_wifi_s2, sizeof(mesh_ping_wifi_s2),
+                             "%lu ms", wifi_rtt);
                 }
             } else {
-                snprintf(wifi_s1, sizeof(wifi_s1), "no reply");
-                snprintf(wifi_s2, sizeof(wifi_s2), "err %d", code);
+                snprintf(mesh_ping_wifi_s1, sizeof(mesh_ping_wifi_s1),
+                         "no reply");
+                snprintf(mesh_ping_wifi_s2, sizeof(mesh_ping_wifi_s2),
+                         "err %d", code);
             }
         } else {
-            snprintf(wifi_s1, sizeof(wifi_s1), "begin fail");
-            snprintf(wifi_s2, sizeof(wifi_s2), "bad URL");
+            snprintf(mesh_ping_wifi_s1, sizeof(mesh_ping_wifi_s1), "begin fail");
+            snprintf(mesh_ping_wifi_s2, sizeof(mesh_ping_wifi_s2), "bad URL");
         }
     }
+    mesh_ping_state = MESH_PING_MESH_TX;
+}
 
-    // ---- Mesh path: sparse private probe, wait ACK ----
-    n = 0;
-    push("Mesh private DM …");
-    push("MC|k → Heltec");
-    if (!g_mesh.has_identity) push("no identity");
-    else if (!g_mesh.radio_ready) push("radio not ready");
-    else if (!g_mesh.heltec_pk_hex[0]) push("no GW pubkey");
+// ---- Mesh path: sparse private probe, wait ACK ----
+static void ui_mesh_ping_step_mesh_tx() {
+    mesh_ping_nlines = 0;
+    mesh_ping_push("Mesh private DM …");
+    mesh_ping_push("MC|k → Heltec");
+    if (!g_mesh.has_identity) mesh_ping_push("no identity");
+    else if (!g_mesh.radio_ready) mesh_ping_push("radio not ready");
+    else if (!g_mesh.heltec_pk_hex[0]) mesh_ping_push("no GW pubkey");
     else if (g_mesh_chat_tx.active || mesh_client_ack_pending())
-        push("radio busy - retry");
-    else push("waiting ACK…");
-    hw_ui_show_mesh_ping("MESH", ptrs, n);
-    yield();
+        mesh_ping_push("radio busy - retry");
+    else mesh_ping_push("waiting ACK…");
+    hw_ui_show_mesh_ping("MESH", mesh_ping_ptrs, mesh_ping_nlines);
 
-    uint32_t ok_before = g_mesh.last_ok_ms;
-    uint32_t rtt_before = g_mesh.last_rtt_ms;
-    bool tx = false;
+    mesh_ping_ok_before = g_mesh.last_ok_ms;
+    mesh_ping_rtt_before = g_mesh.last_rtt_ms;
+    mesh_ping_tx = false;
     if (g_mesh.has_identity && g_mesh.radio_ready && g_mesh.heltec_pk_hex[0] &&
         !g_mesh_chat_tx.active && !mesh_client_ack_pending()) {
-        tx = mesh_probe_gateway(nullptr);
-        unsigned long t_wait = millis();
-        /* ACK often ~0.5–2s on local path; multi-hop a bit more. */
-        while (millis() - t_wait < 2800UL) {
-            skill_meshcore_poll();
-            if (g_mesh.last_ok_ms != ok_before && g_mesh.last_ok_ms != 0)
-                break;
-            delay(25);
-            yield();
-        }
+        mesh_ping_tx = mesh_probe_gateway(nullptr);
+        // The meshcore skill tick polls the radio every loop pass; this state
+        // machine only watches for the pong until the deadline.
+        mesh_ping_deadline_ms = millis() + MESH_PING_WAIT_MS;
+    } else {
+        mesh_ping_deadline_ms = millis();   // nothing in flight: no wait
     }
+    mesh_ping_state = MESH_PING_MESH_WAIT;
+}
 
-    if (g_mesh.last_ok_ms != ok_before && g_mesh.last_ok_ms != 0) {
+// ---- Mesh wait + verdict: identical classification to the blocking version.
+static void ui_mesh_ping_step_wait() {
+    bool pong = (g_mesh.last_ok_ms != mesh_ping_ok_before &&
+                 g_mesh.last_ok_ms != 0);
+    if (!pong && (long)(millis() - mesh_ping_deadline_ms) < 0)
+        return;   // keep waiting — one check per loop pass, nothing blocks
+
+    char mesh_s1[24] = "", mesh_s2[24] = "";
+    bool mesh_ok = false;
+
+    if (pong) {
         mesh_ok = true;
-        uint32_t rtt = g_mesh.last_rtt_ms ? g_mesh.last_rtt_ms
-                                          : (rtt_before ? rtt_before : 0);
+        uint32_t rtt = g_mesh.last_rtt_ms
+                           ? g_mesh.last_rtt_ms
+                           : (mesh_ping_rtt_before ? mesh_ping_rtt_before : 0);
         if (rtt)
             snprintf(mesh_s1, sizeof(mesh_s1), "%lu ms", (unsigned long)rtt);
         else
             snprintf(mesh_s1, sizeof(mesh_s1), "ACK");
         snprintf(mesh_s2, sizeof(mesh_s2), "live");
-    } else if (tx) {
+    } else if (mesh_ping_tx) {
         /* TX accepted but no ACK in window — still show last-known if fresh. */
         int age = mesh_alive_age_s();
         if (age >= 0 && age < 120) {
@@ -1959,11 +2060,28 @@ static void ui_mesh_ping_gateway() {
             snprintf(mesh_s2, sizeof(mesh_s2), "never");
     }
 
-    hw_ui_show_mesh_ping_result(wifi_ok, wifi_s1, wifi_s2,
+    hw_ui_show_mesh_ping_result(mesh_ping_wifi_ok, mesh_ping_wifi_s1,
+                                mesh_ping_wifi_s2,
                                 mesh_ok, mesh_s1, mesh_s2);
-    if (wifi_ok || mesh_ok) hw_haptic_notify(0);
+    if (mesh_ping_wifi_ok || mesh_ok) hw_haptic_notify(0);
     else hw_haptic_notify(1);
     ui_note_input();
+    mesh_ping_state = MESH_PING_IDLE;
+}
+
+// Loop task: advance the PING sequence. Any exit from the PING face cancels
+// the run before it can paint a stale result into another screen.
+static void ui_mesh_ping_poll() {
+    if (mesh_ping_state == MESH_PING_IDLE) return;
+    if (hw_ui_screen() != HW_UI_MESH_PING) {
+        mesh_ping_state = MESH_PING_IDLE;
+        return;
+    }
+    switch (mesh_ping_state) {
+    case MESH_PING_HTTP:      ui_mesh_ping_step_http(); break;
+    case MESH_PING_MESH_TX:   ui_mesh_ping_step_mesh_tx(); break;
+    case MESH_PING_MESH_WAIT: ui_mesh_ping_step_wait(); break;
+    }
 }
 
 static void kb_layout_save() {
@@ -2947,6 +3065,10 @@ void loop() {
         if (err == ESP_OK) event_add("firmware auto-confirmed");
     }
 
+    // Deferred STA sequence raised by HTTP handlers (mode → disconnect →
+    // begin, millis() settle gaps) — the AsyncTCP task never touches WiFi.
+    wifi_reconnect_poll();
+
     // WiFi reconnect — one non-blocking attempt every 20 minutes while offline.
     // Skipped while the user turned WiFi off from the menu (mesh-only test):
     // they toggled it off, loop must not undo their choice.
@@ -3143,6 +3265,10 @@ void loop() {
     for (int i = 0; i < g_skill_count; i++) {
         if (g_skills[i]->tick) g_skills[i]->tick();
     }
+
+    // PING screen sequence — after the skill ticks so the meshcore poll above
+    // has already had its chance to receive the pong this pass.
+    ui_mesh_ping_poll();
 
     delay(10);
 }
