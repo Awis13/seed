@@ -29,14 +29,31 @@ reservation after restart returns HTTP 409 with `ambiguous=true` and is never
 resent automatically. This avoids duplicate chat history but requires manual
 resolution for the rare crash-after-radio window.
 
+## Device replies
+
+The T-Lora pager holds its own low-privilege bearer (device scope) that is
+valid only for `GET /ping` (gateway probe from the pager UI) and
+`POST /reply` (`{"key": "<card key>", "reply": "<typed text>"}`). It cannot
+call `/notify-out`, `/send`, `/pager`, or any agent inbox.
+
+When the HTTP POST fails, the firmware falls back to a single mesh DM frame
+`R1|key|reply`; the gateway feeds both transports into the same durable
+`replies.json` store (capped, one logical entry per key+text, so the
+WiFi/mesh double delivery never duplicates a reply). Consumers read stored
+replies newest-first via `GET /replies` (admin bearer, optional `?key=`
+filter).
+
 ## Install or update
 
 1. Create a virtual environment and install `aiohttp`, `PyYAML`, and the
    MeshCore Python package used by the radio companion.
 2. Copy `config.yaml.example` to `config.yaml` and set the serial port, pager
    URL, exact pager public key, and durable inbox path. Put `PAGER_TOKEN=...`,
-   `MESHCORE_GATEWAY_TOKEN=...`, `MESHCORE_OPENCODE_TOKEN=...`, and
-   `MESHCORE_CODEX_TOKEN=...` in a mode-0600 service environment file.
+   `MESHCORE_GATEWAY_TOKEN=...`, `MESHCORE_OPENCODE_TOKEN=...`,
+   `MESHCORE_CODEX_TOKEN=...`, `MESHCORE_HERMES_NOTIFY_TOKEN=...`, and
+   `MESHCORE_DEVICE_TOKEN=...` in a mode-0600 service environment file. All
+   five API tokens are required; the daemon refuses to start if any of them
+   is empty.
 3. Adapt `meshcore-daemon.service.example`, install it with systemd, run
    `systemctl daemon-reload`, then restart the service.
 4. Verify `/health`; then send one message to each room and confirm only the

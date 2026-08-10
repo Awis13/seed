@@ -1,10 +1,12 @@
 import asyncio
 import importlib.util
+import os
 import sys
 import tempfile
 import types
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 def load_daemon():
@@ -336,6 +338,7 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
         class Request:
             def __init__(self, path, token, body=None):
                 self.path = path
+                self.method = "POST"
                 self.headers = {"Authorization": f"Bearer {token}"}
                 self._body = body or {}
 
@@ -428,6 +431,137 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result["ok"])
         self.assertFalse(result["mesh"]["thread_ok"])
         self.assertTrue(result["mesh"]["visible_ok"])
+
+
+class _ScopeRequest:
+    def __init__(self, path, method="POST", body=None, token=None):
+        self.path = path
+        self.method = method
+        self.headers = {"Authorization": f"Bearer {token}"} if token else {}
+        self._body = body
+
+    async def json(self):
+        if self._body is None:
+            raise ValueError("no body")
+        return self._body
+
+
+class HermesNotifyScopeTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.daemon = load_daemon()
+        self.daemon.cfg = {}
+
+    def test_hermes_notify_token_read_from_env(self):
+        with mock.patch.dict(
+            os.environ, {"MESHCORE_HERMES_NOTIFY_TOKEN": "env-secret"}
+        ):
+            self.assertEqual(
+                self.daemon.gateway_api_tokens()["hermes_notify"], "env-secret"
+            )
+
+    def test_hermes_notify_token_falls_back_to_webhook_config(self):
+        self.daemon.cfg = {"webhook": {"hermes_notify_token": "cfg-secret"}}
+        with mock.patch.dict(os.environ, clear=False):
+            os.environ.pop("MESHCORE_HERMES_NOTIFY_TOKEN", None)
+            tokens = self.daemon.gateway_api_tokens()
+        self.assertEqual(tokens["hermes_notify"], "cfg-secret")
+
+    def test_missing_hermes_notify_token_is_empty(self):
+        with mock.patch.dict(os.environ, clear=False):
+            os.environ.pop("MESHCORE_HERMES_NOTIFY_TOKEN", None)
+            tokens = self.daemon.gateway_api_tokens()
+        self.assertEqual(tokens["hermes_notify"], "")
+
+    async def test_hermes_note_payload_resolves_hermes_notify_scope(self):
+        scope = await self.daemon._request_agent_scope(
+            _ScopeRequest(
+                "/notify-out", body={"source": "hermes", "id": "hermes-note"}
+            )
+        )
+        self.assertEqual(scope, "hermes_notify")
+
+    async def test_path_prefix_scopes_still_resolve(self):
+        self.assertEqual(
+            await self.daemon._request_agent_scope(_ScopeRequest("/opencode/inbox")),
+            "opencode",
+        )
+        self.assertEqual(
+            await self.daemon._request_agent_scope(_ScopeRequest("/codex/inbox")),
+            "codex",
+        )
+
+    async def test_near_miss_hermes_payloads_do_not_resolve_the_scope(self):
+        self.assertIsNone(
+            await self.daemon._request_agent_scope(
+                _ScopeRequest("/notify-out", body={"source": "hermes", "id": "other"})
+            )
+        )
+        self.assertIsNone(
+            await self.daemon._request_agent_scope(
+                _ScopeRequest(
+                    "/notify-out", body={"source": "other", "id": "hermes-note"}
+                )
+            )
+        )
+
+    async def test_non_post_hermes_payload_does_not_resolve_the_scope(self):
+        self.assertIsNone(
+            await self.daemon._request_agent_scope(
+                _ScopeRequest(
+                    "/notify-out",
+                    method="GET",
+                    body={"source": "hermes", "id": "hermes-note"},
+                )
+            )
+        )
+
+    async def test_generic_notify_out_falls_back_to_admin(self):
+        # GET /ping is device-scoped now; see test_device_replies.py.
+        self.assertIsNone(
+            await self.daemon._request_agent_scope(
+                _ScopeRequest("/notify-out", body={"source": "watcher", "id": "x"})
+            )
+        )
+
+    async def test_hermes_token_scoped_to_hermes_note_only(self):
+        self.daemon.cfg = {
+            "webhook": {"token": "admin-secret", "hermes_notify_token": "hermes-secret"}
+        }
+        self.daemon.web.json_response = lambda body, status=200: (status, body)
+
+        async def handler(_request):
+            return "ok"
+
+        with mock.patch.dict(os.environ, clear=False):
+            os.environ.pop("MESHCORE_HERMES_NOTIFY_TOKEN", None)
+            os.environ.pop("MESHCORE_GATEWAY_TOKEN", None)
+            allowed = await self.daemon.gateway_auth_middleware(
+                _ScopeRequest(
+                    "/notify-out",
+                    body={"source": "hermes", "id": "hermes-note"},
+                    token="hermes-secret",
+                ),
+                handler,
+            )
+            denied = await self.daemon.gateway_auth_middleware(
+                _ScopeRequest(
+                    "/notify-out",
+                    body={"source": "watcher", "id": "generic"},
+                    token="hermes-secret",
+                ),
+                handler,
+            )
+            admin_ok = await self.daemon.gateway_auth_middleware(
+                _ScopeRequest(
+                    "/notify-out",
+                    body={"source": "hermes", "id": "hermes-note"},
+                    token="admin-secret",
+                ),
+                handler,
+            )
+        self.assertEqual(allowed, "ok")
+        self.assertEqual(denied, (401, {"ok": False, "error": "unauthorized"}))
+        self.assertEqual(admin_ok, "ok")
 
 
 async def _async_next(iterator):

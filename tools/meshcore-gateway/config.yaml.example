@@ -5,10 +5,14 @@ serial:
 webhook:
   host: 0.0.0.0
   port: 8325
-  # Set independent admin/OpenCode/Codex tokens in the service environment.
+  # Set independent admin/OpenCode/Codex/Hermes/device tokens in the service
+  # environment.
   token: ""
   opencode_token: ""
   codex_token: ""
+  hermes_notify_token: ""
+  # Pager device scope: GET /ping and POST /reply only.
+  device_token: ""
 
 pager:
   url: http://PAGER-IP:8080
@@ -34,6 +38,9 @@ allow_shell_commands: false
 
 agent_inbox:
   path: /var/lib/meshcore-gateway/agent-inboxes.json
+
+replies:
+  path: /var/lib/meshcore-gateway/replies.json
 
 agent_bridge:
   url: http://127.0.0.1:8091
