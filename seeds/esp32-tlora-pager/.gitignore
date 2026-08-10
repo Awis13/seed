@@ -1,0 +1,8 @@
+# MeshCore identity secrets (never commit)
+data/mesh_identity.id
+data/mesh_pair.json
+data/mesh_probe_s.txt
+# WireGuard + WiFi secrets (never commit)
+data/wg.json
+data/wifi.json
+data/auth_token.txt

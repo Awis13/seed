@@ -18,9 +18,10 @@
 #define AGENTS_N            3
 #define AGENT_ID_LEN        12
 #define AGENT_NAME_LEN      16
-/* Long bot replies: store big chunks; UI scrolls with the encoder. */
-#define AGENT_TEXT_LEN      384
-#define AGENT_THREAD_MAX    16   /* ~6KB per agent ring */
+/* Long bot / mesh multi-part: bigger ring, UTF-8 safe split still applies.
+ * 0.9.22: 512 * 40 * 3 ≈ 60 KB static — fine on S3 with 8 MB PSRAM free for other. */
+#define AGENT_TEXT_LEN      512
+#define AGENT_THREAD_MAX    40
 #define AGENT_BRIDGE_LEN    96
 #define AGENT_BRIDGE_FILE   "/agent_bridge.txt"
 #define AGENT_SESSION_LEN   24
@@ -235,7 +236,17 @@ static void agents_clean_text(const char *in, char *out, size_t out_n) {
     out[j] = '\0';
 }
 
-/* Public: send a line as the user. Always stored locally; bridge if configured. */
+/* Optional mesh uplink (registered by meshcore skill). Same C1 framing as downlink. */
+typedef bool (*AgentsMeshUplinkFn)(const char *agent_id, const char *text);
+static AgentsMeshUplinkFn g_agents_mesh_uplink = nullptr;
+
+static void agents_set_mesh_uplink(AgentsMeshUplinkFn fn) {
+    g_agents_mesh_uplink = fn;
+}
+
+/* Public: send a line as the user.
+ * Path: local thread always → WiFi bridge if up → else MeshCore C1 uplink.
+ * Downlink reply uses the same C1 (or WiFi /agents/inbound). One chat loop. */
 static bool agents_send(const char *agent_id, const char *text) {
     int idx = agents_find(agent_id);
     if (idx < 0 || !text || !text[0]) return false;
@@ -251,12 +262,24 @@ static bool agents_send(const char *agent_id, const char *text) {
     event_add("agent %s << %s", agent_id, cleaned);
     display_force = true;
 
-    bool ok = agents_bridge_post(agent_id, cleaned);
-    if (!ok) {
+    bool wifi_ok = agents_bridge_post(agent_id, cleaned);
+    bool mesh_ok = false;
+    if (!wifi_ok && g_agents_mesh_uplink) {
+        mesh_ok = g_agents_mesh_uplink(agent_id, cleaned);
+        if (mesh_ok) event_add("agent %s mesh uplink", agent_id);
+    }
+    if (!wifi_ok && !mesh_ok) {
         portENTER_CRITICAL(&agents_mux);
-        if (g_bridge[0]) agents_push_line(idx, false, "(bridge offline)");
-        else agents_push_line(idx, false, "(no bridge URL)");
+        if (g_bridge[0] && WiFi.status() != WL_CONNECTED)
+            agents_push_line(idx, false, "(offline - mesh failed)");
+        else if (g_bridge[0])
+            agents_push_line(idx, false, "(bridge offline)");
+        else if (g_agents_mesh_uplink)
+            agents_push_line(idx, false, "(mesh failed)");
+        else
+            agents_push_line(idx, false, "(no bridge / mesh)");
         portEXIT_CRITICAL(&agents_mux);
+        display_force = true;
     }
     return true;
 }
@@ -317,11 +340,10 @@ static const char *agents_bridge_url() { return g_bridge; }
 static const char *agents_describe() {
     return
         "# agents\n\n"
-        "Pocket chat with Grok / Claude / Hermes. The seed stores a short\n"
-        "thread per agent and POSTs your lines to a LAN bridge when configured.\n"
-        "Agent answers should come back as POST /notify with matching `source`.\n\n"
-        "SPIFFS `/agent_bridge.txt` = base URL (http://host:port).\n"
-        "POST {bridge}/v1/chat JSON: {agent, session, text, from}.\n";
+        "Pocket chat with Grok / Claude / Hermes.\n"
+        "Uplink: WiFi bridge /v1/chat, else MeshCore C1|agent|…|u|… private DM.\n"
+        "Downlink: same C1 side=a (or WiFi /agents/inbound) — one loop.\n\n"
+        "SPIFFS `/agent_bridge.txt` = base URL (http://host:port).\n";
 }
 
 static const SkillEndpoint agents_endpoints[] = {

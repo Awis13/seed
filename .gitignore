@@ -32,3 +32,6 @@ __pycache__/
 seeds/esp32-tlora-pager/.pio/
 seeds/esp32-tlora-pager/data/wifi.json
 seeds/esp32-tlora-pager/data/auth_token.txt
+seeds/esp32-tlora-pager/data/mesh_identity.id
+seeds/esp32-tlora-pager/data/mesh_pair.json
+seeds/esp32-tlora-pager/data/mesh_probe_s.txt

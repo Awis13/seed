@@ -5,6 +5,7 @@
 //   - Letters by default (layout-dependent: EN / RU PHON / RU JCUKEN).
 //   - Orange ALT (0x14): HOLD for symbols/digits (momentary).
 //   - CAPS (0x1C): toggle case; ALT+CAPS cycles layout.
+//   - Long CAPS (~0.7s): lock/unlock keyboard (pocket).
 //   - Key 0x1E is SPACE — not a SYM latch.
 
 #include "hw_kb.h"
@@ -37,6 +38,11 @@ static bool symbol = false;
 static bool alt_held = false;
 static HwKbLayout layout = HW_KB_LAYOUT_EN;
 static bool layout_changed = false;
+static bool kb_locked = false;
+static bool lock_changed = false;
+static uint32_t caps_down_ms = 0;
+static bool caps_long_done = false;  // long-press already fired this hold
+#define CAPS_LONG_MS 700u
 
 // Latin letter map (QWERTY positions).
 static const char KEYMAP_EN[4][10] = {
@@ -269,6 +275,30 @@ void hw_kb_reset_mods() {
     alt_held = false;
 }
 
+bool hw_kb_locked() { return kb_locked; }
+
+void hw_kb_set_locked(bool on) {
+    if (kb_locked == on) return;
+    kb_locked = on;
+    lock_changed = true;
+    if (on) {
+        caps = false;
+        symbol = false;
+        alt_held = false;
+    }
+    Serial.printf("[kb] %s\n", on ? "LOCKED (long CAPS to unlock)" : "unlocked");
+}
+
+bool hw_kb_take_lock_changed() {
+    bool c = lock_changed;
+    lock_changed = false;
+    return c;
+}
+
+static void kb_toggle_lock() {
+    hw_kb_set_locked(!kb_locked);
+}
+
 bool hw_kb_read(char *out, size_t out_sz) {
     if (!kb_ok || !out || out_sz < 2) return false;
     out[0] = 0;
@@ -278,6 +308,12 @@ bool hw_kb_read(char *out, size_t out_sz) {
     n &= 0x0F;
     if (n == 0) {
         tca_write(TCA_REG_INT_STAT, 0x01);
+        /* While CAPS held, poll duration so long-press fires without release. */
+        if (caps_down_ms != 0 && !caps_long_done &&
+            (millis() - caps_down_ms) >= CAPS_LONG_MS) {
+            caps_long_done = true;
+            kb_toggle_lock();
+        }
         return false;
     }
 
@@ -291,21 +327,36 @@ bool hw_kb_read(char *out, size_t out_sz) {
     k--;
 
     if (k == KEY_ALT) {
+        if (kb_locked) return false;  // no mods while locked
         alt_held = pressed;
         symbol = pressed;
         return false;
     }
     if (k == KEY_CAPS) {
         if (pressed) {
+            caps_down_ms = millis();
+            caps_long_done = false;
+        } else {
+            /* Release: short tap = caps/layout; long already handled. */
+            uint32_t held = (caps_down_ms != 0) ? (millis() - caps_down_ms) : 0;
+            caps_down_ms = 0;
+            if (caps_long_done) {
+                caps_long_done = false;
+                return false;  // long-press already toggled lock
+            }
+            if (kb_locked) return false;  // short CAPS ignored while locked
             if (alt_held) {
-                // ALT+CAPS = cycle EN / PHON / RU
                 hw_kb_cycle_layout();
-            } else {
+            } else if (held < CAPS_LONG_MS) {
                 caps = !caps;
             }
         }
         return false;
     }
+
+    /* Locked: swallow everything else (still drain FIFO above). */
+    if (kb_locked) return false;
+
     if (k == KEY_BACKSPACE) {
         if (pressed) return emit_byte(out, out_sz, alt_held ? '\x1b' : '\b');
         return false;
