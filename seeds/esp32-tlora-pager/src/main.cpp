@@ -1417,6 +1417,7 @@ static void handle_wifi_networks_post(AsyncWebServerRequest *request) {
 #include "skills/backlight.cpp"
 #include "skills/wg.cpp"
 #include "skills/gps.cpp"    // after notify: reuses notify_send_json; uses hw_ui_expand_ok
+#include "skills/rns.cpp"    // Reticulum bring-up; uses write_spiffs_file_atomic
 
 static void skills_init() {
     skill_notify_init();
@@ -1426,6 +1427,7 @@ static void skills_init() {
     skill_backlight_init();
     skill_wg_init();
     skill_gps_init();
+    skill_rns_init();
 }
 
 // Build one second of the home clock face (tembed look, 480x222).
