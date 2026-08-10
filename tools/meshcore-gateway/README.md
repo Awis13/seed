@@ -39,9 +39,12 @@ call `/notify-out`, `/send`, `/pager`, or any agent inbox.
 When the HTTP POST fails, the firmware falls back to a single mesh DM frame
 `R1|key|reply`; the gateway feeds both transports into the same durable
 `replies.json` store (capped, one logical entry per key+text, so the
-WiFi/mesh double delivery never duplicates a reply). Consumers read stored
-replies newest-first via `GET /replies` (admin bearer, optional `?key=`
-filter).
+WiFi/mesh double delivery never duplicates a reply). Each entry keeps `ts`
+as the first-arrival time; a repeated arrival for the same key+text bumps
+`duplicates`, updates `lastTransport`, and refreshes `last_ts` to the
+current time. Consumers filtering replies by recency must use `last_ts`,
+not `ts`. Stored replies are read newest-first via `GET /replies` (admin
+bearer, optional `?key=` filter).
 
 ## Install or update
 

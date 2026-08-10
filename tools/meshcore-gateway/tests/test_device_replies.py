@@ -1,3 +1,4 @@
+import json
 import os
 import stat
 import tempfile
@@ -230,10 +231,36 @@ class ReplyIntakeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.daemon._replies), 2)
         self.assertEqual(self.daemon._replies[0]["duplicates"], 1)
 
+    async def test_first_store_sets_last_ts_equal_to_ts(self):
+        status, _body = await self.daemon.webhook_reply(
+            _Request("/reply", body={"key": "card-1", "reply": "ok"})
+        )
+        self.assertEqual(status, 200)
+        row = self.daemon._replies[0]
+        self.assertEqual(row["last_ts"], row["ts"])
+
+    async def test_duplicate_arrival_refreshes_last_ts_but_not_ts(self):
+        self.daemon.time = types.SimpleNamespace(time=lambda: 1000)
+        await self.daemon.webhook_reply(
+            _Request("/reply", body={"key": "card-1", "reply": "ok"})
+        )
+        # Same key+text arrives again a day later (recurring card, habitual "ok").
+        self.daemon.time = types.SimpleNamespace(time=lambda: 1000 + 86400)
+        status, body = await self.daemon.webhook_reply(
+            _Request("/reply", body={"key": "card-1", "reply": "ok"})
+        )
+        self.assertEqual(status, 200)
+        self.assertTrue(body["duplicate"])
+        row = self.daemon._replies[0]
+        self.assertEqual(row["ts"], 1000)
+        self.assertEqual(row["last_ts"], 1000 + 86400)
+        self.assertEqual(row["duplicates"], 1)
+
     async def test_replies_survive_daemon_restart(self):
         await self.daemon.webhook_reply(
             _Request("/reply", body={"key": "card-1", "reply": "persisted"})
         )
+        original = self.daemon._replies[0]
         reloaded = load_daemon()
         reloaded.cfg = self.daemon.cfg
         reloaded.load_replies()
@@ -241,6 +268,13 @@ class ReplyIntakeTests(unittest.IsolatedAsyncioTestCase):
             [(row["key"], row["reply"]) for row in reloaded._replies],
             [("card-1", "persisted")],
         )
+        self.assertEqual(reloaded._replies[0]["last_ts"], original["last_ts"])
+
+    async def test_load_replies_backfills_last_ts_for_legacy_rows(self):
+        legacy = [{"key": "card-1", "reply": "old", "transport": "http", "ts": 123}]
+        self.replies_path.write_text(json.dumps(legacy), encoding="utf-8")
+        self.daemon.load_replies()
+        self.assertEqual(self.daemon._replies[0]["last_ts"], 123)
 
     def test_replies_store_is_capped(self):
         for i in range(self.daemon._REPLIES_MAX + 5):
@@ -292,6 +326,18 @@ class MeshR1Tests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(rows[0]["transport"], "http")
         self.assertEqual(rows[0]["lastTransport"], "mesh")
         self.assertEqual(rows[0]["duplicates"], 1)
+
+    async def test_r1_duplicate_after_http_refreshes_last_ts(self):
+        self.daemon.time = types.SimpleNamespace(time=lambda: 2000)
+        await self.daemon.webhook_reply(
+            _Request("/reply", body={"key": "card-1", "reply": "ok"})
+        )
+        self.daemon.time = types.SimpleNamespace(time=lambda: 2077)
+        await self.daemon.on_mesh_message(self._event("R1|card-1|ok"))
+        row = self.daemon._replies[0]
+        self.assertEqual(row["ts"], 2000)
+        self.assertEqual(row["last_ts"], 2077)
+        self.assertEqual(row["lastTransport"], "mesh")
 
     async def test_malformed_r1_is_dropped_without_reaching_command_bot(self):
         for text in ("R1|", "R1|card-1", "R1||reply", "R1|card-1|", "R1|   |reply"):

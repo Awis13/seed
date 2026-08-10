@@ -252,6 +252,10 @@ def load_replies() -> None:
             for row in saved[-_REPLIES_MAX:]
             if isinstance(row, dict) and row.get("key") and row.get("reply")
         ]
+        # Backfill last_ts for rows persisted before the field existed, so
+        # consumers get a uniform entry shape without fallback logic.
+        for row in _replies:
+            row["last_ts"] = row.get("last_ts") or row.get("ts")
 
 
 def _clean_reply_fields(key: Any, reply: Any) -> tuple[str, str] | None:
@@ -271,11 +275,18 @@ def store_reply(key: str, reply: str, transport: str) -> tuple[bool, dict[str, A
     The firmware may deliver the same reply twice — WiFi POST /reply plus a
     mesh R1 fallback when the HTTP path looked failed. The second arrival must
     not create a duplicate entry: it only bumps the duplicate counter.
+
+    Reply keys are stable by design (a recurring card reuses its key), so a
+    repeated arrival keeps `ts` as the first-arrival time for transport-race
+    forensics while `last_ts` always reflects the most recent arrival.
+    Consumers filtering "replies since ..." must use `last_ts`.
     """
+    now = int(time.time())
     for row in _replies:
         if row.get("key") == key and row.get("reply") == reply:
             row["duplicates"] = int(row.get("duplicates") or 0) + 1
             row["lastTransport"] = transport
+            row["last_ts"] = now
             _persist_replies()
             return False, row
     entry: dict[str, Any] = {
@@ -283,7 +294,8 @@ def store_reply(key: str, reply: str, transport: str) -> tuple[bool, dict[str, A
         "key": key,
         "reply": reply,
         "transport": transport,
-        "ts": int(time.time()),
+        "ts": now,
+        "last_ts": now,
         "duplicates": 0,
     }
     _replies.append(entry)
