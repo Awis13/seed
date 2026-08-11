@@ -871,11 +871,37 @@ assert "lxmf_parse(g_rns_lxmf_payload, len, &g_rns_lxmf_msg)" in lxmf_poll, (
 assert "lxmf_parse(" not in lcb, (
     "the parse must never appear in the callback: it is tens of ms in the drain"
 )
-# The three-line poll body (drain the ring, count OK, count bad) is where the
-# proof of the pipe lives; both counters must move from it.
+# The poll drains the ring, counts OK vs bad, and (TLORA-LXMF C3) ROUTES the
+# clean ones onto the screen; both counters must still move from it.
 assert "g_rns_lxmf_ok++" in lxmf_poll and "g_rns_lxmf_bad++" in lxmf_poll, (
     "the poll must bump data_lxmf_ok on a clean parse and data_lxmf_bad on a "
     "malformed one — the disjoint 'device alive but did not understand' signal"
+)
+# 8i.5-bis THE RECEIVE MILESTONE: a clean parse is ROUTED, not just counted. The
+# card-vs-room decision is the pure lxmf_route_plan() (src/lxmf_route.h), and the
+# poll raises a card through notify_ingest() or hands a thread to the room router,
+# with the same two off-loop calls the seed.pager pickup uses. Still after the
+# stack, still off the drain.
+assert "lxmf_route_plan(&g_rns_lxmf_msg" in lxmf_poll, (
+    "the clean-parse path must call the pure router lxmf_route_plan() — the "
+    "card-vs-room / severity / key decision is factored out and host-tested"
+)
+assert "notify_ingest(" in lxmf_poll, (
+    "the DEFAULT (a plain client, no custom fields) must raise a card — without "
+    "this the phone writes and nothing lands on the screen"
+)
+assert "g_rns_room_router(" in lxmf_poll, (
+    "a message carrying a thread must route to a room INSTEAD of a card"
+)
+assert '#include "../lxmf_route.h"' in rns, (
+    "rns.cpp must include the pure routing header that owns the decision"
+)
+# The text that reaches the screen is sanitised the seed.pager way — control
+# bytes stripped, length bounded — never the raw codec buffer straight to notify.
+assert "rns_text_sanitize(" in lxmf_poll and \
+       "g_rns_card_body" in lxmf_poll and "g_rns_room_text" in lxmf_poll, (
+    "title/content must go through rns_text_sanitize() into the shared card/room "
+    "buffers, exactly as the seed.pager pickup does"
 )
 # It runs on the tick, after the stack, right after the seed.pager pickup.
 assert "rns_lxmf_inbox_poll();" in tick, "the tick must drive the lxmf poll"
@@ -1008,10 +1034,11 @@ pickup = re.sub(r"//[^\n]*", " ", pickup)
 assert "rns_inbox_take(" in pickup and "notify_ingest(" in pickup, (
     "the pickup is what takes the messages and what raises the cards"
 )
-assert rns_code.count("notify_ingest(") == 1, (
-    "there is exactly one card site, and it is on the loop task outside the "
-    "drain — a notify_ingest() reachable from the callback would take the "
-    "notify_mux critical section inside Transport::inbound()"
+assert rns_code.count("notify_ingest(") == 2, (
+    "there are exactly two card sites — the seed.pager pickup and the LXMF poll "
+    "(TLORA-LXMF C3) — and BOTH are on the loop task outside the drain: a "
+    "notify_ingest() reachable from either callback would take the notify_mux "
+    "critical section inside Transport::inbound()"
 )
 for banned in ("new ", "malloc", "String "):
     assert banned not in pickup, (
@@ -1380,13 +1407,16 @@ assert re.search(r"^static rns_room_router g_rns_room_router = nullptr;", rns, r
     "the router defaults to null, and null is not a degraded mode: it is the "
     "behaviour that shipped before the hook existed — a card and nothing else"
 )
-assert rns_code.count("g_rns_room_router(") == 1, (
-    "the router is called from exactly ONE site. Two would put a message into "
-    "a conversation twice, and there is nothing downstream that could tell"
+assert rns_code.count("g_rns_room_router(") == 2, (
+    "the router is called from exactly TWO sites, each routing a distinct "
+    "receive path AT MOST ONCE per message: the seed.pager pickup (an envelope "
+    "with a session) and the LXMF poll (a message with a thread, TLORA-LXMF C3). "
+    "A third, or the same message through both, would put it into a conversation "
+    "twice with nothing downstream to tell"
 )
 assert "g_rns_room_router(" in pickup, (
-    "the one call site is the loop-task pickup, after rns_stack.loop() — the "
-    "router's contract (no synchronous SD, no blocking) is written against "
+    "one call site is the loop-task seed.pager pickup, after rns_stack.loop() — "
+    "the router's contract (no synchronous SD, no blocking) is written against "
     "that task and that position in the tick"
 )
 # ITS TWO ARGUMENTS ARE PINNED BY NAME, because the transformations above can

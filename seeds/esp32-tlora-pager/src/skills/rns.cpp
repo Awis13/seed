@@ -263,6 +263,7 @@
  * <string.h>/<stddef.h>, so it stands on its own wherever it lands. */
 #include "../agents_chat_route.h"
 #include "../lxmf_codec.h"
+#include "../lxmf_route.h"
 
 /* The two wire constants rns/pktfilter.h mirrors, checked against the library's
  * own enums here — this is the only translation unit that sees both. A value
@@ -898,6 +899,15 @@ static LxmfMsg g_rns_lxmf_msg;
  * signal. data_lxmf_rx (the packets that arrived) is g_rns_lxmf_inbox.received. */
 static uint32_t g_rns_lxmf_ok = 0;
 static uint32_t g_rns_lxmf_bad = 0;
+/* Where the parsed messages WENT, split the way the seed.pager path splits
+ * data_cards from data_envelopes: data_lxmf_cards is a parsed message routed to
+ * a notification card (the default, plain-client path), data_lxmf_rooms one
+ * carrying a thread and handed to the chat router instead. They partition the
+ * data_lxmf_ok total, so a gap between them and it is a message that parsed but
+ * whose card the notify store refused. Loop-task-written scalars, like the pair
+ * above. */
+static uint32_t g_rns_lxmf_cards = 0;
+static uint32_t g_rns_lxmf_rooms = 0;
 
 static void rns_lxmf_data_callback(const RNS::Bytes &data, const RNS::Packet &packet) {
     (void)packet;
@@ -1997,6 +2007,10 @@ static void rns_status_json(JsonDocument &doc) {
     doc["data_lxmf_rx"] = (unsigned long)g_rns_lxmf_inbox.received;
     doc["data_lxmf_ok"] = (unsigned long)g_rns_lxmf_ok;
     doc["data_lxmf_bad"] = (unsigned long)g_rns_lxmf_bad;
+    /* Where the parsed messages went: cards + rooms partition data_lxmf_ok, so a
+     * shortfall against it is a message that parsed but whose card was refused. */
+    doc["data_lxmf_cards"] = (unsigned long)g_rns_lxmf_cards;
+    doc["data_lxmf_rooms"] = (unsigned long)g_rns_lxmf_rooms;
 
     /* THE ENVELOPE MADE VISIBLE, and the pair at the top of it is the point:
      * a payload is either read as `1|<address>|<session>|<text>` or shown
@@ -2662,30 +2676,6 @@ static void rns_announce_poll() {
     g_rns_ann_was_online = online;
 }
 
-/* Take whatever the lxmf.delivery callback left and PARSE it off the drain.
- *
- * Loop task only, and after rns_stack.loop() for the same reason rns_inbox_poll()
- * below is: the drain that fills this ring runs inside that call, so a pickup
- * ahead of it is one tick stale. What this adds that the seed.pager pickup does
- * not is the parse, and the parse is the whole reason it is HERE and not in the
- * callback — lxmf_parse() walks hostile msgpack now and will run an Ed25519
- * verify in a later commit, tens of milliseconds either way, which must never
- * land in the 8 ms drain.
- *
- * C2 proves the pipe and no more: a clean parse bumps data_lxmf_ok, a malformed
- * one bumps data_lxmf_bad, and the real card/chat routing (title/content onto a
- * card, a reply) is a later commit. The counters plus data_lxmf_rx in
- * /rns/status are how the receive path is shown to work end to end. */
-static void rns_lxmf_inbox_poll() {
-    uint16_t len = 0;
-    while (rns_inbox_take(&g_rns_lxmf_inbox, g_rns_lxmf_payload,
-                          sizeof(g_rns_lxmf_payload), &len)) {
-        LxmfReason rr = lxmf_parse(g_rns_lxmf_payload, len, &g_rns_lxmf_msg);
-        if (rr == LXMF_OK) g_rns_lxmf_ok++;
-        else g_rns_lxmf_bad++;
-    }
-}
-
 /* Take whatever the packet callback left in the inbox and put it on the screen.
  *
  * Loop task only, and deliberately AFTER rns_stack.loop() — see skill_rns_poll().
@@ -2789,6 +2779,80 @@ static void rns_lxmf_inbox_poll() {
  * RNS_CARD_CUT_MARK_MAX is the separate buffer the marker is formatted into. */
 #define RNS_CARD_CUT_RESERVE  12
 #define RNS_CARD_CUT_MARK_MAX 16
+
+/* Take whatever the lxmf.delivery callback left, PARSE it off the drain, and
+ * ROUTE the result onto the screen. This is the RECEIVE MILESTONE: a message a
+ * phone sent lands as a card here.
+ *
+ * Loop task only, and after rns_stack.loop() for the same reason rns_inbox_poll()
+ * below is: the drain that fills this ring runs inside that call, so a pickup
+ * ahead of it is one tick stale. What this adds that the seed.pager pickup does
+ * not is the parse — lxmf_parse() walks hostile msgpack, tens of milliseconds,
+ * which is exactly the work the callback was forbidden and the whole reason it is
+ * HERE and not in the drain. C1's counters still move: a clean parse bumps
+ * data_lxmf_ok, a malformed one data_lxmf_bad.
+ *
+ * WHERE A CLEAN MESSAGE GOES is a pure function of its fields — lxmf_route_plan()
+ * (src/lxmf_route.h), host-tested apart from the firmware. The DEFAULT, and the
+ * milestone, is a plain client (Retichat) with only title+content: it raises a
+ * notification card, source "lxmf" and a derived replace-in-place key so a resend
+ * updates in place rather than stacking. meta.sev picks the severity, meta.src
+ * the source label, meta.key the card key; a thread routes to a room INSTEAD of a
+ * card. The renderer is ignored here — every card is plain in v1; a micron-page
+ * body is a later ticket.
+ *
+ * THE TEXT IS SANITISED THE SEED.PAGER WAY. The codec bounds title/content, but
+ * they are still arbitrary bytes; rns_text_sanitize() strips control bytes and
+ * bounds length into the SAME g_rns_card_body / g_rns_room_text buffers the
+ * seed.pager pickup uses, the card body against the screen's character budget and
+ * the room text uncut. This never rate-limits: like rns_inbox_poll(), a burst is
+ * a buzz per message and that gap is named there, not closed here. */
+static void rns_lxmf_inbox_poll() {
+    uint16_t len = 0;
+    while (rns_inbox_take(&g_rns_lxmf_inbox, g_rns_lxmf_payload,
+                          sizeof(g_rns_lxmf_payload), &len)) {
+        LxmfReason rr = lxmf_parse(g_rns_lxmf_payload, len, &g_rns_lxmf_msg);
+        if (rr != LXMF_OK) { g_rns_lxmf_bad++; continue; }
+        g_rns_lxmf_ok++;
+
+        LxmfRoute route;
+        lxmf_route_plan(&g_rns_lxmf_msg, &route);
+
+        /* A THREAD ROUTES TO A ROOM, INSTEAD of a card — see lxmf_route.h. The
+         * router runs ON THIS TASK, after rns_stack.loop(), so it may not block
+         * or touch SD synchronously; with none installed the message is shown
+         * nowhere, exactly as a control frame is in rns_inbox_poll(). The content
+         * is sanitised uncut into the room's own buffer, the seed.pager way. */
+        if (route.kind == LXMF_ROUTE_ROOM) {
+            if (g_rns_room_router) {
+                int reason = 0;
+                rns_text_sanitize((const uint8_t *)g_rns_lxmf_msg.content,
+                                  g_rns_lxmf_msg.content_len,
+                                  g_rns_room_text, sizeof(g_rns_room_text), 0);
+                if (g_rns_room_router(route.room, g_rns_room_text, &reason))
+                    g_rns_lxmf_rooms++;
+            }
+            continue;
+        }
+
+        /* THE DEFAULT: a card. Title and content are sanitised the seed.pager
+         * way — control bytes stripped, the body cut to the screen's character
+         * budget — into a title scratch and g_rns_card_body. An empty title still
+         * makes a card; notify_ingest() supplies its own placeholder. */
+        char title[NOTIFY_TITLE_LEN];
+        rns_text_sanitize((const uint8_t *)g_rns_lxmf_msg.title,
+                          g_rns_lxmf_msg.title_len,
+                          title, sizeof(title), 0);
+        rns_text_sanitize((const uint8_t *)g_rns_lxmf_msg.content,
+                          g_rns_lxmf_msg.content_len,
+                          g_rns_card_body, sizeof(g_rns_card_body),
+                          RNS_CARD_VISIBLE_CHARS);
+        if (notify_ingest(route.level, route.source,
+                          title[0] ? title : "lxmf",
+                          g_rns_card_body, route.key) != 0)
+            g_rns_lxmf_cards++;
+    }
+}
 
 static void rns_inbox_poll() {
     uint16_t len = 0;
