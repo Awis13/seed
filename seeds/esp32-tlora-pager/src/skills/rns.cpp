@@ -10,15 +10,28 @@
  * Where the pieces live:
  *   rns/hdlc.h            framing codec, no Arduino deps, host-tested by
  *                         tools/test_rns_hdlc.sh
+ *   rns/pktfilter.h       the inbound keep/drop decision, likewise pure and
+ *                         host-tested (tools/test_rns_filter.sh)
  *   RnsTcpInterface       RNS::InterfaceImpl subclass; drain, framing and the
  *                         reconnect state machine all run on the loop task
  *   /rns.json (SPIFFS)    {enabled, host, port} — gitignored, it names a host
  *                         behind the tunnel
  *   GET  /rns/status      stack + interface state, counters, last error, plus
  *                         three loop-task health fields (loop_stack_free_bytes,
- *                         drain_us_max, path_hashes); ?reset=1 zeroes the
- *                         drain_us_max rolling max after it has been read
+ *                         drain_us_max, path_hashes) and the prefilter's
+ *                         announces_dropped / announces_kept; ?reset=1 zeroes
+ *                         the drain_us_max rolling max after it has been read
  *   POST /rns/config      upsert of the three fields above
+ *
+ * THE ANNOUNCE PREFILTER is the reason this file is not simply a TCP interface.
+ * One accepted announce measured 221 ms of loop task against an 8 ms drain
+ * budget, essentially all of it a software Ed25519 verification inside
+ * Identity::validate_announce (no ECC accelerator on the ESP32-S3, no Ed25519
+ * in mbedTLS). That cost cannot be reduced, so it is not paid: a filter
+ * registered on Transport's inbound hook drops every announce that is not a
+ * PATH_RESPONSE, ~350 lines of Transport::inbound() before the verification.
+ * See the prefilter block further down for what the hook does and does not
+ * permit.
  *
  * THE TICK IS NOW ON, and it brings four library behaviours with it that no
  * caller can switch off. They are accepted, not worked around:
@@ -41,16 +54,49 @@
  * ever held. What is also true: the receive path allocates. RNS::Bytes(
  * g_rns_rx.buf, g_rns_rx.len) below copies each frame into a std::vector before
  * handle_incoming() is entered, and Transport::inbound() allocates a good deal
- * more behind that. The bound on the exposure is therefore the drain budget —
- * bytes, frames and milliseconds per tick — and not an absence of allocation.
+ * more behind that. -DRNS_PERSIST_HASHLIST=0 adds one allocation of its own to
+ * that path and it is worth naming: with a working store, the packet hashlist's
+ * put() stops short-circuiting on isValid() and BasicHeapStore::put()
+ * (HeapStore.h) now sweeps the whole map for expired records and then inserts a
+ * std::map node through ContainerAllocator, once per accepted packet, on the
+ * loop task. It is bounded — the hashlist is capped at 100 records — but it is
+ * not free, and it is the price of the dedupe the store was switched on for.
+ * The bound on the exposure is therefore the drain budget — bytes, frames and
+ * milliseconds per tick — and not an absence of allocation.
  *
- * Persistence: -DRNS_PERSIST_PATHS=0 in platformio.ini is likewise a
- * requirement of the drain rather than a preference. At the library default the
- * path store is a microStore::BasicFileStore, so every announce Transport
- * accepts writes SPIFFS from inside the drain loop; at 0 it is a BasicHeapStore
- * and the announce path never touches flash. The reasoning is spelled out at
- * the flag itself. The identity below is the one thing that must survive a
- * reboot, and this file persists it without the library's help.
+ * Persistence: -DRNS_PERSIST_PATHS=0 and -DRNS_PERSIST_HASHLIST=0 in
+ * platformio.ini turn the path store and the packet hashlist from
+ * microStore::BasicFileStore into BasicHeapStore. This is a requirement of the
+ * drain rather than a preference, but NOT for the reason this comment used to
+ * give. The old claim — that at the default the announce path writes SPIFFS
+ * from inside the drain loop — is wrong for the configuration this firmware
+ * actually runs: Transport::start() calls init() on all three stores inside
+ * `if (Reticulum::transport_enabled())` (Transport.cpp), and this node sets
+ * transport_enabled(false). A FileStore with no filesystem has isValid() false,
+ * so every put() returns false without touching flash. What the default
+ * therefore bought was not a flash write but a broken store: `paths` would never
+ * count and the packet hashlist would never dedupe anything. BasicHeapStore::
+ * isValid() is unconditionally true, so at 0 they work. The flash hazard is real
+ * but conditional: it is what the same code would do the day
+ * transport_enabled(true) is set, and these flags defuse it in advance. The
+ * reasoning is spelled out at the flags themselves.
+ *
+ * The THIRD store, known destinations, stays at the library default and stays
+ * broken on purpose. It was switched to 0 as well and that had to be reverted:
+ * a live BasicHeapStore evicts only when policy_max_recs > 0, which meant this
+ * file had to call Identity::known_destinations_maxsize() before start() — on a
+ * store whose init() the library never runs here — and that build panic-looped
+ * on the device and was rolled back. What faulted is NOT established; see
+ * platformio.ini, which says so and says why the setter cannot itself be it.
+ * The flag is gone because the flag's own justification had
+ * already been removed by the prefilter below: it existed because a failed
+ * Identity::remember() logged an ERROR through Log.cpp's blocking Serial.flush()
+ * once per accepted announce, and remember() is reached from
+ * Identity::validate_announce(), which a dropped announce never gets to. Nothing
+ * on this node reads the store. See platformio.ini for the full note.
+ *
+ * The identity below is the one thing that must survive a reboot, and this file
+ * persists it without the library's help.
  *
  * Blocking is the central hazard, because arduino-esp32 3.3.9's NetworkClient
  * is only partly non-blocking:
@@ -162,6 +208,17 @@
 #undef socket
 
 #include "rns/hdlc.h"
+#include "rns/pktfilter.h"
+
+/* The two wire constants rns/pktfilter.h mirrors, checked against the library's
+ * own enums here — this is the only translation unit that sees both. A value
+ * drifting in a future microReticulum breaks the firmware build instead of
+ * quietly changing which packets the filter drops on the device. */
+static_assert(RNS_PKT_TYPE_ANNOUNCE == (uint8_t)RNS::Type::Packet::ANNOUNCE,
+              "rns/pktfilter.h ANNOUNCE does not match RNS::Type::Packet");
+static_assert(RNS_PKT_CONTEXT_PATH_RESPONSE ==
+                  (uint8_t)RNS::Type::Packet::PATH_RESPONSE,
+              "rns/pktfilter.h PATH_RESPONSE does not match RNS::Type::Packet");
 
 #define RNS_ID_PATH  "/rns_identity.id"
 #define RNS_ID_TMP   "/rns_identity.tmp"
@@ -327,6 +384,61 @@ static volatile uint8_t g_path_hash_n = 0;
 static uint32_t g_loop_stack_free_bytes = 0;
 static uint32_t g_drain_us_max = 0;
 
+/* ---- inbound packet prefilter ----
+ *
+ * Transport::inbound() offers one hook, set_filter_packet_callback, and calls it
+ * roughly 350 lines before Identity::validate_announce(). That gap is the whole
+ * point: an announce this node has no use for costs two field reads here
+ * instead of an Ed25519 verification that measured 221 ms on this board.
+ *
+ * The decision itself is rns_filter_keep_packet() in rns/pktfilter.h — a pure
+ * function of packet type and context, host-tested by tools/test_rns_filter.sh.
+ * What lives here is only the plumbing, and every line of it is constrained:
+ *
+ *   - The hook is a BARE FUNCTION POINTER (Transport::Callbacks::filter_packet
+ *     is `bool(*)(const Packet&)`), so there is nowhere to put state except file
+ *     scope. Hence the two statics below rather than anything captured.
+ *   - It runs inside the drain, on the loop task, once per inbound packet, so it
+ *     must be O(1), allocate nothing and have no side effect beyond those two
+ *     counters. Packet::packet_type() and Packet::context() are inline reads of
+ *     the packet object's own fields; neither copies, allocates or throws.
+ *   - The hook is FAIL-OPEN, but only for one kind of throw. Transport.cpp
+ *     initialises `accept = true` and wraps the call in
+ *     `catch (const std::exception&)`, so a std::exception out of here leaves
+ *     the packet accepted and silently disables the filter — the safe
+ *     direction. Anything NOT derived from std::exception escapes
+ *     Transport::inbound() instead, and inbound() sets `_jobs_locked = true` on
+ *     entry and clears it only on the normal way out; Transport::jobs() is
+ *     guarded by `if (!_jobs_locked)`, so it would never run again for the rest
+ *     of the boot. That is the real reason nothing in this function is allowed
+ *     to be ABLE to throw, and it is a contract for whoever edits it next: the
+ *     escape hatch below you is narrower than it looks.
+ *   - A DROPPED PACKET NEVER ENTERS THE PACKET HASHLIST, because Transport only
+ *     records the hash on the accept path. The same announce arriving twice is
+ *     therefore judged twice, and the judgement must not differ — which is why
+ *     the decision function reads nothing but its arguments and the counters
+ *     below are written after it, never read by it.
+ *
+ * The counters are announce-specific on purpose: every non-announce packet is
+ * kept unconditionally, so counting those would only measure traffic. kept +
+ * dropped is the number of announces that reached the filter. */
+static uint32_t g_rns_ann_dropped = 0;
+static uint32_t g_rns_ann_kept = 0;
+
+static bool rns_packet_filter(const RNS::Packet &packet) {
+    uint8_t type = (uint8_t)packet.packet_type();
+    uint8_t context = (uint8_t)packet.context();
+    bool keep = rns_filter_keep_packet(type, context);
+    if (type == RNS_PKT_TYPE_ANNOUNCE) {
+        if (keep) {
+            g_rns_ann_kept++;
+        } else {
+            g_rns_ann_dropped++;
+        }
+    }
+    return keep;
+}
+
 /* ---- status snapshot ----
  *
  * GET /rns/status answers on the AsyncTCP task, and every interesting number it
@@ -353,11 +465,16 @@ struct RnsStatusSnap {
     uint32_t paths;
     uint32_t up_age_s;
     uint32_t rx, tx, rxbytes, txbytes;
+    /* Prefilter counters. They are written by rns_packet_filter() on the loop
+     * task and would be single-copy atomic to read directly, like g_rns_attempts
+     * — they are copied here anyway so that "the status handler reads the
+     * snapshot" stays a rule with no exceptions worth arguing about. */
+    uint32_t ann_dropped, ann_kept;
     uint16_t port;
     char host[RNS_TCP_HOST_MAX];
     char last_error[64];
 };
-static RnsStatusSnap g_rns_snap = {"off", false, 0, 0, 0, 0, 0, 0, 0,
+static RnsStatusSnap g_rns_snap = {"off", false, 0, 0, 0, 0, 0, 0, 0, 0, 0,
                                    RNS_TCP_PORT_DEFAULT, {0}, {0}};
 
 /* ---- configuration ---- */
@@ -860,6 +977,10 @@ static void rns_status_publish() {
         g_rns_snap.txbytes = (uint32_t)g_rns_iface.txbytes();
     }
 
+    /* Prefilter counters, published like everything else the handler reads. */
+    g_rns_snap.ann_dropped = g_rns_ann_dropped;
+    g_rns_snap.ann_kept = g_rns_ann_kept;
+
     g_rns_snap.port = g_rns_port;
     memcpy(g_rns_snap.host, g_rns_host, sizeof(g_rns_snap.host) - 1);
     memcpy(g_rns_snap.last_error, g_rns_last_error,
@@ -1029,6 +1150,15 @@ static void rns_status_json(JsonDocument &doc) {
     iface["loop_stack_free_bytes"] = (unsigned long)g_loop_stack_free_bytes;
     iface["drain_us_max"] = (unsigned long)g_drain_us_max;
 
+    /* What the inbound prefilter did, and the only evidence that it fires at
+     * all: announces_dropped is announces refused before Ed25519, announces_kept
+     * is the PATH_RESPONSE ones that went through and paid for the verification.
+     * Both come from the loop-side snapshot, never from the live counters.
+     * Watch these against drain_us_max: dropped climbing with drain_us_max flat
+     * near the 8 ms budget is the whole result. */
+    iface["announces_dropped"] = (unsigned long)g_rns_snap.ann_dropped;
+    iface["announces_kept"] = (unsigned long)g_rns_snap.ann_kept;
+
     /* The library's own counters next to the platform's, so /rns/status can be
      * diffed against /capabilities when the stack starts carrying traffic.
      * alloc_count/free_count read 0 under RNS_HEAP_ALLOCATOR — the library only
@@ -1074,6 +1204,16 @@ static const char *rns_describe() {
            "microseconds, zeroed by `?reset=1`) and `path_hashes` — up to eight\n"
            "path-table destination hashes with `path_hashes_total` for the full\n"
            "count.\n"
+           "Inbound packets pass a filter registered on Transport before the\n"
+           "stack starts: this node is a leaf, so it drops announces not\n"
+           "marked as a path response, before the Ed25519 signature is\n"
+           "checked — a verification that costs about 220 ms of loop task\n"
+           "against an 8 ms drain budget. The mark is a header field the\n"
+           "sender chooses, so this bounds the ordinary announce traffic a\n"
+           "leaf has no use for and is not a defence against a peer that sets\n"
+           "it. `iface.announces_dropped` and `iface.announces_kept` report\n"
+           "what the filter did; everything that is not an announce is kept\n"
+           "untouched.\n"
            "`mem.alloc_count` and `mem.free_count` are expected to read 0: the\n"
            "build uses the library's heap allocator, which leaves the global\n"
            "`operator new` — and therefore the counters — alone.\n"
@@ -1192,7 +1332,7 @@ static void skill_rns_poll() {
 
 static const Skill rns_skill = {
     .name = "rns",
-    .version = "0.2.0",
+    .version = "0.3.0",
     .describe = rns_describe,
     .endpoints = rns_endpoints,
     .register_routes = rns_register_routes,
@@ -1221,6 +1361,33 @@ static void skill_rns_init() {
             RNS::loglevel(RNS::LOG_ERROR);
             RNS::Reticulum::transport_enabled(false);
             RNS::Reticulum::probe_destination_enabled(false);
+            /* BEFORE start(), and before any interface exists to deliver a
+             * packet: Transport::inbound() reads _callbacks._filter_packet on
+             * every packet with no null check beyond `if (_callbacks.
+             * _filter_packet)`, so a late registration is simply a window in
+             * which announces are verified at full price. Nothing here depends
+             * on the stack being up — the setter writes one static pointer. */
+            RNS::Transport::set_filter_packet_callback(rns_packet_filter);
+            /* NOTHING ELSE GOES BETWEEN HERE AND start(). A previous revision
+             * called Identity::known_destinations_maxsize(64) and
+             * Transport::path_table_maxsize(64) on this line, to cap heap stores
+             * that -DRNS_PERSIST_*=0 had made live and that the library's own
+             * set_max_recs calls do not reach on a node with
+             * transport_enabled(false). That firmware panic-looped on the device
+             * and was rolled back. Do not read that as "these two lines faulted"
+             * — they cannot, each is a scalar store into a static that was
+             * constructed before app_main, and the OTA image is confirmed on 60 s
+             * of uptime rather than on reaching the end of setup(). They are gone
+             * because the flag that needed them is gone: known destinations is
+             * back at
+             * the library default, where the store is an invalid FileStore that
+             * stores nothing and therefore grows by nothing. The path store
+             * keeps its flag — it has been a live heap store across every build
+             * that has booted here, bounded only by a one-week per-entry TTL,
+             * and the filter above strictly reduces what reaches it. It is not
+             * capped here either: this is where that was tried. The hashlist caps
+             * itself: set_max_recs runs at the top of Transport::start(),
+             * outside the transport_enabled() block. See platformio.ini. */
             rns_stack = RNS::Reticulum();
             rns_stack.start();
             rns_started = true;
