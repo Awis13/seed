@@ -1276,12 +1276,12 @@ static const char *notify_describe() {
            "```\n"
            "curl -H \"Authorization: Bearer $TOKEN\" -H 'Content-Type: application/json' \\\n"
            "  -d '{\"level\":\"crit\",\"source\":\"home-rig\",\"title\":\"RAID degraded\"}' \\\n"
-           "  http://seed.local:8080/notify\n"
+           "  http://$NODE_IP:8080/notify\n"
            "\n"
            "curl -H \"Authorization: Bearer $TOKEN\" -H 'Content-Type: application/json' \\\n"
            "  -d '{\"source\":\"claude\",\"title\":\"Deploy to prod?\",\"options\":[\"Yes\",\"No\",\"Later\"]}' \\\n"
-           "  http://seed.local:8080/notify\n"
-           "curl -H \"Authorization: Bearer $TOKEN\" http://seed.local:8080/notify/one?id=12\n"
+           "  http://$NODE_IP:8080/notify\n"
+           "curl -H \"Authorization: Bearer $TOKEN\" http://$NODE_IP:8080/notify/one?id=12\n"
            "```\n";
 }
 

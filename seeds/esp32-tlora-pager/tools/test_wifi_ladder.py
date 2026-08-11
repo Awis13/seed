@@ -51,11 +51,14 @@ assert "wifi_reconnect_state == WIFI_RECONNECT_IDLE" in retry, (
 
 # 4. A successful association resets the ladder, so the next loss starts at
 #    the quick 30 s rung again. Anchor to the connected branch specifically:
-#    a reset that drifted to the offline branch would defeat the backoff.
+#    a reset that drifted out of it (into code that also runs on link loss)
+#    would defeat the backoff. The branch used to be closed by the mDNS
+#    teardown "} else"; with mDNS gone the next statement is the clock repaint,
+#    which runs on both edges and so is the correct end of the up branch.
 conn = main[main.index("if (now_connected != was_connected)") :]
 conn = conn[: conn.index("// Front panel")]
 up = conn[conn.index("if (now_connected) {") :]
-up = up[: up.index("} else")]
+up = up[: up.index("if (hw_ui_screen() == HW_UI_CLOCK)")]
 assert "wifi_retry_step = 0" in up, (
     "ladder must reset in the link-up branch of the transition"
 )

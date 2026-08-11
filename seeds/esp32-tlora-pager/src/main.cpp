@@ -36,7 +36,8 @@
 #include <stdarg.h>
 #include <time.h>
 #include <WiFi.h>
-#include <ESPmDNS.h>
+/* No mDNS header here: mDNS is deliberately off on this board — see the
+ * comment on the WiFi up/down transition in loop() for the crash it caused. */
 #include <SPIFFS.h>
 #include <Wire.h>
 #include <ESPAsyncWebServer.h>
@@ -469,7 +470,11 @@ static void hw_probe() {
 // ===== Globals =====
 static AsyncWebServer server(HTTP_PORT);
 static String auth_token = "";
-static String mdns_name = "";
+/* Node identifier ("seed-<mac suffix>"). A label only — it is shown on the
+ * INFO screen, on the clock face and in /capabilities so a node can be told
+ * apart in a fleet. It is NOT resolvable: mDNS is off (see loop()), and
+ * nothing registers it with a DNS server, so reach the node by IP. */
+static String node_name = "";
 static unsigned long boot_time = 0;
 
 /* Active credentials. Fixed buffers, not Arduino Strings: they are written on
@@ -480,7 +485,6 @@ static unsigned long boot_time = 0;
 static char wifi_ssid[33] = "";
 static char wifi_pass[65] = "";
 static bool wifi_user_off = false;
-static bool mdns_started = false;
 /* Background retry backoff. After an association loss (or a failed attempt)
  * the next try comes quickly — a router reboot or a walk back into range is
  * usually over in seconds — then the interval stretches until it reaches the
@@ -837,8 +841,8 @@ static void wifi_setup() {
      * scheduler, causing the same UI stalls the 20-minute cadence avoids. */
     WiFi.setAutoReconnect(false);
     String suffix = get_mac_suffix();
-    mdns_name = "seed-" + suffix;
-    mdns_name.toLowerCase();
+    node_name = "seed-" + suffix;
+    node_name.toLowerCase();
 
     // Start SNTP with the stored TZ before associating: the daemon is
     // non-blocking and keeps retrying on its own, so the clock also syncs after
@@ -924,7 +928,10 @@ static void handle_capabilities(AsyncWebServerRequest *request) {
     doc["version"] = SEED_VERSION;
     doc["seed"] = true;
     doc["board"] = hw.board;
-    doc["hostname"] = mdns_name;
+    /* Identifier, not an address: mDNS is off on this board, so this name
+     * resolves nowhere. Per the capabilities spec the field is a "node
+     * hostname or identifier"; talk to the node on wifi_ip below. */
+    doc["hostname"] = node_name;
 
     // Chip
     doc["chip"] = hw.chip_model;
@@ -1328,7 +1335,7 @@ static void handle_skill(AsyncWebServerRequest *request) {
 
     String s = "# ESP32 Seed - T-Lora Pager\n\n";
     s += "Host: " + ip + ":" + String(HTTP_PORT) + "\n";
-    s += "mDNS: " + mdns_name + ".local\n";
+    s += "Name: " + node_name + " (identifier; mDNS is off, reach it by IP)\n";
     s += "WiFi mode: STA only; no provisioning AP\n\n";
     s += "Auth: `Authorization: Bearer <token>` (except /health)\n\n";
     s += "## Grow cycle\n\n";
@@ -1577,7 +1584,8 @@ static void ui_clock_paint(const char *note) {
     if (WiFi.status() == WL_CONNECTED) {
         snprintf(addr, sizeof(addr), "%s", WiFi.localIP().toString().c_str());
         snprintf(row1l, sizeof(row1l), "RSSI %d dBm", (int)WiFi.RSSI());
-        snprintf(row1r, sizeof(row1r), "%s.local", mdns_name.c_str());
+        /* Plain node name, no ".local" — mDNS is off, nothing resolves it. */
+        snprintf(row1r, sizeof(row1r), "%s", node_name.c_str());
     } else {
         snprintf(addr, sizeof(addr), "offline");
         snprintf(row1l, sizeof(row1l), "WiFi offline");
@@ -2955,7 +2963,7 @@ static void ui_open_info() {
     snprintf(ver, sizeof(ver), "v%s", SEED_VERSION);
     String ip = (WiFi.status() == WL_CONNECTED)
         ? WiFi.localIP().toString() : String("");
-    hw_ui_show_info(ver, mdns_name.c_str(), ip.c_str(),
+    hw_ui_show_info(ver, node_name.c_str(), ip.c_str(),
                     auth_token.c_str(), ESP.getFreeHeap(),
                     notify_unread_count());
     ui_note_input();
@@ -3621,14 +3629,42 @@ void loop() {
         if (now_connected) {
             wifi_retry_step = 0;  /* next loss starts the ladder over */
             wifi_persist_profiles();
-            if (!mdns_started && MDNS.begin(mdns_name.c_str())) {
-                MDNS.addService("http", "tcp", HTTP_PORT);
-                MDNS.addService("seed", "tcp", HTTP_PORT);
-                mdns_started = true;
-            }
-        } else if (mdns_started) {
-            MDNS.end();
-            mdns_started = false;
+            /* mDNS used to be started here (begin + http/seed services).
+             * It is gone, and it must stay gone until internal DRAM is free
+             * again. The board boot-looped on an inbound multicast mDNS query;
+             * the coredump, decoded against the matching .elf, read:
+             *
+             *   tcpip_thread -> ethernet_input -> ip4_input -> udp_input
+             *     -> mdns_networking_lwip.c:176 receive() -> esp_log
+             *     -> vprintf -> uart_write -> _lock_acquire_recursive
+             *     -> lock_init_generic -> abort()
+             *
+             * That is not an mDNS bug. The component logged, the console lock
+             * allocated its mutex lazily on first use, the allocation failed
+             * for want of internal DRAM, and _lock_acquire_recursive aborts on
+             * failure — it has no way to report one. Static internal RAM had
+             * just gone from 58.1% to 65.0%, leaving ~114 KB for every task
+             * stack, lwIP, WiFi, the SD buffers and the heap. Any unsolicited
+             * packet that reached a logging path could have done it; mDNS just
+             * listens on a multicast group the network keeps talking to.
+             *
+             * Silencing the log would not have fixed it — it would have moved
+             * the abort to the next allocation. Removing the start is what
+             * takes the receive path off the tcpip thread for good.
+             *
+             * Since then the history index, the write-queue storage and the
+             * page/render buffers moved to PSRAM (src/psram_alloc.h), so the
+             * 65.0% above is no longer this build's figure: with the whole RNS
+             * stack linked in, static internal RAM is 61.1% (200112 B), leaving
+             * ~127 KB. The pressure is lower, not gone — and a link-time figure
+             * is not the number that aborted the board anyway; free internal
+             * heap at the moment of the packet is.
+             *
+             * Before reinstating this: measure free internal DRAM at runtime
+             * (esp_get_free_internal_heap_size / the RAM figure in `pio run`),
+             * and only then decide. The node is reachable by IP, and the
+             * fleet finds it that way. Convenience is not worth the boot loop.
+             */
         }
         if (hw_ui_screen() == HW_UI_CLOCK) {
             hw_ui_invalidate_clock();
