@@ -56,7 +56,7 @@
 #include "hw_kb.h"
 
 // ===== Configuration =====
-#define SEED_VERSION        "0.9.55"
+#define SEED_VERSION        "0.9.56"
 // Core clock: datasheet puts 240 vs 80 ~11.5mA apart on WAITI. Periph bus holds
 // at 80 for every PLL-fed core clock; go lower and RMT/I2S retimes. Same floor
 // as tembed idle policy (no light sleep — notify latency is the job).
@@ -1415,6 +1415,7 @@ static void handle_wifi_networks_post(AsyncWebServerRequest *request) {
 // After notify: reuses notify_send_json / notify_send_error / notify_ingest_p1.
 #include "skills/progress.cpp"
 #include "skills/agents.cpp"
+#include "skills/history.cpp"  // append-only SD history archive + off-loop write queue
 #include "skills/meshcore.cpp"
 #include "skills/backlight.cpp"
 #include "skills/wg.cpp"
@@ -3340,6 +3341,7 @@ void setup() {
     token_load();     // after wifi_setup(): needs RF up for a real hardware RNG
     skills_init();    // notify store load + route registration data
     ui_page_store_begin();  // micron system-layer page store (wheel-paged from home)
+    history_begin();        // append-only SD archive + off-loop write-queue task (no producers yet)
     ui_go_clock(WiFi.status() == WL_CONNECTED ? "ready" : "click = menu");
     ui_note_input();
     setup_routes();
