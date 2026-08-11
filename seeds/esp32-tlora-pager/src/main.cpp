@@ -57,7 +57,7 @@
 #include "hw_kb.h"
 
 // ===== Configuration =====
-#define SEED_VERSION        "0.9.62"
+#define SEED_VERSION        "0.9.63"
 // Core clock: datasheet puts 240 vs 80 ~11.5mA apart on WAITI. Periph bus holds
 // at 80 for every PLL-fed core clock; go lower and RMT/I2S retimes. Same floor
 // as tembed idle policy (no light sleep — notify latency is the job).
@@ -816,6 +816,12 @@ static void wifi_setup() {
 static bool     history_on_sd(void);
 static uint32_t history_drops(void);
 static uint32_t history_index_live_count(void);
+// history_ready() is a lock-free read of the boot-latched write-queue handle
+// (false => the queue alloc failed and NOTHING persists); history_queued() is a
+// lock-free uxQueueMessagesWaiting read of the queue occupancy (early overflow
+// warning). Both are AsyncTCP-safe: no g_hist_mux, no SPI bus.
+static bool     history_ready(void);
+static uint32_t history_queued(void);
 
 static void handle_health(AsyncWebServerRequest *request) {
     JsonDocument doc;
@@ -840,6 +846,12 @@ static void handle_health(AsyncWebServerRequest *request) {
     doc["history_sd"] = history_on_sd();
     doc["history_drops"] = (unsigned long)history_drops();
     doc["history_records"] = (unsigned long)history_index_live_count();
+    // Queue health: history_ready=false means the write queue failed to allocate
+    // at boot and every enqueue drops (a dead queue is otherwise invisible while
+    // history_drops climbs); history_queued is live occupancy, an early warning
+    // that fills before drops start.
+    doc["history_ready"] = history_ready();
+    doc["history_queued"] = (unsigned long)history_queued();
     String response;
     serializeJson(doc, response);
     request->send(200, "application/json", response);

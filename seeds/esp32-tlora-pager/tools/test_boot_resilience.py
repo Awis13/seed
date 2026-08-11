@@ -113,6 +113,13 @@ for field in ("reset_reason", "boots_since_panic", "panic_count", "storage_ok"):
 # live. Read-only — no store selector, no behaviour change.
 for field in ("history_sd", "history_drops", "history_records"):
     assert f'doc["{field}"]' in health, f"/health must serve {field}"
+# Queue health (hardening): a DEAD write queue (boot alloc failed => nothing
+# persists) and the live queue occupancy (early overflow warning) must both be
+# visible, so a queue that silently drops everything is not mistaken for healthy.
+for field in ("history_ready", "history_queued"):
+    assert f'doc["{field}"]' in health, f"/health must serve {field}"
+assert "history_ready()" in health, "history_ready must come from the history_ready() getter"
+assert "history_queued()" in health, "history_queued must come from the history_queued() getter"
 assert "history_on_sd()" in health, "history_sd must come from the history_on_sd() getter"
 assert "history_index_live_count()" in health, (
     "history_records must be the RAM index count (history_index_live_count), not an SD scan"
