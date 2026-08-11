@@ -7,6 +7,7 @@
 #include "hw_ui.h"
 #include "board_pins.h"
 #include "hw_sound.h"   // tft_wake pumps the sound queue across its settle
+#include "micron/micron_layout.h"  // pure page layout -> grid (C3)
 
 #include <SPI.h>
 #include <Wire.h>
@@ -2304,7 +2305,12 @@ static int g_micron_last_dirty = -1;
 // whole page); it never takes the lock — the bus mutex is non-recursive.
 static void tft_draw_cell(uint16_t x, uint16_t y, uint32_t cp,
                           uint16_t fg, uint16_t bg, uint8_t attr) {
-    if (x >= PANEL_W || y >= PANEL_H) return;
+    // Defensive clip like tft_fill_rect: guard the FAR edge too, not just the
+    // origin — C3 drives this from untrusted page content. A glyph cell is a
+    // fixed 10x14 block that cannot be partially blitted cleanly, so a cell
+    // that would spill past the panel is rejected whole rather than clipped.
+    if (x >= PANEL_W || y >= PANEL_H ||
+        x + MICRON_CELL_W > PANEL_W || y + MICRON_CELL_H > PANEL_H) return;
     const uint8_t *g = font_glyph(cp);
     uint8_t cols[5];
     for (uint8_t c = 0; c < 5; c++) cols[c] = pgm_read_byte(&g[c]);
@@ -2371,4 +2377,17 @@ void hw_ui_show_page(const micron_grid *g) {
     // Copy incoming -> retained so the next call diffs against this frame.
     memcpy(&g_micron_front, g, sizeof(g_micron_front));
     g_micron_force = false;
+}
+
+// hw_ui_render_page: the C3 bridge. Lay a whole micron page source into the
+// back grid at `scroll` (a visible-row offset), then paint it via
+// hw_ui_show_page. The layout is PURE (micron_layout_page touches no hardware);
+// only hw_ui_show_page takes the bus lock, so there is NO second lock site
+// here. Returns the total (bounded) page height so the caller can clamp its own
+// scroll; the applied (clamped) scroll is what the window shows.
+size_t hw_ui_render_page(const char *src, size_t len, int scroll) {
+    micron_grid *back = hw_ui_page_back();
+    micron_layout_result r = micron_layout_page(src, len, scroll, back);
+    hw_ui_show_page(back);
+    return r.total_rows;
 }

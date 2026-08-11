@@ -130,6 +130,7 @@ typedef struct {
     uint8_t section_depth;  /* clamped depth for this line */
     uint8_t is_divider;
     uint8_t is_comment;
+    uint8_t is_header;      /* this line began with '>' (a section header) */
     uint32_t divider_fill;  /* fill code point for a divider (default U+2500) */
     uint8_t truncated;      /* line exceeded the byte budget and was cut */
 } micron_line;
@@ -209,6 +210,7 @@ static inline void micron__reset_line(micron_line *out, uint8_t align,
     out->section_depth = depth;
     out->is_divider = 0;
     out->is_comment = 0;
+    out->is_header = 0;
     out->divider_fill = 0x2500;  /* box-drawing horizontal, the default rule */
     out->truncated = 0;
 }
@@ -308,6 +310,7 @@ static inline void micron_parse_line(micron_state *st, const char *line,
         if (d > MICRON_MAX_SECTION_DEPTH) d = MICRON_MAX_SECTION_DEPTH;
         depth = (uint8_t)d;
         out->section_depth = depth;
+        out->is_header = 1;
         st->section_depth = depth;
         /* header text (if any) follows and is parsed like any other run */
     } else if (n > 0 && p[0] == '-') {

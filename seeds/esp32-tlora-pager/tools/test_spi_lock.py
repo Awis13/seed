@@ -131,6 +131,10 @@ CS_PRIMITIVES = [
     "static void tft_fill(uint16_t color)",
     "static void tft_fill_rect(",
     "static void tft_draw_glyph(",
+    # C3 folds in the C2 follow-up: pin tft_draw_cell's lock-free property
+    # statically (it is the micron page glyph blit; hw_ui_show_page holds the
+    # bus lock for the whole page and this helper must never re-take it).
+    "static void tft_draw_cell(",
 ]
 for sig in CS_PRIMITIVES:
     body = fn_body(hw_ui, sig)

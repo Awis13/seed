@@ -265,6 +265,13 @@ void micron_render_invalidate();
 // cheap measurement of what the diff saved. -1 before the first paint.
 int micron_render_last_dirty();
 
+// hw_ui_render_page: the C3 bridge — lay a whole micron page source into the
+// back grid at scroll offset `scroll` (a top-visible row index) and paint it.
+// The layout is pure; only hw_ui_show_page inside touches the bus (no second
+// lock site). Returns the page's total (bounded) height in visual rows so the
+// caller can clamp its scroll. `scroll` is clamped internally to [0, max].
+size_t hw_ui_render_page(const char *src, size_t len, int scroll);
+
 // Free-text reply composer. buffer is UTF-8 draft.
 // caps/sym badges + layout_name ("ABC"/"PHON"/"RU") in header.
 void hw_ui_show_reply(const char *title,
