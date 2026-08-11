@@ -16,27 +16,64 @@
  * Identity::validate_announce(), so returning false here costs two field reads
  * instead of a signature verification.
  *
- * THE POLICY. This node is a leaf: zero destinations, zero announce handlers,
- * transport_enabled(false). An accepted announce only fills a path table and a
- * known-destinations table that nothing on this board reads. So:
+ * THE POLICY. This node has one destination of its own and no announce
+ * handlers, and runs transport_enabled(false). An accepted INBOUND announce
+ * fills a path table and a known-destinations table that nothing on this board
+ * reads. So:
  *
  *   - ANNOUNCE with context PATH_RESPONSE is KEPT. A path response is the
  *     answer to a path request we sent; dropping it would break the one
- *     announce-shaped exchange a leaf actually initiates.
+ *     announce-shaped exchange this node initiates.
  *   - Any other ANNOUNCE is DROPPED.
  *   - Everything else is KEPT, untouched — including packet types and contexts
  *     this function does not recognise. Fail-open is deliberate: never drop
  *     what we do not understand.
  *
- * IF THIS NODE EVER REGISTERS A DESTINATION OF ITS OWN, RE-READ THIS FILE.
+ * THE RE-READ THIS FILE ASKED FOR HAS HAPPENED. The previous version of this
+ * comment said "zero destinations" and ended with an instruction, in capitals,
+ * to come back here the day the node registered one. It has: skills/rns.cpp
+ * builds an IN/SINGLE destination so the node has an address. The policy above
+ * is UNCHANGED, and this is why it is still correct.
+ *
+ * Being addressable means answering path requests, and the worry was that this
+ * filter would drop them. It does not, and it cannot, for two independent
+ * reasons:
+ *
+ *   1. A PATH REQUEST IS NOT AN ANNOUNCE. It arrives as packet_type = DATA
+ *      (0x00) with context = CONTEXT_NONE (0x00), addressed to the library's
+ *      own PLAIN "path.request" destination. That is not a guess from the shape
+ *      of the code: Transport::request_path() builds it as a plain Packet on a
+ *      path.request Destination and the source states the defaults outright
+ *      ("packet_type=DATA, context=CONTEXT_NONE, transport_type=BROADCAST,
+ *      header_type=HEADER_1 are all defaults"), and upstream Python's
+ *      Transport.py says the same values explicitly at its own path-request
+ *      send. So the very first statement of the decision below — packet_type is
+ *      not ANNOUNCE, therefore keep — returns true and nothing else is
+ *      consulted. There is no PATH_REQUEST context constant in either
+ *      implementation to confuse this with; the only path-shaped context that
+ *      exists is PATH_RESPONSE = 0x0B, which is the REPLY.
+ *   2. THE REPLY IS OUTBOUND. Transport answers a path request for a local
+ *      destination by calling announce() on it, and Transport::outbound() never
+ *      consults the filter callback — the hook is on the inbound path only. An
+ *      announce this node emits therefore cannot be filtered by this file even
+ *      in principle.
+ *
+ * What the reply DOES cost is a software Ed25519 signature on the loop task,
+ * inside the drain, once per undeduplicated path request. That is the price of
+ * having an address, not something this filter can reduce; skills/rns.cpp
+ * records it where the cost is paid.
+ *
+ * The other consequence named in the original note still stands unchanged.
  * Passive key learning is gone with the dropped announces: a peer's public key
  * is remembered only inside Identity::validate_announce(), which is exactly
- * what a dropped announce never reaches. After this change a peer can be
- * addressed only by asking for it — an explicit Transport::request_path() and
- * the PATH_RESPONSE announce it draws, which this filter keeps for that reason.
- * Nothing reports the difference: a send to a peer whose announce was dropped
- * simply finds no path and no identity to encrypt to, so the failure would be
- * silent rather than loud.
+ * what a dropped announce never reaches. A peer can be addressed only by asking
+ * for it — an explicit Transport::request_path() and the PATH_RESPONSE announce
+ * it draws, which this filter keeps for that reason. Nothing reports the
+ * difference: a send to a peer whose announce was dropped simply finds no path
+ * and no identity to encrypt to, so the failure would be silent rather than
+ * loud. Note the asymmetry this leaves, because it is the shape of the node:
+ * others can reach US without our help (they path-request, the library answers),
+ * while we must ask before we can reach THEM.
  *
  * The mark this policy turns on is also chosen by the sender. Any peer can flag
  * an ordinary announce as PATH_RESPONSE and still cost us the full Ed25519.

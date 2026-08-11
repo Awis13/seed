@@ -12,16 +12,51 @@
  *                         tools/test_rns_hdlc.sh
  *   rns/pktfilter.h       the inbound keep/drop decision, likewise pure and
  *                         host-tested (tools/test_rns_filter.sh)
+ *   rns/annsched.h        when to announce, same shape, host-tested by
+ *                         tools/test_rns_annsched.sh
  *   RnsTcpInterface       RNS::InterfaceImpl subclass; drain, framing and the
  *                         reconnect state machine all run on the loop task
+ *   rns_destination       one IN/SINGLE destination, seed.pager, on the stored
+ *                         identity — the address this node answers to
  *   /rns.json (SPIFFS)    {enabled, host, port} — gitignored, it names a host
  *                         behind the tunnel
- *   GET  /rns/status      stack + interface state, counters, last error, plus
+ *   GET  /rns/status      stack + interface state, counters, last error, the
+ *                         destination address and its announce timings, plus
  *                         three loop-task health fields (loop_stack_free_bytes,
  *                         drain_us_max, path_hashes) and the prefilter's
  *                         announces_dropped / announces_kept; ?reset=1 zeroes
  *                         the drain_us_max rolling max after it has been read
  *   POST /rns/config      upsert of the three fields above
+ *
+ * BEING ADDRESSABLE HAS A PRICE, and it is paid on the loop task. Once a
+ * destination is registered, every path request for its hash that reaches this
+ * node is answered by the library, inside the drain, with a full announce:
+ * Transport::path_request_handler() finds the hash in _destinations and calls
+ * local_destination.announce(..., true, ...), which signs with software Ed25519.
+ * The prefilter cannot touch this — a path request is a DATA packet, and the
+ * reply is outbound, where no filter runs.
+ *
+ * THIS IS NOT RATE LIMITED, and an earlier version of this comment claimed it
+ * was. The claim was that _discovery_pr_tags dedupes the request with a 30 s
+ * window. Both halves were wrong. _discovery_pr_tags is a GenerationalSet
+ * bounded by COUNT — RNS_PR_TAGS_MAX, 32 entries (Transport.cpp) — with no time
+ * component at all; the 30 s PR_TAG_WINDOW is a TTL on Destination::
+ * _path_responses, a different structure serving a different purpose. And the
+ * tag it dedupes on is chosen by the REQUESTER: Transport::request_path() fills
+ * it with Identity::get_random_hash() when the caller does not supply one. So
+ * the set suppresses a literal retransmission of one request and nothing else.
+ * N path requests carrying N fresh tags are N announces and N signatures, at
+ * whatever rate they arrive. Nor does the set hold 32 tags before it forgets:
+ * GenerationalSet keeps two generations and rotates once the active one reaches
+ * (max_size + 1) / 2, so its own header puts the effective window at roughly
+ * max_size/2 to max_size — as few as 16 distinct tags here, after which even
+ * the retransmissions come back.
+ *
+ * That is the same shape as the prefilter's own limitation — a field the sender
+ * controls decides what we pay — and it is stated here for the same reason:
+ * this is the cost of having an address, it cannot be prefiltered away, nothing
+ * in this file throttles it, and announce_us_max is the number that would show
+ * it happening.
  *
  * THE ANNOUNCE PREFILTER is the reason this file is not simply a TCP interface.
  * One accepted announce measured 221 ms of loop task against an 8 ms drain
@@ -207,6 +242,7 @@
 #undef shutdown
 #undef socket
 
+#include "rns/annsched.h"
 #include "rns/hdlc.h"
 #include "rns/pktfilter.h"
 
@@ -219,6 +255,25 @@ static_assert(RNS_PKT_TYPE_ANNOUNCE == (uint8_t)RNS::Type::Packet::ANNOUNCE,
 static_assert(RNS_PKT_CONTEXT_PATH_RESPONSE ==
                   (uint8_t)RNS::Type::Packet::PATH_RESPONSE,
               "rns/pktfilter.h PATH_RESPONSE does not match RNS::Type::Packet");
+
+/* ---- this node's own destination ----
+ *
+ * app_name and aspects together are the ADDRESS. Destination::hash() is
+ * SHA256(SHA256("app_name.aspects")[:10] || identity.hash())[:16] — 16 bytes,
+ * 32 hex characters, which is what `rnpath` and `rnprobe` take as input.
+ * Changing either string changes the address, so neither may be edited casually
+ * and neither may be squatted in advance: the LXMF delivery destination this
+ * node will eventually want is "lxmf.delivery", it is a SEPARATE destination
+ * with a SEPARATE address, and naming this one that today would have to be
+ * undone the day LXMF arrives.
+ *
+ * A dot in app_name throws std::invalid_argument out of the constructor
+ * (Destination.cpp); aspects is ONE dot-joined string here, unlike Python's
+ * varargs form. */
+#define RNS_DEST_APP_NAME "seed"
+#define RNS_DEST_ASPECTS  "pager"
+/* 16-byte destination hash -> 32 hex chars + NUL. */
+#define RNS_DEST_ADDR_MAX 33
 
 #define RNS_ID_PATH  "/rns_identity.id"
 #define RNS_ID_TMP   "/rns_identity.tmp"
@@ -296,6 +351,33 @@ static char rns_hexhash[RNS_HEXHASH_MAX] = {0};
 static microStore::FileSystem rns_filesystem{microStore::Adapters::SPIFFSFileSystem()};
 static RNS::Reticulum rns_stack{RNS::Type::NONE};
 static RNS::Identity rns_identity{RNS::Type::NONE};
+
+/* The destination that makes this node addressable. File scope for the same
+ * reason as rns_stack and rns_identity: Transport::register_destination() keeps
+ * a COPY in its _destinations map and the announce path looks it up there, but
+ * the announce schedule below calls announce() on this handle, so the handle has
+ * to outlive bring-up.
+ *
+ * It is constructed with rns_identity, and that is not an incidental detail: the
+ * Destination constructor treats a NONE identity on an IN/SINGLE destination as
+ * a request to MINT ONE (Destination.cpp: "identity not provided, creating new
+ * one"), silently, with no error and no persistence. The address would then
+ * change on every boot and nothing would say so. Never construct this from
+ * anything but the loaded identity, and never before rns_identity_ok.
+ *
+ * THE ADDRESS IS ONLY AS STABLE AS THE IDENTITY FILE, and there is a likelier
+ * way to lose it than the NONE-identity mistake warned about above. If
+ * /rns_identity.id does not exist, rns_identity_bring_up() mints a keypair and
+ * tries to save it; when that write fails it sets rns_error to "identity
+ * generated but could not be saved" and carries on with rns_identity_ok true.
+ * That is the right call for the identity — the node still works this boot —
+ * but it means the destination is built on a key that dies at reboot, so the
+ * address in /rns/status is good until power is cut and then silently
+ * different. Anything published as a permanent contact for this node has to be
+ * checked against a boot that reports created:false and no error. */
+static RNS::Destination rns_destination{RNS::Type::NONE};
+static bool rns_dest_ok = false;
+static char rns_dest_addr[RNS_DEST_ADDR_MAX] = {0};
 
 /* ---- TCP interface state ----
  *
@@ -438,6 +520,104 @@ static bool rns_packet_filter(const RNS::Packet &packet) {
     }
     return keep;
 }
+
+/* ---- inbound data callback ----
+ *
+ * Destination::set_packet_callback() is what stands between "a packet addressed
+ * to us was decrypted" and "a packet addressed to us was decrypted and thrown
+ * away". Without it Destination::receive() unpacks the packet, verifies nothing
+ * is listening and returns, so an inbound DATA packet would leave no trace at
+ * all and the first thing anyone sent us would look identical to a packet that
+ * never arrived. g_rns_data_rx is the evidence, and today it is the whole of
+ * what this node does with an inbound packet — there is no application on top
+ * yet, and inventing one here would be a different commit.
+ *
+ * WHAT AN INBOUND PACKET COSTS BEFORE THIS FUNCTION IS EVEN REACHED, because
+ * the rest of this comment enumerates costs we avoid and that would be a
+ * misleading list on its own. Destination::receive() hands every non-LINKREQUEST
+ * packet matching our hash to decrypt() -> Identity::decrypt(), which runs an
+ * X25519 exchange against the sender's ephemeral public key, an HKDF, and a
+ * token decrypt — on the loop task, inside the drain, BEFORE anything has been
+ * authenticated and regardless of whether it ever will be. Anyone who knows the
+ * address can make us do that. Nothing in this file can decline it: the
+ * prefilter runs on packet type and context, and a packet addressed to us is a
+ * DATA packet it keeps by policy.
+ *
+ * THE BLIND SPOT THAT FOLLOWS FROM THAT, stated because it would otherwise be
+ * read out of /rns/status backwards: Identity::decrypt() swallows its own
+ * failures and returns empty, and Destination::receive() only calls this
+ * callback when the plaintext is non-empty. So a flood of garbage addressed to
+ * our hash costs an X25519 per packet and leaves data_rx at ZERO. data_rx
+ * counts packets that decrypted, not packets that arrived; the flood would show
+ * up in iface.rx and drain_us_max, and nowhere else.
+ *
+ * THE SAME BUDGET AS THE PREFILTER APPLIES, for the same reasons, and the
+ * constraints are worth restating rather than referring to:
+ *
+ *   - Destination::Callbacks::packet is `void(*)(const Bytes&, const Packet&)`,
+ *     a BARE FUNCTION POINTER, so there is nowhere for state to live except file
+ *     scope. Both arguments are const references; taking either BY VALUE would
+ *     be a heap copy of the packet payload on the loop task, which is exactly
+ *     the kind of edit tools/test_task_unblock.py's allowlist exists to stop.
+ *   - It runs on the loop task, inside the 8 ms drain, reached from
+ *     handle_incoming() -> Transport::inbound() -> Destination::receive().
+ *     So: no logging (Log.cpp ends every emitted line with a blocking
+ *     Serial.flush()), no String, no allocation, no SPIFFS, no clock.
+ *   - It must not be ABLE to throw, though the consequence is narrower here than
+ *     at the prefilter and this file should not overstate it. Destination::
+ *     receive() already wraps the callback in `catch (const std::exception&)`
+ *     and only logs (Destination.cpp), so a std::exception out of here is
+ *     absorbed one frame up. What is NOT absorbed is anything not derived from
+ *     std::exception: that unwinds out of Destination::receive() into
+ *     Transport::inbound(), which sets _jobs_locked = true on entry and clears
+ *     it only on the normal way out, leaving Transport::jobs() disabled for the
+ *     rest of the boot. The rule stands; the reason it stands is the second
+ *     case, not the first.
+ *
+ * A plain uint32_t increment satisfies all of that and nothing else here does.
+ */
+static uint32_t g_rns_data_rx = 0;
+
+static void rns_data_callback(const RNS::Bytes &data, const RNS::Packet &packet) {
+    (void)data;
+    (void)packet;
+    g_rns_data_rx++;
+}
+
+/* ---- announce state ----
+ *
+ * The schedule itself is rns_announce_due() in rns/annsched.h — pure, host
+ * tested by tools/test_rns_annsched.sh. What lives here is the state it reads
+ * and the measurement it is worth.
+ *
+ * WHY THE TIMING IS INSTRUMENTED. Destination::announce() is fully synchronous
+ * on the calling task: it builds the announce, signs it with software Ed25519
+ * (rweather — the same library whose verify measured 221 ms on this chip) and
+ * hands it to Transport::outbound() before returning. All of that lands on the
+ * loop task, in the same tick that owns the socket drain. Nobody has measured
+ * the sign side on this board; a signature is normally cheaper than a
+ * verification, but "normally" is not a number and this file does not guess at
+ * numbers. announce_us_last and announce_us_max are how that number gets known.
+ *
+ * These are plain uint32_t written on the loop task and read by GET /rns/status
+ * on the AsyncTCP task, which is the same naturally-aligned single-copy-atomic
+ * arrangement g_rns_attempts and g_rns_downs already use — not the snapshot,
+ * because unlike the path table there is no container here to iterate and
+ * nothing to be seen half-written. rns_dest_addr is written once during bring-up
+ * and never again. */
+static bool g_rns_announced = false;    /* an announce has been ATTEMPTED */
+static bool g_rns_ann_was_online = false;
+/* An offline->online transition is owed an announce. Sticky: set by
+ * rns_announce_edge_latch(), cleared by NOTHING except an announce firing. This
+ * is what makes RNS_ANNOUNCE_RECONNECT_MIN_MS a deferral rather than a filter —
+ * the edge itself lasts one tick, so a floor that read the raw transition would
+ * throw away every reconnect that happened within a minute of an announce and
+ * push it out to the full 30 min interval. See rns/annsched.h. */
+static bool g_rns_ann_edge_pending = false;
+static uint32_t g_rns_ann_last_ms = 0;
+static uint32_t g_rns_ann_sent = 0;     /* announce() returned without throwing */
+static uint32_t g_rns_ann_us_last = 0;
+static uint32_t g_rns_ann_us_max = 0;
 
 /* ---- status snapshot ----
  *
@@ -733,8 +913,15 @@ void RnsTcpInterface::drain() {
      * to the receiving interface's HW_MTU, so the condition is not structurally
      * impossible — and a dropped frame is otherwise visible only as a counter
      * nobody is watching. Say it out loud, once.
-     * TODO: clamp an inbound link MTU to RNS_TCP_HW_MTU once this node owns
-     * destinations and can actually terminate a link. */
+     *
+     * This node now owns a destination, which used to be the condition on a TODO
+     * here to clamp an inbound link MTU ourselves. No code is needed: the
+     * library already clamps it. Transport::inbound() computes nh_mtu from the
+     * receiving interface only when it sets AUTOCONFIGURE_MTU or FIXED_MTU, and
+     * RnsTcpInterface sets neither — so nh_mtu is Type::Reticulum::MTU, 500,
+     * below our HW_MTU of 1024, and a link established through this interface
+     * cannot negotiate its way past the frame buffer. The destination declines
+     * link requests outright besides (accepts_links(false) at bring-up). */
     if (g_rns_rx.rejected_long != 0 && !g_rns_mtu_warned) {
         g_rns_mtu_warned = true;
         event_add("rns frame over mtu");
@@ -1087,6 +1274,40 @@ static void rns_status_json(JsonDocument &doc) {
     } else {
         doc["hash"] = (const char *)nullptr;
     }
+
+    /* THE ADDRESS. `hash` above is the IDENTITY hash and this is the
+     * DESTINATION hash; they are different values and neither substitutes for
+     * the other. This one is Destination::hash().toHex() — 32 lowercase hex
+     * characters, no separators — which is exactly the form `rnpath` and
+     * `rnprobe` take on the command line. It is null until the address string
+     * has actually been rendered, which needs the destination, which needs the
+     * identity — so a node reporting identity:false reports no address either.
+     * Note that it is keyed on the STRING and not on rns_dest_ok: those two can
+     * differ for exactly one reason (a throw out of toHex(), see the bring-up
+     * block), and in that case the honest report is a live destination with an
+     * address we failed to render, not a missing destination.
+     *
+     * announced/announces_sent/announce_us_* are the announce schedule made
+     * visible: `announced` is "we have attempted at least one announce", which
+     * is deliberately not the same as announces_sent — a send that threw still
+     * stamps the schedule so it cannot retry every 20 ms (see
+     * rns_announce_poll). announce_us_last and announce_us_max are the
+     * measurement this destination was added to take: Destination::announce()
+     * signs with software Ed25519 on the loop task, inside the tick that owns
+     * the 8 ms drain, and nothing on this board had measured the sign side.
+     * Read announce_us_max against iface.drain_us_max.
+     *
+     * data_rx is the packet callback's count — the only evidence that anything
+     * ever addressed us successfully. All of these are naturally aligned 32-bit
+     * scalars written by the loop task, read here exactly like iface.attempts;
+     * rns_dest_addr is written once during bring-up. */
+    doc["address"] = rns_dest_addr[0] ? rns_dest_addr : (const char *)nullptr;
+    doc["announced"] = g_rns_announced;
+    doc["announces_sent"] = (unsigned long)g_rns_ann_sent;
+    doc["announce_us_last"] = (unsigned long)g_rns_ann_us_last;
+    doc["announce_us_max"] = (unsigned long)g_rns_ann_us_max;
+    doc["data_rx"] = (unsigned long)g_rns_data_rx;
+
     doc["transport"] = RNS::Reticulum::transport_enabled();
     doc["interfaces"] = (unsigned long)g_rns_snap.interfaces;
     /* The number that proves the peer's announces landed: it stays 0 until a
@@ -1173,7 +1394,7 @@ static void rns_status_json(JsonDocument &doc) {
 }
 
 static const SkillEndpoint rns_endpoints[] = {
-    {"GET", "/rns/status", "Reticulum stack, identity, TCP interface and counters"},
+    {"GET", "/rns/status", "Reticulum stack, identity, destination address, TCP interface and counters"},
     {"POST", "/rns/config", "Set TCP interface {host, port, enabled}"},
     {NULL, NULL, NULL}
 };
@@ -1204,16 +1425,35 @@ static const char *rns_describe() {
            "microseconds, zeroed by `?reset=1`) and `path_hashes` — up to eight\n"
            "path-table destination hashes with `path_hashes_total` for the full\n"
            "count.\n"
+           "The node is addressable: it owns one IN/SINGLE destination,\n"
+           "`seed.pager`, built on the stored identity. `address` in\n"
+           "`/rns/status` is its 32-hex-character destination hash — the\n"
+           "argument `rnpath` takes — and is a DIFFERENT value from `hash`,\n"
+           "which is the identity hash. It announces about 5 s after the\n"
+           "interface comes online, then every 30 min while it stays online,\n"
+           "and again on a reconnect but never more than once a minute — the\n"
+           "TCP backoff resets on every successful connect, so a flapping\n"
+           "peer would otherwise buy a signature every 3 s. It never\n"
+           "announces while offline.\n"
+           "`announce_us_last` and `announce_us_max` time each\n"
+           "announce, which is synchronous and signs with software Ed25519 on\n"
+           "the loop task. The destination declines link requests and keeps\n"
+           "the default PROVE_NONE proof strategy — nothing here terminates a\n"
+           "link yet, and both would run public-key work inside the drain.\n"
+           "A packet callback counts what arrives as `data_rx`; there is no\n"
+           "application on top of it yet.\n"
            "Inbound packets pass a filter registered on Transport before the\n"
-           "stack starts: this node is a leaf, so it drops announces not\n"
-           "marked as a path response, before the Ed25519 signature is\n"
-           "checked — a verification that costs about 220 ms of loop task\n"
-           "against an 8 ms drain budget. The mark is a header field the\n"
-           "sender chooses, so this bounds the ordinary announce traffic a\n"
-           "leaf has no use for and is not a defence against a peer that sets\n"
-           "it. `iface.announces_dropped` and `iface.announces_kept` report\n"
-           "what the filter did; everything that is not an announce is kept\n"
-           "untouched.\n"
+           "stack starts: it drops announces not marked as a path response,\n"
+           "before the Ed25519 signature is checked — a verification that\n"
+           "costs about 220 ms of loop task against an 8 ms drain budget.\n"
+           "Being addressable does not change that: a path request for this\n"
+           "node arrives as a DATA packet, which the filter keeps, and the\n"
+           "reply is an outbound announce the filter never sees. The mark is\n"
+           "a header field the sender chooses, so this bounds the ordinary\n"
+           "announce traffic this node has no use for and is not a defence\n"
+           "against a peer that sets it. `iface.announces_dropped` and\n"
+           "`iface.announces_kept` report what the filter did; everything\n"
+           "that is not an announce is kept untouched.\n"
            "`mem.alloc_count` and `mem.free_count` are expected to read 0: the\n"
            "build uses the library's heap allocator, which leaves the global\n"
            "`operator new` — and therefore the counters — alone.\n"
@@ -1315,6 +1555,93 @@ static void rns_register_routes(AsyncWebServer &server) {
     }, NULL, handle_body_collect);
 }
 
+/* Announce this node's destination when rns/annsched.h says it is time.
+ *
+ * Loop task only, and deliberately AFTER rns_stack.loop(): the online flag it
+ * reads is set by RnsTcpInterface::loop(), which Reticulum::loop() drives, so
+ * running before it would act on last tick's link state and announce into a
+ * socket that has already gone.
+ *
+ * The whole call is wrapped: Destination::announce() reaches Transport::
+ * outbound(), Identity::sign() and our own send_outgoing(), and an exception out
+ * of any of them would otherwise escape the skill tick into loop(). The stamps
+ * are taken whether it threw or not, on purpose — a failing announce that left
+ * g_rns_announced false would be re-attempted on EVERY tick, i.e. a software
+ * Ed25519 signature every 20 ms. Backing off to the interval is the only sane
+ * failure mode. announces_sent counts successes, so sent < attempts is visible
+ * as announced:true with announces_sent behind the clock. */
+static void rns_announce_poll() {
+    if (!rns_dest_ok) return;
+
+    bool online = (bool)g_rns_iface && g_rns_iface.online();
+    uint32_t now = millis();
+
+    /* Latch first, decide second. The transition is visible for exactly one
+     * evaluation; the latch is what carries it forward when the floor refuses
+     * it, so a reconnect is postponed to last_announce + the floor instead of
+     * being dropped into the next 30 min interval. */
+    g_rns_ann_edge_pending = rns_announce_edge_latch(
+        g_rns_ann_edge_pending, online, g_rns_ann_was_online);
+
+    if (rns_announce_due(now, g_rns_ann_last_ms, g_rns_announced, online,
+                         g_rns_ann_edge_pending, g_rns_up_ms)) {
+        g_rns_ann_last_ms = now;
+        g_rns_announced = true;
+        /* The ONLY place this is cleared. Not on a refusal, not on the link
+         * going down again — the debt outlives both. */
+        g_rns_ann_edge_pending = false;
+        /* micros() rather than millis(): the number being measured is expected
+         * to be a fraction of the 8 ms drain budget, and millis() cannot see
+         * it. The unsigned subtraction is correct across the ~71 min micros()
+         * rollover. Empty app_data — a display name belongs to LXMF. */
+        /* The failure text is COPIED inside the catch and printed outside it.
+         * Both halves of that are deliberate. Printed inside, Serial.printf()
+         * would block on the UART — milliseconds at 115200 baud — inside a
+         * window documented as the Ed25519 sign cost, quietly turning
+         * announce_us_max into a measurement of the console. Held as a
+         * `const char*` from e.what() and printed outside, it would be a
+         * dangling pointer: the exception object is destroyed when the handler
+         * exits. So the bytes are copied (cheap, RAM only, no UART) while the
+         * exception is alive, and emitted after the clock has stopped.
+         *
+         * It is the COPY that makes this safe, not the storage: an automatic
+         * buffer is enough, this function runs only on the loop task and never
+         * re-enters, and 64 bytes of stack beats 64 bytes of permanent .bss
+         * plus a reader wondering who else shares it. */
+        char err[64];
+        uint32_t t0 = micros();
+        bool ok = false;
+        bool failed = false;
+        try {
+            rns_destination.announce();
+            ok = true;
+        } catch (const std::exception &e) {
+            failed = true;
+            snprintf(err, sizeof(err), "%s", e.what());
+        } catch (...) {
+            failed = true;
+            snprintf(err, sizeof(err), "unknown exception");
+        }
+        uint32_t dt = (uint32_t)(micros() - t0);
+        if (failed) Serial.printf("[rns] announce failed: %s\n", err);
+        g_rns_ann_us_last = dt;
+        if (dt > g_rns_ann_us_max) g_rns_ann_us_max = dt;
+        if (ok) {
+            g_rns_ann_sent++;
+            /* Same "-" placeholder the boot line uses: the address string is
+             * absent only when toHex() failed at bring-up, and an event ring
+             * entry reading "rns announced  in 210us" would be the only record
+             * of an announce that did happen. */
+            event_add("rns announced %s in %luus",
+                      rns_dest_addr[0] ? rns_dest_addr : "-", (unsigned long)dt);
+        }
+    }
+
+    /* Stamped every tick, not only when an announce fired: this is what makes
+     * the offline->online edge a one-tick event rather than a permanent state. */
+    g_rns_ann_was_online = online;
+}
+
 /* The tick Reticulum finally gets. Gated on rns_started because
  * Reticulum::loop() opens with assert(_object) — a no-op under NDEBUG, so an
  * unstarted stack would dereference null rather than trip the assert. */
@@ -1325,6 +1652,7 @@ static void skill_rns_poll() {
     if (now - last < RNS_TICK_MS) return;
     last = now;
     rns_stack.loop();
+    rns_announce_poll();
     /* Loop task, right after the stack has run: everything GET /rns/status is
      * not allowed to read live is republished here. */
     rns_status_publish();
@@ -1332,7 +1660,7 @@ static void skill_rns_poll() {
 
 static const Skill rns_skill = {
     .name = "rns",
-    .version = "0.3.0",
+    .version = "0.4.0",
     .describe = rns_describe,
     .endpoints = rns_endpoints,
     .register_routes = rns_register_routes,
@@ -1411,6 +1739,77 @@ static void skill_rns_init() {
             Serial.printf("[rns] identity failed: %s\n", e.what());
         } catch (...) {
             rns_error = "unknown exception during identity bring-up";
+        }
+    }
+
+    /* Destination: the thing that makes this node addressable at all.
+     *
+     * Its own scope, after the identity and after start(), for the reason the
+     * identity phase has one: the constructor calls
+     * Transport::register_destination() itself and that THROWS
+     * std::runtime_error on a duplicate hash (Transport.cpp), so a second
+     * bring-up must not be able to un-report rns_started. skill_rns_init()'s
+     * `if (rns_started) return;` guard is what keeps it to one construction per
+     * boot; nothing else does.
+     *
+     * Gated on rns_identity_ok, not just rns_started — see the rns_destination
+     * declaration for what a NONE identity would silently do to the address.
+     *
+     * accepts_links(false) is NOT a default. Destination::Object initialises
+     * _accept_link_requests = true, and an inbound LINKREQUEST to a destination
+     * that accepts one runs an X25519 key exchange plus an Ed25519 signature
+     * synchronously inside the 8 ms drain, at the request of any stranger who
+     * can reach the interface. Nothing on this node terminates a link yet, so
+     * every one of those would be paid for and discarded. The library's own
+     * probe destination sets exactly this (Transport.cpp, probe responder).
+     *
+     * The proof strategy is left at the library default, PROVE_NONE. PROVE_ALL
+     * would sign a proof for every inbound DATA packet, again inside the drain,
+     * and it is not what makes the node reachable: reachability is answered by
+     * path requests, which the library handles on its own and which need no
+     * proof strategy at all. */
+    if (rns_started && rns_identity_ok) {
+        try {
+            rns_destination = RNS::Destination(
+                rns_identity, RNS::Type::Destination::IN,
+                RNS::Type::Destination::SINGLE, RNS_DEST_APP_NAME,
+                RNS_DEST_ASPECTS);
+            rns_destination.accepts_links(false);
+            rns_destination.set_packet_callback(rns_data_callback);
+            /* Everything after the constructor is an inline scalar store into
+             * the shared object and cannot throw, so this line is the first
+             * moment the destination is both registered AND configured — which
+             * is exactly what rns_dest_ok means. Nothing that can throw is
+             * allowed between the constructor and here. */
+            rns_dest_ok = true;
+        } catch (const std::exception &e) {
+            rns_error = "exception creating the destination";
+            Serial.printf("[rns] destination failed: %s\n", e.what());
+        } catch (...) {
+            rns_error = "unknown exception creating the destination";
+        }
+    }
+
+    /* Separate scope for the address STRING, for the same reason the identity
+     * has one and with a distinct error of its own. From the constructor above
+     * onwards the destination is registered in Transport::_destinations: it is
+     * already answering path requests and already paying a signature for each
+     * one, whatever this file thinks of it. Bytes::toHex() builds a std::string
+     * and is the only statement here that can fail. Folding it into the block
+     * above would report "exception creating the destination" for a destination
+     * that was created perfectly well — /rns/status would show address:null
+     * beside an error denying the destination exists, while announces_sent
+     * climbed. What actually failed in that case is the rendering, and that is
+     * what it now says. */
+    if (rns_dest_ok) {
+        try {
+            snprintf(rns_dest_addr, sizeof(rns_dest_addr), "%s",
+                     rns_destination.hash().toHex().c_str());
+        } catch (const std::exception &e) {
+            rns_error = "destination created but its address could not be rendered";
+            Serial.printf("[rns] address render failed: %s\n", e.what());
+        } catch (...) {
+            rns_error = "destination created but its address could not be rendered";
         }
     }
 
