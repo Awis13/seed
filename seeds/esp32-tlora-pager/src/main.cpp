@@ -56,7 +56,7 @@
 #include "hw_kb.h"
 
 // ===== Configuration =====
-#define SEED_VERSION        "0.9.57"
+#define SEED_VERSION        "0.9.58"
 // Core clock: datasheet puts 240 vs 80 ~11.5mA apart on WAITI. Periph bus holds
 // at 80 for every PLL-fed core clock; go lower and RMT/I2S retimes. Same floor
 // as tembed idle policy (no light sleep — notify latency is the job).
@@ -1698,6 +1698,32 @@ static bool ui_page_render(int ordinal) {
     page_total_rows = hw_ui_render_page(src, len, page_scroll);
     return true;
 }
+
+// Rebuild the notify RAM ring from the persistent history archive (ticket C3).
+// Runs in setup() AFTER history_begin() (archive mounted + index seeded) and
+// after skill_notify_init() memset the ring — single-threaded, before the web
+// server and mesh start, so it fills the ring without the notify spinlock (same
+// discipline as the old /notify.json restore). It walks the archive index for
+// MICRON_NS_NOTIFY entries NEWEST-FIRST (history_restore_at), decodes each card
+// body (notify_rec_decode), and inserts it (notify_restore_one, which dedups by
+// id and clamps like a POST body). Namespace isolation is structural: only
+// MICRON_NS_NOTIFY records are walked, so a SYSTEM/FOREIGN page can never enter
+// the notify ring. Graceful no-SD: an empty/absent archive yields nothing on the
+// first rank and the ring simply stays empty — notify still works in RAM.
+static void notify_restore_from_archive() {
+    time_t now = time(NULL);
+    unsigned long now_ms = millis();
+    int restored = 0;
+    for (int rank = 0; rank < NOTIFY_MAX; rank++) {
+        history_record rec;
+        if (!history_restore_at(MICRON_NS_NOTIFY, rank, &rec)) break;  // past the last
+        notify_rec nr;
+        if (!notify_rec_decode(rec.payload, rec.len, &nr)) continue;   // skip a bad body
+        if (notify_restore_one(&nr, now, now_ms)) restored++;
+    }
+    notify_restore_finish(restored);   // drop ttls that ran out while powered off
+}
+
 // UTF-8 draft: keep room for ~40 Cyrillic codepoints (2–3 bytes each).
 static char reply_buf[192];
 // Idle return to clock (Advisor: shelf is a clock). Longer while typing.
@@ -3392,7 +3418,8 @@ void setup() {
     token_load();     // after wifi_setup(): needs RF up for a real hardware RNG
     skills_init();    // notify store load + route registration data
     ui_page_store_begin();  // micron system-layer page store (wheel-paged from home)
-    history_begin();        // append-only SD archive + off-loop write-queue task (no producers yet)
+    history_begin();        // append-only SD archive + off-loop write-queue task
+    notify_restore_from_archive();  // rebuild the notify ring from the archive (after mount+seed)
     ui_go_clock(WiFi.status() == WL_CONNECTED ? "ready" : "click = menu");
     ui_note_input();
     setup_routes();

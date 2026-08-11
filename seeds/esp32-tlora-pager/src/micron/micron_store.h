@@ -80,6 +80,9 @@
 typedef enum {
     MICRON_NS_SYSTEM  = 0,  /* our own data UI (trusted producer) */
     MICRON_NS_FOREIGN = 1,  /* untrusted browser pages */
+    MICRON_NS_NOTIFY  = 2,  /* persisted notify cards (ticket C3): isolated in the
+                               unified archive — a notify record can never surface
+                               as a SYSTEM/FOREIGN page and vice-versa */
 } micron_namespace;
 
 /* One stored page. */

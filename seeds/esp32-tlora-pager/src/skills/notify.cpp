@@ -81,23 +81,21 @@
  *
  * Persistence
  * -----------
- * The newest NOTIFY_PERSIST entries are mirrored to SPIFFS so that a reboot —
- * an OTA apply, a flat battery, a watchdog — does not silently lose a critical
- * message. Not the whole queue: flash has a finite number of erase cycles and
- * the tail of the queue is by definition the part nobody is going to miss.
+ * Persistence is the unified history ARCHIVE (ticket TLORA-HISTORY / C3), not a
+ * /notify.json SPIFFS snapshot any more. A card is written THROUGH the off-loop
+ * history_enqueue() queue when it is created/updated and whenever its unread
+ * badge changes, and the RAM ring is rebuilt from the archive at boot. Nothing
+ * here writes SPIFFS or SD on the loop/tick task: history_enqueue is a 0-tick
+ * queue hand-off and the actual append runs on the archive's own write task,
+ * which is the whole point — the old loop-task snapshot write was a LOOPHEALTH
+ * loop-blocker. See notify_record.h for the card <-> record codec.
  *
- * Writes are coalesced. A burst of notifications produces one write, and
- * NOTIFY_COALESCE_MS after the last of them; a critical one is written on the
- * next loop() pass instead, because the reboot it is warning about may be
- * seconds away. The file is a snapshot taken entry by entry rather than under
- * one long lock, so a notification arriving mid-snapshot can appear twice —
- * notify_load() drops the duplicate by id rather than paying for a longer
- * critical section on every save.
- *
- * The write goes to a temp name and is renamed over the real one. Opening the
- * real file for writing would empty it first, which spends the whole write
- * with no snapshot on flash at all — and the message worth keeping across a
- * power loss is exactly the kind that arrives just before one.
+ * A record carries the fields that must survive a reboot — id, level, unread,
+ * ttl_s, created_epoch, source, title, body, key. The reply OPTIONS and chosen
+ * index are ephemeral UI and are NOT archived: a historical card needs no
+ * buttons, so it comes back as a plain notification. The archive is append-only
+ * and newest-wins, so an update of the same card (same identity key) supersedes
+ * the older record rather than duplicating it.
  *
  * Ages survive the reboot through the stored epoch: millis() restarts at zero,
  * so an entry whose creation time was known is aged against the wall clock and
@@ -105,6 +103,15 @@
  * before the first NTP sync therefore reads as new until the clock lands, at
  * which point every age corrects itself.
  */
+
+#include "../micron/notify_record.h"
+
+/* Forward decl: the off-loop archive enqueue is defined in skills/history.cpp,
+ * which is #included AFTER this file in the unity build (main.cpp). Notify's
+ * persistence is a write-through to that queue. The signature matches the
+ * definition exactly. */
+static bool history_enqueue(uint8_t ns, const char *key,
+                            const uint8_t *payload, size_t len);
 
 /* --- Limits ---
  *
@@ -130,8 +137,8 @@
 /* The range an id may take is 1..NOTIFY_ID_MAX, and both ends are excluded for
    the same reason. 0 marks a free slot. 0xFFFFFFFF is the id whose successor is
    0, and the id counter is always left one past the highest id in play — by
-   notify_push() as it hands one out, and by notify_restore_entries() as it reads
-   a snapshot back. An id of 0xFFFFFFFF therefore parks the counter on 0, and the
+   notify_push() as it hands one out, and by notify_restore_one() as it reads a
+   card back from the archive. An id of 0xFFFFFFFF therefore parks the counter on 0, and the
    next notification is queued carrying the value that marks its slot free: the
    caller is told "queue full" for a message that WAS queued, the next one takes
    the same slot and overwrites it, and the list shows that one twice. */
@@ -151,13 +158,9 @@
    itself: the endpoint and the builder both say it, and two copies of a number
    are how a device ends up stating a limit it no longer has. */
 static const char *NOTIFY_OPT_ERR = "options must be an array of at most 4 strings";
-#define NOTIFY_FILE         "/notify.json"
-/* The snapshot is written here and renamed into place; see notify_save(). */
-#define NOTIFY_FILE_TMP     "/notify.tmp"
 /* A month. Longer than this is indistinguishable from "no expiry", which is
    what ttl_s 0 already means. */
 #define NOTIFY_TTL_MAX      (30UL * 24UL * 3600UL)
-#define NOTIFY_COALESCE_MS  3000
 
 enum { NOTIFY_INFO = 0, NOTIFY_WARN, NOTIFY_CRIT };
 
@@ -220,6 +223,13 @@ struct NotifyView {
 static_assert(sizeof(Notification) == 376,
               "Notification changed size: the queue costs NOTIFY_MAX times this");
 
+/* The archive codec (notify_record.h) mirrors the persisted field widths; pin
+ * the equality so the two cannot drift and quietly truncate a stored card. */
+static_assert(NR_SOURCE_CAP == NOTIFY_SOURCE_LEN, "notify_rec source cap drift");
+static_assert(NR_TITLE_CAP  == NOTIFY_TITLE_LEN,  "notify_rec title cap drift");
+static_assert(NR_BODY_CAP   == NOTIFY_BODY_LEN,   "notify_rec body cap drift");
+static_assert(NR_KEY_CAP    == NOTIFY_KEY_LEN,    "notify_rec key cap drift");
+
 /* The store itself is sliced onto the host too, because the restore loop under
    it is where a refused entry can leak a slot and only a real slot array shows
    that. The markers work the same way they do in the types region. */
@@ -240,8 +250,6 @@ static portMUX_TYPE notify_mux = portMUX_INITIALIZER_UNLOCKED;
 /* Raised by the endpoint, consumed by loop(). The endpoints never draw. */
 static volatile bool notify_arrived = false;
 static volatile uint32_t notify_arrived_id = 0;
-static volatile bool notify_dirty = false;
-static unsigned long notify_save_at = 0;
 
 /* A second, independent set of one-shots for the LED ring. The screen and the
    ring both want to hear about the same arrival, and a single flag would let
@@ -266,31 +274,6 @@ static volatile bool notify_ring_acked = false;
 static volatile bool notify_snd_arrived = false;
 static uint8_t notify_snd_level = NOTIFY_INFO;
 static char notify_snd_source[NOTIFY_SOURCE_LEN];
-
-/*
- * Ask for the flash mirror to be rewritten, no sooner than `delay_ms` from now.
- *
- * Every path that changes the store goes through here, because the deadline
- * and the flag are one decision. Setting the flag without the deadline leaves
- * whatever the last POST wrote — which is in the past, and after 24.8 days of
- * uptime with no POST since boot is far enough in the past for the millis()
- * subtraction to read as negative, deferring an acknowledged critical until
- * the counter wraps.
- *
- * The earliest asked-for deadline wins: a crit POST pulls the write onto the
- * next loop() pass, and an ack or an expiry arriving after it must not push
- * that back out into a coalescing window it never asked for.
- *
- * Both fields are touched from the web server task and from loop() without the
- * store lock, as they were before this became a function. Losing that race
- * costs a coalescing window either way, never a write: the flag stays raised
- * until a save actually runs.
- */
-static void notify_mark_dirty(unsigned long delay_ms) {
-    unsigned long at = millis() + delay_ms;
-    if (!notify_dirty || (long)(at - notify_save_at) < 0) notify_save_at = at;
-    notify_dirty = true;
-}
 
 /* --- Levels --- */
 
@@ -447,7 +430,7 @@ static unsigned long notify_age_of(const Notification &e, time_t now,
         return (now >= e.created_epoch) ? (unsigned long)(now - e.created_epoch) : 0;
     }
     /* Unsigned subtraction, so this stays correct across a millis() rollover
-       and across the negative created_ms notify_load() deliberately produces. */
+       and across the negative created_ms notify_restore_one() deliberately produces. */
     return (now_ms - e.created_ms) / 1000;
 }
 
@@ -509,6 +492,73 @@ static int notify_victim() {
     return notify_len - 1;
 }
 
+/* --- Archive write-through (ticket C3) ---
+ *
+ * The single producer seam onto the off-loop history archive. Every path that
+ * persists a card goes through here: notify_push at create/update, and the ack
+ * paths when a card's unread badge changes. It runs OUTSIDE the notify spinlock
+ * with a stack copy of the card, and history_enqueue is a 0-tick queue hand-off,
+ * so this never blocks a producer and never touches SD/SPIFFS on the loop task.
+ *
+ * The archive identity is (MICRON_NS_NOTIFY, key). The namespace is a DISTINCT,
+ * trusted qualifier — never derived from the card's `source` (client-supplied
+ * body) — so a notify record can never surface under a SYSTEM/FOREIGN page walk.
+ * The key is derived by notify_rec_archive_key(): the card's dedup key when it is
+ * a valid archive key, else the synthetic "#<id>". The '#' sentinel keeps client
+ * keys and synthetic id-keys in DISJOINT subspaces so a client key "5" and a
+ * keyless card whose id is 5 can never collide onto one identity (see the header).
+ * A stable key makes an update of the same card an upsert (newest-wins) rather
+ * than a duplicate.
+ *
+ * Options and the chosen index are NOT persisted (ephemeral UI, see
+ * notify_record.h). The card's own dedup key travels IN the payload too, so the
+ * reply-routing key is restored intact even when the archive key is the id. */
+static void notify_archive_put(const Notification &e) {
+    notify_rec r;
+    memset(&r, 0, sizeof(r));
+    r.id = e.id;
+    r.ttl_s = e.ttl_s;
+    r.created_epoch = (uint32_t)(e.created_epoch > 0 ? e.created_epoch : 0);
+    r.level = e.level;
+    r.unread = e.unread ? 1 : 0;
+    memcpy(r.source, e.source, sizeof(r.source));
+    memcpy(r.title,  e.title,  sizeof(r.title));
+    memcpy(r.body,   e.body,   sizeof(r.body));
+    memcpy(r.key,    e.key,    sizeof(r.key));
+    r.source[sizeof(r.source) - 1] = '\0';
+    r.title[sizeof(r.title) - 1]   = '\0';
+    r.body[sizeof(r.body) - 1]     = '\0';
+    r.key[sizeof(r.key) - 1]       = '\0';
+
+    /* Client dedup keys and synthetic id-keys occupy DISJOINT archive subspaces:
+       a valid client key is used raw, otherwise the '#'-prefixed "#<id>". This
+       prevents a client key "5" and a keyless card with id 5 from colliding onto
+       one (NS_NOTIFY,"5") identity and silently upserting each other. */
+    char idkey[NOTIFY_ARCHIVE_IDKEY_CAP];
+    const char *key = notify_rec_archive_key(e.key, e.id, idkey, sizeof(idkey));
+
+    uint8_t buf[NOTIFY_REC_MAX];
+    size_t n = notify_rec_encode(&r, buf, sizeof(buf));
+    if (n) history_enqueue(MICRON_NS_NOTIFY, key, buf, n);
+}
+
+/* Re-archive the card carrying `id` (its unread badge just changed). Copies the
+ * card out under the lock, then write-through outside it. No-op if the id is gone
+ * (expired/evicted under the caller) — the archive already holds its last state. */
+static void notify_archive_by_id(uint32_t id) {
+    Notification e;
+    bool found = false;
+    portENTER_CRITICAL(&notify_mux);
+    for (int i = 0; i < notify_len; i++) {
+        if (notify_slot[notify_order[i]].id != id) continue;
+        e = notify_slot[notify_order[i]];
+        found = true;
+        break;
+    }
+    portEXIT_CRITICAL(&notify_mux);
+    if (found) notify_archive_put(e);
+}
+
 /* --- Store operations (each takes the lock itself) --- */
 
 /*
@@ -563,6 +613,12 @@ static uint32_t notify_push(Notification &e, const NotifyOptions *opts,
 
     uint32_t id = e.id;
     portEXIT_CRITICAL(&notify_mux);
+
+    /* Write-through to the off-loop archive: this is the create/update seam for
+       BOTH producers (POST /notify and mesh ingest go through notify_push). The
+       enqueue is a 0-tick hand-off, safe from the AsyncTCP task and the loop task
+       alike — the SD append is on the archive's own write task. */
+    notify_archive_put(e);
 
     if (replaced_out) *replaced_out = replaced;
     return id;
@@ -720,7 +776,7 @@ static bool notify_ack_id(uint32_t id) {
     }
     portEXIT_CRITICAL(&notify_mux);
     if (changed) {
-        notify_mark_dirty(NOTIFY_COALESCE_MS);
+        notify_archive_by_id(id);   /* unread badge changed: persist the new state */
         display_force = true;
         notify_ring_acked = true;
     }
@@ -768,9 +824,10 @@ static bool notify_choose_id(uint32_t id, uint8_t index) {
     portEXIT_CRITICAL(&notify_mux);
     if (!ok) return false;
 
-    notify_ack_id(id);
+    notify_ack_id(id);   /* answering marks read; that ack persists the card */
     if (changed) {
-        notify_mark_dirty(NOTIFY_COALESCE_MS);
+        /* The chosen index is ephemeral UI and is not archived (see
+           notify_record.h) — only redraw, no persistence write. */
         display_force = true;
     }
     return true;
@@ -830,22 +887,25 @@ static bool notify_set_reply(uint32_t id, const char *text) {
     portEXIT_CRITICAL(&notify_mux);
     if (!found) return false;
 
-    notify_ack_id(id);
-    notify_mark_dirty(NOTIFY_COALESCE_MS);
+    notify_ack_id(id);   /* answering marks read; that ack persists the card. The
+                            free-text reply itself is UI state and is not archived. */
     display_force = true;
     return true;
 }
 
 static int notify_ack_all() {
+    uint32_t changed_ids[NOTIFY_MAX];
     int n = 0;
     portENTER_CRITICAL(&notify_mux);
     for (int i = 0; i < notify_len; i++) {
         Notification &e = notify_slot[notify_order[i]];
-        if (e.unread) { e.unread = false; n++; }
+        if (e.unread) { e.unread = false; changed_ids[n++] = e.id; }
     }
     portEXIT_CRITICAL(&notify_mux);
     if (n > 0) {
-        notify_mark_dirty(NOTIFY_COALESCE_MS);
+        /* Persist each newly-read card to the archive (off-loop write-through).
+           Collected under the lock, enqueued outside it. */
+        for (int i = 0; i < n; i++) notify_archive_by_id(changed_ids[i]);
         display_force = true;
         notify_ring_acked = true;
     }
@@ -933,273 +993,89 @@ static bool notify_take_sound_arrival(uint8_t *level, char *source, size_t n) {
     return true;
 }
 
-/* --- Persistence ---
+/* --- Persistence / boot-restore (ticket C3) ---
  *
- * The two halves of the file format, one entry at a time, with no filesystem
- * and no store in either of them. tools/test_notify_options.sh compiles them on
- * the host against the real ArduinoJson and round-trips one through the other,
- * which is what pins the two-letter keys to each other: a writer emitting "op"
- * against a reader looking for "opt" loses every reply across a reboot and
- * nothing else in this firmware would notice.
+ * Notify persistence is the unified history archive now — cards are written
+ * through history_enqueue() at create/ack (see notify_archive_put) and the RAM
+ * ring is rebuilt from the archive at boot. There is no /notify.json snapshot,
+ * no loop-task SPIFFS write, and no JSON codec for persistence any more.
+ *
+ * notify_restore_one() inserts ONE archived card into the ring and is driven
+ * newest-first by the boot restorer (main.cpp), which reads the archive index
+ * for MICRON_NS_NOTIFY. It runs at setup() time, single-threaded, before the web
+ * server and mesh exist — so it rewrites notify_slot[]/notify_order[]/notify_len
+ * WITHOUT the spinlock, exactly as the pre-C3 SPIFFS restore did. Do not call it
+ * from anywhere else.
+ *
+ * The clamps mirror the old snapshot-restore: an archive is not a more trusted
+ * source than a POST body, so every ranged field is bounded and the strings go
+ * through notify_copy_text(). created_ms is device-relative and is reconstructed
+ * from created_epoch and the wall clock (millis wound back), so a card's age and
+ * ttl survive the reboot. Dedup by id drops a duplicate (belt-and-braces: the
+ * archive holds one identity per card, but a corrupted card carrying a live id
+ * must not shadow it). A card needs a title, like the old restore.
  */
-/* host-test:begin snapshot — sliced out by tools/test_notify_options.sh */
+static bool notify_restore_one(const notify_rec *r, time_t now, unsigned long now_ms) {
+    if (notify_len >= NOTIFY_MAX) return false;
+    if (r->id == 0 || r->id > NOTIFY_ID_MAX) return false;
+    if (r->title[0] == '\0') return false;
 
-/*
- * One entry into one JSON object.
- *
- * `e` and `op` are NON-CONST, and that is load-bearing rather than an
- * oversight. ArduinoJson stores a `const char *` by pointer and duplicates a
- * `char *`; the entries here are stack copies taken under the lock, and they
- * are gone by the time the document is serialised. Take these by const
- * reference and the snapshot silently fills with whatever the stack holds
- * later — it compiles, it runs, and the file is garbage.
- */
-static void notify_snapshot_store(JsonObject o, Notification &e, NotifyOptions &op,
-                                  time_t now) {
-    o["id"] = e.id;
-    o["lv"] = e.level;
-    o["ur"] = e.unread;
-    o["tt"] = e.ttl_s;
-    /* An entry that arrived before the first NTP sync has no epoch of its own.
-       Stamping it with the current one on the way out is the best available
-       answer and beats writing a zero that reads as "just now" forever. */
-    o["ts"] = (uint32_t)(e.created_epoch > TIME_VALID_EPOCH ? e.created_epoch
-                         : (now > TIME_VALID_EPOCH ? now : 0));
-    if (e.source[0]) o["sr"] = e.source;
-    o["ti"] = e.title;
-    if (e.body[0]) o["bd"] = e.body;
-    if (e.key[0])  o["ky"] = e.key;
-    /* Options and the reply travel together or not at all: `ch` is an index
-       into `op` and means nothing beside a different set of labels. */
-    if (e.opt_count > 0) {
-        JsonArray a = o["op"].to<JsonArray>();
-        for (uint8_t i = 0; i < e.opt_count && i < NOTIFY_OPT_MAX; i++)
-            a.add(op.label[i]);
-        o["ch"] = e.chosen;
-    }
-}
+    for (int i = 0; i < notify_len; i++)
+        if (notify_slot[notify_order[i]].id == r->id) return false;   /* dedup by id */
 
-/*
- * One JSON object back into one entry, clamped.
- *
- * False when there is nothing usable here — no id, or no title — which is how
- * the caller skips an object instead of restoring a blank. `e` and `op` are
- * fully overwritten either way, and a refusal leaves `e.id` at 0: the caller
- * restores straight into a slot, and a non-zero id in a slot the caller then
- * skips is a slot no free-slot search will ever hand out again. Every path
- * that returns false must therefore clear the id it had already read.
- *
- * Every field that has a range is clamped into it. A stored file is not a more
- * trustworthy source than a request body: this filesystem can be replaced
- * wholesale by anyone who can write an image, so the numbers coming out of it
- * get the same treatment the endpoint gives the ones coming in.
- */
-static bool notify_snapshot_restore(JsonObjectConst o, Notification &e, NotifyOptions &op,
-                                    time_t now, unsigned long now_ms) {
+    int slot = notify_free_slot();
+    if (slot < 0) return false;
+
+    Notification &e = notify_slot[slot];
     memset(&e, 0, sizeof(e));
-    memset(&op, 0, sizeof(op));
     e.chosen = -1;
-
-    e.id = o["id"] | 0u;
-    /* The id has a range like every other field here — see NOTIFY_ID_MAX — and a
-       stored file is the one place a value outside it can come from, because
-       nothing on the device ever issues one. 0xFFFFFFFF is the only value that
-       ever reaches the clamp: anything wider, negative, or not a number at all
-       reads back from the JSON as 0 and is refused a line below. The clamp is
-       not free. The first entry to hit it keeps its message under a name that
-       is not its own, and every later entry that clamps onto the same id — as
-       does a legitimate holder of NOTIFY_ID_MAX — is dropped whole by the load
-       loop as the duplicate it has been made into. */
-    if (e.id > NOTIFY_ID_MAX) e.id = NOTIFY_ID_MAX;
-    if (e.id == 0 || !o["ti"].is<const char *>()) { e.id = 0; return false; }
-
-    e.level = (uint8_t)(o["lv"] | 0);
-    if (e.level > NOTIFY_CRIT) e.level = NOTIFY_INFO;
-    e.unread = o["ur"] | false;
-    /* The same ceiling the API enforces, and a ttl past the cap says "never
-       expires", which is what ttl_s 0 already spells. */
-    e.ttl_s = o["tt"] | 0u;
-    if (e.ttl_s > NOTIFY_TTL_MAX) e.ttl_s = NOTIFY_TTL_MAX;
-    e.created_epoch = (time_t)(uint32_t)(o["ts"] | 0u);
-    /* Wind millis() back by however long the entry has really been alive. The
-       subtraction is meant to go negative and wrap: notify_age_of() reads it
-       back with the same unsigned arithmetic. */
+    e.opt_count = 0;
+    e.id = r->id;
+    e.level = (r->level > NOTIFY_CRIT) ? (uint8_t)NOTIFY_INFO : r->level;
+    e.unread = r->unread ? true : false;
+    e.ttl_s = (r->ttl_s > NOTIFY_TTL_MAX) ? (uint32_t)NOTIFY_TTL_MAX : r->ttl_s;
+    e.created_epoch = (time_t)(uint32_t)r->created_epoch;
+    /* Wind millis() back by however long the entry has really been alive — the
+       same reconstruction the old /notify.json restore did. */
     unsigned long elapsed = 0;
     if (e.created_epoch > TIME_VALID_EPOCH && now > e.created_epoch)
         elapsed = (unsigned long)(now - e.created_epoch) * 1000UL;
     e.created_ms = now_ms - elapsed;
-    /* Through the same copy the API path uses, for the same reason: these
-       strings go back out over GET /notify, and a stored file is not a more
-       trustworthy source of UTF-8 than a POST body. */
-    notify_copy_text(e.source, sizeof(e.source), o["sr"] | "");
-    notify_copy_text(e.title, sizeof(e.title), o["ti"] | "");
-    notify_copy_text(e.body, sizeof(e.body), o["bd"] | "");
-    notify_copy_text(e.key, sizeof(e.key), o["ky"] | "");
+    notify_copy_text(e.source, sizeof(e.source), r->source);
+    notify_copy_text(e.title,  sizeof(e.title),  r->title);
+    notify_copy_text(e.body,   sizeof(e.body),   r->body);
+    notify_copy_text(e.key,    sizeof(e.key),    r->key);
 
-    /* The options go through the endpoint's own validator, so a set that could
-       not have been posted cannot be restored either. A set that fails takes
-       the reply with it and leaves a plain notification, which is the readable
-       half of the entry and the half worth keeping. */
-    JsonArrayConst a = o["op"];
-    if (!a.isNull()) {
-        const char *labels[NOTIFY_OPT_MAX];
-        size_t n = a.size();
-        for (size_t i = 0; i < n && i < NOTIFY_OPT_MAX; i++) labels[i] = a[i] | "";
-        if (!notify_options_build(op, e.opt_count, labels, n, NULL)) {
-            memset(&op, 0, sizeof(op));
-            e.opt_count = 0;
-        }
-    }
-    if (e.opt_count > 0) {
-        int chosen = o["ch"] | -1;
-        /* -1 is "unanswered" and 0..opt_count-1 is an answer; anything else is
-           a reply to a question this entry is not asking. */
-        if (chosen >= 0 && chosen < (int)e.opt_count) e.chosen = (int8_t)chosen;
-    }
+    memset(&notify_opt[slot], 0, sizeof(notify_opt[slot]));  /* options not archived */
+    notify_reply[slot][0] = '\0';
+
+    notify_order[notify_len++] = (uint8_t)slot;   /* caller feeds newest-first */
+    if (r->id >= notify_next_id) notify_next_id = r->id + 1;
     return true;
 }
 
-/*
- * Fill the store from a stored array, and say how many entries went in.
- *
- * A function of its own rather than a loop inside notify_load() so that the
- * host suite can run it against a real slot array: everything that can go
- * wrong here is a slot left in a state nothing looks at again, which no test
- * of notify_snapshot_restore() alone can see.
- *
- * setup()-time only. It walks and rewrites notify_slot[], notify_order[] and
- * notify_len WITHOUT taking notify_mux, and that is safe for exactly one
- * reason: notify_load() calls it from setup(), before the web server and its
- * AsyncTCP task exist, so there is no second party to race. Do not call it from
- * anywhere else — from a request handler it would rewrite the arrays a
- * concurrent notify_push() is reading.
- *
- * The file is newest-first, so appending to the tail rebuilds the order as it
- * was. Nothing else runs yet — notify_load() is called from setup() — so the
- * slots are filled directly instead of going through notify_push(), which would
- * issue new ids and reverse the list.
- *
- * Every path out of the loop that does not publish the slot puts its id back to
- * 0 first. Restoring writes into the slot before it knows whether the entry is
- * usable, so an id left behind on a slot that never reaches notify_order[] is
- * a slot that is neither free nor in the list: notify_free_slot() skips it
- * forever, and a file whose entries all fail this way leaves POST /notify
- * answering "queue full" on an empty queue.
- */
-static int notify_restore_entries(JsonArrayConst arr, time_t now, unsigned long now_ms) {
-    int restored = 0;
-
-    for (JsonObjectConst o : arr) {
-        if (notify_len >= NOTIFY_MAX) break;
-
-        int slot = notify_free_slot();
-        if (slot < 0) break;
-
-        if (!notify_snapshot_restore(o, notify_slot[slot], notify_opt[slot], now, now_ms)) {
-            /* Redundant today: notify_snapshot_restore() has one refusal path and
-               it clears the id itself. Kept because the state it prevents — a slot
-               neither free nor listed — answers "queue full" on an empty queue and
-               comes back only with a reflash, and that is one guard away. The line
-               DOES run, on every refused entry; what no test can observe is the
-               assignment doing anything, because the id is already 0 whenever the
-               guard upstream holds. Read it as belt-and-braces, not as something
-               the suite has proven. */
-            notify_slot[slot].id = 0;
-            continue;
-        }
-
-        uint32_t id = notify_slot[slot].id;
-        bool dup = false;
-        for (int i = 0; i < notify_len && !dup; i++)
-            dup = (notify_slot[notify_order[i]].id == id);
-        if (dup) { notify_slot[slot].id = 0; continue; }
-
-        notify_order[notify_len++] = (uint8_t)slot;
-        if (id >= notify_next_id) notify_next_id = id + 1;
-        restored++;
-    }
-    return restored;
-}
-/* host-test:end */
-
-static void notify_save() {
-    JsonDocument doc;
-    JsonArray arr = doc["n"].to<JsonArray>();
-    time_t now = time(NULL);
-
-    /* One short critical section per entry rather than one long one. A
-       notification arriving between two of them can be copied twice; the id
-       makes that harmless on the way back in. */
-    int count = notify_count();
-    if (count > NOTIFY_PERSIST) count = NOTIFY_PERSIST;
-    for (int i = 0; i < count; i++) {
-        Notification e;
-        NotifyOptions op;
-        portENTER_CRITICAL(&notify_mux);
-        bool ok = (i < notify_len);
-        if (ok) {
-            e = notify_slot[notify_order[i]];
-            op = notify_opt[notify_order[i]];
-        }
-        portEXIT_CRITICAL(&notify_mux);
-        if (!ok) break;
-
-        notify_snapshot_store(arr.add<JsonObject>(), e, op, now);
-    }
-
-    String out;
-    serializeJson(doc, out);
-    /* Not a plain write: that truncates the file first, and the entries this
-       skill exists to protect are the ones a power loss during the write would
-       take. The new snapshot is complete on flash before the old one goes. */
-    if (!write_spiffs_file_atomic(NOTIFY_FILE, NOTIFY_FILE_TMP, out))
-        event_add("notify: save failed");
-}
-
-static void notify_load() {
-    String json = read_spiffs_file(NOTIFY_FILE);
-    /* Nothing under the real name means the last save was interrupted between
-       its remove and its rename. What is under the temp name is then the whole
-       snapshot, so take it; a save interrupted earlier than that leaves a
-       partial file there instead, which fails to parse and is discarded like
-       any other unreadable one. */
-    if (json.length() == 0) json = read_spiffs_file(NOTIFY_FILE_TMP);
-    if (json.length() == 0) return;
-
-    JsonDocument doc;
-    if (deserializeJson(doc, json) != DeserializationError::Ok) {
-        event_add("notify: stored queue unreadable, discarded");
-        return;
-    }
-
-    int restored = notify_restore_entries(doc["n"].as<JsonArrayConst>(),
-                                          time(NULL), millis());
-
-    /* A ttl that ran out while the device was off has still run out. */
+/* After the boot restorer has inserted every archived card (newest-first), drop
+ * any whose ttl ran out while the device was off — the same final step the
+ * pre-C3 SPIFFS restore did. Runs single-threaded at setup(). */
+static void notify_restore_finish(int restored) {
     int dropped = notify_expire();
-    if (restored > 0) {
-        event_add("notify: restored %d of %d stored", restored - dropped, restored);
-    }
+    if (restored > 0)
+        event_add("notify: restored %d of %d archived", restored - dropped, restored);
 }
 
 /* Called every loop() pass. Expiry is worth checking at most once a second —
-   ttls are in seconds — and the flash write waits for the coalescing window so
-   that a burst of notifications costs one erase cycle rather than ten. */
+   ttls are in seconds. There is NO persistence write here any more (ticket C3):
+   cards are written through to the off-loop archive at create/ack, so the loop/
+   tick task never touches SD or SPIFFS for notify state. */
 static void notify_poll() {
     static unsigned long last_expire = 0;
     unsigned long now_ms = millis();
 
     if (now_ms - last_expire >= 1000) {
         last_expire = now_ms;
-        if (notify_expire() > 0) {
-            notify_mark_dirty(NOTIFY_COALESCE_MS);
-            display_force = true;
-        }
-    }
-
-    if (notify_dirty && (long)(now_ms - notify_save_at) >= 0) {
-        notify_dirty = false;
-        notify_save();
+        /* An expired card just leaves the RAM ring; its archive record stays and
+           is re-expired at the next boot restore, so expiry needs no write. */
+        if (notify_expire() > 0) display_force = true;
     }
 }
 
@@ -1239,7 +1115,7 @@ static uint32_t notify_ingest(const char *level_s,
     notify_ring_level = e.level;
     notify_ring_arrived = true;
     notify_request_sound(e.level, e.source);
-    notify_mark_dirty(e.level == NOTIFY_CRIT ? 0 : NOTIFY_COALESCE_MS);
+    /* Persistence already happened inside notify_push (archive write-through). */
     display_force = true;
     event_add("notify %s: %s%s%s", notify_level_name(e.level),
               e.source[0] ? e.source : "", e.source[0] ? ": " : "", e.title);
@@ -1389,13 +1265,13 @@ static const char *notify_describe() {
            "carrying the old reply onto it would be worse than losing it.\n"
            "Answering also marks the entry read.\n\n"
            "### Behaviour\n\n"
-           "Twenty entries are held in RAM and the newest six survive a reboot.\n"
+           "Cards are held in RAM and mirrored to a persistent history store, so\n"
+           "recent ones survive a reboot with their read state and age intact.\n"
            "A full queue drops the oldest read entry first, and only ever drops\n"
            "an unread critical when every slot holds one.\n\n"
-           "Nothing here blocks: a POST is a struct copy, and the flash write\n"
-           "that mirrors the queue happens on the main loop a few seconds\n"
-           "later — immediately for a `crit`, which may be warning about the\n"
-           "very reboot that would lose it.\n\n"
+           "Nothing here blocks: a POST is a struct copy, and the write to the\n"
+           "history store is handed to a background task, never done on the\n"
+           "request or the main loop.\n\n"
            "### Example\n\n"
            "```\n"
            "curl -H \"Authorization: Bearer $TOKEN\" -H 'Content-Type: application/json' \\\n"
@@ -1428,9 +1304,10 @@ static void notify_send_json(AsyncWebServerRequest *req, int code, JsonDocument 
  * One entry as the API renders it, shared by the list and the single-entry
  * read so the two cannot drift into describing the same message differently.
  *
- * `v` is NON-CONST for the reason spelled out at notify_snapshot_store():
- * ArduinoJson keeps a `const char *` by pointer and copies a `char *`, and this
- * view is a stack local that is reused on the next pass of the caller's loop.
+ * `v` is NON-CONST for an ArduinoJson reason: it keeps a `const char *` by
+ * pointer and copies a `char *`, and this view is a stack local that is reused on
+ * the next pass of the caller's loop — so its strings must be duplicated, not
+ * pointed at, which is what passing a non-const `char[]` makes ArduinoJson do.
  *
  * `options` and `chosen` appear only on an entry that has options, so their
  * absence means "this message asks nothing" rather than "no reply yet" — which
@@ -1615,7 +1492,7 @@ static void notify_register_routes(AsyncWebServer &server) {
         notify_ring_level = e.level;
         notify_ring_arrived = true;
         notify_request_sound(e.level, e.source);
-        notify_mark_dirty(e.level == NOTIFY_CRIT ? 0 : NOTIFY_COALESCE_MS);
+        /* Persistence already happened inside notify_push (archive write-through). */
         display_force = true;
 
         event_add("notify %s: %s%s%s", notify_level_name(e.level),
@@ -1748,17 +1625,19 @@ static const Skill notify_skill = {
     .describe = notify_describe,
     .endpoints = notify_endpoints,
     .register_routes = notify_register_routes,
-    // Order-free (C8): expiry raises display_force (and the coalesced save
-    // flag), which the loop consumes on its next pass — a one-pass repaint
-    // deferral, benign. Arrival/sound flags are produced by the HTTP handlers
-    // and mesh ingest, not by this poll.
+    // Order-free (C8): expiry raises display_force, which the loop consumes on
+    // its next pass — a one-pass repaint deferral, benign. There is no save from
+    // this poll any more (C3): persistence is the off-loop archive. Arrival/sound
+    // flags are produced by the HTTP handlers and mesh ingest, not by this poll.
     .tick = notify_poll
 };
 
+// The RAM ring is memset empty here; the archive restore runs later in setup()
+// (notify_restore_from_archive, main.cpp) once the history archive is mounted and
+// its index seeded — the ring cannot be rebuilt before the store it reads exists.
 static void skill_notify_init() {
     memset(notify_slot, 0, sizeof(notify_slot));
     memset(notify_opt, 0, sizeof(notify_opt));
     memset(notify_reply, 0, sizeof(notify_reply));
-    notify_load();
     skill_register(&notify_skill);
 }

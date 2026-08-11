@@ -389,6 +389,32 @@ static bool history_read_at(uint32_t offset, history_record *out) {
     return o.found;
 }
 
+/* --- boot-restore seam: rank-th newest archived record under a namespace ----- */
+
+/*
+ * Fetch the rank-th newest archived record under `ns` (newest-first by seq),
+ * reading its body from SD, for rebuilding a producer's RAM ring at boot — the
+ * notify card ring (ticket C3). The RAM index (seeded by the mount scan) resolves
+ * the identity and its file offset under g_hist_mux; the body is then read with
+ * ONE bounded record read (history_read_at, mode "r"), never a whole-archive scan.
+ * The mux is released BEFORE history_read_at so the two mux takes never nest.
+ * Returns false past the last indexed identity (rank out of range) or on a read
+ * miss — the caller stops paging in cleanly. Runs in setup() single-threaded
+ * (before any producer enqueues), so the index cannot shift under the walk.
+ */
+static bool history_restore_at(uint8_t ns, int rank, history_record *out) {
+    uint32_t offset = 0;
+    bool have = false;
+
+    if (g_hist_mux) xSemaphoreTake(g_hist_mux, portMAX_DELAY);
+    const history_index_entry *e = history_index_ns_at(&g_hist_index, ns, rank);
+    if (e) { offset = e->offset; have = true; }
+    if (g_hist_mux) xSemaphoreGive(g_hist_mux);
+
+    if (!have) return false;
+    return history_read_at(offset, out);   /* takes g_hist_mux itself — not nested */
+}
+
 /* --- wheel navigation seam (mutex-guarded reads of the RAM nav index) -------- */
 
 /*

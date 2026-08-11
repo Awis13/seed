@@ -2,8 +2,9 @@
 """Static regressions for the C8 pattern unification.
 
 Poll dispatch: polls whose order provably does not matter run through the
-Skill.tick dispatcher (notify: expiry/snapshot only raise flags consumed next
-pass; progress: reaping updates a snapshot read at 1 Hz / 30 s scales). Polls
+Skill.tick dispatcher (notify: expiry only raises flags consumed next pass —
+persistence is the off-loop history archive now, no loop-task write; progress:
+reaping updates a snapshot read at 1 Hz / 30 s scales). Polls
 whose position in loop() carries an ordering constraint stay hand-placed and
 say so in an ORDER comment (backlight before the arrival block — C3 wake
 order; reply upstream after the keyboard drain; the sound DMA refill before
@@ -118,7 +119,9 @@ for text in sources:
 assert len(tmps) == len(set(tmps)), (
     f"duplicate tmp file names: {sorted(t for t in tmps if tmps.count(t) > 1)}"
 )
-expected = {"/gw_token.tmp", "/notify.tmp", "/gps.tmp", "/backlight.tmp",
+# /notify.tmp is gone (ticket C3): notify persistence moved off the loop-task
+# SPIFFS snapshot onto the off-loop history archive.
+expected = {"/gw_token.tmp", "/gps.tmp", "/backlight.tmp",
             "/kb_layout.tmp", "/agent_bridge.tmp"}
 assert set(tmps) == expected, f"unexpected tmp set: {sorted(set(tmps))}"
 

@@ -357,6 +357,49 @@ static inline const history_index_entry *history_index_get(const history_index *
     return idx >= 0 ? &ix->e[idx] : NULL;
 }
 
+/* --- boot-restore of a producer's RAM ring from the archive (ticket C3) ------
+ *
+ * Rebuilding a producer's RAM set at boot (the notify card ring) walks the
+ * indexed identities under one namespace, NEWEST-FIRST by seq — the same axis
+ * the wheel uses, but WITHOUT the live-store dedup (history_nav_archive_at needs
+ * a micron_store to skip RAM-resident pages; a fresh boot ring has none yet).
+ * NAMESPACE ISOLATION holds: only entries whose ns matches are counted or
+ * returned, so restoring MICRON_NS_NOTIFY can never pull a SYSTEM/FOREIGN page
+ * into the notify ring. Selection is the same array-free "largest seq strictly
+ * below the previous pick" walk as history_nav_archive_at; seqs are distinct
+ * (one entry per identity, monotonic writer seq), so there are no ties. */
+
+/* Distinct indexed (ns,key) under `ns`. */
+static inline int history_index_ns_count(const history_index *ix, uint8_t ns) {
+    if (!ix) return 0;
+    int n = 0;
+    for (int i = 0; i < HISTORY_INDEX_MAX; i++)
+        if (ix->e[i].used && ix->e[i].ns == ns) n++;
+    return n;
+}
+
+/* The `rank`-th indexed (ns,key) under `ns`, newest-first by seq, or NULL. */
+static inline const history_index_entry *history_index_ns_at(const history_index *ix,
+                                                             uint8_t ns, int rank) {
+    if (!ix || rank < 0) return NULL;
+    const history_index_entry *pick = NULL;
+    int have_prev = 0;
+    uint32_t prev_seq = 0;
+    for (int step = 0; step <= rank; step++) {
+        pick = NULL;
+        for (int i = 0; i < HISTORY_INDEX_MAX; i++) {
+            const history_index_entry *e = &ix->e[i];
+            if (!e->used || e->ns != ns) continue;
+            if (have_prev && e->seq >= prev_seq) continue;   /* already taken / newer */
+            if (!pick || e->seq > pick->seq) pick = e;
+        }
+        if (!pick) return NULL;   /* ran out before reaching rank */
+        prev_seq = pick->seq;
+        have_prev = 1;
+    }
+    return pick;
+}
+
 /* --- index saturation policy: a bounded MRU-by-seq window (ticket C2) -------
  *
  * DECISION. history_index is a bounded window of the NEWEST HISTORY_INDEX_MAX
