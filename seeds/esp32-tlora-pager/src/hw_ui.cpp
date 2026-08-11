@@ -8,6 +8,7 @@
 #include "board_pins.h"
 #include "hw_sound.h"   // tft_wake pumps the sound queue across its settle
 #include "micron/micron_layout.h"  // pure page layout -> grid (C3)
+#include "box_glyphs.h"            // box-drawing + block glyphs for micron pages
 
 #include <SPI.h>
 #include <Wire.h>
@@ -484,6 +485,10 @@ static const uint8_t *font_glyph(uint32_t cp) {
         return &FONT_CYR_UP[(cp - 0x0410) * 5];
     if (cp >= 0x0430 && cp <= 0x044F)
         return &FONT_CYR_LO[(cp - 0x0430) * 5];
+    // Box-drawing (U+2500..) and block elements (U+2588 family): tables/frames
+    // on foreign NomadNet pages, chat separators, the decrypt/progress bars.
+    if (const uint8_t *bx = box_glyph(cp))
+        return bx;
     return &FONT5X7[('?' - 0x20) * 5];
 }
 
