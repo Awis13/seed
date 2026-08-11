@@ -126,6 +126,51 @@ assert "history_index_live_count()" in health, (
 )
 assert 'boot_diag_init()' in setup, "counters must be initialized in setup()"
 
+# --- 7d. NVS panic counter that survives a manual reset ----------------------
+# The reset button on this board reports ESP_RST_POWERON (same as real power),
+# which wipes RTC_NOINIT — so panic_count/boots_since_panic are erased by every
+# manual reset. panics_since_flash lives in NVS (flash, not wiped on poweron) and
+# must survive that; it is cleared ONLY on a build-signature change (a reflash),
+# NOT on a poweron. poweron_count tallies button+power events.
+decide = (ROOT / "src" / "boot_diag_decide.h").read_text(encoding="utf-8")
+# The decision is a pure, host-tested function — not re-derived at the call site.
+assert "boot_diag_nvs_decide(" in decide, (
+    "the reset/increment decision must be a pure function in boot_diag_decide.h"
+)
+assert "boot_diag_nvs_decide(" in diag, (
+    "boot_diag_init must call the pure decision, not inline its own copy"
+)
+# The reset of panics_since_flash is gated on the signature change, NOT on
+# ESP_RST_POWERON: the pure decision only ever consults the signature (sig_changed)
+# and the panic flag — it never sees the reset reason, so a poweron cannot clear
+# it. Check the function BODY (not the file's header comment, which names the
+# reason it defends against) takes no reset reason and never branches on one.
+decide_body = fn_body(decide, "boot_diag_nvs_decide(\n", terminator="\n}")
+assert "reset_reason" not in decide_body and "ESP_RST" not in decide_body, (
+    "the NVS-counter reset must depend on the build signature, never on the reset "
+    "reason — a poweron/button must NOT clear panics_since_flash"
+)
+assert "is_panic" in decide_body, (
+    "the decision must key off the panic flag and the signature only"
+)
+assert "sig_changed" in decide, "a fresh flash is detected by a signature change"
+# The signature is SEED_VERSION plus the compiler build stamp, so any reflash
+# changes it while a bare poweron leaves it identical.
+assert "SEED_VERSION" in main and "__DATE__" in main and "__TIME__" in main, (
+    "the build signature must combine SEED_VERSION with the per-build compile stamp"
+)
+assert "BOOT_DIAG_BUILD_SIG" in diag, "the current build signature must be compared"
+# Storage is real NVS (Preferences), opened read-write inside boot_diag_init.
+assert "Preferences" in main, "panics_since_flash must be stored in NVS (Preferences)"
+assert 'prefs.begin(' in diag, "the NVS namespace must be opened in boot_diag_init"
+# The RTC counter must reuse the SAME is_panic decision (passed in), so both agree.
+assert "is_panic" in diag and diag.index("is_panic") < diag.index("boot_diag_nvs_decide("), (
+    "the NVS counter must reuse the existing is_panic decision, not a new one"
+)
+# The new fields surface on /health next to the RTC ones.
+for field in ("panics_since_flash", "poweron_count"):
+    assert f'doc["{field}"]' in health, f"/health must serve {field}"
+
 # --- 7b. s10 (C6): full S3 reset-reason coverage and its panic classing ------
 # The vendored IDF header (esp_system.h, ESP32-S3) also defines USB, JTAG,
 # EFUSE, PWR_GLITCH and CPU_LOCKUP; every one must map to a readable string.
