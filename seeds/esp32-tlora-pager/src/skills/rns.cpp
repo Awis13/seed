@@ -14,7 +14,10 @@
  *                         reconnect state machine all run on the loop task
  *   /rns.json (SPIFFS)    {enabled, host, port} — gitignored, it names a host
  *                         behind the tunnel
- *   GET  /rns/status      stack + interface state, counters, last error
+ *   GET  /rns/status      stack + interface state, counters, last error, plus
+ *                         three loop-task health fields (loop_stack_free_bytes,
+ *                         drain_us_max, path_hashes); ?reset=1 zeroes the
+ *                         drain_us_max rolling max after it has been read
  *   POST /rns/config      upsert of the three fields above
  *
  * THE TICK IS NOW ON, and it brings four library behaviours with it that no
@@ -108,6 +111,7 @@
 
 #include <atomic>
 #include <errno.h>
+#include <esp_timer.h>   /* esp_timer_get_time() for the drain-time diagnostic */
 
 /* Raw socket send, because NetworkClient::write() can sit for ~10 s.
  *
@@ -284,6 +288,44 @@ static size_t g_rns_tx_sent = 0;
 static uint32_t g_rns_tx_pending_ms = 0;
 
 static RNS::Interface g_rns_iface{RNS::Type::NONE};
+
+/* ---- loop-task health diagnostics ----
+ *
+ * Three numbers a phase-2 test wants to watch continuously, all produced on the
+ * loop task and all read (never mutated live) by GET /rns/status.
+ *
+ * g_loop_stack_free_bytes is uxTaskGetStackHighWaterMark(NULL) sampled in the
+ * RNS tick, i.e. the minimum free stack the loop task has ever had. On this
+ * Arduino-ESP32 3.3.9 / ESP-IDF 5 build the return is in BYTES, not words:
+ * .../framework-arduinoespressif32-libs/esp32s3/include/freertos/
+ * FreeRTOS-Kernel/include/freertos/task.h documents it as "the minimum free
+ * stack space there has been in bytes (as opposed to words in the standard
+ * FreeRTOS documentation)". The unit is baked into the field name so no reader
+ * has to guess the 4x. The high-water mark is already the worst case, so it is
+ * stored and reported as-is.
+ *
+ * g_drain_us_max is the rolling maximum microseconds a single drain() pass has
+ * spent on the loop task (esp_timer_get_time). GET /rns/status?reset=1 zeroes
+ * it after the read so a fresh worst case can be measured over a chosen window.
+ * It is a naturally aligned 32-bit scalar; the loop task's `if (dt > max)
+ * max = dt` and the handler's reset can only ever cost one lost sample, the
+ * same hazard class the other direct-read counters already accept.
+ *
+ * g_path_hash is a loop-side snapshot of the destination hashes in Transport's
+ * path table (RNS::Transport::_new_path_table). That table is inserted into by
+ * Transport::inbound() on the loop task, so iterating it from the AsyncTCP
+ * status handler would race a concurrent insert and invalidate the iterator.
+ * The snapshot is filled in rns_status_publish() — the same place, and the same
+ * task, that already reads the table's size — and the handler serves ONLY this
+ * buffer. It is bounded to RNS_PATH_HASH_MAX 16-byte hashes as 32-char hex;
+ * g_path_hash_n is how many slots are filled and g_rns_snap.paths carries the
+ * full count, published as path_hashes_total so a truncated array is visible. */
+#define RNS_PATH_HASH_MAX 8
+/* 16-byte truncated destination hash -> 32 hex chars + NUL. */
+static char g_path_hash[RNS_PATH_HASH_MAX][33];
+static volatile uint8_t g_path_hash_n = 0;
+static uint32_t g_loop_stack_free_bytes = 0;
+static uint32_t g_drain_us_max = 0;
 
 /* ---- status snapshot ----
  *
@@ -547,6 +589,19 @@ void RnsTcpInterface::tx_flush() {
  * MSG_DONTWAIT, so neither can wait; the three budgets bound how much work one
  * tick may do with the data they return. */
 void RnsTcpInterface::drain() {
+    /* Rolling max of the whole pass, measured with a scope guard rather than an
+     * inline t0/dt pair because drain() has an early return partway through the
+     * inner loop — that path still did handle_incoming() work worth timing, and
+     * a guard credits every exit exactly once without editing any existing
+     * statement. esp_timer_get_time() is microseconds. */
+    struct DrainTimer {
+        uint64_t t0 = (uint64_t)esp_timer_get_time();
+        ~DrainTimer() {
+            uint32_t dt = (uint32_t)((uint64_t)esp_timer_get_time() - t0);
+            if (dt > g_drain_us_max) g_drain_us_max = dt;
+        }
+    } drain_timer;
+
     uint32_t started = millis();
     size_t bytes = 0;
     int frames = 0;
@@ -809,6 +864,33 @@ static void rns_status_publish() {
     memcpy(g_rns_snap.host, g_rns_host, sizeof(g_rns_snap.host) - 1);
     memcpy(g_rns_snap.last_error, g_rns_last_error,
            sizeof(g_rns_snap.last_error) - 1);
+
+    /* Loop-task health, sampled here so GET /rns/status never touches the loop
+     * task's live structures. See the diagnostics block above for the units. */
+    g_loop_stack_free_bytes = (uint32_t)uxTaskGetStackHighWaterMark(NULL);
+
+    /* Snapshot up to RNS_PATH_HASH_MAX destination hashes from the path table.
+     * new_path_table() hands back a const reference, but its begin()/end() are
+     * non-const (the iterator lazily decodes each record), so a const_cast is
+     * needed to walk it — this is the same container the library itself iterates
+     * as `for (const auto& path : _new_path_table)`. Loop task only, so no
+     * Transport::inbound() insert runs concurrently. The full count stays in
+     * g_rns_snap.paths (read just above). A decode fault must not take the tick
+     * down, so the walk is guarded. */
+    uint8_t pn = 0;
+    try {
+        auto &pt = const_cast<RNS::Persistence::NewPathTable &>(
+            RNS::Transport::new_path_table());
+        for (const auto &path : pt) {
+            if (pn >= RNS_PATH_HASH_MAX) break;
+            std::string hx = path.key.toHex();
+            snprintf(g_path_hash[pn], sizeof(g_path_hash[pn]), "%s", hx.c_str());
+            pn++;
+        }
+    } catch (...) {
+        /* report whatever was gathered before the fault */
+    }
+    g_path_hash_n = pn;
 }
 
 /* ---- identity ---- */
@@ -891,6 +973,21 @@ static void rns_status_json(JsonDocument &doc) {
      * that Transport::inbound() inserts into on the loop task, so it is read
      * from the snapshot and never from the table itself. */
     doc["paths"] = (unsigned long)g_rns_snap.paths;
+
+    /* The destination hashes currently in the path table, so phase-2 can
+     * confirm the learned path is to a known announcer. These come from the
+     * loop-side snapshot g_path_hash (filled in rns_status_publish) and are
+     * NEVER iterated live from this AsyncTCP handler — a concurrent
+     * Transport::inbound() insert would invalidate the iterator. The array is
+     * bounded to RNS_PATH_HASH_MAX; path_hashes_total is the full count (the
+     * same number as `paths`), so a reader can tell a truncated array from a
+     * complete one. */
+    JsonArray phash = doc["path_hashes"].to<JsonArray>();
+    uint8_t phn = g_path_hash_n;
+    if (phn > RNS_PATH_HASH_MAX) phn = RNS_PATH_HASH_MAX;
+    for (uint8_t i = 0; i < phn; i++) phash.add((const char *)g_path_hash[i]);
+    doc["path_hashes_total"] = (unsigned long)g_rns_snap.paths;
+
     if (rns_error) doc["error"] = rns_error;
 
     JsonObject iface = doc["iface"].to<JsonObject>();
@@ -922,6 +1019,15 @@ static void rns_status_json(JsonDocument &doc) {
     iface["rx_errors"] = g_rns_rx_errors;
     iface["frames_short"] = g_rns_rx.rejected_short;
     iface["frames_long"] = g_rns_rx.rejected_long;
+
+    /* Loop-task health sampled in the RNS tick (rns_status_publish).
+     * loop_stack_free_bytes is uxTaskGetStackHighWaterMark(NULL) — the
+     * minimum-free-ever stack of the loop task, in BYTES on this ESP-IDF build
+     * (see the diagnostics block for the header quote). drain_us_max is the
+     * rolling max microseconds one drain() pass has taken; GET
+     * /rns/status?reset=1 zeroes it after this read. */
+    iface["loop_stack_free_bytes"] = (unsigned long)g_loop_stack_free_bytes;
+    iface["drain_us_max"] = (unsigned long)g_drain_us_max;
 
     /* The library's own counters next to the platform's, so /rns/status can be
      * diffed against /capabilities when the stack starts carrying traffic.
@@ -962,6 +1068,12 @@ static const char *rns_describe() {
            "(off/idle/connecting/connected/failed), the endpoint, rx/tx\n"
            "counters, the last error and `paths` — the path-table size, which\n"
            "is what shows the peer's announces arriving.\n"
+           "It also reports loop-task health sampled in the RNS tick:\n"
+           "`iface.loop_stack_free_bytes` (the loop task's minimum-free stack in\n"
+           "bytes), `iface.drain_us_max` (the longest single drain pass in\n"
+           "microseconds, zeroed by `?reset=1`) and `path_hashes` — up to eight\n"
+           "path-table destination hashes with `path_hashes_total` for the full\n"
+           "count.\n"
            "`mem.alloc_count` and `mem.free_count` are expected to read 0: the\n"
            "build uses the library's heap allocator, which leaves the global\n"
            "`operator new` — and therefore the counters — alone.\n"
@@ -977,6 +1089,14 @@ static void rns_register_routes(AsyncWebServer &server) {
         if (!require_auth(req)) return;
         JsonDocument doc;
         rns_status_json(doc);
+        /* ?reset=1 zeroes the drain-time rolling max — and only that — after it
+         * has been read into the response, so a caller can start a fresh
+         * worst-case window. A lost concurrent drain sample is acceptable for a
+         * diagnostic; see the diagnostics block. */
+        if (req->hasParam("reset") &&
+            req->getParam("reset")->value() == "1") {
+            g_drain_us_max = 0;
+        }
         notify_send_json(req, 200, doc);
     });
 
