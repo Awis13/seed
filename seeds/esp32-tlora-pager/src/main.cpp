@@ -45,6 +45,7 @@
 #include <esp_ota_ops.h>
 #include <esp_system.h>
 #include <esp_attr.h>
+#include <esp_core_dump.h>
 #include <HTTPClient.h>
 #include "board_pins.h"
 #include "hw_ui.h"
@@ -56,7 +57,7 @@
 #include "hw_kb.h"
 
 // ===== Configuration =====
-#define SEED_VERSION        "0.9.60"
+#define SEED_VERSION        "0.9.61"
 // Core clock: datasheet puts 240 vs 80 ~11.5mA apart on WAITI. Periph bus holds
 // at 80 for every PLL-fed core clock; go lower and RMT/I2S retimes. Same floor
 // as tembed idle policy (no light sleep — notify latency is the job).
@@ -147,17 +148,34 @@ static const char *reset_reason_str(esp_reset_reason_t r) {
     }
 }
 
-// Panic-class resets: real panics plus watchdogs (both fire the panic
-// handler), a CPU lockup (double exception) and a detected power glitch —
-// unexpected faults that must count as instability. USB and JTAG resets are
-// host-driven (flashing/debugging) and stay clean, like poweron. An efuse
-// error reset is also clean: it means the eFuse controller re-read its
-// block, a one-shot hardware event with no firmware cause, so counting it
-// as instability would misdirect the crash counters.
+// UNCONDITIONAL panic-class resets: real panics plus the interrupt/task
+// watchdogs (both fire the panic handler on a genuine firmware hang), a CPU
+// lockup (double exception) and a detected power glitch — unexpected faults
+// that must count as instability. USB and JTAG resets are host-driven
+// (flashing/debugging) and stay clean, like poweron. An efuse error reset is
+// also clean: the eFuse controller re-read its block, a one-shot hardware
+// event with no firmware cause, so counting it would misdirect the counters.
+//
+// ESP_RST_WDT (the generic RTC/other watchdog) is intentionally NOT listed
+// here: it is ambiguous and gets a coredump-gated decision in boot_diag_init.
+// It is BOTH what esptool's `--after watchdog_reset` fires on every plain
+// reflash (board_upload.after_reset in platformio.ini) AND a genuine early
+// RTC-watchdog hang in the bootloader / earliest init, before the task and
+// interrupt watchdogs exist. A blanket exclude would drop that early-hang
+// class; a blanket include would false-alarm panic_count on every reflash.
 static bool reset_is_panic(esp_reset_reason_t r) {
     return r == ESP_RST_PANIC || r == ESP_RST_INT_WDT ||
-           r == ESP_RST_TASK_WDT || r == ESP_RST_WDT ||
+           r == ESP_RST_TASK_WDT ||
            r == ESP_RST_CPU_LOCKUP || r == ESP_RST_PWR_GLITCH;
+}
+
+// A CRC-valid ELF coredump image sits in the coredump partition only after a
+// crash that reached the panic handler. Coredump-to-flash is enabled in the
+// precompiled Arduino-ESP32 esp32s3 libs (CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH,
+// _DATA_FORMAT_ELF, _CHECKSUM_CRC32) and the partition table carries a
+// data,coredump slot at 0xFF0000, so this returns true iff a real dump landed.
+static bool coredump_image_present() {
+    return esp_core_dump_image_check() == ESP_OK;
 }
 
 static void boot_diag_init() {
@@ -167,7 +185,18 @@ static void boot_diag_init() {
         boots_since_panic = 0;
         panic_count = 0;
     }
-    if (reset_is_panic(reset_reason)) {
+    bool is_panic = reset_is_panic(reset_reason);
+    // ESP_RST_WDT is ambiguous (see reset_is_panic): discriminate by coredump
+    // presence. The flash tool's `--after watchdog_reset` never leaves a dump,
+    // so a plain reflash does NOT bump panic_count; a genuine early RTC-WDT
+    // hang that reached the panic handler does leave one, so it still counts.
+    // (Residual edge: a stale dump from an earlier real panic that was never
+    // pulled/erased makes the next reflash-triggered ESP_RST_WDT count once —
+    // accepted, since the dump is deliberately kept in flash for offline decode.)
+    if (reset_reason == ESP_RST_WDT) {
+        is_panic = coredump_image_present();
+    }
+    if (is_panic) {
         panic_count++;
         boots_since_panic = 0;
     } else {
