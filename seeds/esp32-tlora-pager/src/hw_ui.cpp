@@ -2277,3 +2277,98 @@ void hw_ui_show_info(const char *version,
     tft_draw_text(MARGIN, y, "TOKEN", COL_DIM, COL_BG, 1); y += 16;
     tft_draw_text(MARGIN, y, token && token[0] ? token : "(none)", COL_TIME, COL_BG, 1);
 }
+
+// ---- micron page renderer (second paint consumer) --------------------------
+// The cell/palette model and the pure diff live in micron/micron_render.h
+// (host-tested); only the on-target glyph blit and the bus-lock entry live
+// here. Two 2.7 KB grids in plain static RAM (no PSRAM): the retained front
+// (last painted) and a back buffer C3 fills. 38x12 cells of 5x7 glyphs at
+// scale 2 (10x14 px each) -> 380x168, centred in the 480x222 panel.
+static const uint16_t MICRON_ORIGIN_X = 50;   // (480-380)/2
+static const uint16_t MICRON_ORIGIN_Y = 27;   // (222-168)/2
+static const uint16_t MICRON_CELL_W   = 10;   // 5 cols * scale 2, no gap column
+static const uint16_t MICRON_CELL_H   = 14;   // 7 rows * scale 2
+
+static micron_grid g_micron_front;            // retained last-painted frame
+static micron_grid g_micron_back;             // C3 fills this and hands it back
+static uint8_t g_micron_dirty[MICRON_GRID_CELLS];
+static bool g_micron_force = true;            // first paint is a full repaint
+static int g_micron_last_dirty = -1;
+
+// Draw one micron cell: a 5x7 glyph at scale 2 filling a 10x14 block (no
+// inter-glyph gap column — the grid pitch is a fixed 10 px). bg fill + glyph in
+// one windowed blit, matching tft_draw_glyph's fast path. Bold thickens each
+// stroke one pixel to the right (double-strike); underline forces the bottom
+// glyph row to fg. Italic is NOT supported by the 5x7 primitive (no shear) and
+// is skipped. HELPER: assumes the bus lock is HELD (hw_ui_show_page guards the
+// whole page); it never takes the lock — the bus mutex is non-recursive.
+static void tft_draw_cell(uint16_t x, uint16_t y, uint32_t cp,
+                          uint16_t fg, uint16_t bg, uint8_t attr) {
+    if (x >= PANEL_W || y >= PANEL_H) return;
+    const uint8_t *g = font_glyph(cp);
+    uint8_t cols[5];
+    for (uint8_t c = 0; c < 5; c++) cols[c] = pgm_read_byte(&g[c]);
+
+    const bool bold = (attr & MICRON_ATTR_BOLD) != 0;
+    const bool under = (attr & MICRON_ATTR_UNDERLINE) != 0;
+
+    uint8_t rowbuf[MICRON_CELL_W * 2];  // one output row, RGB565 big-endian
+    tft_window(x, y, x + MICRON_CELL_W - 1, y + MICRON_CELL_H - 1);
+    disp_spi->beginTransaction(SPISettings(DISP_SPI_HZ, MSBFIRST, SPI_MODE0));
+    digitalWrite(PIN_DISP_CS, LOW); digitalWrite(PIN_DISP_DC, HIGH);
+
+    for (uint8_t row = 0; row < 7; row++) {
+        for (uint8_t col = 0; col < 5; col++) {
+            uint8_t bits = cols[col];
+            if (bold && col > 0) bits |= cols[col - 1];  // stays inside 5 cols
+            uint8_t on = (uint8_t)((bits >> row) & 1u);
+            if (under && row == 6) on = 1;               // underline = bottom row
+            uint16_t color = on ? fg : bg;
+            uint8_t hi = (uint8_t)(color >> 8), lo = (uint8_t)color;
+            rowbuf[(col * 2 + 0) * 2 + 0] = hi;  // scale-2: two pixels per col
+            rowbuf[(col * 2 + 0) * 2 + 1] = lo;
+            rowbuf[(col * 2 + 1) * 2 + 0] = hi;
+            rowbuf[(col * 2 + 1) * 2 + 1] = lo;
+        }
+        disp_spi->writeBytes(rowbuf, MICRON_CELL_W * 2);  // scale-2: row twice
+        disp_spi->writeBytes(rowbuf, MICRON_CELL_W * 2);
+    }
+    digitalWrite(PIN_DISP_CS, HIGH);
+    disp_spi->endTransaction();
+}
+
+micron_grid *hw_ui_page_back() { return &g_micron_back; }
+
+void micron_render_invalidate() { g_micron_force = true; }
+
+int micron_render_last_dirty() { return g_micron_last_dirty; }
+
+void hw_ui_show_page(const micron_grid *g) {
+    if (!panel_ok || !g) return;
+
+    // Pure diff first (no bus traffic): decide which cells changed. force after
+    // an invalidate/first paint marks all 456 dirty for a full repaint.
+    int dirty_n = micron_grid_diff(&g_micron_front, g, g_micron_dirty,
+                                   g_micron_force ? 1 : 0);
+    g_micron_last_dirty = dirty_n;
+
+    HwSpiBusGuard bus;  // C4 invariant: take the lock BEFORE the first tft_ call
+    for (int i = 0; i < MICRON_GRID_CELLS; i++) {
+        if (!g_micron_dirty[i]) continue;  // unchanged cell: skip the blit
+        const micron_cell *cell = &g->cells[i];
+        int col = i % MICRON_GRID_COLS;
+        int row = i / MICRON_GRID_COLS;
+        uint16_t x = (uint16_t)(MICRON_ORIGIN_X + col * MICRON_CELL_W);
+        uint16_t y = (uint16_t)(MICRON_ORIGIN_Y + row * MICRON_CELL_H);
+        // The DEFAULT sentinel resolves to the plane default here (fg white,
+        // bg black); any other index is a real palette colour.
+        uint16_t fg = (cell->fg == MICRON_PAL_DEFAULT)
+                          ? COL_FG : micron_palette_rgb565(cell->fg);
+        uint16_t bg = (cell->bg == MICRON_PAL_DEFAULT)
+                          ? COL_BG : micron_palette_rgb565(cell->bg);
+        tft_draw_cell(x, y, cell->cp, fg, bg, cell->attr);
+    }
+    // Copy incoming -> retained so the next call diffs against this frame.
+    memcpy(&g_micron_front, g, sizeof(g_micron_front));
+    g_micron_force = false;
+}

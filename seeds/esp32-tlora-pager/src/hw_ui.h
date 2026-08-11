@@ -8,6 +8,8 @@
 
 #include <Arduino.h>
 
+#include "micron/micron_render.h"  // micron_grid, the cell/palette model
+
 bool hw_ui_begin();
 bool hw_ui_ready();
 bool hw_ui_expand_ok();
@@ -240,6 +242,28 @@ void hw_ui_show_info(const char *version,
                      int unread);
 
 void hw_ui_invalidate_clock();
+
+// --- micron page renderer (second consumer of the paint primitives) ---------
+// A fixed 38x12 cell grid painted beside the clock/menu. NEVER calls another
+// hw_ui_show_* entry (the bus lock is non-recursive). Diffs the incoming grid
+// against a retained previous frame and repaints ONLY the changed cells — a
+// full 456-cell blit is the freeze class STAB fought.
+//
+// hw_ui_show_page: public paint entry — takes the bus lock, paints dirty cells
+// at scale 2 (bg fill + 5x7 glyph, bold/underline honoured, italic skipped),
+// then copies the incoming grid into the retained buffer.
+void hw_ui_show_page(const micron_grid *g);
+
+// Static back buffer C3 fills and hands to hw_ui_show_page. Realises the second
+// of the two 2.7 KB grids in plain static RAM (no PSRAM).
+micron_grid *hw_ui_page_back();
+
+// Force a full repaint on the next hw_ui_show_page (screen re-entry).
+void micron_render_invalidate();
+
+// How many cells the last hw_ui_show_page actually repainted (out of 456) — a
+// cheap measurement of what the diff saved. -1 before the first paint.
+int micron_render_last_dirty();
 
 // Free-text reply composer. buffer is UTF-8 draft.
 // caps/sym badges + layout_name ("ABC"/"PHON"/"RU") in header.

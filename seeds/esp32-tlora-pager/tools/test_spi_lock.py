@@ -75,6 +75,9 @@ PAINT_ENTRIES = [
     "void hw_ui_show_msglist(",
     "void hw_ui_show_reply(",
     "void hw_ui_show_info(",
+    # Micron page renderer: second paint consumer (cell grid + diff). Guards the
+    # whole page; its tft_draw_cell HELPER assumes the lock (never re-takes it).
+    "void hw_ui_show_page(",
     # Boot-progress note (storage format feedback) is a public paint entry
     # like any other: guarded for the whole paint, releases before returning.
     "void hw_ui_boot_note(",
