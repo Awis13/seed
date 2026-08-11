@@ -9,9 +9,11 @@
 #include "hw_sound.h"   // tft_wake pumps the sound queue across its settle
 #include "micron/micron_layout.h"  // pure page layout -> grid (C3)
 #include "box_glyphs.h"            // box-drawing + block glyphs for micron pages
+#include "boot_logo.h"             // PURE b33pr boot-splash decrypt logic
 
 #include <SPI.h>
 #include <Wire.h>
+#include <esp_system.h>            // esp_random() for boot-splash jitter
 #include <string.h>
 #include <stdio.h>
 
@@ -678,6 +680,51 @@ static void draw_field(char *cache, size_t n, const char *text,
     (void)tw;
 }
 
+// ---- boot splash: b33pr "decrypt" animation --------------------------------
+// RGB888 (0xRRGGBB, from boot_logo's colour ramp) -> RGB565 for the panel.
+static inline uint16_t rgb888_to_565(uint32_t c) {
+    uint8_t r = (uint8_t)(c >> 16), g = (uint8_t)(c >> 8), b = (uint8_t)c;
+    return (uint16_t)(((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3));
+}
+
+// Play the boot logo ONCE. The pure schedule/phase/colour logic lives in
+// boot_logo.h (host-tested); here we only inject entropy, blit each frame and
+// pace it. Bus discipline: one HwSpiBusGuard per FRAME (taken, painted,
+// released), never held across the delay. Runs on the setup task before any
+// async/mesh task exists, so this short blocking sequence is safe. Bounded to
+// <=1.44s by construction (see boot_logo.h), so it does not disturb the 60s
+// OTA auto-confirm window.
+static void boot_splash_play() {
+    if (!panel_ok) return;
+    using namespace bootlogo;
+
+    const uint32_t seed = (uint32_t)esp_random() ^ (uint32_t)millis();
+    const Schedule sched = build_schedule(seed);
+
+    const uint8_t  SC = 6;                       // 5x7 glyph at scale 6
+    const uint16_t adv = (uint16_t)(6 * SC);     // cell pitch (5 cols + 1 gap)
+    const uint16_t gw = adv, gh = (uint16_t)(7 * SC);
+    const uint16_t total_w = (uint16_t)(adv * N_CELLS);
+    const uint16_t x0 = (uint16_t)((PANEL_W - total_w) / 2);
+    const uint16_t y0 = (uint16_t)((PANEL_H - gh) / 2);
+    const uint16_t bg = rgb888_to_565(0x07110Bu);  // preview LCD-off ground
+
+    { HwSpiBusGuard bus; tft_fill(bg); }
+
+    for (uint16_t f = 0; f < sched.total_frames; f++) {
+        {
+            HwSpiBusGuard bus;
+            for (int i = 0; i < N_CELLS; i++) {
+                CellOut o = cell_out(sched, i, (int)f);
+                uint16_t x = (uint16_t)(x0 + adv * i);
+                if (!o.shown) { tft_fill_rect(x, y0, gw, gh, bg); continue; }
+                tft_draw_glyph(x, y0, o.cp, rgb888_to_565(o.rgb), bg, SC);
+            }
+        }
+        delay(TICK_MS);
+    }
+}
+
 // ---- public ----------------------------------------------------------------
 SPIClass *hw_ui_spi() { return disp_spi; }
 
@@ -691,13 +738,11 @@ bool hw_ui_begin() {
     bl_set(12);
     clock_measure();
     screen = HW_UI_CLOCK;
-    {
-        HwSpiBusGuard bus;
-        tft_fill(COL_BG);
-        tft_draw_text(MARGIN, 40, "T-Lora Pager", COL_ACCENT, COL_BG, 2);
-        tft_draw_text(MARGIN, 80, "booting...", COL_DIM, COL_BG, 2);
-    }
-    Serial.printf("[hw] panel %ux%u, clock face ready\n", PANEL_W, PANEL_H);
+    // b33pr decrypt splash IS the boot screen: its final frame leaves the
+    // settled gold logo centered on the preview ground. Do not clear or draw
+    // over it here — it stays until the clock/home UI paints (ui_go_clock).
+    boot_splash_play();
+    Serial.printf("[hw] panel %ux%u, boot logo shown\n", PANEL_W, PANEL_H);
     return true;
 }
 
@@ -708,9 +753,11 @@ bool hw_ui_begin() {
 void hw_ui_boot_note(const char *line1, const char *line2) {
     if (!panel_ok) return;
     HwSpiBusGuard bus;
-    tft_fill_rect(0, 120, PANEL_W, 60, COL_BG);
-    if (line1) tft_draw_text(MARGIN, 120, line1, COL_ACCENT, COL_BG, 2);
-    if (line2) tft_draw_text(MARGIN, 150, line2, COL_DIM, COL_BG, 2);
+    // Render boot status at the bottom edge, clear of the centered b33pr boot
+    // logo (which occupies the vertical middle), so the logo stays dominant.
+    tft_fill_rect(0, PANEL_H - 44, PANEL_W, 44, COL_BG);
+    if (line1) tft_draw_text(MARGIN, PANEL_H - 40, line1, COL_ACCENT, COL_BG, 2);
+    if (line2) tft_draw_text(MARGIN, PANEL_H - 20, line2, COL_DIM, COL_BG, 2);
 }
 
 bool hw_ui_ready() { return panel_ok; }
