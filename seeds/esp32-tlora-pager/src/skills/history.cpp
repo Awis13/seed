@@ -28,8 +28,13 @@
  *   - SD is mounted on the SHARED FSPI SPIClass (hw_ui_spi()), never a second
  *     SPIClass — a second instance on these pins hangs the SX1262.
  *   - Every g_hist_store I/O burst holds HwSpiBusGuard for the whole logical op.
- *   - LOCK ORDER: g_hist_mux (archive state) FIRST, bus lock SECOND, release in
- *     reverse. Nothing takes g_hist_mux while holding the bus lock.
+ *   - LOCK ORDER: wherever BOTH are taken (history_read_at, history_scan_chunked)
+ *     g_hist_mux (archive state) is taken FIRST, bus lock SECOND, released in
+ *     reverse. Nothing takes g_hist_mux while holding the bus lock. The write task
+ *     does NOT nest them: its SD append takes ONLY the bus (an EOF append is
+ *     correct against readers without the mux), then AFTER close() it takes ONLY
+ *     g_hist_mux to publish the record's offset into the RAM index — so a loop-task
+ *     nav lookup waits on that tiny index update, never on the writer's SD I/O.
  */
 
 #include <SD.h>
@@ -69,6 +74,12 @@ static TaskHandle_t      g_hist_task     = nullptr;
 static SemaphoreHandle_t g_hist_mux      = nullptr;  /* archive state; taken before the bus */
 static uint32_t          g_hist_seq      = 0;        /* monotonic; re-seeded from archive on mount, only the write task advances it */
 static uint32_t          g_hist_drops    = 0;        /* records dropped on a full write queue (data-loss visibility) */
+/* RAM read/navigation index (ticket C2): newest record offset per (ns,key), a
+ * bounded MRU-by-seq window over the archive (history_store.h owns the policy).
+ * Seeded from the mount scan, advanced by the write task on each append, all
+ * mutation under g_hist_mux. The wheel navigates it in O(1) instead of scanning
+ * the whole archive per detent; a page body is fetched from SD only on open. */
+static history_index     g_hist_index;
 
 static const char *history_store_name() { return g_hist_is_sd ? "sd" : "spiffs"; }
 
@@ -130,23 +141,51 @@ static void history_write_task(void *arg) {
         rec.key[MICRON_STORE_KEY_CAP - 1] = '\0';
         if (item.len) memcpy(rec.payload, item.payload, item.len);
 
-        /* LOCK ORDER: archive state mutex FIRST, then the bus for the burst. */
-        if (g_hist_mux) xSemaphoreTake(g_hist_mux, portMAX_DELAY);
+        /* seq/stamp are WRITER-PRIVATE: g_hist_seq is advanced only by this single
+         * task (re-seeded at boot before the task starts) and read by no one else,
+         * so it needs no lock. It must be assigned HERE, before history_encode,
+         * because the seq is part of the record streamed to SD. */
         rec.seq = ++g_hist_seq;
         rec.stamp_ms = millis();
+
+        /* THE SD APPEND TAKES ONLY THE BUS — NOT g_hist_mux. HwSpiBusGuard already
+         * serialises this burst against every other bus user, and mode "a" appends
+         * at EOF, so the write is correct against concurrent readers without the
+         * archive mutex. Holding g_hist_mux across this open/write/flush/close (as
+         * the pre-fix code did) would re-couple the loop task's pure-RAM nav
+         * lookups (history_nav_page_*, mux-only) to the writer's SD I/O — the exact
+         * loop-blocking coupling C1 kept off the loop. So the burst is bus-only,
+         * and rec_off (the pre-append EOF offset) is captured as part of it. */
+        uint32_t rec_off = 0;
+        bool wrote = false;
         {
             HwSpiBusGuard bus;  /* one record (<= HISTORY_REC_MAX) = one bus burst */
             File f = g_hist_store->open(HISTORY_PATH, "a");
             if (f) {
+                rec_off = (uint32_t)f.size();  /* start offset of this append (for the index) */
                 history_sink sink;
                 sink.write = history_file_sink_write;
                 sink.ctx = &f;
-                history_encode(&sink, &rec);
+                if (history_encode(&sink, &rec)) wrote = true;
                 f.flush();
                 f.close();
             }
         }
-        if (g_hist_mux) xSemaphoreGive(g_hist_mux);
+
+        /* PUBLISH into the RAM read/nav index ONLY AFTER close(), under g_hist_mux.
+         * The nav readers (history_nav_page_*) and history_read_at take g_hist_mux
+         * to read the index; publishing rec_off only after the record is fully
+         * written+closed guarantees they can only ever observe an offset whose
+         * record is COMPLETE — never a torn/partial append. This tiny in-RAM
+         * critical section (no bus, no I/O) is the ONLY thing a loop-task lookup
+         * can now wait on; it never waits on the SD burst above. The append burst
+         * takes only the bus and this publish takes only the mux, so the two are
+         * no longer nested and cannot invert the mux->bus order held elsewhere. */
+        if (wrote) {
+            if (g_hist_mux) xSemaphoreTake(g_hist_mux, portMAX_DELAY);
+            history_index_observe(&g_hist_index, &rec, rec_off);
+            if (g_hist_mux) xSemaphoreGive(g_hist_mux);
+        }
     }
 }
 
@@ -291,30 +330,127 @@ static bool history_read_newest(uint8_t ns, const char *key, history_record *out
     return h.found;
 }
 
+/* --- bounded single-record read at a known offset (C2 page-body fetch) ------ */
+
+/* Grab the first whole record from a bounded buffer via the PURE reader (no new
+ * parse path): the record at an index offset is guaranteed to start there and to
+ * fit in HISTORY_REC_MAX, so exactly one push yields it. */
+struct HistoryOneRec {
+    history_record rec;
+    bool           found;
+};
+
+static void history_one_cb(void *ctx, const history_record *rec, uint32_t offset) {
+    (void)offset;
+    HistoryOneRec *o = (HistoryOneRec *)ctx;
+    if (!o->found) { o->rec = *rec; o->found = true; }
+}
+
+/*
+ * Read the single archived record that STARTS at `offset` (a value handed out by
+ * the nav index) into *out. One bounded burst: seek + read at most HISTORY_REC_MAX
+ * (<= 564 B, one bus burst), then decode via the pure history_reader — NOT a
+ * whole-archive scan, so a wheel detent onto an archive page costs one record
+ * read, not a file walk. LOCK ORDER holds: g_hist_mux FIRST, bus SECOND. Reads
+ * with mode "r", so the off-loop-write pin (only the write task appends) is
+ * untouched. Returns false with no store / bad offset / decode miss.
+ */
+static bool history_read_at(uint32_t offset, history_record *out) {
+    if (!g_hist_store) return false;
+
+    /* One scratch record buffer, reused across detents; only the loop task calls
+     * this (paging), never re-entrantly, so a file-scope static is safe. */
+    static uint8_t buf[HISTORY_REC_MAX];
+    size_t got = 0;
+    bool opened = false;
+
+    if (g_hist_mux) xSemaphoreTake(g_hist_mux, portMAX_DELAY);
+    {
+        HwSpiBusGuard bus;   /* one bounded record = one bus burst */
+        if (g_hist_store->exists(HISTORY_PATH)) {
+            File f = g_hist_store->open(HISTORY_PATH, "r");
+            if (f) {
+                if (f.seek(offset)) got = f.read(buf, sizeof(buf));
+                f.close();
+                opened = true;
+            }
+        }
+    }
+    if (g_hist_mux) xSemaphoreGive(g_hist_mux);
+
+    if (!opened || got == 0) return false;
+
+    HistoryOneRec o;
+    o.found = false;
+    history_reader r;
+    history_reader_init(&r);
+    history_reader_push(&r, buf, got, history_one_cb, &o);
+    if (o.found && out) *out = o.rec;
+    return o.found;
+}
+
+/* --- wheel navigation seam (mutex-guarded reads of the RAM nav index) -------- */
+
+/*
+ * The pure navigation core (history_nav_* in history_store.h) is fed the RAM
+ * hot-set (the caller's micron_store) and this file's archive index. The index
+ * is mutated by the write task, so these thin wrappers hold g_hist_mux for the
+ * O(1) lookup — a wheel detent never reads a torn index entry. The returned
+ * result is by value (a stable RAM slot pointer, or an archive identity+offset
+ * copied out), so it stays valid after the mutex is released.
+ */
+static int history_nav_page_count(const micron_store *st, uint8_t ns) {
+    int n;
+    if (g_hist_mux) xSemaphoreTake(g_hist_mux, portMAX_DELAY);
+    n = history_nav_count(&g_hist_index, st, ns);
+    if (g_hist_mux) xSemaphoreGive(g_hist_mux);
+    return n;
+}
+
+static history_nav_result history_nav_page_at(const micron_store *st, uint8_t ns,
+                                              int ordinal) {
+    history_nav_result r;
+    if (g_hist_mux) xSemaphoreTake(g_hist_mux, portMAX_DELAY);
+    r = history_nav_at(&g_hist_index, st, ns, ordinal);
+    if (g_hist_mux) xSemaphoreGive(g_hist_mux);
+    return r;
+}
+
 /* --- seq reseed on mount: newest-wins must survive a reboot ---------------- */
 
-static void history_seedseq_cb(void *ctx, const history_record *rec, uint32_t offset) {
-    (void)offset;
-    history_seq_scan_observe((history_seq_scan *)ctx, rec);
+/* One mount-scan pass feeds BOTH the seq reseed and the read/nav index, so the
+ * archive is walked exactly once at boot (C1 reseed + C2 index in one scan). */
+struct HistorySeedCtx {
+    history_seq_scan seq;
+    history_index   *ix;
+};
+
+static void history_seed_cb(void *ctx, const history_record *rec, uint32_t offset) {
+    HistorySeedCtx *c = (HistorySeedCtx *)ctx;
+    history_seq_scan_observe(&c->seq, rec);
+    history_index_observe(c->ix, rec, offset);   /* build the nav index in the same pass */
 }
 
 /*
  * Re-seed g_hist_seq from the archive so a fresh append after a reboot outranks
- * every pre-reboot record for the same (ns,key). g_hist_seq starts at 0 each
- * boot and is only advanced by ++, while newest-wins is resolved by seq
- * (history_newest_cb / history_index_observe); without this seed a post-reboot
- * append (seq=1) would be shadowed by a higher-seq pre-reboot record. One bounded
- * chunked scan (the SAME bus discipline as any read) finds the max stored seq;
- * the next ++g_hist_seq then yields max+1. Empty/absent archive => stays 0.
+ * every pre-reboot record for the same (ns,key), AND build the read/navigation
+ * index from what is on the card. g_hist_seq starts at 0 each boot and is only
+ * advanced by ++, while newest-wins is resolved by seq (history_newest_cb /
+ * history_index_observe); without the reseed a post-reboot append (seq=1) would
+ * be shadowed by a higher-seq pre-reboot record. One bounded chunked scan (the
+ * SAME bus discipline as any read) finds the max stored seq and populates the
+ * MRU index window; the next ++g_hist_seq then yields max+1. Empty/absent archive
+ * => seq stays 0 and the index stays empty (nav then shows only the RAM hot-set).
  * Runs before the write task starts, so no concurrent append can race it.
  */
 static void history_seed_seq() {
-    history_seq_scan s;
-    history_seq_scan_init(&s);
-    history_scan_chunked(history_seedseq_cb, &s);
-    g_hist_seq = history_seq_scan_result(&s);
-    Serial.printf("[history] seq reseeded from archive: max=%u\n",
-                  (unsigned)g_hist_seq);
+    HistorySeedCtx c;
+    history_seq_scan_init(&c.seq);
+    c.ix = &g_hist_index;
+    history_scan_chunked(history_seed_cb, &c);
+    g_hist_seq = history_seq_scan_result(&c.seq);
+    Serial.printf("[history] seq reseeded from archive: max=%u, index entries=%d\n",
+                  (unsigned)g_hist_seq, g_hist_index.count);
 }
 
 /* --- boot: mount + create the queue and the write task --------------------- */
@@ -322,7 +458,8 @@ static void history_seed_seq() {
 static void history_begin() {
     history_mount();
     g_hist_mux = xSemaphoreCreateMutex();
-    history_seed_seq();   /* max stored seq -> g_hist_seq, before the writer starts */
+    history_index_init(&g_hist_index);
+    history_seed_seq();   /* max stored seq -> g_hist_seq + nav index, before the writer starts */
     g_hist_q = xQueueCreate(HISTORY_WRITE_QUEUE_DEPTH, sizeof(HistoryWriteItem));
     if (g_hist_q) {
         xTaskCreate(history_write_task, "hist_wq", HISTORY_WRITE_TASK_STACK,

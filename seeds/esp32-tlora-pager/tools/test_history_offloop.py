@@ -123,13 +123,36 @@ for m in re.finditer(r'g_hist_store->open\(HISTORY_PATH,\s*"a"\)', hist):
     )
 
 # --- 5. shared-bus discipline survives the move off-loop ---------------------
-# The write task holds the state mutex BEFORE the bus (lock order), and the burst
-# is guarded.
-assert "LOCK ORDER" in hist, "history.cpp must document the g_hist_mux-first order"
-assert task.index("xSemaphoreTake(g_hist_mux") < task.index("HwSpiBusGuard"), (
-    "lock order: g_hist_mux must be taken BEFORE the bus lock in the write task"
-)
+# NEW CONTRACT (LOOPHEALTH fix): the write task must NOT hold g_hist_mux across
+# the SD append. The append burst takes ONLY the bus (an EOF append is correct
+# against readers without the mux); g_hist_mux is taken ONLY afterwards, around
+# the in-RAM index publish. This keeps the loop task's pure-RAM nav lookups
+# (history_nav_page_*, mux-only) from waiting on the writer's SD I/O.
+assert "LOCK ORDER" in hist, "history.cpp must still document the lock order"
 assert "HwSpiBusGuard" in task, "the append burst must hold the SPI bus lock"
+# The append burst (bus) comes FIRST, the mux take comes AFTER it — the inverse
+# of the old "mux across the whole append" shape.
+assert task.index("HwSpiBusGuard") < task.index("xSemaphoreTake(g_hist_mux"), (
+    "the SD append (HwSpiBusGuard burst) must run BEFORE g_hist_mux is taken — "
+    "the mux must NOT be held across the file burst"
+)
+# The append (open "a") must NOT sit inside a g_hist_mux critical section: there
+# is no mux take between the start of the task's work and the append.
+assert APPEND not in task[task.index("xSemaphoreTake(g_hist_mux") :], (
+    "the archive append must not run under g_hist_mux — it belongs to the "
+    "bus-only burst, before the index-publish critical section"
+)
+# The mux is taken ONLY to publish the index, and that publish happens AFTER the
+# record is closed — so a concurrent reader can only observe complete records.
+assert task.index("f.close()") < task.index("xSemaphoreTake(g_hist_mux"), (
+    "g_hist_mux must be taken only AFTER close() — the offset is published post-"
+    "close so readers never see a torn/partial record"
+)
+assert (
+    task.index("xSemaphoreTake(g_hist_mux")
+    < task.index("history_index_observe(")
+    < task.index("xSemaphoreGive(g_hist_mux")
+), "history_index_observe must run INSIDE the g_hist_mux critical section"
 
 # The whole-file scan bounds the bus hold (chunked) and yields between chunks —
 # the agents.cpp discipline, so the off-loop reader still cooperates on the bus.

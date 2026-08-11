@@ -260,6 +260,67 @@ static void test_eviction_oldest_when_none_expired(void) {
     printf("  eviction picks the oldest when none expired: OK\n");
 }
 
+/* --- flush seam: eviction returns the displaced page's FULL body (C2) ------- */
+
+/* The archive tier flushes an evicted page to SD; to do that the caller needs the
+ * victim's whole content, captured before the slot is reused in place. This pins
+ * that micron_put_result carries evicted_src/evicted_len for exactly the evicted
+ * slot, and nothing for a non-evicting put. */
+static void test_evicted_payload_captured(void) {
+    micron_store st;
+    micron_store_init(&st);
+
+    /* Fill all eight slots with DISTINCT bodies, strictly increasing now_ms so
+     * p0 is unambiguously the oldest (the next insert's victim). */
+    for (int i = 0; i < MICRON_STORE_SLOTS; i++) {
+        char key[8], body[32];
+        snprintf(key, sizeof(key), "p%d", i);
+        snprintf(body, sizeof(body), "body-of-p%d", i);
+        micron_put_result r = micron_store_put(&st, MICRON_NS_SYSTEM, key, body,
+                                               strlen(body), 0,
+                                               (uint32_t)(1000 + i * 10));
+        assert(r.status == MICRON_PUT_INSERTED && r.evicted == 0);
+        /* A non-evicting insert leaves the flush payload empty. */
+        assert(r.evicted_len == 0);
+    }
+
+    /* The ninth insert evicts p0 — its identity AND full body must come back so
+     * the caller can flush it to the archive. */
+    micron_put_result r = micron_store_put(&st, MICRON_NS_SYSTEM, "p8", "NINE", 4,
+                                           0, 9000);
+    assert(r.status == MICRON_PUT_INSERTED);
+    assert(r.evicted == 1);
+    assert(r.evicted_ns == MICRON_NS_SYSTEM);
+    assert(strcmp(r.evicted_key, "p0") == 0);
+    assert(r.evicted_len == strlen("body-of-p0"));
+    assert(memcmp(r.evicted_src, "body-of-p0", r.evicted_len) == 0);
+
+    /* An in-place upsert never evicts: no flush payload. */
+    micron_put_result u = micron_store_put(&st, MICRON_NS_SYSTEM, "p8", "TEN", 3,
+                                           0, 9100);
+    assert(u.status == MICRON_PUT_UPDATED && u.evicted == 0 && u.evicted_len == 0);
+
+    /* A binary-clean body (embedded NUL, full length) round-trips whole — the
+     * flush must not treat the source as a C string. */
+    micron_store st2;
+    micron_store_init(&st2);
+    for (int i = 0; i < MICRON_STORE_SLOTS; i++) {
+        char key[8];
+        snprintf(key, sizeof(key), "q%d", i);
+        micron_store_put(&st2, MICRON_NS_SYSTEM, key, "x", 1, 0,
+                         (uint32_t)(1000 + i * 10));
+    }
+    char blob[6] = { 'a', 'b', '\0', 'c', 'd', 'e' };
+    micron_put_result rb = micron_store_put(&st2, MICRON_NS_SYSTEM, "q8", blob,
+                                            sizeof(blob), 0, 9000);
+    assert(rb.evicted == 1 && rb.evicted_len == 1 && rb.evicted_src[0] == 'x');
+    /* And the freshly-stored binary body reads back with the NUL intact. */
+    const micron_slot *q8 = micron_store_get(&st2, MICRON_NS_SYSTEM, "q8");
+    assert(q8 && q8->len == sizeof(blob) && memcmp(q8->src, blob, sizeof(blob)) == 0);
+
+    printf("  eviction returns the displaced page's full body (flush seam): OK\n");
+}
+
 /* --- source cap: an over-long page is cut on a code-point boundary ---------- */
 
 static void test_src_cap(void) {
@@ -314,6 +375,7 @@ int main(void) {
     test_eviction_prefers_free();
     test_eviction_prefers_expired();
     test_eviction_oldest_when_none_expired();
+    test_evicted_payload_captured();
     test_src_cap();
     test_expiry_predicate();
     return 0;

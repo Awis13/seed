@@ -56,7 +56,7 @@
 #include "hw_kb.h"
 
 // ===== Configuration =====
-#define SEED_VERSION        "0.9.56"
+#define SEED_VERSION        "0.9.57"
 // Core clock: datasheet puts 240 vs 80 ~11.5mA apart on WAITI. Periph bus holds
 // at 80 for every PLL-fed core clock; go lower and RMT/I2S retimes. Same floor
 // as tembed idle policy (no light sleep — notify latency is the job).
@@ -1629,6 +1629,26 @@ static int    page_scroll = 0;      // top-visible visual row inside the open pa
 static size_t page_total_rows = 0;  // last render's bounded page height (scroll clamp)
 static bool   page_open = false;
 
+// Store a page in the RAM hot-set and, when the insert DISPLACES a live slot,
+// FLUSH the displaced page to the SD archive so it is not lost — read-back
+// (wheel-paging past the hot window) pulls it back later. The flush is a single
+// off-loop history_enqueue(): the queue + write task own the SD append, so this
+// NEVER writes SD on the loop task. The displaced page's full body travels in the
+// put result (evicted_src/_len), captured before the slot was overwritten. The
+// namespace travels with it (evicted_ns), so a FOREIGN page archives under
+// FOREIGN and can never surface through a SYSTEM wheel walk. This is the single
+// producer seam every page insert goes through (C3 adds notify-card producers).
+static micron_put_result ui_page_put(uint8_t ns, const char *key,
+                                     const char *src, size_t len, uint32_t ttl_ms) {
+    micron_put_result r = micron_store_put(&g_page_store, ns, key, src, len,
+                                           ttl_ms, millis());
+    if (r.evicted) {
+        history_enqueue(r.evicted_ns, r.evicted_key,
+                        (const uint8_t *)r.evicted_src, r.evicted_len);
+    }
+    return r;
+}
+
 // Bring up the system-layer page store and seed our own data UI. The namespace
 // (MICRON_NS_SYSTEM) is chosen HERE, by trusted firmware — it is the delivery
 // account of a page WE produce, never a field any page body could set. The
@@ -1643,21 +1663,39 @@ static void ui_page_store_begin() {
         "\n"
         "Turn the wheel from the clock to flip through stored pages. "
         "Click to open one, then the wheel scrolls it.\n";
-    micron_store_put(&g_page_store, MICRON_NS_SYSTEM, "help",
-                     kHelpPage, sizeof(kHelpPage) - 1, 0, millis());
+    ui_page_put(MICRON_NS_SYSTEM, "help", kHelpPage, sizeof(kHelpPage) - 1, 0);
 }
 
-// Render the `ordinal`-th SYSTEM page (wheel-paging order) at page_scroll and
-// remember its height for the in-page scroll clamp. Namespace is fixed to
-// MICRON_NS_SYSTEM here, so paging from home can only ever surface system
-// pages — a foreign page is structurally unreachable from this call site.
-// Returns false when there is no such page (empty store / out of range).
+// Scratch record for an archive page body pulled from SD. File-scope (564 B) to
+// keep it off the loop task's stack; only ui_page_render touches it.
+static history_record g_page_fetch;
+
+// Render the `ordinal`-th SYSTEM page at page_scroll and remember its height for
+// the in-page scroll clamp. The ordinal spans the combined nav axis: RAM hot-set
+// first, then older archived pages (history_nav_page_at). A RAM page renders
+// straight from its slot; an archive page's body is fetched from SD with ONE
+// bounded record read (history_read_at) here on open/render — never a full scan.
+// Namespace is fixed to MICRON_NS_SYSTEM, so paging can only ever surface system
+// pages: a foreign page is structurally unreachable from this call site, through
+// the RAM hot-set AND the archive. Returns false when there is no such page
+// (empty store / out of range / archive body unreadable — graceful, no SD).
 static bool ui_page_render(int ordinal) {
-    const micron_slot *s = micron_store_ns_at(&g_page_store,
-                                              MICRON_NS_SYSTEM, ordinal);
-    if (!s) return false;
+    history_nav_result nav = history_nav_page_at(&g_page_store,
+                                                 MICRON_NS_SYSTEM, ordinal);
+    const char *src = NULL;
+    size_t len = 0;
+    if (nav.kind == HISTORY_NAV_RAM) {
+        src = nav.slot->src;
+        len = nav.slot->len;
+    } else if (nav.kind == HISTORY_NAV_ARCHIVE) {
+        if (!history_read_at(nav.offset, &g_page_fetch)) return false;
+        src = (const char *)g_page_fetch.payload;
+        len = g_page_fetch.len;
+    } else {
+        return false;   // out of range: paging stops at the last real page
+    }
     page_ordinal = ordinal;
-    page_total_rows = hw_ui_render_page(s->src, s->len, page_scroll);
+    page_total_rows = hw_ui_render_page(src, len, page_scroll);
     return true;
 }
 // UTF-8 draft: keep room for ~40 Cyrillic codepoints (2–3 bytes each).
@@ -3202,9 +3240,17 @@ static void ui_on_steps(int steps) {
         break;
     }
     case HW_UI_CLOCK: {
-        // Wheel from home enters page paging when the system store is non-empty.
-        // First detent lands on page 0 (CW) or the last page (CCW).
-        int n = micron_store_ns_count(&g_page_store, MICRON_NS_SYSTEM);
+        // Wheel from home enters page paging when there is anything to show.
+        // First detent lands on page 0 (CW) or the last page (CCW). The count
+        // spans the RAM hot-set AND older archived pages, so a CCW step can land
+        // straight on a page pulled from the SD archive.
+        // NOTE: the ordinal axis is intentionally NOT snapshot-consistent across
+        // the separate nav_count->nav_at mux acquisitions here. The writer only
+        // GROWS the archive range and never touches g_page_store (micron_store),
+        // so a concurrent append can at worst land a fixed ordinal on an adjacent
+        // archive page — never OOB, never a foreign page — and it self-corrects on
+        // the next detent. No snapshot lock is needed.
+        int n = history_nav_page_count(&g_page_store, MICRON_NS_SYSTEM);
         if (n <= 0) break;
         page_open = false;
         page_scroll = 0;
@@ -3212,7 +3258,12 @@ static void ui_on_steps(int steps) {
         break;
     }
     case HW_UI_PAGE: {
-        int n = micron_store_ns_count(&g_page_store, MICRON_NS_SYSTEM);
+        // As in HW_UI_CLOCK: the nav_count->nav_at pair is deliberately not
+        // snapshot-consistent across its two mux takes. A concurrent append only
+        // grows the archive range (never mutates g_page_store), so at worst a fixed
+        // ordinal shifts onto an adjacent archive page — never OOB/foreign — and
+        // the next detent corrects it.
+        int n = history_nav_page_count(&g_page_store, MICRON_NS_SYSTEM);
         if (n <= 0) { ui_go_clock(NULL); break; }
         if (page_open) {
             // Scrolling WITHIN the open page (C3 in-page scroll). One detent

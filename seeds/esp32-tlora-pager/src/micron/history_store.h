@@ -301,11 +301,15 @@ static inline int history_index__find(const history_index *ix, uint8_t ns,
  * Observe one decoded record at `offset` during a scan. NEWEST-WINS: if (ns,key)
  * is already indexed, the entry is advanced to this record only when its seq is
  * >= the stored seq (append order breaks a tie; monotonic seq means ties do not
- * occur in practice). A brand new (ns,key) takes a free entry. Returns 1 if the
- * record was recorded/updated, 0 only if the index is full of OTHER identities
- * (archive has more distinct live keys than HISTORY_INDEX_MAX — the scan still
- * completes, this identity is simply not resolvable from the index). The key is
- * assumed already validated by history_decode.
+ * occur in practice). A brand new (ns,key) takes a free entry.
+ *
+ * SATURATION = bounded MRU-by-seq window (see the DECISION note above). When the
+ * table is full and a NEW distinct identity arrives, it evicts the smallest-seq
+ * entry IFF it is strictly newer than that minimum — so the index keeps the
+ * newest HISTORY_INDEX_MAX distinct identities. A record OLDER than the whole
+ * window is not indexable and returns 0 (its page is beyond wheel-navigation but
+ * still on the card; NOT a silent loss). Returns 1 when recorded/updated.
+ * The key is assumed already validated by history_decode.
  */
 static inline int history_index_observe(history_index *ix, const history_record *rec,
                                         uint32_t offset) {
@@ -327,7 +331,19 @@ static inline int history_index_observe(history_index *ix, const history_record 
         ix->count++;
         return 1;
     }
-    return 0;   /* index saturated with other identities */
+    /* Full: keep the newest window. Evict the smallest-seq entry iff this record
+     * is strictly newer than it; otherwise this identity is older than the whole
+     * window and is not indexable (returns 0). count is unchanged — one identity
+     * is swapped for another. */
+    int minidx = 0;
+    for (int i = 1; i < HISTORY_INDEX_MAX; i++)
+        if (ix->e[i].seq < ix->e[minidx].seq) minidx = i;
+    if (rec->seq <= ix->e[minidx].seq) return 0;   /* older than the whole window */
+    ix->e[minidx].ns = rec->ns;
+    ix->e[minidx].seq = rec->seq;
+    ix->e[minidx].offset = offset;
+    memcpy(ix->e[minidx].key, rec->key, MICRON_STORE_KEY_CAP);
+    return 1;
 }
 
 /* The newest indexed record for (ns,key), or NULL. Namespace must match, so an
@@ -339,6 +355,137 @@ static inline const history_index_entry *history_index_get(const history_index *
     if (!micron_store_key_valid(key)) return NULL;
     int idx = history_index__find(ix, ns, key);
     return idx >= 0 ? &ix->e[idx] : NULL;
+}
+
+/* --- index saturation policy: a bounded MRU-by-seq window (ticket C2) -------
+ *
+ * DECISION. history_index is a bounded window of the NEWEST HISTORY_INDEX_MAX
+ * distinct (ns,key) in the archive, not a first-64 snapshot. history_index_observe
+ * (below) evicts the smallest-seq entry when a strictly-newer distinct identity
+ * arrives and the table is full. The mount scan replays the archive oldest->newest,
+ * so after boot the window holds the most recent HISTORY_INDEX_MAX identities —
+ * exactly the pages nearest the RAM hot window, which is what wheel-paging walks
+ * into first.
+ *
+ * JUSTIFICATION vs. the alternatives. Growing the index unboundedly would put an
+ * archive-sized table in DRAM (the whole point of the SD tier is that the archive
+ * is unbounded and RAM is not). A first-64 snapshot would index the OLDEST pages
+ * and leave the ones next to the hot set unreachable — backwards for paging.
+ * The MRU window gives O(1) navigation for RAM_hot + up to 64 archived distinct
+ * keys (72 pages of back-paging), far past any realistic wheel walk. A page OLDER
+ * than the 64th-newest archived identity is NOT navigable from the wheel — this is
+ * DOCUMENTED, not silent: history_index_observe returns 0 for such a record and
+ * navigation past the window stops cleanly (history_nav_* below), never OOB. Deep
+ * archive retrieval (older than the window) is a future search/export concern, not
+ * a wheel-paging one; the record is still on the card and still resolvable by a
+ * full history_read_newest() scan.
+ */
+
+/* --- wheel navigation across the RAM hot-set + the archive index (C2) --------
+ *
+ * The wheel pages one namespace as a single ordinal axis:
+ *   ordinals [0 .. R-1]      the R live pages in the RAM hot-set, in the store's
+ *                            own stable seq order (micron_store_ns_at) — the fast
+ *                            hot window, rendered straight from RAM.
+ *   ordinals [R .. R+A-1]    the A distinct (ns,key) held ONLY in the archive
+ *                            index (not currently live in RAM), NEWEST-FIRST by
+ *                            seq — older pages whose body is fetched from SD when
+ *                            the ordinal is opened/rendered (one bounded record
+ *                            read, never a full scan).
+ * DEDUP: a (ns,key) that is live in RAM is NEVER also an archive ordinal — RAM
+ * holds its newest content, the archive only a superseded copy. NAMESPACE
+ * ISOLATION holds end to end: only entries whose ns matches are counted or
+ * resolved, so a FOREIGN archived page can never surface under a SYSTEM walk,
+ * exactly the property micron_store_ns_at proves for the hot set. A NULL index
+ * (archive absent / nothing flushed) reduces the axis to the RAM hot-set alone.
+ */
+
+/* Distinct archived (ns,key) under `ns` that are NOT currently live in `st`. */
+static inline int history_nav_archive_count(const history_index *ix,
+                                            const micron_store *st, uint8_t ns) {
+    if (!ix || !st) return 0;
+    int n = 0;
+    for (int i = 0; i < HISTORY_INDEX_MAX; i++) {
+        const history_index_entry *e = &ix->e[i];
+        if (!e->used || e->ns != ns) continue;
+        if (micron_store__find(st, ns, e->key) >= 0) continue;  /* live in RAM: shown from the hot set */
+        n++;
+    }
+    return n;
+}
+
+/* Total pageable pages under `ns`: RAM hot-set + archive-only. */
+static inline int history_nav_count(const history_index *ix,
+                                    const micron_store *st, uint8_t ns) {
+    return micron_store_ns_count(st, ns) + history_nav_archive_count(ix, st, ns);
+}
+
+/* The `rank`-th archive-only (ns,key) under `ns`, newest-first by seq, or NULL.
+ * Selection without materialising an array: pick the largest seq strictly below
+ * the previous pick, `rank + 1` times. The archive index holds one entry per
+ * (ns,key) and the writer's seq is monotonic, so seqs are distinct — no ties. */
+static inline const history_index_entry *history_nav_archive_at(
+        const history_index *ix, const micron_store *st, uint8_t ns, int rank) {
+    if (!ix || !st || rank < 0) return NULL;
+    const history_index_entry *pick = NULL;
+    int have_prev = 0;
+    uint32_t prev_seq = 0;
+    for (int step = 0; step <= rank; step++) {
+        pick = NULL;
+        for (int i = 0; i < HISTORY_INDEX_MAX; i++) {
+            const history_index_entry *e = &ix->e[i];
+            if (!e->used || e->ns != ns) continue;
+            if (micron_store__find(st, ns, e->key) >= 0) continue;   /* deduped: live in RAM */
+            if (have_prev && e->seq >= prev_seq) continue;           /* already taken / newer */
+            if (!pick || e->seq > pick->seq) pick = e;
+        }
+        if (!pick) return NULL;   /* ran out before reaching rank */
+        prev_seq = pick->seq;
+        have_prev = 1;
+    }
+    return pick;
+}
+
+typedef enum {
+    HISTORY_NAV_NONE = 0,   /* ordinal out of range */
+    HISTORY_NAV_RAM,        /* live in the hot-set: render from RAM (slot) */
+    HISTORY_NAV_ARCHIVE,    /* older page: fetch its body from SD at offset */
+} history_nav_kind;
+
+typedef struct {
+    history_nav_kind   kind;
+    const micron_slot *slot;                 /* set when kind == RAM */
+    uint8_t  ns;                             /* archive identity to fetch */
+    char     key[MICRON_STORE_KEY_CAP];
+    uint32_t seq;
+    uint32_t offset;                         /* file offset of the newest record */
+} history_nav_result;
+
+/* Resolve `ordinal` on the combined axis. RAM ordinals return the slot pointer;
+ * archive ordinals return the identity + file offset for a bounded SD read. */
+static inline history_nav_result history_nav_at(const history_index *ix,
+                                                const micron_store *st,
+                                                uint8_t ns, int ordinal) {
+    history_nav_result r;
+    memset(&r, 0, sizeof(r));
+    r.kind = HISTORY_NAV_NONE;
+    if (!st || ordinal < 0) return r;
+
+    int ram = micron_store_ns_count(st, ns);
+    if (ordinal < ram) {
+        const micron_slot *s = micron_store_ns_at(st, ns, ordinal);
+        if (s) { r.kind = HISTORY_NAV_RAM; r.slot = s; }
+        return r;
+    }
+    const history_index_entry *e = history_nav_archive_at(ix, st, ns, ordinal - ram);
+    if (e) {
+        r.kind = HISTORY_NAV_ARCHIVE;
+        r.ns = e->ns;
+        memcpy(r.key, e->key, MICRON_STORE_KEY_CAP);
+        r.seq = e->seq;
+        r.offset = e->offset;
+    }
+    return r;
 }
 
 /* --- seq reseed: the maximum stored seq across the whole archive ------------ */

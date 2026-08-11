@@ -446,6 +446,173 @@ static void test_seq_reseed_survives_reboot(void) {
            sc.max_seq, fresh_seq);
 }
 
+/* --- C2: wheel navigation across the RAM hot-set + the archive index -------- */
+
+/* Helper: observe an archive-only (ns,key) at (seq, offset) into an index. */
+static void obs(history_index *ix, uint8_t ns, const char *key, uint32_t seq,
+                uint32_t offset) {
+    history_record r;
+    memset(&r, 0, sizeof(r));
+    r.ns = ns;
+    snprintf(r.key, sizeof(r.key), "%s", key);
+    r.seq = seq;
+    r.len = 1;
+    r.payload[0] = 'x';
+    history_index_observe(ix, &r, offset);
+}
+
+static void test_nav_hot_then_archive(void) {
+    /* Two live RAM pages under SYSTEM (seq order == insertion order). */
+    micron_store st;
+    micron_store_init(&st);
+    micron_store_put(&st, MICRON_NS_SYSTEM, "ram-a", "AAAA", 4, 0, 100);
+    micron_store_put(&st, MICRON_NS_SYSTEM, "ram-b", "BBBB", 4, 0, 110);
+    assert(micron_store_ns_count(&st, MICRON_NS_SYSTEM) == 2);
+
+    /* Three archive-only distinct keys under SYSTEM, increasing seq. */
+    history_index ix;
+    history_index_init(&ix);
+    obs(&ix, MICRON_NS_SYSTEM, "old-1", 5, 1000);
+    obs(&ix, MICRON_NS_SYSTEM, "old-2", 6, 2000);
+    obs(&ix, MICRON_NS_SYSTEM, "old-3", 7, 3000);
+
+    /* Total axis = 2 RAM + 3 archive, no gap/dup. */
+    assert(history_nav_count(&ix, &st, MICRON_NS_SYSTEM) == 5);
+
+    /* Ordinals 0..1 are the RAM hot-set in stable seq order. */
+    history_nav_result n0 = history_nav_at(&ix, &st, MICRON_NS_SYSTEM, 0);
+    assert(n0.kind == HISTORY_NAV_RAM && strcmp(n0.slot->key, "ram-a") == 0);
+    history_nav_result n1 = history_nav_at(&ix, &st, MICRON_NS_SYSTEM, 1);
+    assert(n1.kind == HISTORY_NAV_RAM && strcmp(n1.slot->key, "ram-b") == 0);
+
+    /* Ordinals 2..4 are archive-only, NEWEST-FIRST (old-3, old-2, old-1) with the
+     * right file offsets — this is the hot/archive boundary the read-back crosses. */
+    history_nav_result n2 = history_nav_at(&ix, &st, MICRON_NS_SYSTEM, 2);
+    assert(n2.kind == HISTORY_NAV_ARCHIVE && strcmp(n2.key, "old-3") == 0 && n2.offset == 3000);
+    history_nav_result n3 = history_nav_at(&ix, &st, MICRON_NS_SYSTEM, 3);
+    assert(n3.kind == HISTORY_NAV_ARCHIVE && strcmp(n3.key, "old-2") == 0 && n3.offset == 2000);
+    history_nav_result n4 = history_nav_at(&ix, &st, MICRON_NS_SYSTEM, 4);
+    assert(n4.kind == HISTORY_NAV_ARCHIVE && strcmp(n4.key, "old-1") == 0 && n4.offset == 1000);
+
+    /* One past the end stops cleanly (no OOB, no wrap). */
+    assert(history_nav_at(&ix, &st, MICRON_NS_SYSTEM, 5).kind == HISTORY_NAV_NONE);
+
+    /* DEDUP: a key that is ALSO live in RAM (a superseded archive copy) must not
+     * appear as an archive ordinal — no double-count, no duplicate page. */
+    obs(&ix, MICRON_NS_SYSTEM, "ram-a", 8, 4000);   /* older copy of a live key */
+    assert(history_nav_count(&ix, &st, MICRON_NS_SYSTEM) == 5);  /* still 5, not 6 */
+    for (int o = 2; o < 5; o++) {
+        history_nav_result n = history_nav_at(&ix, &st, MICRON_NS_SYSTEM, o);
+        assert(n.kind == HISTORY_NAV_ARCHIVE && strcmp(n.key, "ram-a") != 0);
+    }
+    printf("  nav: RAM hot-set then newest-first archive, live keys deduped, no off-by-one: OK\n");
+}
+
+static void test_nav_namespace_isolation(void) {
+    /* One live SYSTEM page in RAM; the SAME key "status" archived under BOTH
+     * namespaces. A SYSTEM walk must never surface the FOREIGN copy, and a FOREIGN
+     * walk must never surface the SYSTEM one — isolation holds through the archive. */
+    micron_store st;
+    micron_store_init(&st);
+    micron_store_put(&st, MICRON_NS_SYSTEM, "sys-live", "S", 1, 0, 100);
+
+    history_index ix;
+    history_index_init(&ix);
+    obs(&ix, MICRON_NS_SYSTEM, "status", 5, 10);
+    obs(&ix, MICRON_NS_FOREIGN, "status", 6, 20);
+
+    /* SYSTEM axis: sys-live (RAM) + the SYSTEM "status" archive only. */
+    assert(history_nav_count(&ix, &st, MICRON_NS_SYSTEM) == 2);
+    assert(history_nav_at(&ix, &st, MICRON_NS_SYSTEM, 0).kind == HISTORY_NAV_RAM);
+    history_nav_result a1 = history_nav_at(&ix, &st, MICRON_NS_SYSTEM, 1);
+    assert(a1.kind == HISTORY_NAV_ARCHIVE && a1.ns == MICRON_NS_SYSTEM &&
+           strcmp(a1.key, "status") == 0 && a1.offset == 10);
+    /* No SYSTEM ordinal ever resolves to the FOREIGN record's offset (20). */
+    for (int o = 0; o < history_nav_count(&ix, &st, MICRON_NS_SYSTEM); o++) {
+        history_nav_result n = history_nav_at(&ix, &st, MICRON_NS_SYSTEM, o);
+        assert(!(n.kind == HISTORY_NAV_ARCHIVE && n.offset == 20));
+    }
+
+    /* FOREIGN axis: only the FOREIGN archive (no foreign RAM pages here). */
+    assert(history_nav_count(&ix, &st, MICRON_NS_FOREIGN) == 1);
+    history_nav_result f0 = history_nav_at(&ix, &st, MICRON_NS_FOREIGN, 0);
+    assert(f0.kind == HISTORY_NAV_ARCHIVE && f0.ns == MICRON_NS_FOREIGN && f0.offset == 20);
+    printf("  nav: namespace isolation holds through the archive (system<->foreign): OK\n");
+}
+
+static void test_nav_graceful_no_archive(void) {
+    /* Nothing flushed (no SD / empty index): the axis is exactly the RAM hot-set,
+     * paging stops at the last live slot, and a NULL index is tolerated. */
+    micron_store st;
+    micron_store_init(&st);
+    micron_store_put(&st, MICRON_NS_SYSTEM, "only", "X", 1, 0, 100);
+
+    history_index ix;
+    history_index_init(&ix);
+    assert(history_nav_count(&ix, &st, MICRON_NS_SYSTEM) == 1);
+    assert(history_nav_at(&ix, &st, MICRON_NS_SYSTEM, 0).kind == HISTORY_NAV_RAM);
+    assert(history_nav_at(&ix, &st, MICRON_NS_SYSTEM, 1).kind == HISTORY_NAV_NONE);
+
+    assert(history_nav_count(NULL, &st, MICRON_NS_SYSTEM) == 1);
+    assert(history_nav_at(NULL, &st, MICRON_NS_SYSTEM, 1).kind == HISTORY_NAV_NONE);
+    printf("  nav: graceful with no archive — paging stops at the RAM hot-set: OK\n");
+}
+
+static void test_index_mru_window_boundary(void) {
+    /* Observe HISTORY_INDEX_MAX + 8 distinct keys in INCREASING seq — exactly the
+     * mount scan's oldest->newest replay order. The index is a bounded MRU-by-seq
+     * window: it must end holding the NEWEST HISTORY_INDEX_MAX identities, the
+     * oldest 8 dropped (documented, not silent). */
+    history_index ix;
+    history_index_init(&ix);
+    const int total = HISTORY_INDEX_MAX + 8;
+    for (int i = 0; i < total; i++) {
+        char k[16];
+        snprintf(k, sizeof(k), "k%04d", i);
+        obs(&ix, MICRON_NS_SYSTEM, k, (uint32_t)(i + 1), (uint32_t)(i + 1) * 10);
+    }
+    assert(ix.count == HISTORY_INDEX_MAX);
+
+    /* The oldest 8 are no longer resolvable... */
+    for (int i = 0; i < 8; i++) {
+        char k[16];
+        snprintf(k, sizeof(k), "k%04d", i);
+        assert(history_index_get(&ix, MICRON_NS_SYSTEM, k) == NULL);
+    }
+    /* ...the newest HISTORY_INDEX_MAX are, at their real offsets. */
+    for (int i = 8; i < total; i++) {
+        char k[16];
+        snprintf(k, sizeof(k), "k%04d", i);
+        const history_index_entry *e = history_index_get(&ix, MICRON_NS_SYSTEM, k);
+        assert(e && e->offset == (uint32_t)(i + 1) * 10);
+    }
+
+    /* A record OLDER than the whole window is not indexable and evicts nothing. */
+    history_record r;
+    memset(&r, 0, sizeof(r));
+    r.ns = MICRON_NS_SYSTEM;
+    snprintf(r.key, sizeof(r.key), "ancient");
+    r.seq = 1;   /* below the window minimum (k8 has seq 9) */
+    r.len = 1; r.payload[0] = 'x';
+    assert(history_index_observe(&ix, &r, 7) == 0);
+    assert(history_index_get(&ix, MICRON_NS_SYSTEM, "ancient") == NULL);
+    assert(ix.count == HISTORY_INDEX_MAX);
+
+    /* Navigation past the indexed window stops cleanly — never OOB. */
+    micron_store st;
+    micron_store_init(&st);
+    int nav = history_nav_count(&ix, &st, MICRON_NS_SYSTEM);
+    assert(nav == HISTORY_INDEX_MAX);   /* 0 RAM + 64 archived distinct */
+    assert(history_nav_at(&ix, &st, MICRON_NS_SYSTEM, nav).kind == HISTORY_NAV_NONE);
+    /* The newest archived key is the first archive ordinal (rank 0). */
+    history_nav_result top = history_nav_at(&ix, &st, MICRON_NS_SYSTEM, 0);
+    char newest[16];
+    snprintf(newest, sizeof(newest), "k%04d", total - 1);
+    assert(top.kind == HISTORY_NAV_ARCHIVE && strcmp(top.key, newest) == 0);
+    printf("  index MRU window: newest %d distinct keys navigable, older drop (documented): OK\n",
+           HISTORY_INDEX_MAX);
+}
+
 int main(void) {
     test_codec_roundtrip();
     test_codec_bounds();
@@ -456,5 +623,9 @@ int main(void) {
     test_chunked_reassembly();
     test_reader_resync_keeps_neighbours();
     test_seq_reseed_survives_reboot();
+    test_nav_hot_then_archive();
+    test_nav_namespace_isolation();
+    test_nav_graceful_no_archive();
+    test_index_mru_window_boundary();
     return 0;
 }
