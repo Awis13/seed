@@ -239,6 +239,29 @@ static uint32_t history_queued(void) {
     return g_hist_q ? (uint32_t)uxQueueMessagesWaiting(g_hist_q) : 0;
 }
 
+/* Is the archive on the removable microSD (true) or the SPIFFS fallback (false)?
+ * Pure read of the mount result latched ONCE by history_mount() at boot, before
+ * any reader runs and never mutated afterwards — so it needs no lock and no bus,
+ * and is safe to call straight from the AsyncTCP /health handler. Wired to
+ * /health by C4 so the store tier ("did the card mount?") is verifiable live. */
+static bool history_on_sd(void) { return g_hist_is_sd; }
+
+/* How many distinct (ns,key) identities the RAM read/nav index currently holds —
+ * the cheapest HONEST "records known" number for /health. This is INDEXED
+ * IDENTITIES (the bounded MRU-by-seq window, HISTORY_INDEX_MAX max), NOT the
+ * whole-archive record count: a true archive total would need a full SD scan,
+ * which the /health handler must never do. Taken under g_hist_mux only — the SAME
+ * brief, bus-free critical section the nav readers (history_nav_page_*) use, since
+ * the write task mutates the index; NO bus is touched, so no lock-order/deadlock
+ * risk on the AsyncTCP task (mux-only, never mux->bus here). Wired to /health by C4. */
+static uint32_t history_index_live_count(void) {
+    uint32_t n = 0;
+    if (g_hist_mux) xSemaphoreTake(g_hist_mux, portMAX_DELAY);
+    n = (uint32_t)g_hist_index.count;
+    if (g_hist_mux) xSemaphoreGive(g_hist_mux);
+    return n;
+}
+
 /* --- chunked archive scan over the real FS --------------------------------- */
 
 /*

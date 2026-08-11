@@ -103,6 +103,20 @@ assert "g_hist_drops++" in enqueue, (
 assert re.search(r"uint32_t\s+history_drops\(void\)", hist), (
     "a pure history_drops() getter must expose the drop count (for C4 /health)"
 )
+# C4 /health getters: store tier + indexed-identity count. history_on_sd() is a
+# lock-free read of the boot-latched mount flag; history_index_live_count() reads
+# the RAM index under g_hist_mux ONLY (no SPI bus), so it is safe on the AsyncTCP
+# /health task and introduces no mux->bus order.
+assert re.search(r"bool\s+history_on_sd\(void\)", hist), (
+    "a pure history_on_sd() getter must expose the SD-vs-SPIFFS store tier (C4 /health)"
+)
+live = fn_body(hist, "static uint32_t history_index_live_count(void)")
+assert "xSemaphoreTake(g_hist_mux" in live and "g_hist_index.count" in live, (
+    "history_index_live_count() must read the RAM index count under g_hist_mux"
+)
+assert "HwSpiBusGuard" not in live, (
+    "history_index_live_count() must be mux-only (no SPI bus) — safe on the AsyncTCP handler"
+)
 # The drop path still returns without touching the store (no SD write on drop).
 assert "g_hist_store->open" not in enqueue, (
     "the drop path must not fall back to a synchronous SD write"

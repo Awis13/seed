@@ -56,7 +56,7 @@
 #include "hw_kb.h"
 
 // ===== Configuration =====
-#define SEED_VERSION        "0.9.58"
+#define SEED_VERSION        "0.9.59"
 // Core clock: datasheet puts 240 vs 80 ~11.5mA apart on WAITI. Periph bus holds
 // at 80 for every PLL-fed core clock; go lower and RMT/I2S retimes. Same floor
 // as tembed idle policy (no light sleep — notify latency is the job).
@@ -777,6 +777,17 @@ static void wifi_setup() {
 
 // ===== HTTP Handlers =====
 
+// History archive health getters. Defined in skills/history.cpp, which is
+// #included far below this handler, so they are forward-declared here (same TU,
+// static). All three are cheap and AsyncTCP-safe: history_on_sd() is a lock-free
+// read of a boot-latched flag; history_drops() reads a plain writer-side counter;
+// history_index_live_count() takes ONLY g_hist_mux (no SPI bus) for a brief RAM
+// index read — no bus lock is taken on the /health handler (no history_bytes),
+// so no mux->bus order and no new deadlock hazard on this task.
+static bool     history_on_sd(void);
+static uint32_t history_drops(void);
+static uint32_t history_index_live_count(void);
+
 static void handle_health(AsyncWebServerRequest *request) {
     JsonDocument doc;
     doc["ok"] = true;
@@ -791,6 +802,15 @@ static void handle_health(AsyncWebServerRequest *request) {
     doc["boots_since_panic"] = (unsigned long)boots_since_panic;
     doc["panic_count"] = (unsigned long)panic_count;
     doc["storage_ok"] = storage_ok;
+    // History archive observability (ticket C4, read-only): is the archive on the
+    // SD card or the SPIFFS fallback, how many records have been dropped on a full
+    // write queue, and how many identities the RAM index knows. history_records is
+    // INDEXED IDENTITIES (the bounded MRU nav window), not the whole-archive total
+    // — an honest count with no SD scan on this handler. No store selector, no
+    // behaviour change: this only surfaces state C1-C3 already track.
+    doc["history_sd"] = history_on_sd();
+    doc["history_drops"] = (unsigned long)history_drops();
+    doc["history_records"] = (unsigned long)history_index_live_count();
     String response;
     serializeJson(doc, response);
     request->send(200, "application/json", response);

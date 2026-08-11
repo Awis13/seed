@@ -270,7 +270,21 @@ static inline history_decode_status history_decode(const uint8_t *buf, size_t av
 /* Distinct (ns,key) identities held in the RAM read index. 64 covers the live
  * producers (8 micron page slots + notify cards) with headroom; each entry is
  * ~48 B, so the table is ~3 KB of plain DRAM. The archive on disk is unbounded;
- * this is only the resolution index for the newest record per identity. */
+ * this is only the resolution index for the newest record per identity.
+ *
+ * FINDING 1 — SHARED WINDOW ACROSS ALL NAMESPACES (accept + document, tunable).
+ * This one window is shared across EVERY namespace (SYSTEM / FOREIGN / NOTIFY):
+ * it is a single MRU-by-seq set of the newest HISTORY_INDEX_MAX distinct
+ * identities IN TOTAL, not a per-namespace budget. So boot-restore
+ * (history_restore_at) and wheel-navigation (history_nav_*) can only ever see the
+ * newest HISTORY_INDEX_MAX identities summed over all namespaces — a burst of
+ * pages in one namespace can push another namespace's older identities out of the
+ * window. Records beyond the window are NOT lost: they stay on the SD archive and
+ * remain fetchable by key via history_read_newest() (a full scan); they are just
+ * not auto-restored at boot nor reachable by wheel detent. This is a deliberate,
+ * tunable trade governed by exactly this one constant. FOLLOW-UP (only if page
+ * churn ever starves notify restore): give each namespace its own budget instead
+ * of one shared table — a small, local change to this index, not a redesign. */
 #define HISTORY_INDEX_MAX 64
 
 typedef struct {
