@@ -55,9 +55,10 @@
 #include "hw_haptic.h"
 #include "hw_sound.h"
 #include "hw_kb.h"
+#include "psram_alloc.h"          // psram_calloc_pref: park big buffers in PSRAM
 
 // ===== Configuration =====
-#define SEED_VERSION        "0.9.63"
+#define SEED_VERSION        "0.9.64"
 // Core clock: datasheet puts 240 vs 80 ~11.5mA apart on WAITI. Periph bus holds
 // at 80 for every PLL-fed core clock; go lower and RMT/I2S retimes. Same floor
 // as tembed idle policy (no light sleep — notify latency is the job).
@@ -1679,7 +1680,9 @@ static char reply_title[NOTIFY_TITLE_LEN];
 // now_ms — the store never reads a clock itself. The namespace is set by the
 // PRODUCER (our own trusted boot code for a system page; an untrusted browser
 // transport would pass MICRON_NS_FOREIGN), never parsed from a page body.
-static micron_store g_page_store;
+// Parked in PSRAM (~4.5 KB, 8 x micron_slot): allocated once by
+// ui_page_store_begin(), touched only from the loop/AsyncTCP task context.
+static micron_store *g_page_store;
 // Wheel-paging view state. Two distinct input modes, never conflated:
 //   page_open == false → PAGING between pages: a wheel detent changes which
 //                        system page is shown (ordinal); a click OPENS it.
@@ -1701,7 +1704,8 @@ static bool   page_open = false;
 // producer seam every page insert goes through (C3 adds notify-card producers).
 static micron_put_result ui_page_put(uint8_t ns, const char *key,
                                      const char *src, size_t len, uint32_t ttl_ms) {
-    micron_put_result r = micron_store_put(&g_page_store, ns, key, src, len,
+    if (!g_page_store) { micron_put_result z; memset(&z, 0, sizeof(z)); return z; }
+    micron_put_result r = micron_store_put(g_page_store, ns, key, src, len,
                                            ttl_ms, millis());
     if (r.evicted) {
         history_enqueue(r.evicted_ns, r.evicted_key,
@@ -1718,7 +1722,14 @@ static micron_put_result ui_page_put(uint8_t ns, const char *key,
 // transport, which will store under MICRON_NS_FOREIGN from its own transport
 // identity — and can never reach this namespace.
 static void ui_page_store_begin() {
-    micron_store_init(&g_page_store);
+    // ~4.5 KB in PSRAM (internal-DRAM fallback). A null here means both pools are
+    // exhausted; ui_page_put guards on it and the page UI degrades to empty.
+    g_page_store = (micron_store *)psram_calloc_pref(sizeof(*g_page_store));
+    if (!g_page_store) {
+        Serial.println("[ui] page store alloc FAILED — page UI disabled");
+        return;
+    }
+    micron_store_init(g_page_store);
     static const char kHelpPage[] =
         ">System pages\n"
         "\n"
@@ -1741,7 +1752,8 @@ static history_record g_page_fetch;
 // the RAM hot-set AND the archive. Returns false when there is no such page
 // (empty store / out of range / archive body unreadable — graceful, no SD).
 static bool ui_page_render(int ordinal) {
-    history_nav_result nav = history_nav_page_at(&g_page_store,
+    if (!g_page_store) return false;
+    history_nav_result nav = history_nav_page_at(g_page_store,
                                                  MICRON_NS_SYSTEM, ordinal);
     const char *src = NULL;
     size_t len = 0;
@@ -3337,7 +3349,7 @@ static void ui_on_steps(int steps) {
         // so a concurrent append can at worst land a fixed ordinal on an adjacent
         // archive page — never OOB, never a foreign page — and it self-corrects on
         // the next detent. No snapshot lock is needed.
-        int n = history_nav_page_count(&g_page_store, MICRON_NS_SYSTEM);
+        int n = g_page_store ? history_nav_page_count(g_page_store, MICRON_NS_SYSTEM) : 0;
         if (n <= 0) break;
         page_open = false;
         page_scroll = 0;
@@ -3350,7 +3362,7 @@ static void ui_on_steps(int steps) {
         // grows the archive range (never mutates g_page_store), so at worst a fixed
         // ordinal shifts onto an adjacent archive page — never OOB/foreign — and
         // the next detent corrects it.
-        int n = history_nav_page_count(&g_page_store, MICRON_NS_SYSTEM);
+        int n = g_page_store ? history_nav_page_count(g_page_store, MICRON_NS_SYSTEM) : 0;
         if (n <= 0) { ui_go_clock(NULL); break; }
         if (page_open) {
             // Scrolling WITHIN the open page (C3 in-page scroll). One detent

@@ -10,6 +10,7 @@
 #include "micron/micron_layout.h"  // pure page layout -> grid (C3)
 #include "box_glyphs.h"            // box-drawing + block glyphs for micron pages
 #include "boot_logo.h"             // PURE b33pr boot-splash decrypt logic
+#include "psram_alloc.h"           // psram_calloc_pref: micron grids in PSRAM
 
 #include <SPI.h>
 #include <Wire.h>
@@ -728,7 +729,12 @@ static void boot_splash_play() {
 // ---- public ----------------------------------------------------------------
 SPIClass *hw_ui_spi() { return disp_spi; }
 
+// Defined next to the micron grids (further down the file, after their
+// declarations); allocates the two render buffers in PSRAM before any paint.
+static void micron_render_begin();
+
 bool hw_ui_begin() {
+    micron_render_begin();   // micron double-buffer grids into PSRAM (see below)
     Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL);
     Wire.setClock(400000);
     xl_ok = xl_begin();
@@ -2342,11 +2348,23 @@ static const uint16_t MICRON_ORIGIN_Y = 27;   // (222-168)/2
 static const uint16_t MICRON_CELL_W   = 10;   // 5 cols * scale 2, no gap column
 static const uint16_t MICRON_CELL_H   = 14;   // 7 rows * scale 2
 
-static micron_grid g_micron_front;            // retained last-painted frame
-static micron_grid g_micron_back;             // C3 fills this and hands it back
+// Two ~2.7 KB grids parked in PSRAM (internal-DRAM fallback), allocated once by
+// hw_ui_begin(). Painted only from the loop/UI task — never an ISR. Null (both
+// pools exhausted) makes the page painters no-op via their guards.
+static micron_grid *g_micron_front = nullptr; // retained last-painted frame
+static micron_grid *g_micron_back  = nullptr; // C3 fills this and hands it back
 static uint8_t g_micron_dirty[MICRON_GRID_CELLS];
 static bool g_micron_force = true;            // first paint is a full repaint
 static int g_micron_last_dirty = -1;
+
+// Allocate the two render grids in PSRAM (internal-DRAM fallback), called once
+// from hw_ui_begin() before any paint. Idempotent. Painters guard on a null.
+static void micron_render_begin() {
+    if (!g_micron_front) g_micron_front = (micron_grid *)psram_calloc_pref(sizeof(*g_micron_front));
+    if (!g_micron_back)  g_micron_back  = (micron_grid *)psram_calloc_pref(sizeof(*g_micron_back));
+    if (!g_micron_front || !g_micron_back)
+        Serial.println("[hw] micron grid alloc FAILED — page view disabled");
+}
 
 // Draw one micron cell: a 5x7 glyph at scale 2 filling a 10x14 block (no
 // inter-glyph gap column — the grid pitch is a fixed 10 px). bg fill + glyph in
@@ -2395,18 +2413,18 @@ static void tft_draw_cell(uint16_t x, uint16_t y, uint32_t cp,
     disp_spi->endTransaction();
 }
 
-micron_grid *hw_ui_page_back() { return &g_micron_back; }
+micron_grid *hw_ui_page_back() { return g_micron_back; }
 
 void micron_render_invalidate() { g_micron_force = true; }
 
 int micron_render_last_dirty() { return g_micron_last_dirty; }
 
 void hw_ui_show_page(const micron_grid *g) {
-    if (!panel_ok || !g) return;
+    if (!panel_ok || !g || !g_micron_front) return;
 
     // Pure diff first (no bus traffic): decide which cells changed. force after
     // an invalidate/first paint marks all 456 dirty for a full repaint.
-    int dirty_n = micron_grid_diff(&g_micron_front, g, g_micron_dirty,
+    int dirty_n = micron_grid_diff(g_micron_front, g, g_micron_dirty,
                                    g_micron_force ? 1 : 0);
     g_micron_last_dirty = dirty_n;
 
@@ -2427,7 +2445,7 @@ void hw_ui_show_page(const micron_grid *g) {
         tft_draw_cell(x, y, cell->cp, fg, bg, cell->attr);
     }
     // Copy incoming -> retained so the next call diffs against this frame.
-    memcpy(&g_micron_front, g, sizeof(g_micron_front));
+    memcpy(g_micron_front, g, sizeof(*g_micron_front));
     g_micron_force = false;
 }
 
@@ -2439,6 +2457,7 @@ void hw_ui_show_page(const micron_grid *g) {
 // scroll; the applied (clamped) scroll is what the window shows.
 size_t hw_ui_render_page(const char *src, size_t len, int scroll) {
     micron_grid *back = hw_ui_page_back();
+    if (!back) return 0;   // grids not allocated (OOM at boot) — nothing to paint
     micron_layout_result r = micron_layout_page(src, len, scroll, back);
     screen = HW_UI_PAGE;  // the page view owns the panel now (wheel-paged from home)
     hw_ui_show_page(back);
