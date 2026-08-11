@@ -129,16 +129,43 @@ for enum, name in (("ESP_RST_USB", '"usb"'), ("ESP_RST_JTAG", '"jtag"'),
                    ("ESP_RST_CPU_LOCKUP", '"cpu_lockup"')):
     assert enum in rr and name in rr, f"{enum} must map to {name}"
 panic = fn_body(main, "static bool reset_is_panic(")
-assert "ESP_RST_CPU_LOCKUP" in panic, (
-    "a CPU lockup (double exception) is an unexpected fault: panic-class"
-)
-assert "ESP_RST_PWR_GLITCH" in panic, (
-    "a detected power glitch is an unexpected fault: panic-class"
+for fault in ("ESP_RST_PANIC", "ESP_RST_INT_WDT", "ESP_RST_TASK_WDT",
+              "ESP_RST_CPU_LOCKUP", "ESP_RST_PWR_GLITCH"):
+    assert fault in panic, (
+        f"{fault} is an unexpected fault and must count as panic-class"
+    )
+# The interrupt/task watchdogs are genuine firmware hangs and stay panic-class.
+# The generic ESP_RST_WDT is ambiguous: BOTH esptool's --after watchdog_reset on
+# every plain reflash (board_upload.after_reset in platformio.ini) AND a genuine
+# early RTC-watchdog hang before the task/int watchdogs exist. It is therefore
+# NOT in reset_is_panic's unconditional set — it gets a coredump-gated decision
+# in boot_diag_init instead (the coredump-aware path shipped, since coredump-to-
+# flash is live in the precompiled Arduino-ESP32 esp32s3 libs).
+assert "ESP_RST_WDT" not in panic, (
+    "ESP_RST_WDT is ambiguous (flash-tool reset vs early RTC hang) and must NOT "
+    "be in reset_is_panic's unconditional set — it is coredump-gated in "
+    "boot_diag_init"
 )
 for clean in ("ESP_RST_USB", "ESP_RST_JTAG", "ESP_RST_EFUSE"):
     assert clean not in panic, (
         f"{clean} must stay out of the panic classification"
     )
+
+# --- 7c. ESP_RST_WDT is coredump-gated in boot_diag_init ---------------------
+# A flash-tool watchdog_reset never leaves a coredump, so it must NOT bump
+# panic_count; a real early RTC-WDT hang that reached the panic handler does,
+# so it still counts. The discriminator is a valid coredump image in flash.
+diag = fn_body(main, "static void boot_diag_init()")
+assert "ESP_RST_WDT" in diag, (
+    "boot_diag_init must special-case ESP_RST_WDT rather than exclude it blindly"
+)
+assert "coredump_image_present()" in diag, (
+    "the ESP_RST_WDT decision must be gated on coredump presence"
+)
+cd = fn_body(main, "static bool coredump_image_present()")
+assert "esp_core_dump_image_check()" in cd and "ESP_OK" in cd, (
+    "coredump presence must come from esp_core_dump_image_check() == ESP_OK"
+)
 
 # --- 8. ipc1 prime-suspect mitigation stays pinned ---------------------------
 wifi_setup = fn_body(main, "static void wifi_setup()")
