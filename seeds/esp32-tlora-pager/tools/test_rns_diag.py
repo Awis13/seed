@@ -56,8 +56,8 @@ route = slice_between(
 )
 
 # --- version bump so /health distinguishes this build ------------------------
-assert '#define SEED_VERSION        "0.9.66"' in main, (
-    "SEED_VERSION must bump to 0.9.66 for this build"
+assert '#define SEED_VERSION        "0.9.67"' in main, (
+    "SEED_VERSION must bump to 0.9.67 for this build"
 )
 
 # --- 1. stack field: sampled on the loop task, unit baked into the name ------

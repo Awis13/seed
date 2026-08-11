@@ -49,6 +49,18 @@ Eight sites, one rule each:
     rules live in a pure header like every other decision in this file, and the
     pickup's position in the tick is pinned: ahead of the stack it would serve
     last tick's message.
+  - And rns.cpp now SENDS, which is the first handoff in this firmware that
+    genuinely crosses tasks: POST /rns/send answers on the AsyncTCP task and the
+    send must run on the loop task. So the ring's publish-last discipline stops
+    being defensive and becomes load-bearing — the indices are atomics with one
+    writer each and the stores are release/acquire — and the handler is pinned
+    as an ordered allowlist that reaches Transport nowhere. The send itself is
+    pinned in the order that keeps it from vanishing: with no path,
+    Transport::outbound() broadcasts a packet the hub drops and receipt_send()
+    still returns a receipt, so has_path() and recall() must both answer before
+    anything is sent, recall() is paid for at most once per message, the path is
+    requested once, and a ladder that runs out reports a REASON rather than a
+    silence.
 """
 
 import re
@@ -291,7 +303,7 @@ assert "RNS_TCP_TX_STALL_MS" in loop_body
 # POST /rns/config only writes the file; the loop task applies it, so the
 # endpoint the connect task reads never changes underneath it.
 cfg = rns[rns.index('exact("/rns/config")') :
-          rns.index("static void skill_rns_poll")]
+          rns.index('exact("/rns/send")')]
 assert "g_rns_cfg_dirty = true;" in cfg
 assert "begin_connect" not in cfg and "link_down" not in cfg, (
     "the handler must only raise the flag; the poll owns the socket"
@@ -830,7 +842,7 @@ assert rns_code.count("rns_inbox_take(") == 1, (
 # between a stranger's arbitrary bytes and the card body was pinned by a comment
 # about it. Every assertion below runs against code.
 pickup_raw = rns[rns.index("static void rns_inbox_poll") :
-                 rns.index("static void skill_rns_poll")]
+                 rns.index("static void rns_send_retire")]
 pickup = re.sub(r"/\*.*?\*/", " ", pickup_raw, flags=re.S)
 pickup = re.sub(r"//[^\n]*", " ", pickup)
 assert "rns_inbox_take(" in pickup and "notify_ingest(" in pickup, (
@@ -1049,6 +1061,545 @@ assert "== 1);" in inbox_test and "for (int b = 0; b < 256; b++)" in inbox_test,
     "the length-preserving invariant must be pinned over a corpus that reaches "
     "every branch of the mapping, or an expanding escape would silently corrupt "
     "the count on the card"
+)
+
+
+# --- 10. rns.cpp: the send, which is the first REAL cross-task handoff -------
+# Everything above defers from one context of the loop task to another. This one
+# does not: POST /rns/send answers on the AsyncTCP task and the send has to run
+# on the loop task, because it reaches Identity::recall() and
+# Transport::outbound() — which walk and lock structures rns_stack.loop()
+# mutates — and because it pays for an X25519 key exchange. So the ring in
+# rns/outbox.h is the first queue in this firmware whose memory ordering is
+# load-bearing rather than defensive, and this section pins that along with the
+# ordering that keeps a send from vanishing.
+outbox = (ROOT / "src" / "rns" / "outbox.h").read_text(encoding="utf-8")
+assert '#include "rns/outbox.h"' in rns
+
+# rns_describe() returns a page of markdown that NAMES these calls — it is a
+# string literal, so stripping comments does not remove it, and counting call
+# sites across the whole file would count the documentation as code. Everything
+# below counts against the implementation with that page cut out.
+rns_impl = (rns_code[: rns_code.index("static const char *rns_describe")] +
+            rns_code[rns_code.index("static void rns_register_routes") :])
+
+
+# 10a. The rules live in a pure header, like inbox.h, annsched.h and
+# pktfilter.h, so the host test compiles the real code rather than a copy.
+outbox_code = re.sub(r"/\*.*?\*/", " ", outbox, flags=re.S)
+outbox_code = re.sub(r"//[^\n]*", " ", outbox_code)
+assert not re.search(r"^\s*static\s+(?!inline\b)", outbox_code, re.M), (
+    "rns/outbox.h must hold no state of its own; the firmware owns the storage "
+    "and passes it in, which is what lets the host test drive the real rules"
+)
+for banned in ("millis(", "micros(", "esp_timer", "printf", "new ", "malloc",
+               "Serial", "time(", "RNS::"):
+    assert banned not in outbox_code, (
+        "rns/outbox.h must not reach for %s: half of it runs on the AsyncTCP "
+        "task, and all of it has to compile on the host" % banned
+    )
+
+# 10b. The ceiling is the same 383 the inbox receives into, and it is pinned
+# against the library in the one translation unit that can see both. Nothing in
+# microReticulum checks the plaintext size before encrypting — Packet::pack()
+# throws on the PACKED size, after Destination::encrypt() has already generated
+# an ephemeral X25519 keypair — so this arithmetic is the only thing standing
+# between a caller and public-key time spent to produce an exception.
+assert "#define RNS_OUTBOX_PAYLOAD_MAX 383" in outbox_code
+assert "RNS_OUTBOX_PAYLOAD_MAX == (size_t)RNS::Type::Packet::ENCRYPTED_MDU" in rns, (
+    "the outbound ceiling must be static_asserted against the library's own "
+    "value, exactly like the inbox's; the host test cannot see the library"
+)
+# The envelope overhead is arithmetic, not a number somebody typed: version,
+# separator, 32-character address, separator, separator.
+assert "#define RNS_OUTBOX_ENVELOPE_OVERHEAD 36" in outbox_code
+assert "#define RNS_OUTBOX_ADDR_HEX 32" in outbox_code
+assert "#define RNS_OUTBOX_SESSION_MAX 23" in outbox_code
+# ...and the budget must be measured against the ACTUAL session name. A budget
+# that used RNS_OUTBOX_TEXT_MAX alone is right for an empty session and one byte
+# over the packet for every named one.
+budget = outbox_code[outbox_code.index("size_t rns_envelope_text_budget(") :]
+budget = budget[: budget.index("\n}\n")]
+assert "strlen(session)" in budget, (
+    "the text budget is 347 - len(session), so it has to read the session name; "
+    "a constant budget overflows the packet for every named session"
+)
+
+# 10c. PUBLISH-LAST, WITH A RELEASE STORE. Unlike rns_inbox_put()'s counterpart
+# this is not defensive: the consumer is another task on a dual-core chip, so a
+# payload store that floats past the index publishing it is a slot transmitted
+# while it was still being filled. A single-threaded host test cannot see that,
+# which is why the ordering is pinned in the source text.
+put_body = outbox_code[outbox_code.index("bool rns_outbox_put(") :]
+put_body = put_body[: put_body.index("\n}\n")]
+put_stmts = [ln.strip() for ln in put_body.splitlines() if ln.strip()]
+take_body = outbox_code[outbox_code.index("bool rns_outbox_take(") :]
+take_body = take_body[: take_body.index("\n}\n")]
+take_stmts = [ln.strip() for ln in take_body.splitlines() if ln.strip()]
+assert put_stmts[-1] == "return true;" and \
+       put_stmts[-2] == "bx->wr.store(wr + 1, std::memory_order_release);", (
+    "rns_outbox_put() must publish the message LAST, with a release store, "
+    "after every byte is in place. Found: %r" % put_stmts[-2:]
+)
+# The two indices are ATOMIC and MONOTONIC, one writer each. A shared count
+# incremented by one task and decremented by the other — which is what inbox.h
+# uses, correctly, because there both sides are the loop task — is a
+# read-modify-write from two tasks here, and it loses messages.
+assert "std::atomic<uint32_t> wr;" in outbox_code and \
+       "std::atomic<uint32_t> rd;" in outbox_code, (
+    "the ring indices must be atomics with exactly one writer each: the "
+    "producer is the AsyncTCP task and the consumer is the loop task"
+)
+# THE TWO ACQUIRE LOADS, PINNED AS STATEMENTS — not as a substring anywhere in
+# the file. `"std::memory_order_acquire" in outbox_code` was the first version
+# of this check and it is satisfied by the two loads in rns_outbox_depth()
+# alone: relaxing EITHER of the loads that actually guard a payload access
+# passed the whole suite. The take-side one is the serious one — relaxed, the
+# reads of buf[slot]/len[slot]/to[slot] may be hoisted above the load that says
+# the slot is published, which is precisely the torn message this header exists
+# to prevent — and no single-threaded host test can fail on either.
+assert "wr = bx->wr.load(std::memory_order_acquire);" in take_stmts, (
+    "rns_outbox_take() must load wr with ACQUIRE: it pairs with put()'s release "
+    "store and it is what stops the payload reads below being hoisted above it"
+)
+assert "rd = bx->rd.load(std::memory_order_acquire);" in put_stmts, (
+    "rns_outbox_put() must load rd with ACQUIRE: it pairs with take()'s release "
+    "store and it is what makes 'this slot is free' mean the consumer has "
+    "finished reading it"
+)
+# ...and each is the load of the OTHER task's counter. Its own is relaxed
+# because it is its only writer; swapping the two would pin nothing.
+assert "wr = bx->wr.load(std::memory_order_relaxed);" in put_stmts
+assert "rd = bx->rd.load(std::memory_order_relaxed);" in take_stmts
+
+# THE DEPTH MUST BE A POWER OF TWO, and this is a correctness requirement rather
+# than a round number: the slot index is the monotonic counter modulo the depth,
+# and that is only continuous across the 2^32 wrap when the depth divides 2^32.
+# At five slots, wr = 0xFFFFFFFF and wr = 0 are the same slot — one queued
+# message overwritten unread, another delivered twice — while the depth still
+# reads 2. Setting RNS_OUTBOX_SLOTS to 5 passed every test before this assert.
+assert re.search(r"static_assert\(\(RNS_OUTBOX_SLOTS & \(RNS_OUTBOX_SLOTS - 1\)\)"
+                 r" == 0", outbox_code), (
+    "RNS_OUTBOX_SLOTS must be static_asserted to a power of two; any other "
+    "depth loses and duplicates a message when the counter wraps"
+)
+slots = int(re.search(r"#define RNS_OUTBOX_SLOTS (\d+)", outbox_code).group(1))
+assert slots > 0 and (slots & (slots - 1)) == 0, (
+    "RNS_OUTBOX_SLOTS is %d, which is not a power of two" % slots
+)
+assert take_stmts[-1] == "return true;" and \
+       take_stmts[-2] == "bx->rd.store(rd + 1, std::memory_order_release);", (
+    "rns_outbox_take() must release the slot LAST: until that store the "
+    "producer must not believe it is free to overwrite. Found: %r"
+    % take_stmts[-2:]
+)
+
+# 10d. THE PRODUCER PATH: POST /rns/send validates, builds and enqueues, and
+# does nothing else. Pinned as an ORDERED ALLOWLIST of the calls it makes, for
+# the reason sections 6d and 8c give: a denylist of forbidden identifiers could
+# not be completed, and the things it would miss are exactly the ones that
+# matter — a log call that blocks on the UART, an allocation, or a single
+# reach into the Reticulum stack from the wrong task.
+sendh = rns[rns.index('exact("/rns/send")') :
+            rns.index("/* Announce this node's destination")]
+sendh_code = re.sub(r"/\*.*?\*/", " ", sendh, flags=re.S)
+sendh_code = re.sub(r"//[^\n]*", " ", sendh_code)
+KEYWORDS = {"if", "for", "while", "switch", "return", "catch", "do"}
+calls = [c for c in re.findall(r"\b([A-Za-z_][A-Za-z0-9_:]*)\s*\(", sendh_code)
+         if c not in KEYWORDS]
+SEND_HANDLER_CALLS = [
+    "exact",                    # the route
+    "require_auth",             # ...behind auth, like every other route here
+    "notify_take_body",         # the collected body, malloc'd by the collector
+    "free",                     # ...and released before anything else happens
+    "notify_send_error",        #   (no body)
+    "deserializeJson",
+    "free",                     # ...released before the error branch too
+    "notify_send_error",        #   (bad json)
+    "rns_addr_valid",           # this node has an address to put in the envelope
+    "notify_send_error",        #   (no address yet)
+    "rns_addr_valid",           # ...and the caller's `to` is 32 hex characters
+    "notify_send_error",        #   (bad to)
+    "rns_envelope_build",       # the agreed wire format, budget checked
+    "sizeof",
+    "notify_send_error",        #   (bad session / empty text / over budget)
+    "rns_env_reason",
+    "rns_outbox_put",           # THE HANDOFF, and the last thing it does
+    "notify_send_error",        #   (queue full)
+    "rns_outbox_depth",
+    "notify_send_json",
+]
+assert calls == SEND_HANDLER_CALLS, (
+    "the POST /rns/send handler is pinned call for call: it runs on the "
+    "AsyncTCP task, which may not touch Transport and may not block, so "
+    "anything new in it has to be argued for here first.\n  expected: %r\n"
+    "  found:    %r" % (SEND_HANDLER_CALLS, calls)
+)
+# The body collector is passed as the fourth argument rather than called, so it
+# is not in the list above — but it is what bounds the body this route accepts,
+# and a route registered without it takes the framework's unbounded default.
+assert "}, NULL, handle_body_collect);" in sendh_code, (
+    "the send route must use the shared bounded body collector, like every "
+    "other body route in this firmware"
+)
+# The allowlist above says what it DOES; these say what it must never become.
+# Both live here because the list is ordered and a reviewer reading it should
+# not have to derive the hazard from the absence of a name.
+for banned in ("RNS::", "rns_stack", "rns_destination", "Transport::",
+               "Identity::", "receipt_send", "Serial.", "event_add(",
+               "String ", "new ", "malloc(", "delay("):
+    assert banned not in sendh_code, (
+        "POST /rns/send runs on the AsyncTCP task; %s does not belong in it — "
+        "the handler enqueues and the loop task sends" % banned
+    )
+# The values come out of the parsed document as const char*, not as String:
+# they point into storage the document already owns, so the only allocation on
+# this path is the parse itself.
+assert 'const char *to = input["to"] | "";' in sendh_code
+assert 'const char *session = input["session"] | "";' in sendh_code
+assert 'const char *text = input["text"] | "";' in sendh_code
+# It answers "accepted", not an outcome: resolving a path takes up to a minute
+# and holding the request open for it would both stall an AsyncTCP slot and lie
+# about what was proven.
+assert 'resp["accepted"] = true;' in sendh_code, (
+    "the handler must answer promptly with acceptance; the outcome is polled "
+    "from GET /rns/status, exactly as POST /rns/config already documents"
+)
+
+# 10e. Exactly one producer and exactly one consumer, and each is where it
+# belongs. Comments are stripped first: the prose names both functions.
+assert rns_impl.count("rns_outbox_put(") == 1, (
+    "rns_outbox_put() belongs in the POST handler and nowhere else"
+)
+assert rns_impl.count("rns_outbox_take(") == 1, (
+    "rns_outbox_take() belongs in the loop-task send poll and nowhere else"
+)
+assert "rns_outbox_put(" in sendh_code, "the handler is the producer"
+
+# 10f. THE SEND RUNS ON THE LOOP TASK, AFTER THE STACK. The path response the
+# send is waiting for arrives through the drain inside rns_stack.loop(), so a
+# step taken ahead of it reads last tick's path table and every rung of the
+# ladder costs an extra RNS_TICK_MS.
+assert "rns_send_poll();" in tick, "the tick must drive the send"
+assert tick.index("rns_stack.loop();") < tick.index("rns_send_poll();"), (
+    "the send poll must run AFTER Reticulum::loop(), which is what runs the "
+    "drain that carries the path response it is waiting for"
+)
+
+sendpoll = rns[rns.index("static void rns_send_poll") :
+               rns.index("/* The tick Reticulum finally gets")]
+sendpoll_code = re.sub(r"/\*.*?\*/", " ", sendpoll, flags=re.S)
+sendpoll_code = re.sub(r"//[^\n]*", " ", sendpoll_code)
+
+# 10g. RESOLVE, THEN SEND — the ordering this whole commit exists for. With no
+# path in the table Transport::outbound() falls through to the BROADCAST branch,
+# emits a HEADER_1 packet, and the hub drops it without a word; receipt_send()
+# still hands back a receipt, because a receipt means "an interface accepted it"
+# and one did. So a send to an unresolvable peer does not fail — it vanishes,
+# and nothing anywhere says so. These three assertions are what makes that
+# unreachable.
+assert "RNS::Transport::has_path(" in sendpoll_code, (
+    "the send must check Transport::has_path() first; without a path the "
+    "packet is broadcast and silently dropped by the hub"
+)
+assert rns_impl.count("receipt_send(") == 1, (
+    "there is exactly one send site, and it is the one behind the resolve"
+)
+assert sendpoll_code.index("has_path(") < sendpoll_code.index("Identity::recall(") \
+       < sendpoll_code.index("receipt_send("), (
+    "the order is has_path -> recall -> send, and it is not negotiable: either "
+    "resolve step failing means the packet would go nowhere in silence"
+)
+# ...and the guard must be a REFUSAL, not a warning. `return` out of each
+# failing step is what keeps receipt_send() unreachable while it is failing.
+resolve = sendpoll_code[sendpoll_code.index("if (!RNS::Transport::has_path(") :
+                        sendpoll_code.index("RNS::Bytes payload(")]
+assert resolve.count("return;") == 2, (
+    "both failing resolve steps must return, not fall through to the send: the "
+    "missing path and the unrecoverable identity"
+)
+# has_path() IS CHECKED ON EVERY ATTEMPT, not only while resolving. Inside the
+# `if (!g_rns_out_resolved)` block it made this file's own stated invariant —
+# nothing sends unless has_path() said yes — true once per MESSAGE: a rung whose
+# send took no receipt re-entered at the packet build and sent again without
+# re-asking. Not reachable in this port today (nothing culls the path table and
+# the per-entry TTL is a week), which is exactly why it needs a pin rather than
+# a comment.
+assert sendpoll_code.index("if (!RNS::Transport::has_path(") < \
+       sendpoll_code.index("if (!g_rns_out_resolved)"), (
+    "has_path() must be checked ahead of the resolve cache, so it runs on every "
+    "attempt and not only on the ones that resolve"
+)
+
+# 10h. recall() IS BOUNDED BY ATTEMPTS, NOT BY SUCCESSES — and that distinction
+# is the defect this pin exists for. It is expensive here for a reason specific
+# to this port: the known-destinations store is a BasicFileStore whose init()
+# sits behind transport_enabled (false on this node), so recall() only works
+# through the library's RNS_IDENTITY_ANNOUNCE_RECALL fallback, whose FAILURE
+# path is a full _new_path_table.get() — a msgpack decode and a Packet unpack —
+# where has_path() above is a bare exists() that never decodes.
+#
+# Caching only the success (g_rns_out_resolved) therefore bounds nothing when
+# has_path() is true and recall() returns NONE: every rung re-enters and pays
+# again, seven times, on the task that owns the socket drain. That is reachable
+# without malice, from a path entry whose stored announce will not reconstruct.
+assert rns_impl.count("Identity::recall(") == 1, (
+    "exactly one recall() site: it is the expensive half of the resolve and it "
+    "must not be reachable from anywhere else"
+)
+assert "static bool g_rns_out_recalled = false;" in rns, (
+    "recall() needs a latch of its own — g_rns_out_resolved only stops a "
+    "SUCCESSFUL recall from repeating, and it is the failing one that is "
+    "expensive"
+)
+# The latch guards the call, and is set BEFORE it so a throw cannot leave it
+# clear. Pinned as the ordered pair, because either half alone is satisfied by
+# code that still calls recall() on every rung.
+recall_branch = sendpoll_code[sendpoll_code.index("if (g_rns_out_recalled)") :
+                              sendpoll_code.index("if (!peer)")]
+assert recall_branch.index("g_rns_out_recalled = true;") < \
+       recall_branch.index("RNS::Identity::recall(hash)"), (
+    "the recall latch must be set before the call it guards"
+)
+assert "Identity::recall(" not in \
+       sendpoll_code[: sendpoll_code.index("if (g_rns_out_recalled)")], (
+    "recall() may not be reachable ahead of its own latch"
+)
+# ...and its result is cached, so a retry after a successful resolve does not
+# pay for it again. The cache is the Destination, and the flag that guards it.
+assert "g_rns_out_resolved = true;" in sendpoll_code
+assert re.search(r"static RNS::Destination g_rns_out_dest\{RNS::Type::NONE\};",
+                 rns), (
+    "the resolved destination must be cached at file scope across ticks"
+)
+assert sendpoll_code.index("g_rns_out_dest = RNS::Destination(") < \
+       sendpoll_code.index("g_rns_out_resolved = true;"), (
+    "the flag must be raised after the destination it promises exists"
+)
+# Two clear sites, and only two: the pickup that starts a message and the
+# retire that ends one. Anything else leaves a stale peer key attached to a new
+# address.
+clears = re.findall(r"(?<!bool )g_rns_out_resolved = false;", rns_code)
+assert len(clears) == 2, (
+    "g_rns_out_resolved is cleared when a message is picked up and when one is "
+    "retired, and nowhere else; found %d sites" % len(clears)
+)
+
+# 10i. The path is requested ONCE per message, and that request is the ONLY
+# thing that releases the recall latch. A path request is an outbound packet of
+# its own, so repeating it on every rung answers a quiet peer with traffic
+# instead of patience; there is no completion to wait for either —
+# request_path() returns void, this port has no await_path() and its announce
+# handlers explicitly skip path responses — so polling across ticks is the whole
+# mechanism and nothing here may block.
+assert rns_impl.count("request_path(") == 1, (
+    "exactly one request_path() site, behind the once-per-message latch"
+)
+ask = rns_code[rns_code.index("static void rns_send_ask_path") :
+               rns_code.index("static void rns_send_poll")]
+assert ask.index("g_rns_out_path_asked = true;") < ask.index("request_path("), (
+    "the latch must be set before the request, so a throw out of request_path "
+    "cannot leave it asking again on every rung"
+)
+# THE PAIRING. Releasing the recall latch here and nowhere else is what makes
+# the bound two rather than one or seven: the only event that can change what
+# recall() answers is a fresh announce for the destination, a path response IS
+# such an announce, and this call is the only way this node can ask for one. A
+# release anywhere else is a release not caused by anything.
+assert "g_rns_out_recalled = false;" in ask, (
+    "firing request_path() must release the recall latch: it is the only event "
+    "that can change the answer recall() gives"
+)
+releases = re.findall(r"(?<!bool )g_rns_out_recalled = false;", rns_code)
+assert len(releases) == 3, (
+    "g_rns_out_recalled is cleared in exactly three places — the pickup that "
+    "starts a message, the retire that ends one, and the path request that "
+    "makes a second recall worth paying for; found %d" % len(releases)
+)
+
+# 10j. The ladder is the tested pure function, not an inline comparison, and it
+# is bounded. GIVE_UP is the OUTCOME this commit exists to produce: it is what
+# converts a message that went nowhere into a failure with a reason.
+assert "rns_outbox_next(" in outbox_code and "rns_outbox_next(" in sendpoll_code, (
+    "the retry decision must be the pure function the host test drives"
+)
+assert "RNS_OUTBOX_GIVE_UP" in sendpoll_code and \
+       "RNS_OUTBOX_WAIT" in sendpoll_code, (
+    "both non-GO answers must be handled: WAIT returns, GIVE_UP fails the "
+    "message with a reason"
+)
+assert "(uint32_t)(now_ms - last_try_ms) >= RNS_OUTBOX_RETRY_MS" in outbox_code, (
+    "the throttle must compare by unsigned subtraction; `now >= last + "
+    "interval` goes permanently true for one rollover's worth of time"
+)
+assert "#define RNS_OUTBOX_ATTEMPTS_MAX" in outbox_code and \
+       "#define RNS_OUTBOX_RETRY_MS" in outbox_code, (
+    "both bounds of the ladder must be named constants"
+)
+# The attempt is stamped BEFORE the work, for the reason the announce stamps its
+# schedule first: a step that throws must back off to the throttle rather than
+# retry on every 20 ms tick.
+assert sendpoll_code.index("g_rns_out_tries++;") < \
+       sendpoll_code.index("RNS::Bytes hash;"), (
+    "the attempt must be counted before the work it pays for, or a throwing "
+    "step retries on every tick"
+)
+assert "catch (...)" in sendpoll_code, (
+    "assignHex, recall, the Destination constructor, pack()'s encryption and "
+    "Transport::outbound() are all reachable here; a throw must not escape the "
+    "skill tick"
+)
+
+# 10k. The encryption is MEASURED, the way the announce is. Sending does not
+# sign — there is no Ed25519 on this path — but it does encrypt, with a fresh
+# ephemeral X25519 keypair per packet and nothing cached between sends.
+assert "micros()" in sendpoll_code, (
+    "each send must be timed: it generates an ephemeral keypair and runs an "
+    "exchange on the loop task, and nobody has measured that on this board"
+)
+# The clock must start at the PACKET, not at the resolve: including recall()
+# would make the number a measurement of the path table instead.
+assert sendpoll_code.index("uint32_t t0 = micros();") > \
+       sendpoll_code.index("Identity::recall("), (
+    "the timed window must start after the resolve, or send_us_max measures "
+    "the path table rather than the encryption"
+)
+assert "Serial." not in sendpoll_code[
+    sendpoll_code.index("uint32_t t0 = micros();"):
+    sendpoll_code.index("micros() - t0")], (
+    "nothing may block on the UART inside the timed window, or send_us_max "
+    "becomes a measurement of the console at 115200 baud"
+)
+
+# 10l. THE SILENT FAILURE IS NOW VISIBLE, which is the requirement this whole
+# section serves. Every one of these answers a question no other key can.
+for key in ('"send_queued"', '"send_refused"', '"sent"', '"send_failed"',
+            '"send_error"', '"send_us_last"', '"send_us_max"'):
+    assert key in json_builder, (
+        "GET /rns/status must publish %s: a send to a peer we cannot resolve "
+        "vanishes without one, and a message nobody can see lost is a message "
+        "nobody can fix" % key
+    )
+# The failure must carry a REASON, not just a count — "it failed" and "there is
+# no path to that address" are different pieces of information and only the
+# second one tells anybody what to do.
+assert "g_rns_snap.send_error" in json_builder, (
+    "the last failure reason must come from the loop-side snapshot"
+)
+assert "g_rns_send_error" not in json_builder, (
+    "the handler must not read the reason at its source: the loop task rewrites "
+    "that array in place, and the snapshot is how every other such value is "
+    "served"
+)
+# A BUFFER, NOT A `const char *`. A pointer can only carry a literal chosen from
+# a fixed list, so a std::length_error out of pack(), a std::invalid_argument
+# and a std::bad_alloc all reach the operator as one indistinguishable sentence
+# — and e.what() would then exist only on a console nobody is watching. The
+# copy into the snapshot follows last_error's rule: one byte short, so a reader
+# crossing it can see mixed characters but never an unterminated array.
+assert re.search(r"^static char g_rns_send_error\[\d+\] = \{0\};", rns, re.M), (
+    "send_error must be a buffer the loop task formats into, or the text of an "
+    "exception cannot reach anybody without a serial cable"
+)
+assert "memcpy(g_rns_snap.send_error, g_rns_send_error,\n" \
+       "           sizeof(g_rns_snap.send_error) - 1);" in publish, (
+    "the reason must be copied into the snapshot one byte short of the end, "
+    "exactly like last_error"
+)
+# ...and it must name the DESTINATION. Four messages can be queued and the
+# ladder takes them one at a time, so a bare reason does not say which address
+# failed, and the message is gone by the time anybody polls.
+retire_raw = rns[rns.index("static void rns_send_retire") :
+                 rns.index("static void rns_send_ask_path")]
+assert 'snprintf(g_rns_send_error, sizeof(g_rns_send_error), "%s: %s",' in \
+       retire_raw, (
+    "the published reason must carry the destination it belonged to"
+)
+assert rns_code.count("snprintf(g_rns_send_error") == 1, (
+    "the reason is written in exactly one place, on the loop task"
+)
+# The exception text must reach it, not only Serial. `err` is the copy taken
+# inside the catch — e.what()'s storage dies with the handler.
+assert "rns_send_retire(false, err);" in sendpoll_code, (
+    "a throw must publish what it actually was: a fixed literal makes a "
+    "length_error, an invalid_argument and a bad_alloc the same event"
+)
+
+# 10l-bis. ONLY A SUCCESSFUL SEND IS TIMED, and this is not tidiness. When
+# Transport::outbound() returns false, Packet::receipt_send() emits ERROR("No
+# interfaces could process the outbound packet") and Log.cpp ends every emitted
+# line with a blocking Serial.flush() — INSIDE the t0..micros() window, from
+# within the library, where no source-text pin over this file can see it. Timing
+# the failure would publish a 115200-baud console flush as the cost of an X25519
+# exchange.
+assert "if (sent && dt > 0) {" in sendpoll_code, (
+    "send_us_last/max must be updated only when the send succeeded: the failing "
+    "branch has already blocked on a UART flush inside the measured window"
+)
+assert "g_rns_snap.send_queued = rns_outbox_depth(&g_rns_outbox);" in publish, (
+    "the queue depth is derived from two atomics the AsyncTCP task also writes, "
+    "so it is sampled on the loop task like everything else in the snapshot"
+)
+assert "rns_outbox_depth(&g_rns_outbox)" not in json_builder, (
+    "the depth must come from the snapshot, not be computed in the handler"
+)
+# Failing must be one operation: count it, record why, and release what the
+# message held. A failure that forgot to clear g_rns_out_busy would wedge the
+# queue behind a message that is already dead.
+retire = rns_code[rns_code.index("static void rns_send_retire") :
+                  rns_code.index("static void rns_send_ask_path")]
+for field in ("g_rns_out_busy = false;", "g_rns_out_resolved = false;",
+              "g_rns_out_path_asked = false;", "g_rns_out_recalled = false;",
+              "g_rns_out_dest = RNS::Destination("):
+    assert field in retire, (
+        "retiring a message must reset %s, or the queue stalls behind a message "
+        "that is already finished — or carries its state into the next one"
+        % field
+    )
+
+# 10m. The host test drives the real header, including the two cases a
+# hand-written test skips: the exact byte boundary and a separator inside the
+# text.
+outbox_test = (ROOT / "tools" / "test_rns_outbox.cpp").read_text(encoding="utf-8")
+for call in ("rns_envelope_build(", "rns_outbox_put(", "rns_outbox_take(",
+             "rns_outbox_next("):
+    assert call in outbox_test, (
+        "tools/test_rns_outbox.cpp must drive %s — the point of the pure header "
+        "is that the test runs the shipping code" % call
+    )
+assert "RNS_ENV_TOO_LONG" in outbox_test and "RNS_OUTBOX_PAYLOAD_MAX" in outbox_test, (
+    "the boundary must be exercised at the ceiling AND one byte over it: "
+    "nothing in the library checks it before spending the key exchange"
+)
+assert "split3(" in outbox_test, (
+    "the envelope must be read back the way the peer reads it — on its FIRST "
+    "THREE separators — or the rule that a '|' in the text is an ordinary "
+    "character is only a comment"
+)
+assert ".refused ==" in outbox_test, (
+    "the overflow policy is only a policy if the test pins the counter"
+)
+assert "0xFFFFFFFEu" in outbox_test and "0xFFFFFF00u" in outbox_test, (
+    "both unsigned wraps must be pinned: the ring's monotonic counters at 2^32 "
+    "and the retry throttle across the millis() rollover"
+)
+# put() must refuse a malformed address rather than trust its one caller: it
+# memcpys exactly RNS_OUTBOX_ADDR_HEX bytes out of that pointer, so a shorter
+# string is a read past its terminator. It is the only function in the header
+# that copies a fixed length from a caller's buffer.
+assert "if (!rns_addr_valid(to)) return false;" in put_body, (
+    "rns_outbox_put() must validate `to` itself — it copies a fixed 32 bytes "
+    "out of it, so trusting the caller here is a read overrun and not merely a "
+    "bad value"
+)
+assert 'rns_outbox_put(&bx, "6f796a51", env, len)' in outbox_test, (
+    "the short-address refusal must be exercised"
+)
+assert "(RNS_OUTBOX_ATTEMPTS_MAX - 1) * RNS_OUTBOX_RETRY_MS == 60000UL" in \
+       outbox_test, (
+    "the ladder's real bound must be pinned as arithmetic: the first attempt is "
+    "immediate and the last is not followed by a dwell, so it is 60 s and not "
+    "ATTEMPTS_MAX * RETRY_MS"
 )
 
 print("Task unblock policy tests: OK")

@@ -251,6 +251,7 @@
 #include "rns/annsched.h"
 #include "rns/hdlc.h"
 #include "rns/inbox.h"
+#include "rns/outbox.h"
 #include "rns/pktfilter.h"
 
 /* The two wire constants rns/pktfilter.h mirrors, checked against the library's
@@ -271,6 +272,17 @@ static_assert(RNS_PKT_CONTEXT_PATH_RESPONSE ==
  * arithmetic — RNS/Packet.py ENCRYPTED_MDU, microReticulum Type.h. */
 static_assert(RNS_INBOX_PAYLOAD_MAX == (size_t)RNS::Type::Packet::ENCRYPTED_MDU,
               "rns/inbox.h payload ceiling does not match RNS::Type::Packet");
+
+/* The same ceiling from the other direction, and here it is the one thing
+ * standing between a caller and wasted public-key time: NOTHING in the library
+ * checks the plaintext size before encrypting. Packet::pack() throws
+ * std::length_error on the PACKED size, which is after Destination::encrypt()
+ * has generated an ephemeral X25519 keypair and run the exchange — a tenth of a
+ * second of loop task spent to produce an exception. rns/outbox.h refuses an
+ * oversize message at the door instead, and it can only do that against the
+ * right number. */
+static_assert(RNS_OUTBOX_PAYLOAD_MAX == (size_t)RNS::Type::Packet::ENCRYPTED_MDU,
+              "rns/outbox.h payload ceiling does not match RNS::Type::Packet");
 
 /* ---- this node's own destination ----
  *
@@ -691,6 +703,129 @@ static void rns_data_callback(const RNS::Bytes &data, const RNS::Packet &packet)
     rns_inbox_put(&g_rns_inbox, data.data(), data.size());
 }
 
+/* ---- outbound state ----
+ *
+ * The mirror of the inbox, and it is not symmetric. Receiving hands a payload
+ * from one context of the loop task to another; sending hands a payload from
+ * ANOTHER TASK to the loop task, and then spends real time resolving where it
+ * goes before it can be encrypted.
+ *
+ * WHY THE SEND MAY NOT HAPPEN IN THE HTTP HANDLER. POST /rns/send answers on
+ * the AsyncTCP task. A send from there would call Identity::recall(), which
+ * walks Transport's path table, and Transport::outbound(), which spins on
+ * _jobs_running and then sets _jobs_locked — both of them structures the loop
+ * task mutates inside rns_stack.loop(). It would also pay for an X25519 key
+ * exchange on the socket task. So the handler validates, builds the envelope
+ * and enqueues; the loop task does everything else. rns/outbox.h holds the ring
+ * and the memory ordering that makes a two-task handoff safe.
+ *
+ * WHY A STATE MACHINE AND NOT A CALL. A send to a destination we have no path
+ * for DOES NOT FAIL — it goes nowhere, silently. Transport::outbound() looks
+ * the destination up in the path table, and with no entry it falls through to
+ * the broadcast branch and emits a HEADER_1 packet on every interface; the hub
+ * on the other end of our TCP socket has no reason to forward it and drops it
+ * without a word. receipt_send() still returns a receipt, because a receipt
+ * means "an interface accepted it" and one did. That is the single most
+ * important fact on this path and the reason this block exists at all: the
+ * resolve is not an optimisation before the send, it is the PRECONDITION for
+ * the send, and nothing below may call receipt_send() unless
+ * Transport::has_path() said yes AND Identity::recall() handed back a real
+ * identity.
+ *
+ * Neither of those can be waited for. Transport::request_path() returns void,
+ * this port has no await_path() and its announce handlers explicitly skip path
+ * responses, so there is no completion to hook. Polling has_path() across ticks
+ * is the whole mechanism — and a busy-wait would be worse than untidy, because
+ * the loop task is what drains the socket, so blocking here prevents the frame
+ * carrying the path response from ever being read. Hence: one small step per
+ * tick, request the path once, retry on a throttle, give up with a reason.
+ *
+ * WHY THE RESOLVED HANDLES ARE CACHED. Identity::recall() is expensive AND
+ * noisy on this node, for a reason specific to this port. The ordinary
+ * known-destinations store is a BasicFileStore whose init() sits behind
+ * transport_enabled, which is false here, so remember()/recall() through it
+ * always fail. What makes recall() work at all is the library's
+ * RNS_IDENTITY_ANNOUNCE_RECALL divergence: it digs the destination's last
+ * announce out of the path table, which means decoding a msgpack record,
+ * unpacking a Packet, and then calling remember() — which fails again and emits
+ * an ERRORF, and Log.cpp ends every emitted line with a blocking
+ * Serial.flush() on the calling task. So the Destination built from it is held
+ * for the send.
+ *
+ * CACHING THE SUCCESS IS NOT ENOUGH, and the first version of this file got
+ * that wrong. Holding the resolve behind g_rns_out_resolved bounds recall() to
+ * one call per message only when it SUCCEEDS: when has_path() is true and
+ * recall() returns NONE, every rung re-enters and pays for it again. That is
+ * reachable without anybody misbehaving — has_path() is
+ * Persistence::exists(), a key probe that never decodes, while recall()'s
+ * failure path is a full _new_path_table.get(), i.e. the msgpack decode and the
+ * Packet unpack — so a path entry whose stored announce will not reconstruct
+ * keeps the cheap probe true and buys seven expensive failures on the task that
+ * owns the socket drain.
+ *
+ * So a second latch, g_rns_out_recalled, bounds the ATTEMPTS rather than the
+ * successes. It is cleared by exactly one event: firing request_path(). That is
+ * deliberate and it is the reason the latch is not simply "once per message" —
+ * the answer recall() gives can only change when a fresh announce for that
+ * destination arrives, a path response IS such an announce, and asking for one
+ * is the only way this node can cause it. So the bound is TWO recalls per
+ * message: one that discovers the problem, and one after we have asked for the
+ * thing that would fix it. Never seven.
+ *
+ * ONE MESSAGE IN FLIGHT AT A TIME. The queue is not a pipeline: a message can
+ * occupy the ladder for a minute, so overlapping them would multiply the path
+ * requests without making anything arrive sooner. g_rns_out_busy is what says
+ * one is being worked on.
+ *
+ * An OUT destination is NOT registered with Transport — register_destination()
+ * takes the IN branch only (Transport.cpp) — so constructing one per message is
+ * safe and cannot collide with our own IN destination's hash. */
+static rns_outbox g_rns_outbox;
+/* The message being worked on, as fixed statics for the reason the inbox's
+ * are: the loop task's stack is shared with the drain and with
+ * Transport::inbound(). */
+static char g_rns_out_to[RNS_OUTBOX_ADDR_HEX + 1] = {0};
+static uint8_t g_rns_out_payload[RNS_OUTBOX_PAYLOAD_MAX];
+static uint16_t g_rns_out_len = 0;
+static bool g_rns_out_busy = false;         /* a message is on the ladder */
+static uint8_t g_rns_out_tries = 0;         /* attempts spent on it */
+static uint32_t g_rns_out_last_try_ms = 0;
+static bool g_rns_out_path_asked = false;   /* request_path() fired once */
+/* recall() has been ATTEMPTED since the last path request. Not "since the
+ * message started": see CACHING THE SUCCESS IS NOT ENOUGH above for why the
+ * clear is tied to request_path() and what the bound therefore is. */
+static bool g_rns_out_recalled = false;
+static bool g_rns_out_resolved = false;     /* g_rns_out_dest is usable */
+static RNS::Destination g_rns_out_dest{RNS::Type::NONE};
+/* Why the current message has not gone out yet. It becomes the published
+ * failure reason if the ladder runs out, which is what turns "it vanished" into
+ * something an operator can read. */
+static const char *g_rns_out_why = nullptr;
+
+/* Published counters. Written by the loop task, read by GET /rns/status: the
+ * same naturally-aligned single-copy-atomic arrangement g_rns_ann_us_last and
+ * friends already use. The queued depth and the failure reason go through the
+ * snapshot instead — the depth because it is derived from two atomics the
+ * AsyncTCP task also writes to, and the reason because it is a char array the
+ * loop task rewrites in place, exactly like g_rns_last_error. */
+static uint32_t g_rns_sent = 0;          /* an interface accepted the packet */
+static uint32_t g_rns_send_failed = 0;   /* messages given up on, with a reason */
+static uint32_t g_rns_send_us_last = 0;
+static uint32_t g_rns_send_us_max = 0;
+/* The LAST failure, kept after the message it belonged to is gone.
+ *
+ * A BUFFER AND NOT A `const char *`, and the difference is the whole value of
+ * the field. A pointer can only ever hold a literal chosen from a fixed list,
+ * so a std::length_error out of pack(), a std::invalid_argument and a
+ * std::bad_alloc all arrive at the operator as one indistinguishable sentence —
+ * on a board whose console nobody is watching, which is the only place e.what()
+ * would otherwise go. It also carries the DESTINATION, because several messages
+ * can be queued and "a send failed" does not say which one.
+ *
+ * Written only by the loop task, in one place (rns_send_retire), and read only
+ * through the snapshot. Empty until something has actually failed. */
+static char g_rns_send_error[96] = {0};
+
 /* ---- announce state ----
  *
  * The schedule itself is rns_announce_due() in rns/annsched.h — pure, host
@@ -757,11 +892,22 @@ struct RnsStatusSnap {
      * — they are copied here anyway so that "the status handler reads the
      * snapshot" stays a rule with no exceptions worth arguing about. */
     uint32_t ann_dropped, ann_kept;
+    /* Outbound queue depth. It is derived from two std::atomic counters, one of
+     * which the AsyncTCP task writes, so it is sampled on the loop task like
+     * everything else here rather than computed inside the handler. */
+    uint32_t send_queued;
+    /* Why the last message was given up on, empty if none ever was. A char
+     * array the loop task rewrites in place, so it is copied here under the
+     * same rule as last_error below: the copy stops one byte short and that
+     * last byte is never written after this initialiser, so a reader crossing
+     * the copy can see mixed characters but never an unterminated array. */
+    char send_error[96];
     uint16_t port;
     char host[RNS_TCP_HOST_MAX];
     char last_error[64];
 };
 static RnsStatusSnap g_rns_snap = {"off", false, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                                   0, {0},
                                    RNS_TCP_PORT_DEFAULT, {0}, {0}};
 
 /* ---- configuration ---- */
@@ -1275,6 +1421,14 @@ static void rns_status_publish() {
     g_rns_snap.ann_dropped = g_rns_ann_dropped;
     g_rns_snap.ann_kept = g_rns_ann_kept;
 
+    /* Outbound queue: how many messages are waiting, and why the last one that
+     * did not make it did not make it. Both published here for the same reason
+     * as everything above — the depth reads two atomics the AsyncTCP task also
+     * writes, and the reason pointer is reassigned by this task. */
+    g_rns_snap.send_queued = rns_outbox_depth(&g_rns_outbox);
+    memcpy(g_rns_snap.send_error, g_rns_send_error,
+           sizeof(g_rns_snap.send_error) - 1);
+
     g_rns_snap.port = g_rns_port;
     memcpy(g_rns_snap.host, g_rns_host, sizeof(g_rns_snap.host) - 1);
     memcpy(g_rns_snap.last_error, g_rns_last_error,
@@ -1441,6 +1595,52 @@ static void rns_status_json(JsonDocument &doc) {
     doc["data_cards"] = (unsigned long)g_rns_cards;
     doc["data_card_cut"] = (unsigned long)g_rns_card_cut;
 
+    /* THE SEND PATH MADE VISIBLE, and this is the reason the keys exist rather
+     * than a habit of publishing counters. A send to a peer this node cannot
+     * resolve DOES NOT FAIL: Transport::outbound() takes the broadcast branch
+     * with no path in the table, the packet is emitted as HEADER_1, the hub
+     * drops it, and receipt_send() still hands back a receipt because an
+     * interface did accept it. Nothing anywhere says the message went nowhere.
+     * These six keys are what converts that silence into something a user can
+     * read:
+     *   send_queued      messages waiting for the loop task. Non-zero for a
+     *                    minute at a time is normal while a path is resolved.
+     *   send_refused     POSTs the ring had no room for. The caller was told
+     *                    synchronously as well, so this is a rate signal.
+     *   sent             packets an interface accepted. NOT deliveries — a
+     *                    receipt proves only that much (see rns_send_poll).
+     *   send_failed      messages given up on after the whole retry ladder.
+     *   send_error       which destination was given up on and why, as a
+     *                    sentence — including the text of an exception when one
+     *                    was thrown, because on a board with nothing attached
+     *                    the console is not a place a reason can go.
+     *   send_us_last/max microseconds a SUCCESSFUL send spent. Sending does not
+     *                    sign — no Ed25519 — but it DOES encrypt, and this port
+     *                    caches nothing between packets: every send generates a
+     *                    fresh ephemeral X25519 keypair, runs the exchange,
+     *                    derives with HKDF and builds a token. Read these
+     *                    against announce_us_max and iface.drain_us_max.
+     *                    ONLY successful sends are timed, and that is not
+     *                    tidiness: when Transport::outbound() returns false,
+     *                    Packet::receipt_send() emits ERROR("No interfaces
+     *                    could process the outbound packet") and Log.cpp ends
+     *                    every emitted line with a blocking Serial.flush() —
+     *                    inside the window. Timing the failure would publish a
+     *                    115200-baud console flush as the cost of encryption.
+     * send_queued and send_error come from the loop-side snapshot; sent,
+     * send_failed and the two timings are naturally aligned scalars written by
+     * the loop task, exactly like announce_us_last. send_refused is the one
+     * counter this handler may read at its source, because THIS task is the one
+     * that writes it — rns_outbox_put() runs in POST /rns/send. */
+    doc["send_queued"] = (unsigned long)g_rns_snap.send_queued;
+    doc["send_refused"] = (unsigned long)g_rns_outbox.refused;
+    doc["sent"] = (unsigned long)g_rns_sent;
+    doc["send_failed"] = (unsigned long)g_rns_send_failed;
+    doc["send_error"] = g_rns_snap.send_error[0] ? g_rns_snap.send_error
+                                                 : (const char *)nullptr;
+    doc["send_us_last"] = (unsigned long)g_rns_send_us_last;
+    doc["send_us_max"] = (unsigned long)g_rns_send_us_max;
+
     doc["transport"] = RNS::Reticulum::transport_enabled();
     doc["interfaces"] = (unsigned long)g_rns_snap.interfaces;
     /* The number that proves the peer's announces landed: it stays 0 until a
@@ -1529,6 +1729,7 @@ static void rns_status_json(JsonDocument &doc) {
 static const SkillEndpoint rns_endpoints[] = {
     {"GET", "/rns/status", "Reticulum stack, identity, destination address, TCP interface and counters"},
     {"POST", "/rns/config", "Set TCP interface {host, port, enabled}"},
+    {"POST", "/rns/send", "Send one text to a peer: {to, session, text}"},
     {NULL, NULL, NULL}
 };
 
@@ -1607,10 +1808,39 @@ static const char *rns_describe() {
            "`mem.alloc_count` and `mem.free_count` are expected to read 0: the\n"
            "build uses the library's heap allocator, which leaves the global\n"
            "`operator new` — and therefore the counters — alone.\n"
+           "The node also SENDS. `POST /rns/send` takes\n"
+           "`{to, session, text}` and answers `accepted` without waiting: the\n"
+           "handler runs on the AsyncTCP task, which may not touch Transport,\n"
+           "so it validates, builds the envelope, queues it and returns. The\n"
+           "loop task does the rest and the outcome is read from\n"
+           "`GET /rns/status`, exactly as `POST /rns/config` already works.\n"
+           "The wire format is agreed with the peer and is\n"
+           "`1|<32 hex sender address>|<session>|<text>` — parsed by its FIRST\n"
+           "THREE separators, so a `|` inside the text is an ordinary\n"
+           "character. The sender address is this node's `address`, which is\n"
+           "what lets the peer answer a packet that carries no source. The\n"
+           "session name is `[A-Za-z0-9._-]`, at most 23 bytes, and may be\n"
+           "empty (the peer then routes to its newest session). The envelope\n"
+           "costs 36 bytes plus the session, so the text budget is\n"
+           "`347 - len(session)` and anything longer is refused with a reason\n"
+           "rather than encrypted first and thrown out afterwards.\n"
+           "A SEND TO A PEER WE CANNOT RESOLVE DOES NOT FAIL ON ITS OWN: with\n"
+           "no path in the table `Transport::outbound()` broadcasts a HEADER_1\n"
+           "packet the hub drops in silence, and the receipt still says an\n"
+           "interface accepted it. So the loop task refuses to send until\n"
+           "`Transport::has_path()` and `Identity::recall()` both answer, asks\n"
+           "for the path once, retries about every 10 s up to 7 times and then\n"
+           "gives up with a reason. `send_queued`, `send_refused`, `sent`,\n"
+           "`send_failed`, `send_error`, `send_us_last` and `send_us_max` in\n"
+           "`/rns/status` are that path made visible. Sending signs nothing,\n"
+           "but it encrypts with a fresh ephemeral X25519 keypair per packet\n"
+           "and nothing is cached between sends — the two timings are what\n"
+           "that costs on this chip.\n"
            "If bring-up fails the endpoint stays up and answers `ready:false`\n"
            "with a reason.\n\n"
            "| GET | /rns/status |\n"
-           "| POST | /rns/config |\n";
+           "| POST | /rns/config |\n"
+           "| POST | /rns/send |\n";
 }
 
 static void rns_register_routes(AsyncWebServer &server) {
@@ -1701,6 +1931,87 @@ static void rns_register_routes(AsyncWebServer &server) {
         resp["host"] = cfg["host"].as<String>();
         resp["port"] = cfg["port"].as<long>();
         resp["enabled"] = cfg["enabled"].as<bool>();
+        notify_send_json(req, 200, resp);
+    }, NULL, handle_body_collect);
+
+    /* POST /rns/send — put one text on a peer's screen.
+     *
+     * THIS HANDLER MAY NOT SEND, and that is the whole shape of it. It runs on
+     * the AsyncTCP task; a send from here would reach Identity::recall() and
+     * Transport::outbound(), which walk and lock structures the loop task
+     * mutates inside rns_stack.loop(), and would pay for an X25519 key exchange
+     * on the socket task while it was at it. So it does the three things that
+     * are safe from any task — validate, build, enqueue — and returns.
+     *
+     * IT ANSWERS PROMPTLY WITH "accepted", NOT WITH AN OUTCOME. Resolving a
+     * path can take a minute (see rns_send_poll), and holding an HTTP request
+     * open for that is both a stalled AsyncTCP slot and a lie about what was
+     * proven. The outcome is polled from GET /rns/status, exactly as POST
+     * /rns/config already documents for the endpoint change.
+     *
+     * WHAT IS STILL ANSWERED SYNCHRONOUSLY is every refusal the caller can fix:
+     * a `to` that is not 32 hex characters, a session name outside the agreed
+     * charset, an empty text, a text over the budget, and a full queue. Those
+     * are decided here precisely so the user learns about them from the request
+     * that made them rather than from a counter.
+     *
+     * The values are read as const char* out of the parsed document rather than
+     * as String: they are pointers into storage the document already owns, so
+     * nothing on this path allocates beyond the parse itself, and nothing on it
+     * logs. */
+    server.on(AsyncURIMatcher::exact("/rns/send"), HTTP_POST,
+              [](AsyncWebServerRequest *req) {
+        if (!require_auth(req)) return;
+        char *body = notify_take_body(req);
+        if (!body || !body[0]) {
+            free(body);
+            notify_send_error(req, 400, "body required");
+            return;
+        }
+        JsonDocument input;
+        DeserializationError err = deserializeJson(input, body);
+        free(body);
+        if (err) {
+            notify_send_error(req, 400, "bad json");
+            return;
+        }
+
+        const char *to = input["to"] | "";
+        const char *session = input["session"] | "";
+        const char *text = input["text"] | "";
+
+        /* The envelope carries THIS node's address so the peer can answer, and
+         * without it there is nothing worth sending: a packet to a SINGLE
+         * destination has no source field, so a message from an unaddressed
+         * node is one the recipient can read and never reply to. */
+        if (!rns_dest_ok || !rns_addr_valid(rns_dest_addr)) {
+            notify_send_error(req, 503, "this node has no address yet");
+            return;
+        }
+        if (!rns_addr_valid(to)) {
+            notify_send_error(req, 400, "to must be 32 hex characters");
+            return;
+        }
+
+        uint8_t env[RNS_OUTBOX_PAYLOAD_MAX];
+        uint16_t len = 0;
+        rns_env_result r = rns_envelope_build(rns_dest_addr, session, text,
+                                              env, sizeof(env), &len);
+        if (r != RNS_ENV_OK) {
+            notify_send_error(req, 400, rns_env_reason(r));
+            return;
+        }
+        if (!rns_outbox_put(&g_rns_outbox, to, env, len)) {
+            notify_send_error(req, 503, "outbox full");
+            return;
+        }
+
+        JsonDocument resp;
+        resp["ok"] = true;
+        resp["accepted"] = true;
+        resp["to"] = to;
+        resp["bytes"] = len;
+        resp["queued"] = (unsigned long)rns_outbox_depth(&g_rns_outbox);
         notify_send_json(req, 200, resp);
     }, NULL, handle_body_collect);
 }
@@ -1830,6 +2141,19 @@ static void rns_announce_poll() {
  * are counters; /events does not. Anyone diagnosing this reaches for data_rx and
  * data_dropped, not the ring.
  *
+ * THE RECEIVE PATH KNOWS NOTHING ABOUT THE ENVELOPE, and as of the commit that
+ * added POST /rns/send that is an asymmetry rather than a simple omission. This
+ * function sanitises the whole payload into the card exactly as it arrives, so
+ * when the peer ANSWERS in the agreed format the card reads
+ * "1|<32 hex>|<session>|<text>" with the framing visible on screen. That is
+ * ugly and it is deliberately not fixed here: splitting inbound payloads means
+ * deciding what to do with a payload that is not an envelope at all (every
+ * sender that predates the format, including tools/rns-send), where the sender
+ * address should be shown, and whether the session belongs on the card — none
+ * of which is a send-side question. rns/outbox.h holds the format; a future
+ * commit that teaches this side to read it should take the builder's rules from
+ * there rather than write a second parser.
+ *
  * THE CARD CANNOT HOLD THE WHOLE MESSAGE, and the cut is sized against WHAT THE
  * SCREEN PAINTS rather than against what notify can store. Those are different
  * numbers and using the wrong one is how the previous revision made a marker
@@ -1942,6 +2266,269 @@ static void rns_inbox_poll() {
     }
 }
 
+/* Retire the message on the ladder, successfully or not, and free what it held.
+ *
+ * The Destination is released explicitly rather than left to be overwritten by
+ * the next message: it holds a shared_ptr to an Object carrying the peer's
+ * public key, and a message that fails at 3 a.m. should not keep one alive
+ * until the next send happens. */
+static void rns_send_retire(bool ok, const char *why) {
+    if (ok) {
+        g_rns_sent++;
+    } else {
+        g_rns_send_failed++;
+        /* WITH THE ADDRESS IN FRONT. Four messages can be queued and the ladder
+         * takes them one at a time, so "no path to the destination" on its own
+         * does not say WHICH destination, and the message it belonged to is
+         * gone by the time anybody polls. */
+        snprintf(g_rns_send_error, sizeof(g_rns_send_error), "%s: %s",
+                 g_rns_out_to[0] ? g_rns_out_to : "-",
+                 why ? why : "send failed");
+    }
+    g_rns_out_busy = false;
+    g_rns_out_resolved = false;
+    g_rns_out_path_asked = false;
+    g_rns_out_recalled = false;
+    g_rns_out_tries = 0;
+    g_rns_out_len = 0;
+    g_rns_out_why = nullptr;
+    g_rns_out_dest = RNS::Destination(RNS::Type::NONE);
+}
+
+/* Ask the network where this destination is, ONCE per message.
+ *
+ * A path request is an outbound packet of its own, so repeating it on every
+ * rung would answer a quiet peer with traffic instead of patience. There is
+ * nothing to wait on either: request_path() returns void, this port has no
+ * await_path(), and its announce handlers explicitly skip path responses.
+ *
+ * IT ALSO CLEARS THE RECALL LATCH, and that pairing is the whole reason this is
+ * a function rather than three lines inline. The only event that can change
+ * what Identity::recall() answers is a fresh announce for the destination, a
+ * path response IS such an announce, and this call is the only way this node
+ * can ask for one. So the latch is released exactly here and nowhere else: the
+ * message gets a second, informed recall after the request, and never a third.
+ * The flag is set before the call so a throw out of request_path() cannot leave
+ * it asking again on every rung. */
+static void rns_send_ask_path(const RNS::Bytes &hash) {
+    if (g_rns_out_path_asked) return;
+    g_rns_out_path_asked = true;
+    g_rns_out_recalled = false;
+    RNS::Transport::request_path(hash);
+}
+
+/* Move the outbound message one step, and no further than one step.
+ *
+ * Loop task only, and deliberately AFTER rns_stack.loop() — the same ordering
+ * rns_announce_poll() and rns_inbox_poll() document, for a sharper reason here.
+ * The path response this function is waiting for arrives through the socket
+ * drain that runs INSIDE rns_stack.loop(), so a step taken before it is a step
+ * taken against last tick's path table: every message would spend one extra
+ * RNS_TICK_MS on each rung of the ladder for nothing.
+ *
+ * THE ORDER IS RESOLVE, THEN SEND, AND IT IS NOT NEGOTIABLE. Without a path in
+ * the table Transport::outbound() falls through to the broadcast branch, emits
+ * a HEADER_1 packet on every interface, and the hub on the other end of our TCP
+ * socket drops it without a word. receipt_send() returns a receipt all the same
+ * — a receipt means "an interface accepted it", never "it was delivered" — so
+ * the send reports success and the message is simply gone. Every guard below
+ * exists to make that outcome unreachable: nothing calls receipt_send() unless
+ * Transport::has_path() has said yes AND Identity::recall() has handed back a
+ * usable identity.
+ *
+ * NOTHING HERE BLOCKS. request_path() returns void, this port has no
+ * await_path() and no path-response callback, so polling across ticks is the
+ * only mechanism there is — and blocking would be self-defeating, because this
+ * task is the one that drains the socket the response has to arrive through.
+ * The ladder itself is rns_outbox_next() in rns/outbox.h, host tested.
+ *
+ * ONE recall() PER MESSAGE. See the outbound state block for why it is
+ * expensive here: it reconstructs the identity from the announce in the path
+ * table and then calls remember(), which fails against a store that was never
+ * initialised and emits an ERRORF — and every emitted line ends in a blocking
+ * Serial.flush() on this task. So the Destination it produces is cached in
+ * g_rns_out_dest and g_rns_out_resolved, and a retry after a successful resolve
+ * does not pay for it again.
+ *
+ * The whole attempt is wrapped for the reason rns_announce_poll()'s is:
+ * assignHex, recall, the Destination constructor, pack()'s encryption and
+ * Transport::outbound() are all reachable from here and a throw out of any of
+ * them would otherwise escape the skill tick into loop(). */
+static void rns_send_poll() {
+    /* No rns_started guard: skill_rns_poll() is the only caller and it has
+     * already returned on an unstarted stack. A second copy here would read as
+     * a condition somebody had thought about rather than a line nothing can
+     * reach.
+     *
+     * Pick the next message up. Only one is worked on at a time: a message can
+     * hold the ladder for a minute, and overlapping them would multiply path
+     * requests without making anything arrive sooner. */
+    if (!g_rns_out_busy) {
+        if (!rns_outbox_take(&g_rns_outbox, g_rns_out_to, sizeof(g_rns_out_to),
+                             g_rns_out_payload, sizeof(g_rns_out_payload),
+                             &g_rns_out_len))
+            return;
+        g_rns_out_busy = true;
+        g_rns_out_tries = 0;
+        g_rns_out_last_try_ms = millis();
+        g_rns_out_path_asked = false;
+        g_rns_out_recalled = false;
+        g_rns_out_resolved = false;
+        /* NOT a placeholder like "queued": nothing can read this before the
+         * first attempt has run and set a real one, and a string that can never
+         * be published is a string that will one day be published by accident.
+         * rns_send_retire() has the fallback for the impossible case. */
+        g_rns_out_why = nullptr;
+    }
+
+    uint32_t now = millis();
+    rns_outbox_action act = rns_outbox_next(now, g_rns_out_last_try_ms,
+                                            g_rns_out_tries);
+    if (act == RNS_OUTBOX_WAIT) return;
+    if (act == RNS_OUTBOX_GIVE_UP) {
+        /* The reason is the one the last attempt left, so "gave up" always says
+         * WHAT it gave up on: a path that never arrived, an identity the path
+         * table could not reconstruct, or an interface that took nothing. */
+        Serial.printf("[rns] send to %s gave up: %s\n", g_rns_out_to,
+                      g_rns_out_why ? g_rns_out_why : "unknown");
+        event_add("rns send failed: %s",
+                  g_rns_out_why ? g_rns_out_why : "unknown");
+        rns_send_retire(false, g_rns_out_why);
+        return;
+    }
+
+    /* An attempt is spent whether it reaches the send or stops at the resolve.
+     * Stamped BEFORE the work for the reason the announce stamps its schedule
+     * first: a step that throws must back off to the throttle rather than
+     * retry on every 20 ms tick. */
+    g_rns_out_tries++;
+    g_rns_out_last_try_ms = now;
+
+    bool sent = false;
+    bool failed = false;
+    uint32_t dt = 0;
+    char err[64];
+
+    try {
+        RNS::Bytes hash;
+        hash.assignHex(g_rns_out_to);
+
+        /* EVERY ATTEMPT, NOT ONLY THE UNRESOLVED ONES. This used to live inside
+         * the resolve block, which made the invariant this file states — that
+         * nothing sends unless has_path() has said yes — true once per message
+         * rather than once per send: a rung whose send took no receipt re-entered
+         * at the packet build with a path that could since have gone, and the
+         * next packet would have been broadcast into silence. Nothing culls the
+         * path table in this port today and the per-entry TTL is a week, so this
+         * is not reachable now; a guard that is only correct because of a
+         * setting two layers down is not a guard. It costs a
+         * Persistence::exists() — a key probe, no decode — per rung. */
+        if (!RNS::Transport::has_path(hash)) {
+            g_rns_out_why = "no path to the destination";
+            rns_send_ask_path(hash);
+            return;
+        }
+
+        if (!g_rns_out_resolved) {
+            RNS::Identity peer{RNS::Type::NONE};
+            /* THE LATCH BOUNDS THE ATTEMPTS, NOT THE SUCCESSES. g_rns_out_
+             * resolved alone would only stop a SUCCESSFUL recall from repeating;
+             * a failing one re-enters on every rung, and its failure path is the
+             * expensive one — _new_path_table.get(), so a msgpack decode and a
+             * Packet unpack, where has_path() above was a bare exists(). See
+             * CACHING THE SUCCESS IS NOT ENOUGH in the outbound state block.
+             * Set before the call, so a throw cannot leave it clear. */
+            if (g_rns_out_recalled) {
+                g_rns_out_why = "no identity for the destination";
+            } else {
+                g_rns_out_recalled = true;
+                peer = RNS::Identity::recall(hash);
+                if (!peer) {
+                    /* A path with no recoverable announce behind it. Worth its
+                     * own reason: it is a different fault from "never heard of
+                     * it" and points at the path table rather than at the
+                     * network. */
+                    g_rns_out_why = "no identity for the destination";
+                }
+            }
+            if (!peer) {
+                rns_send_ask_path(hash);
+                return;
+            }
+            /* OUT destinations are not registered with Transport (the IN branch
+             * is the only one that inserts), so this cannot collide with our
+             * own destination and needs no deregistration. */
+            g_rns_out_dest = RNS::Destination(peer, RNS::Type::Destination::OUT,
+                                              RNS::Type::Destination::SINGLE,
+                                              hash);
+            g_rns_out_resolved = true;
+        }
+
+        /* A FRESH Packet PER ATTEMPT: receipt_send() throws std::logic_error on
+         * a Packet that has already been sent, so a retry may never reuse one.
+         *
+         * The clock starts here and not above on purpose. What is being
+         * measured is the ENCRYPTION — pack() calls Destination::encrypt(),
+         * which generates an ephemeral X25519 keypair, runs the exchange,
+         * derives with HKDF and builds a token, with nothing cached between
+         * packets because this port has no ratchets. Including recall() would
+         * make the number a measurement of the path table instead, and
+         * including the Serial.printf below would make it a measurement of the
+         * console at 115200 baud — which is why the reporting is outside the
+         * window, exactly as in rns_announce_poll(). */
+        RNS::Bytes payload(g_rns_out_payload, g_rns_out_len);
+        uint32_t t0 = micros();
+        RNS::Packet pkt(g_rns_out_dest, payload);
+        RNS::PacketReceipt receipt = pkt.receipt_send();
+        dt = (uint32_t)(micros() - t0);
+        sent = (bool)receipt;
+        if (!sent) g_rns_out_why = "no interface accepted the packet";
+    } catch (const std::exception &e) {
+        failed = true;
+        snprintf(err, sizeof(err), "%s", e.what());
+    } catch (...) {
+        failed = true;
+        snprintf(err, sizeof(err), "unknown exception");
+    }
+
+    /* ONLY A SUCCESSFUL SEND IS TIMED. The window closes after receipt_send(),
+     * and on the failing branch that call has already emitted ERROR("No
+     * interfaces could process the outbound packet") — Packet.cpp — whose
+     * Log.cpp line ends in a blocking Serial.flush() on this task. Publishing
+     * that as send_us_last would make a number documented as the cost of an
+     * X25519 exchange into a measurement of the console at 115200 baud, and no
+     * source-text pin can see it because the flush is inside the library. */
+    if (sent && dt > 0) {
+        g_rns_send_us_last = dt;
+        if (dt > g_rns_send_us_max) g_rns_send_us_max = dt;
+    }
+    if (failed) {
+        /* A throw is not retried: assignHex, the Destination constructor and
+         * pack() fail for reasons that do not improve with time, and the
+         * message would otherwise burn the whole ladder to reach the same
+         * exception seven times. The text is copied inside the catch and used
+         * here for the reason rns_announce_poll() explains — e.what()'s storage
+         * dies with the handler.
+         *
+         * IT GOES INTO send_error, not only onto the console. A
+         * std::length_error out of pack(), a std::invalid_argument and a
+         * std::bad_alloc are three different faults with three different fixes,
+         * and a fixed literal makes them one sentence for anybody who is not
+         * holding a serial cable. */
+        Serial.printf("[rns] send to %s threw: %s\n", g_rns_out_to, err);
+        event_add("rns send to %s threw: %s", g_rns_out_to, err);
+        rns_send_retire(false, err);
+        return;
+    }
+    if (sent) {
+        event_add("rns sent %u B to %s in %luus", (unsigned)g_rns_out_len,
+                  g_rns_out_to, (unsigned long)dt);
+        rns_send_retire(true, nullptr);
+    }
+    /* Not sent and not thrown: no interface took it, which is ordinarily the
+     * link being down. Left on the ladder to be retried on the throttle. */
+}
+
 /* The tick Reticulum finally gets. Gated on rns_started because
  * Reticulum::loop() opens with assert(_object) — a no-op under NDEBUG, so an
  * unstarted stack would dereference null rather than trip the assert. */
@@ -1956,6 +2543,11 @@ static void skill_rns_poll() {
     /* After rns_stack.loop(), never before it: the drain that fills the inbox
      * runs inside that call, so a pickup ahead of it is one tick stale. */
     rns_inbox_poll();
+    /* Also after the stack, and for a sharper version of the same reason: the
+     * path response the send is waiting for arrives through the drain inside
+     * rns_stack.loop(), so a step taken ahead of it reads last tick's path
+     * table and every rung of the ladder costs an extra RNS_TICK_MS. */
+    rns_send_poll();
     /* Loop task, right after the stack has run: everything GET /rns/status is
      * not allowed to read live is republished here. */
     rns_status_publish();
@@ -1972,6 +2564,13 @@ static const Skill rns_skill = {
 
 static void skill_rns_init() {
     if (rns_started) return;             /* one bring-up per boot */
+
+    /* Explicit, unlike the inbox's. That one is a plain struct in .bss and
+     * static zero-initialisation is the whole story; this one holds two
+     * std::atomic counters whose default constructor is trivial before C++20,
+     * so "it is a static, therefore it is zero" is an argument about the
+     * linker rather than about the type. Stating it costs one memset at boot. */
+    rns_outbox_init(&g_rns_outbox);
 
     try {
         /* The adapter's init() calls SPIFFS.begin(true, "") — formatOnFail with
