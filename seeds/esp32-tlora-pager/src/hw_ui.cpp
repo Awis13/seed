@@ -476,7 +476,7 @@ static const uint8_t *font_glyph(uint32_t cp) {
     // En/em dash → ASCII -
     if (cp == 0x2013 || cp == 0x2014 || cp == 0x2212)
         return &FONT5X7[('-' - 0x20) * 5];
-    // Middle dot · (chat headers "GROK · s123") → ASCII .
+    // Middle dot · (chat headers "CLAUDE · s123") → ASCII .
     if (cp == 0x00B7)
         return &FONT5X7[('.' - 0x20) * 5];
     // Non-breaking space → space
@@ -1167,12 +1167,12 @@ static const char *const LAYOUT_ITEMS[LAYOUT_N] = {
 };
 
 // Agents list (same geometry language as menu).
-static const int AGENTS_LIST_N = 6;
+static const int AGENTS_LIST_N = 3;
 static const int AGENTS_ROW0_Y = 42;
 static const int AGENTS_ROW_H = 30;
 static const int AGENTS_BAR_H = 25;
 static const char *const AGENTS_LIST_ITEMS[AGENTS_LIST_N] = {
-    "GROK", "CLAUDE", "HERMES", "OPENCODE", "CODEX", "BACK"
+    "CLAUDE", "HERMES", "BACK"
 };
 
 // Card action sheet (after click/Enter on a notification).

@@ -1,10 +1,10 @@
 /*
- * skills/agents.cpp — pocket chat with remote agents (Grok / Claude / Hermes)
+ * skills/agents.cpp — pocket chat with remote agents (Claude / Hermes)
  *
  * Pager is the thin terminal. A bridge on the LAN does the real work:
  *   POST {bridge}/v1/chat  { "agent","session","text" }
  * Answers come back as ordinary /notify
- * (source=grok|claude|hermes|opencode|codex) or, when
+ * (source=claude|hermes) or, when
  * the bridge is missing, as a local stub line in the thread.
  *
  * SPIFFS:
@@ -45,7 +45,7 @@
 #include "../agents_chat_route.h"  // chat-route seam: claude_route_incoming + pure planner
 #include "../rns/outbox.h"         // the OTHER half of that seam: rns_send_envelope + rns_peer_addr
 
-#define AGENTS_N            5
+#define AGENTS_N            2
 #define AGENT_ID_LEN        12
 #define AGENT_NAME_LEN      16
 /* One chat line / viewport cell. 512 stays: bridge + mesh multi-part chunks. */
@@ -84,7 +84,7 @@ struct AgentLine {
 };
 
 struct AgentSlot {
-    const char *id;     // "grok" / "claude" / "hermes" / "opencode" / "codex"
+    const char *id;     // "claude" / "hermes"
     const char *name;   // UI label
     char sessions[AGENT_SESSIONS_MAX][AGENT_SESSION_LEN];
     uint8_t n_sessions;
@@ -103,11 +103,8 @@ struct AgentSlot {
 };
 
 static AgentSlot g_agents[AGENTS_N] = {
-    { "grok",     "GROK",     {}, 0, 0, {}, 0, 0, 0, 0, {} },
     { "claude",   "CLAUDE",   {}, 0, 0, {}, 0, 0, 0, 0, {} },
     { "hermes",   "HERMES",   {}, 0, 0, {}, 0, 0, 0, 0, {} },
-    { "opencode", "OPENCODE", {}, 0, 0, {}, 0, 0, 0, 0, {} },
-    { "codex",    "CODEX",    {}, 0, 0, {}, 0, 0, 0, 0, {} },
 };
 
 static char g_bridge[AGENT_BRIDGE_LEN] = "";
@@ -206,7 +203,7 @@ static bool agents_store_ready() { return g_store != nullptr; }
  * sanitised to [A-Za-z0-9._-]. */
 static String agents_log_path(const char *agent_id, const char *session) {
     /* SPIFFS object-name limit is 32 bytes (31 usable incl. NUL). A suffix of
-     * ".jsonl" pushed the opencode agent's path past it — file never created,
+     * ".jsonl" can push a long agent-id path past it — file never created,
      * empty thread, black chat screen. Drop the extension; content stays JSONL. */
     return String("/") + AGENT_LOG_PREFIX + "." + agent_id + "." + session;
 }
@@ -1060,9 +1057,10 @@ void agents_gps_pending(const char *agent_id) {
  * WHY `claude` AND NOT EVERY AGENT. The room this closes the loop for is the
  * one whose INBOUND half already works: claude_route_incoming() above lands a
  * peer's envelope in a `claude` room by session name, and this is the reply
- * path for exactly that. Codex and OpenCode own their mesh inboxes and Hermes
- * has its own chat door; giving them an RNS uplink as well would be a second,
- * ambiguous consumer — the same reason the legacy bridge is skipped for them.
+ * path for exactly that. `hermes`, the only other agent left in the registry,
+ * has its own chat door and no inbound RNS half at all; giving it an RNS uplink
+ * would be a second, ambiguous consumer answering into a room the peer never
+ * routes back to.
  *
  * THE SESSION FIELD IS THE ROOM'S OWN NAME, which is the whole reason this is
  * not just "send some text": the peer routes its answer back by that name, so a
@@ -1107,10 +1105,10 @@ static bool agents_rns_uplink(const char *agent_id, const char *session,
 
 /* Public: send a line as the user, into the agent's ACTIVE session.
  * Path: local thread/history → owned transport. `claude` goes over Reticulum
- * (see agents_rns_uplink) and falls back to the bridge/mesh only when RNS
- * cannot take it, saying so in the room. OpenCode and Codex have dedicated
- * gateway inboxes and always use C1; the legacy /v1/chat bridge would create a
- * second, ambiguous consumer while WiFi is up.
+ * (see agents_rns_uplink) and falls back only when RNS cannot take it, saying
+ * so in the room. Every other agent — `hermes` is the only one left — keeps the
+ * plain ladder: the WiFi /v1/chat bridge when it is reachable, then the
+ * MeshCore C1 DM when the bridge is down/absent.
  * Downlink reply uses the same transport (or WiFi /agents/inbound). One chat
  * loop. */
 static bool agents_send(const char *agent_id, const char *text) {
@@ -1141,13 +1139,13 @@ static bool agents_send(const char *agent_id, const char *text) {
         return true;
     }
 
-    bool mesh_owned = strcmp(agent_id, "codex") == 0 ||
-                      strcmp(agent_id, "opencode") == 0;
-    bool wifi_ok = mesh_owned
-        ? false
-        : agents_bridge_post(agent_id, agents_active_session(idx), cleaned);
+    /* No mesh-owned agents left to skip the bridge for: codex and opencode were
+     * the two that owned a gateway inbox, and both are gone from the registry.
+     * Everything that reaches here tries the bridge first and the C1 DM after,
+     * which is the ladder the remaining pair has always wanted. */
+    bool wifi_ok = agents_bridge_post(agent_id, agents_active_session(idx), cleaned);
     bool mesh_ok = false;
-    if ((mesh_owned || !wifi_ok) && g_agents_mesh_uplink) {
+    if (!wifi_ok && g_agents_mesh_uplink) {
         mesh_ok = g_agents_mesh_uplink(agent_id, cleaned);
         if (mesh_ok) event_add("agent %s mesh uplink", agent_id);
     }
@@ -1433,9 +1431,9 @@ static const char *agents_bridge_url() { return g_bridge; }
 static const char *agents_describe() {
     return
         "# agents\n\n"
-        "Pocket chat with Grok / Claude / Hermes / OpenCode / Codex.\n"
+        "Pocket chat with Claude / Hermes.\n"
         "Uplink: WiFi bridge /v1/chat, else MeshCore C1|agent|…|u|… private DM\n"
-        "  (agent = grok|claude|hermes|opencode|codex).\n"
+        "  (agent = claude|hermes).\n"
         "Downlink: same C1 side=a (or WiFi /agents/inbound) — one loop.\n"
         "A \"where are you?\" / \"где ты\" message is answered locally with the\n"
         "GNSS fix (POST /gps/fix semantics) and never hits the bridge.\n\n"
@@ -1513,7 +1511,7 @@ static void agents_register_routes(AsyncWebServer &server) {
         const char *text   = input["text"]   | "";
         const char *sess   = input["session"] | "";
         int idx = agents_find(agent);
-        if (idx < 0) { notify_send_error(req, 400, "agent must be grok, claude, hermes, opencode or codex"); return; }
+        if (idx < 0) { notify_send_error(req, 400, "agent must be claude or hermes"); return; }
         if (!text[0]) { notify_send_error(req, 400, "text required"); return; }
         if (sess[0]) {
             agents_lock();
@@ -1567,7 +1565,7 @@ static void agents_register_routes(AsyncWebServer &server) {
         free(body);
         const char *agent = input["agent"] | "";
         const char *text  = input["text"]  | "";
-        if (agents_find(agent) < 0) { notify_send_error(req, 400, "agent must be grok, claude, hermes, opencode or codex"); return; }
+        if (agents_find(agent) < 0) { notify_send_error(req, 400, "agent must be claude or hermes"); return; }
         if (!text[0]) { notify_send_error(req, 400, "text required"); return; }
         agents_on_inbound(agent, text, true);
         event_add("agent %s >> %s", agent, text);
@@ -1612,7 +1610,7 @@ static void agents_register_routes(AsyncWebServer &server) {
         const char *agent = input["agent"] | "";
         const char *sess  = input["session"] | "";
         int idx = agents_find(agent);
-        if (idx < 0) { notify_send_error(req, 400, "agent must be grok, claude, hermes, opencode or codex"); return; }
+        if (idx < 0) { notify_send_error(req, 400, "agent must be claude or hermes"); return; }
         if (!sess[0]) { notify_send_error(req, 400, "session required"); return; }
         agents_lock();
         bool ok = agents_session_select(idx, sess);
@@ -1640,7 +1638,7 @@ static void agents_register_routes(AsyncWebServer &server) {
         const char *agent = input["agent"] | "";
         const char *sess  = input["session"] | "";
         int idx = agents_find(agent);
-        if (idx < 0) { notify_send_error(req, 400, "agent must be grok, claude, hermes, opencode or codex"); return; }
+        if (idx < 0) { notify_send_error(req, 400, "agent must be claude or hermes"); return; }
         agents_lock();
         bool created = false;
         int r = agents_session_create(idx, sess[0] ? sess : nullptr, created);
