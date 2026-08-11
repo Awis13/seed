@@ -100,8 +100,37 @@ assert "g_hist_drops++" in enqueue, (
     "history_enqueue must increment g_hist_drops when the 0-tick send fails "
     "(errQUEUE_FULL) — the dropped record must not vanish silently"
 )
+# TWO drop paths must count: a FULL queue (0-tick send fails) AND a DEAD queue
+# (g_hist_q == nullptr, the ~8.8 KB boot alloc failed). Without the null-queue
+# bump the archive silently persists NOTHING while /health shows history_drops=0
+# and looks healthy. Both paths must ++ the same monotonic counter.
+assert enqueue.count("g_hist_drops++") == 2, (
+    "history_enqueue must count BOTH the full-queue drop and the dead-queue "
+    "(g_hist_q == nullptr) drop — a boot-time queue-alloc failure must not make "
+    "the archive silently persist nothing while history_drops stays 0"
+)
+null_path = enqueue[: enqueue.index("micron_store_key_valid(key)")]
+assert "!g_hist_q" in null_path and "g_hist_drops++" in null_path, (
+    "the g_hist_q == nullptr early-return must increment g_hist_drops before "
+    "returning false (the dead-queue no-persist must be counted/visible)"
+)
 assert re.search(r"uint32_t\s+history_drops\(void\)", hist), (
     "a pure history_drops() getter must expose the drop count (for C4 /health)"
+)
+# Queue-health getters (C4 /health): history_ready() exposes a DEAD queue (the
+# alloc failed => nothing persists) and history_queued() exposes live occupancy
+# (an early warning that fills before drops start). Both must be lock-free (no
+# g_hist_mux, no SPI bus) so they are safe on the AsyncTCP /health task.
+ready = re.search(r"static bool history_ready\(void\)\s*\{([^}]*)\}", hist)
+assert ready, (
+    "a pure history_ready() getter must expose whether the write queue is live"
+)
+assert "g_hist_q != nullptr" in ready.group(1) and "g_hist_mux" not in ready.group(1), (
+    "history_ready() must be a lock-free read of the queue handle (no g_hist_mux)"
+)
+queued = fn_body(hist, "static uint32_t history_queued(void)")
+assert "uxQueueMessagesWaiting" in queued and "g_hist_mux" not in queued, (
+    "history_queued() must be a lock-free uxQueueMessagesWaiting read (no g_hist_mux)"
 )
 # C4 /health getters: store tier + indexed-identity count. history_on_sd() is a
 # lock-free read of the boot-latched mount flag; history_index_live_count() reads

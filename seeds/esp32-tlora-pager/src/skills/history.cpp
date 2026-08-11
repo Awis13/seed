@@ -201,7 +201,16 @@ static void history_write_task(void *arg) {
 [[maybe_unused]]
 static bool history_enqueue(uint8_t ns, const char *key,
                             const uint8_t *payload, size_t len) {
-    if (!g_hist_q) return false;
+    /* No write queue means the ~8.8 KB alloc failed at boot (history_begin) and
+     * this record can NEVER be persisted. Count it as a drop before returning,
+     * exactly like a full-queue drop: otherwise a dead queue looks healthy on
+     * /health (history_drops stays 0) while the archive silently writes nothing.
+     * A plain ++ matches the full-queue path below; the counter is monotonic and
+     * a torn RMW only loses a count, never fabricates one. */
+    if (!g_hist_q) {
+        g_hist_drops++;
+        return false;
+    }
     if (!micron_store_key_valid(key)) return false;
     if (len > HISTORY_PAYLOAD_CAP) return false;
 
@@ -232,12 +241,21 @@ static bool history_enqueue(uint8_t ns, const char *key,
 [[maybe_unused]]
 static uint32_t history_drops(void) { return g_hist_drops; }
 
-/* Current occupancy of the write queue (0 before it is created). For a future
- * /health to show how close the depth-HISTORY_WRITE_QUEUE_DEPTH queue runs. */
-[[maybe_unused]]
+/* Current occupancy of the write queue (0 before it is created). Wired to
+ * /health by C4 as an EARLY warning: the queue fills (queued climbs toward
+ * HISTORY_WRITE_QUEUE_DEPTH) BEFORE it overflows and drops start. uxQueueMessages-
+ * Waiting is a lock-free FreeRTOS read, safe from the AsyncTCP /health task. */
 static uint32_t history_queued(void) {
     return g_hist_q ? (uint32_t)uxQueueMessagesWaiting(g_hist_q) : 0;
 }
+
+/* Is the write queue live (true) or did its boot alloc fail (false)? When false
+ * every history_enqueue drops (counted in g_hist_drops) and the archive persists
+ * NOTHING, so /health must be able to see a dead queue directly rather than infer
+ * it. Pure lock-free read of the queue handle, latched ONCE by history_begin() at
+ * boot before any handler runs (same discipline as history_on_sd) — no lock, no
+ * bus, safe straight from the AsyncTCP /health handler. Wired to /health by C4. */
+static bool history_ready(void) { return g_hist_q != nullptr; }
 
 /* Is the archive on the removable microSD (true) or the SPIFFS fallback (false)?
  * Pure read of the mount result latched ONCE by history_mount() at boot, before
