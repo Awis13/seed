@@ -61,7 +61,7 @@
 #include "psram_alloc.h"          // psram_calloc_pref: park big buffers in PSRAM
 
 // ===== Configuration =====
-#define SEED_VERSION        "0.9.71"
+#define SEED_VERSION        "0.9.72"
 // Core clock: datasheet puts 240 vs 80 ~11.5mA apart on WAITI. Periph bus holds
 // at 80 for every PLL-fed core clock; go lower and RMT/I2S retimes. Same floor
 // as tembed idle policy (no light sleep — notify latency is the job).
@@ -1732,6 +1732,11 @@ static char ag_sess_titles[AGENT_SESSIONS_MAX + 2][AGENT_SESSION_LEN + 2];
 static int  ag_sess_msgs[AGENT_SESSIONS_MAX + 2];
 static bool ag_sess_active[AGENT_SESSIONS_MAX + 2];
 static const char *ag_sess_ptrs[AGENT_SESSIONS_MAX + 2];
+// Live-room roster: dead sessions are hidden from the picker, so a display row
+// is not the raw session index. ag_sess_row2idx maps the row shown to the real
+// session index; ag_sess_vis_n is the count of visible (non-dead) rows drawn.
+static int ag_sess_row2idx[AGENT_SESSIONS_MAX];
+static int ag_sess_vis_n = 0;
 static int msglist_sel = 0;
 // Cached ids for the visible msglist rows (map row → notify id).
 static uint32_t msglist_ids[HW_UI_MSGLIST_MAX];
@@ -2900,16 +2905,23 @@ static void ui_open_agent_chat(int idx) {
  * When the session registry is full the NEW row turns into a visible
  * "MAX n SESSIONS" note and is not selectable — no silent refusal. */
 static void ui_agent_sessions_refresh() {
-    int n = agents_session_count(agent_focus);
-    bool full = (n >= AGENT_SESSIONS_MAX);
-    int total = n + 2;
-    for (int i = 0; i < n; i++) {
-        snprintf(ag_sess_titles[i], sizeof(ag_sess_titles[0]), "%s",
+    int all = agents_session_count(agent_focus);
+    // Registry capacity is over ALL sessions (dead rooms still hold a slot), so
+    // the "NEW" row disables on the full registry regardless of what is hidden.
+    bool full = (all >= AGENT_SESSIONS_MAX);
+    int n = 0;  // visible (non-dead) rows
+    for (int i = 0; i < all; i++) {
+        if (agents_session_is_dead(agent_focus, i)) continue;  // roster: hidden
+        snprintf(ag_sess_titles[n], sizeof(ag_sess_titles[0]), "%s",
                  agents_session_name(agent_focus, i));
-        ag_sess_msgs[i] = agents_session_msg_count(agent_focus, i);
-        ag_sess_active[i] = agents_session_is_active(agent_focus, i);
-        ag_sess_ptrs[i] = ag_sess_titles[i];
+        ag_sess_msgs[n] = agents_session_msg_count(agent_focus, i);
+        ag_sess_active[n] = agents_session_is_active(agent_focus, i);
+        ag_sess_ptrs[n] = ag_sess_titles[n];
+        ag_sess_row2idx[n] = i;
+        n++;
     }
+    ag_sess_vis_n = n;
+    int total = n + 2;
     if (full)
         snprintf(ag_sess_titles[n], sizeof(ag_sess_titles[0]),
                  "MAX %d SESSIONS", AGENT_SESSIONS_MAX);
@@ -2936,9 +2948,17 @@ static void ui_open_agent_sessions(int idx) {
     if (idx >= agents_count()) idx = agents_count() - 1;
     agent_focus = idx;
     agents_session_refresh_counts(idx);
+    // Select the active session's VISIBLE row (dead rooms are hidden, so the
+    // row is not the raw index). If the active room is itself dead it is not in
+    // the list; fall back to the first visible row (0) — refresh clamps into
+    // the NEW/BACK tail when nothing is visible.
     agent_sess_sel = 0;
-    for (int i = 0; i < agents_session_count(idx); i++)
-        if (agents_session_is_active(idx, i)) { agent_sess_sel = i; break; }
+    int vis_row = 0;
+    for (int i = 0; i < agents_session_count(idx); i++) {
+        if (agents_session_is_dead(idx, i)) continue;
+        if (agents_session_is_active(idx, i)) { agent_sess_sel = vis_row; break; }
+        vis_row++;
+    }
     ui_agent_sessions_refresh();
 }
 
@@ -3164,15 +3184,16 @@ static void ui_on_click() {
         }
         break;
     case HW_UI_AGENT_SESSIONS: {
-        int n = agents_session_count(agent_focus);
-        if (agent_sess_sel < n) {  // existing session → open its chat
-            const char *nm = agents_session_name(agent_focus, agent_sess_sel);
+        int n = ag_sess_vis_n;   // visible (non-dead) rows drawn by the refresh
+        if (agent_sess_sel < n) {  // existing visible session → open its chat
+            int si = ag_sess_row2idx[agent_sess_sel];  // row → real session index
+            const char *nm = agents_session_name(agent_focus, si);
             if (nm && nm[0] && agents_session_select(agent_focus, nm)) {
                 hw_haptic_notify(0);
                 ui_open_agent_chat(agent_focus);
             }
         } else if (agent_sess_sel == n) {  // NEW SESSION
-            if (n >= AGENT_SESSIONS_MAX) {
+            if (agents_session_count(agent_focus) >= AGENT_SESSIONS_MAX) {
                 break;   // row is disabled (shown as "MAX n SESSIONS")
             }
             bool created = false;
@@ -3295,13 +3316,14 @@ static void ui_on_steps(int steps) {
         break;
     }
     case HW_UI_AGENT_SESSIONS: {
-        int n = agents_session_count(agent_focus);
+        int n = ag_sess_vis_n;   // visible rows; NEW at n, BACK at n+1
         int cnt = n + 2;
         if (cnt <= 0) break;
         agent_sess_sel += steps;
         while (agent_sess_sel < 0) agent_sess_sel += cnt;
         while (agent_sess_sel >= cnt) agent_sess_sel -= cnt;
-        if (n >= AGENT_SESSIONS_MAX && agent_sess_sel == n) {
+        if (agents_session_count(agent_focus) >= AGENT_SESSIONS_MAX &&
+            agent_sess_sel == n) {
             // full registry — NEW row disabled: skip over it
             agent_sess_sel += (steps > 0) ? 1 : -1;
             if (agent_sess_sel < 0) agent_sess_sel = cnt - 1;

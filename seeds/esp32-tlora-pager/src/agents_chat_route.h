@@ -39,11 +39,20 @@
 
 #include <string.h>
 #include <stddef.h>
+#include <stdint.h>
 
 /* reason codes — also the return value of the pure planner below. */
 #define AGENT_ROUTE_OK        0
 #define AGENT_ROUTE_OVERFLOW  1
 #define AGENT_ROUTE_BADNAME   2
+
+/* Per-session reconcile verdict from the pure roster planner below. */
+#define AGENT_ROSTER_UNCHANGED 0   /* incomplete list: leave liveness as it is */
+#define AGENT_ROSTER_ALIVE     1   /* listed live -> show the room             */
+#define AGENT_ROSTER_DEAD      2   /* complete list, unlisted -> hide the room */
+
+/* Roster payload ceiling: 346 wire bytes (README) + slack + NUL. */
+#define AGENT_ROSTER_PAYLOAD_CAP 384
 
 /* Session-name cap mirrors AGENT_SESSION_LEN in skills/agents.cpp (23 usable). */
 #define AGENT_ROUTE_NAME_CAP  24
@@ -115,6 +124,87 @@ static inline int agents_route_plan(const char *session,
         out_name[j] = '\0';
     }
     return AGENT_ROUTE_OK;
+}
+
+/* Is `tok` the roster's incomplete marker `+<digits>` (^\+[0-9]+$)? Tested on
+ * the RAW token, before any sanitising — '+' is outside the name alphabet, so
+ * agents_route_sanitize would erase it and the marker would vanish. */
+static inline int agents_roster_is_countmarker(const char *tok) {
+    if (!tok || tok[0] != '+' || !tok[1]) return 0;
+    for (const char *p = tok + 1; *p; p++)
+        if (*p < '0' || *p > '9') return 0;
+    return 1;
+}
+
+/*
+ * Pure roster reconcile planner: the receive-end of the "live-room roster"
+ * control frame (README "Telling the pager which rooms are live"). Mirrors the
+ * agents_route_plan pattern so it is host-testable with no FreeRTOS / SD.
+ *
+ * Field 4 of a "1|<addr>|*|<payload>" frame is a FULL SNAPSHOT (never a delta)
+ * of the sessions that can be written to right now: comma-separated labels,
+ * each [A-Za-z0-9._-]{1,23}, with an OPTIONAL trailing `+<digits>` element
+ * meaning "the list was cut for space".
+ *
+ *   payload       raw field-4 text; NULL/empty => no live sessions at all
+ *   existing      the claude agent's current session names (n_existing of them)
+ *   out_action    per-session verdict, one of AGENT_ROSTER_ALIVE / _DEAD /
+ *                 _UNCHANGED (array of at least n_existing bytes)
+ *   out_incomplete set to 1 iff a `+<digits>` element was present, else 0
+ *
+ * Rules (all from the README):
+ *   - split on ',';
+ *   - a final element matching ^\+[0-9]+$ sets incomplete and is NOT a label
+ *     (`+3` alone => incomplete with zero listed live);
+ *   - each other element is sanitised with the name alphabet and compared to
+ *     the session names;
+ *   - a session whose name is in the live set  -> ALIVE;
+ *   - else, if incomplete                       -> UNCHANGED (never infer dead);
+ *   - else (complete list, name unlisted)       -> DEAD;
+ *   - empty/NULL payload => live set empty, incomplete=0 (=> everything DEAD).
+ */
+static inline void agents_roster_reconcile(const char *payload,
+                                           const char *const *existing,
+                                           int n_existing,
+                                           uint8_t *out_action,
+                                           int *out_incomplete) {
+    int incomplete = 0;
+    if (out_action)
+        for (int i = 0; i < n_existing; i++) out_action[i] = AGENT_ROSTER_UNCHANGED;
+
+    char buf[AGENT_ROSTER_PAYLOAD_CAP];
+    size_t bn = 0;
+    if (payload)
+        for (; payload[bn] && bn + 1 < sizeof(buf); bn++) buf[bn] = payload[bn];
+    buf[bn] = '\0';
+
+    /* Pass 1: tokenise; mark listed-live sessions ALIVE, detect the +N marker. */
+    char *s = buf;
+    for (;;) {
+        char *comma = strchr(s, ',');
+        if (comma) *comma = '\0';
+        if (agents_roster_is_countmarker(s)) {
+            incomplete = 1;               /* not a label */
+        } else if (s[0]) {
+            char stok[AGENT_ROUTE_NAME_CAP];
+            agents_route_sanitize(s, stok, sizeof(stok));
+            if (stok[0] && out_action) {
+                for (int i = 0; i < n_existing; i++)
+                    if (existing && existing[i] && strcmp(existing[i], stok) == 0)
+                        out_action[i] = AGENT_ROSTER_ALIVE;
+            }
+        }
+        if (!comma) break;
+        s = comma + 1;
+    }
+
+    /* Pass 2: sessions still not ALIVE are DEAD on a complete list, else kept. */
+    if (out_action)
+        for (int i = 0; i < n_existing; i++)
+            if (out_action[i] != AGENT_ROSTER_ALIVE)
+                out_action[i] = incomplete ? AGENT_ROSTER_UNCHANGED
+                                           : AGENT_ROSTER_DEAD;
+    if (out_incomplete) *out_incomplete = incomplete;
 }
 
 /*

@@ -95,6 +95,11 @@ struct AgentSlot {
     uint8_t vn;                 // messages currently in the view window
     uint32_t win_start;         // absolute line index of view[0] (tail or loaded page)
     AgentLine view[AGENT_VIEW_MAX];   // window over the active session
+    /* Per-session liveness (live-room roster, README). 0 = alive/shown,
+     * 1 = dead/hidden from the room picker. MARK-NOT-DELETE: a dead room's
+     * JSONL history file is never removed — hiding is reversible (a later
+     * roster can un-mark it), deletion is not and is user-only. */
+    uint8_t session_dead[AGENT_SESSIONS_MAX];
 };
 
 static AgentSlot g_agents[AGENTS_N] = {
@@ -154,6 +159,8 @@ int    agents_session_count(int idx);
 const char *agents_session_name(int idx, int i);
 bool   agents_session_is_active(int idx, int i);
 int    agents_session_msg_count(int idx, int i);
+bool   agents_session_is_dead(int idx, int i);   // live-room roster: hidden?
+int    agents_session_visible_count(int idx);    // non-dead session rows
 bool   agents_session_refresh_counts(int idx);   // recount all store sessions
 const char *agents_active_session(int idx);
 bool   agents_session_select(int idx, const char *name);
@@ -433,21 +440,31 @@ static void agents_sync_view(int idx) {
     { HwSpiBusGuard bus; f.close(); }
 }
 
-/* Load the session registry from the store manifest (one agent\tsession/line). */
+/* Load the session registry from the store manifest. Line format is
+ * "agent\tsession" with an OPTIONAL third tab-field "\t<0|1>" carrying the
+ * live-room-roster dead flag. A two-field line (old manifest) loads as alive
+ * (0), so an older on-disk manifest still loads unchanged. */
 static void agents_manifest_load() {
     HwSpiBusGuard bus;
     if (!g_store || !g_store->exists(AGENT_MANIFEST)) return;
     File f = g_store->open(AGENT_MANIFEST, "r");
     if (!f) return;
-    char ln[AGENT_ID_LEN + 1 + AGENT_SESSION_LEN + 2];
+    char ln[AGENT_ID_LEN + 1 + AGENT_SESSION_LEN + 4];  // +\tD room for dead flag
     AgentJScanner sc(f);
     while (sc.next(ln, sizeof(ln))) {
         if (!ln[0]) continue;
         char *tab = strchr(ln, '\t');
         if (!tab || !tab[1]) continue;
         *tab = '\0';
+        char *sess = tab + 1;
+        uint8_t dead = 0;                       // absent 3rd field => alive
+        char *tab2 = strchr(sess, '\t');
+        if (tab2) { *tab2 = '\0'; dead = (tab2[1] == '1') ? 1 : 0; }
         int idx = agents_find(ln);
-        if (idx >= 0) agents_session_add(idx, tab + 1);
+        if (idx >= 0) {
+            int si = agents_session_add(idx, sess);
+            if (si >= 0) g_agents[idx].session_dead[si] = dead;
+        }
     }
     f.close();
 }
@@ -458,7 +475,9 @@ static void agents_manifest_persist() {
     for (int i = 0; i < AGENTS_N; i++) {
         AgentSlot &a = g_agents[i];
         for (int j = 0; j < a.n_sessions; j++) {
-            out += a.id; out += '\t'; out += a.sessions[j]; out += '\n';
+            out += a.id; out += '\t'; out += a.sessions[j];
+            out += '\t'; out += (a.session_dead[j] ? '1' : '0');  // roster flag
+            out += '\n';
         }
     }
     HwSpiBusGuard bus;  /* write burst only — manifest text built above */
@@ -522,6 +541,22 @@ int agents_session_msg_count(int idx, int i) {
     if (idx < 0 || idx >= AGENTS_N || i < 0 || i >= g_agents[idx].n_sessions)
         return 0;
     return (int)g_agents[idx].session_lines[i];
+}
+
+/* Liveness of session i (live-room roster). true => dead/hidden from picker. */
+bool agents_session_is_dead(int idx, int i) {
+    if (idx < 0 || idx >= AGENTS_N || i < 0 || i >= g_agents[idx].n_sessions)
+        return false;
+    return g_agents[idx].session_dead[i] != 0;
+}
+
+/* Count of live (non-dead) sessions — the number of rows the picker shows. */
+int agents_session_visible_count(int idx) {
+    if (idx < 0 || idx >= AGENTS_N) return 0;
+    AgentSlot &a = g_agents[idx];
+    int c = 0;
+    for (int i = 0; i < a.n_sessions; i++) if (!a.session_dead[i]) c++;
+    return c;
 }
 
 /* Recount every session's persisted lines for the agent (cache the counts so
@@ -1182,9 +1217,10 @@ static void agents_on_inbound(const char *agent_id, const char *text,
  * bounded (agents_clean_text) — the third untrusted-input barrier after the mac
  * and the transport receiver. */
 struct AgentRouteItem {
+    uint8_t kind;                       /* 0 = chat message, 1 = live-room roster */
     bool newest;                        /* empty name => newest-active room */
     char session[AGENT_SESSION_LEN];    /* resolved sanitised room (when !newest) */
-    char text[AGENT_TEXT_LEN];          /* cleaned incoming reply */
+    char text[AGENT_TEXT_LEN];          /* kind 0: cleaned reply; kind 1: raw roster payload (<=346 B) */
 };
 
 #define AGENT_ROUTE_QUEUE_DEPTH  8      /* by-value queue: 8 x ~537 B ~= 4.3 KB */
@@ -1193,6 +1229,39 @@ struct AgentRouteItem {
 
 static QueueHandle_t g_route_q    = nullptr;
 static TaskHandle_t  g_route_task = nullptr;
+
+/* Off-loop roster apply (kind==1): the ONLY place the roster path touches SD.
+ * Runs the pure reconcile against the claude agent's sessions[] and REPLACES
+ * the liveness view (full snapshot): listed rooms un-mark alive, unlisted rooms
+ * go dead only on a complete list (!incomplete); an incomplete list (+N) leaves
+ * unlisted rooms untouched. Never creates rooms for unknown labels (V1 does not
+ * auto-create — the roster reports liveness of KNOWN rooms). MARK-NOT-DELETE:
+ * the JSONL history is never removed. Persists the flags and repaints. */
+static void agents_roster_apply(int idx, const char *payload) {
+    if (idx < 0) return;
+    int nlive = 0, ndead = 0, incomplete = 0;
+    agents_lock();
+    AgentSlot &a = g_agents[idx];
+    const char *names[AGENT_SESSIONS_MAX];
+    int n = a.n_sessions;
+    if (n > AGENT_SESSIONS_MAX) n = AGENT_SESSIONS_MAX;
+    for (int i = 0; i < n; i++) names[i] = a.sessions[i];
+    uint8_t action[AGENT_SESSIONS_MAX];
+    agents_roster_reconcile(payload, names, n, action, &incomplete);
+    bool changed = false;
+    for (int i = 0; i < n; i++) {
+        uint8_t want = a.session_dead[i];       /* UNCHANGED keeps current view */
+        if (action[i] == AGENT_ROSTER_ALIVE)      want = 0;
+        else if (action[i] == AGENT_ROSTER_DEAD)  want = 1;
+        if (want != a.session_dead[i]) { a.session_dead[i] = want; changed = true; }
+    }
+    for (int i = 0; i < n; i++) { if (a.session_dead[i]) ndead++; else nlive++; }
+    if (changed) agents_manifest_persist();
+    agents_unlock();
+    event_add("agent claude roster live=%d dead=%d%s", nlive, ndead,
+              incomplete ? " +N" : "");
+    display_force = true;                        /* repaint the room picker */
+}
 
 /* The off-loop drain: the ONLY SD I/O on the route path. Drains the queue
  * forever, resolves the target room, reloads its view from SD and appends the
@@ -1203,7 +1272,12 @@ static void agents_route_task(void *arg) {
     int idx = agents_find("claude");
     for (;;) {
         if (xQueueReceive(g_route_q, &item, portMAX_DELAY) != pdTRUE) continue;
-        if (idx < 0 || !item.text[0]) continue;
+        if (idx < 0) continue;
+        if (item.kind == 1) {              /* live-room roster: reconcile + persist */
+            agents_roster_apply(idx, item.text);
+            continue;
+        }
+        if (!item.text[0]) continue;
         agents_lock();
         AgentSlot &a = g_agents[idx];
         bool created = false;
@@ -1248,6 +1322,24 @@ bool claude_route_incoming(const char *session, const char *text, int *reason) {
     if (reason) *reason = AGENT_ROUTE_OK;
     int idx = agents_find("claude");
     if (idx < 0) return false;
+
+    /* LIVE-ROOM ROSTER CONTROL FRAME — field 3 == "*" (exactly one byte 0x2A).
+     * This test MUST come FIRST, before any sanitising: agents_session_sanitize
+     * strips '*' (outside [A-Za-z0-9._-]) to an empty name, which would deliver
+     * the room list into a room as a normal message reading e.g. "main,sonata"
+     * (README's #1 firmware rule). RAM-only on the caller (loop) task: copy the
+     * RAW payload into a queue item and hand it to the off-loop drain; the SD
+     * reconcile happens in agents_roster_task/apply. An empty payload
+     * (1|<addr>|*|) is a LEGAL frame meaning "no live sessions", so it is
+     * enqueued too (unlike the message path, which drops empty text). */
+    if (session && session[0] == '*' && session[1] == '\0') {
+        AgentRouteItem item;
+        memset(&item, 0, sizeof(item));
+        item.kind = 1;                                  /* roster, not a message */
+        snprintf(item.text, sizeof(item.text), "%s", text ? text : "");
+        if (!g_route_q || xQueueSend(g_route_q, &item, 0) != pdTRUE) return false;
+        return true;
+    }
 
     /* Resolve name + reason against a RAM snapshot of the registry (no I/O). */
     char resolved[AGENT_ROUTE_NAME_CAP];
@@ -1610,7 +1702,10 @@ static void skill_agents_init() {
     for (int i = 0; i < AGENTS_N; i++) {
         AgentSlot &a = g_agents[i];
         a.active_idx = 0; a.file_sync = 0; a.lines = 0; a.vn = 0; a.win_start = 0;
-        for (int j = 0; j < AGENT_SESSIONS_MAX; j++) a.session_lines[j] = 0;
+        for (int j = 0; j < AGENT_SESSIONS_MAX; j++) {
+            a.session_lines[j] = 0;
+            a.session_dead[j] = 0;      // all rooms shown until a roster says otherwise
+        }
         agents_session_add(i, g_session);               // default always present
     }
     agents_manifest_load();                             // existing sessions
