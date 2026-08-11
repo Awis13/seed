@@ -28,6 +28,17 @@
  * throttle are unsigned differences, and both are pinned near 2^32 because the
  * `now >= last + interval` form that fails there is the one a reader is most
  * likely to "simplify" them into.
+ *
+ * SECTIONS 12-17 ARE THE OTHER HALF OF THE FORMAT: the parser the receive path
+ * calls, which lives in the same header as the builder so that the two cannot
+ * drift. SECTION 12 IS THE PROPERTY THAT ENFORCES THAT — anything
+ * rns_envelope_build() emits must come back out of rns_envelope_parse() as
+ * exactly the three inputs, over a corpus chosen for the cases a hand-written
+ * round trip skips. The rest are the hostile ones: a payload arrives from the
+ * network before anything has authenticated it, so every field is validated,
+ * and NOTHING IS EVER DROPPED — a payload that is not an envelope is a normal
+ * outcome with its own reason code, because bare-text senders exist and a
+ * message is never worth losing over its shape.
  */
 
 #include <assert.h>
@@ -50,10 +61,15 @@ static void filltext(char *buf, size_t n) {
 
 /*
  * Split an envelope the way the peer does: on the FIRST THREE separators, with
- * the text as everything after the third. Deliberately written here rather than
- * exported from the header — the device never parses — so that the test proves
- * the emitted bytes are readable under the agreed rule rather than under
- * whatever the builder happens to do.
+ * the text as everything after the third.
+ *
+ * THE DEVICE DOES PARSE NOW — rns_envelope_parse() is in the same header as the
+ * builder — and this stays anyway, as an INDEPENDENT ORACLE. Section 12 checks
+ * the two halves of the header against each other, which is the property that
+ * matters and also the one a shared mistake passes: a builder and a parser that
+ * agreed on the wrong offset would round-trip perfectly. This function is
+ * written from the agreed rule and not from either of them, so the shape
+ * assertions in sections 1-5 fail when both halves drift together.
  */
 static bool split3(const uint8_t *env, size_t len, char *ver, char *from,
                    char *session, char *text, size_t *text_len) {
@@ -451,6 +467,277 @@ int main() {
         assert(rns_outbox_next(9744u - 1u, last, 1) == RNS_OUTBOX_WAIT);
         assert(rns_outbox_next(9744u, last, 1) == RNS_OUTBOX_GO);
         assert(rns_outbox_next(9745u, last, 1) == RNS_OUTBOX_GO);
+    }
+
+    /* ---- 12. THE ROUND TRIP: WHAT THE BUILDER EMITS, THE PARSER READS -------
+     * This is the property that stops the two halves of the format drifting,
+     * and it is the reason both live in one header. Anything
+     * rns_envelope_build() produces must come back out of
+     * rns_envelope_parse() as EXACTLY the three inputs — not merely as three
+     * fields, and not merely with the right lengths.
+     *
+     * The corpus is chosen for the cases a hand-written round trip skips: an
+     * empty session, the longest legal one, the separator inside the text, a
+     * leading and a trailing separator, one byte of text, and the text that
+     * fills the packet to its ceiling. */
+    {
+        char maxtext[RNS_OUTBOX_TEXT_MAX + 8];
+        char s23[RNS_OUTBOX_SESSION_MAX + 2];
+        /* The text that fills the packet WITH a 23-byte session: 347 - 23 =
+         * 324, so the payload is 383 again by the other route. This is the one
+         * case where rns_envelope_text_budget_n() is load-bearing at BOTH ends
+         * at once — the builder refusing a byte more and the parser accepting
+         * exactly this much — and a budget that used the constant alone instead
+         * of the session's length passes every other case in this corpus. */
+        char budgettext[RNS_OUTBOX_TEXT_MAX + 8];
+        filltext(maxtext, RNS_OUTBOX_TEXT_MAX);
+        memset(s23, 'z', RNS_OUTBOX_SESSION_MAX);
+        s23[RNS_OUTBOX_SESSION_MAX] = '\0';
+        filltext(budgettext, RNS_OUTBOX_TEXT_MAX - RNS_OUTBOX_SESSION_MAX);
+        assert(strlen(budgettext) == 324);
+
+        struct { const char *session; const char *text; } cases[] = {
+            {"",      "hello"},
+            {"",      "x"},
+            {"beacon", "Received. Answering only on the device."},
+            {"a.b_c-9", "line one\nline two"},
+            {s23,     "the longest session name the peer accepts"},
+            {s23,     budgettext},
+            {"s1",    "|run a | b | c| and then||done|"},
+            {"pipe",  "|"},
+            {"",      maxtext},
+        };
+
+        for (size_t c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+            rns_envelope_view v;
+            assert(rns_envelope_build(SELF, cases[c].session, cases[c].text,
+                                      env, sizeof(env), &len) == RNS_ENV_OK);
+            assert(rns_envelope_parse(env, len, &v) == RNS_ENVIN_OK);
+            assert(v.from_len == RNS_OUTBOX_ADDR_HEX);
+            assert(memcmp(v.from, SELF, v.from_len) == 0);
+            assert(v.session_len == strlen(cases[c].session));
+            assert(memcmp(v.session, cases[c].session, v.session_len) == 0);
+            assert(v.text_len == strlen(cases[c].text));
+            assert(memcmp(v.text, cases[c].text, v.text_len) == 0);
+            /* The view points INTO the payload rather than at a copy: that is
+             * what lets the firmware sanitise the text straight out of the
+             * receive buffer with nothing allocated in between. */
+            assert(v.from == (const char *)env + 2);
+            assert(v.text + v.text_len == (const char *)env + len);
+        }
+
+        /* BOTH ROUTES TO 383 BYTES, checked as lengths rather than trusted:
+         * an empty session with 347 bytes of text, and a 23-byte session with
+         * 324. The second is the packet-filling case the corpus was missing. */
+        assert(rns_envelope_build(SELF, s23, budgettext, env, sizeof(env),
+                                  &len) == RNS_ENV_OK);
+        assert(len == RNS_OUTBOX_PAYLOAD_MAX);
+        {
+            rns_envelope_view v;
+            assert(rns_envelope_parse(env, len, &v) == RNS_ENVIN_OK);
+            assert(v.session_len == RNS_OUTBOX_SESSION_MAX);
+            assert(v.text_len == RNS_OUTBOX_TEXT_MAX - RNS_OUTBOX_SESSION_MAX);
+            assert(memcmp(v.text, budgettext, v.text_len) == 0);
+        }
+        /* ...and one byte more of text with that session is over the packet. */
+        {
+            char over[RNS_OUTBOX_TEXT_MAX + 8];
+            filltext(over, RNS_OUTBOX_TEXT_MAX - RNS_OUTBOX_SESSION_MAX + 1);
+            assert(rns_envelope_build(SELF, s23, over, env, sizeof(env), &len) ==
+                   RNS_ENV_TOO_LONG);
+        }
+
+        /* The ceiling case above is the whole packet, and it must stay so: a
+         * round trip that quietly stopped at 382 bytes would pass every other
+         * assertion here. */
+        assert(rns_envelope_build(SELF, "", maxtext, env, sizeof(env), &len) ==
+               RNS_ENV_OK);
+        assert(len == RNS_OUTBOX_PAYLOAD_MAX);
+        {
+            rns_envelope_view v;
+            assert(rns_envelope_parse(env, len, &v) == RNS_ENVIN_OK);
+            assert(v.text_len == RNS_OUTBOX_TEXT_MAX);
+        }
+    }
+
+    /* ---- 13. THE PARSER TAKES THE FIRST THREE SEPARATORS AND NOTHING ELSE ---
+     * Same rule as the builder's, from the other side, and the same reason it
+     * is stated as "first three": a naive split on every '|' is correct for
+     * every message anybody tests by hand and CORRUPTS the first one that
+     * quotes a shell pipeline. The payload here is written by hand rather than
+     * built, so the parser is tested against the agreed bytes and not against
+     * whatever the builder happens to do. */
+    {
+        rns_envelope_view v;
+        const char *raw = "1|6f796a5113a5a7f34512d2ede3723f40|beacon|a|b|c";
+        size_t n = strlen(raw);
+        assert(rns_envelope_parse((const uint8_t *)raw, n, &v) == RNS_ENVIN_OK);
+        assert(memcmp(v.from, ADDR, 32) == 0);
+        assert(v.session_len == 6 && memcmp(v.session, "beacon", 6) == 0);
+        assert(v.text_len == 5 && memcmp(v.text, "a|b|c", 5) == 0);
+
+        /* An empty session is a DOCUMENTED value: two adjacent separators, and
+         * the peer routes it to its newest conversation. */
+        const char *nosess = "1|6f796a5113a5a7f34512d2ede3723f40||text";
+        assert(rns_envelope_parse((const uint8_t *)nosess, strlen(nosess), &v) ==
+               RNS_ENVIN_OK);
+        assert(v.session_len == 0);
+        assert(v.text_len == 4 && memcmp(v.text, "text", 4) == 0);
+
+        /* NOT NUL-TERMINATED, EVER. The payload is bytes off a wire and the
+         * length is the only boundary there is, so the parser is handed a
+         * fragment of a longer buffer with more separators and more text
+         * behind it: anything that reached for a terminator would swallow
+         * them. */
+        char buf[64];
+        memset(buf, '|', sizeof(buf));
+        memcpy(buf, nosess, strlen(nosess));
+        assert(rns_envelope_parse((const uint8_t *)buf, strlen(nosess), &v) ==
+               RNS_ENVIN_OK);
+        assert(v.text_len == 4 && memcmp(v.text, "text", 4) == 0);
+    }
+
+    /* ---- 14. WHAT IS NOT AN ENVELOPE, AND WHY THAT IS NOT A FAILURE ---------
+     * Every case below is shown to the user exactly as it arrived. The rule the
+     * firmware depends on is that the outcome is DISTINGUISHABLE from OK and
+     * that the view is left empty, so a caller that ignores the reason still
+     * cannot read a field that was never parsed.
+     *
+     * THE ONE OUTCOME THAT MUST NEVER HAPPEN IS A DROPPED OR BLANKED MESSAGE,
+     * so each of these is a payload the caller must still be able to put on the
+     * screen whole — which it can, because nothing here consumes it. */
+    {
+        rns_envelope_view v;
+        struct { const char *payload; rns_envin_result want; } bad[] = {
+            /* Plain text, no separators at all: tools/rns-send, and every peer
+             * that predates the format. */
+            {"just a message with no framing at all", RNS_ENVIN_NO_FRAME},
+            {"", RNS_ENVIN_NO_FRAME},
+            {"|", RNS_ENVIN_NO_FRAME},
+            {"1|6f796a5113a5a7f34512d2ede3723f40|beacon", RNS_ENVIN_NO_FRAME},
+            /* An UNKNOWN VERSION IS NOT AN ENVELOPE: the fields behind a digit
+             * we do not know are not promised to be in this order, so the
+             * honest answer is the raw bytes. */
+            {"2|6f796a5113a5a7f34512d2ede3723f40|beacon|hi",
+             RNS_ENVIN_BAD_VERSION},
+            {"x|6f796a5113a5a7f34512d2ede3723f40|beacon|hi",
+             RNS_ENVIN_BAD_VERSION},
+            /* A version field of more than one byte: the separator is not where
+             * a version-1 envelope puts it. */
+            {"11|6f796a5113a5a7f34512d2ede3723f40|beacon|hi",
+             RNS_ENVIN_BAD_VERSION},
+            {"|6f796a5113a5a7f34512d2ede3723f40|beacon|hi",
+             RNS_ENVIN_BAD_VERSION},
+            /* NON-HEX ADDRESS. It would decode to a different hash and a reply
+             * would be encrypted to nobody, so it is refused as a field rather
+             * than passed on as a reply target. */
+            {"1|6f796a5113a5a7f34512d2ede3723fzz|beacon|hi", RNS_ENVIN_BAD_FROM},
+            {"1|6f796a51|beacon|hi", RNS_ENVIN_BAD_FROM},              /* short */
+            {"1|6f796a5113a5a7f34512d2ede3723f400|beacon|hi",
+             RNS_ENVIN_BAD_FROM},                                      /* long */
+            {"1||beacon|hi", RNS_ENVIN_BAD_FROM},                      /* empty */
+            /* SESSION CHARSET. Anything outside [A-Za-z0-9._-] would go
+             * straight into a card title. */
+            {"1|6f796a5113a5a7f34512d2ede3723f40|bea con|hi",
+             RNS_ENVIN_BAD_SESSION},
+            {"1|6f796a5113a5a7f34512d2ede3723f40|bea\x01n|hi",
+             RNS_ENVIN_BAD_SESSION},
+            {"1|6f796a5113a5a7f34512d2ede3723f40|beacon/room|hi",
+             RNS_ENVIN_BAD_SESSION},
+            /* AN EMPTY TEXT IS NOT AN ENVELOPE. The builder refuses to emit
+             * one, so this frame was not built here — and taking it apart would
+             * produce a card with an empty body, which is the blank message the
+             * soft-parse rule exists to prevent. Shown raw, all 36 bytes of
+             * visible framing, it is at least evidence. */
+            {"1|6f796a5113a5a7f34512d2ede3723f40|beacon|", RNS_ENVIN_EMPTY_TEXT},
+            {"1|6f796a5113a5a7f34512d2ede3723f40||", RNS_ENVIN_EMPTY_TEXT},
+        };
+
+        for (size_t b = 0; b < sizeof(bad) / sizeof(bad[0]); b++) {
+            memset(&v, 0xAA, sizeof(v));
+            assert(rns_envelope_parse((const uint8_t *)bad[b].payload,
+                                      strlen(bad[b].payload), &v) ==
+                   bad[b].want);
+            /* The view is ZEROED on every outcome but OK, so a caller that
+             * ignores the return value reads nulls rather than the pointers
+             * from the message before this one. */
+            assert(v.from == NULL && v.from_len == 0);
+            assert(v.session == NULL && v.session_len == 0);
+            assert(v.text == NULL && v.text_len == 0);
+            /* Every reason is a usable literal: it is published as-is. */
+            assert(rns_envin_reason(bad[b].want)[0] != '\0');
+        }
+        assert(rns_envelope_parse(NULL, 10, &v) == RNS_ENVIN_NO_FRAME);
+        /* A null view is legal — the firmware only wants the verdict when it is
+         * counting — and must not be dereferenced. */
+        assert(rns_envelope_parse((const uint8_t *)"nope", 4, NULL) ==
+               RNS_ENVIN_NO_FRAME);
+    }
+
+    /* ---- 15. THE SESSION LENGTH BOUNDARY, FROM THE READING SIDE -------------
+     * 23 bytes is the longest name the peer accepts and 24 is not a name at
+     * all. The firmware copies this field into a fixed buffer sized from
+     * RNS_OUTBOX_SESSION_MAX and terminates it, so a parser that let 24 through
+     * would be a one-byte overrun rather than an ugly title — which is why the
+     * boundary is checked here and not only in the builder. */
+    {
+        rns_envelope_view v;
+        char p[128];
+        char sname[RNS_OUTBOX_SESSION_MAX + 2];
+        int n;
+
+        memset(sname, 'a', RNS_OUTBOX_SESSION_MAX);
+        sname[RNS_OUTBOX_SESSION_MAX] = '\0';
+        n = snprintf(p, sizeof(p), "1|%s|%s|hi", SELF, sname);
+        assert(rns_envelope_parse((const uint8_t *)p, (size_t)n, &v) ==
+               RNS_ENVIN_OK);
+        assert(v.session_len == RNS_OUTBOX_SESSION_MAX);
+
+        memset(sname, 'a', RNS_OUTBOX_SESSION_MAX + 1);
+        sname[RNS_OUTBOX_SESSION_MAX + 1] = '\0';
+        assert(strlen(sname) == 24);
+        n = snprintf(p, sizeof(p), "1|%s|%s|hi", SELF, sname);
+        assert(rns_envelope_parse((const uint8_t *)p, (size_t)n, &v) ==
+               RNS_ENVIN_BAD_SESSION);
+    }
+
+    /* ---- 16. THE PACKET CEILING, FROM THE READING SIDE ----------------------
+     * 383 bytes is the largest plaintext one encrypted packet to a SINGLE
+     * destination carries, so a payload of exactly that must parse and one byte
+     * more cannot have arrived through the path this parser serves. The text
+     * budget is checked against the SESSION's length for the same reason the
+     * builder checks it there: a constant budget is right for an empty session
+     * and one byte over the packet for every named one. */
+    {
+        rns_envelope_view v;
+        uint8_t big[RNS_OUTBOX_PAYLOAD_MAX + 2];
+        char maxtext[RNS_OUTBOX_TEXT_MAX + 8];
+
+        filltext(maxtext, RNS_OUTBOX_TEXT_MAX);
+        assert(rns_envelope_build(SELF, "", maxtext, big, sizeof(big), &len) ==
+               RNS_ENV_OK);
+        assert(len == RNS_OUTBOX_PAYLOAD_MAX);
+        assert(rns_envelope_parse(big, len, &v) == RNS_ENVIN_OK);
+        assert(v.text_len == RNS_OUTBOX_TEXT_MAX);
+        assert(memcmp(v.text, maxtext, v.text_len) == 0);
+
+        /* One byte past the ceiling: not a shape this parser will vouch for. */
+        big[len] = 'x';
+        assert(rns_envelope_parse(big, (size_t)len + 1, &v) ==
+               RNS_ENVIN_TOO_LONG);
+    }
+
+    /* ---- 17. THE VERSION DIGIT HAS ONE OWNER -------------------------------
+     * The builder writes RNS_ENVELOPE_VERSION and the parser compares against
+     * it, so a bump moves both at once. If it were a literal in two places, a
+     * bump in the emitter alone would put payloads on the wire that this same
+     * firmware reads as ordinary text — and nothing would say so, because that
+     * is a legal outcome. */
+    {
+        assert(RNS_ENVELOPE_VERSION == '1');
+        assert(rns_envelope_build(SELF, "", "v", env, sizeof(env), &len) ==
+               RNS_ENV_OK);
+        assert(env[0] == RNS_ENVELOPE_VERSION);
     }
 
     printf("RNS outbox tests: OK\n");

@@ -49,6 +49,20 @@ Eight sites, one rule each:
     rules live in a pure header like every other decision in this file, and the
     pickup's position in the tick is pinned: ahead of the stack it would serve
     last tick's message.
+  - That pickup now READS THE ENVELOPE this same firmware emits, using the
+    parser in rns/outbox.h rather than a second copy of the rules, so the card
+    shows the message instead of "1|<32 hex>|<session>|<text>". The parse is
+    SOFT: bare text and anything that does not match the shape is shown exactly
+    as it arrived and counted, because senders predating the format exist and a
+    message is never worth dropping over its shape. The sanitiser pin is
+    therefore no longer a literal buffer name — it is the rule that every
+    sanitising pass reads from one variable and that variable comes from
+    nothing but the raw payload and the parsed text field. A parsed envelope is
+    also offered ONCE to a room router: a function pointer, null by default,
+    because the skill that owns the conversations has not landed yet and a
+    direct call to a symbol nobody has written is a build break dressed up as a
+    design. The card is raised first whatever the router does, and a refusal is
+    counted with its reason.
   - And rns.cpp now SENDS, which is the first handoff in this firmware that
     genuinely crosses tasks: POST /rns/send answers on the AsyncTCP task and the
     send must run on the loop task. So the ring's publish-last discipline stops
@@ -889,9 +903,52 @@ assert set(writes) <= {"mark", "g_rns_card_body"}, (
     "Found a copy from %r — a raw copy of the payload puts unfiltered bytes on "
     "the screen" % sorted(set(writes) - {"mark", "g_rns_card_body"})
 )
-assert "rns_text_sanitize(g_rns_inbox_payload," in pickup_norm, (
-    "the sanitiser must be fed the payload the pickup just took, not something "
-    "assembled around it"
+# THE SANITISER MUST BE FED THE PAYLOAD THE PICKUP JUST TOOK — and since the
+# envelope arrived, "the payload" is one of TWO THINGS: the whole buffer for
+# anything that is not an envelope, and the envelope's TEXT FIELD for anything
+# that is. Both are bytes off the network, so both have to go through the
+# sanitiser, and the earlier form of this pin (the literal
+# `rns_text_sanitize(g_rns_inbox_payload,`) can no longer say that: it would
+# either forbid the parse or pass while the text field went round it.
+#
+# So the pin is in two halves. First, every sanitiser call in the pickup reads
+# from the SAME variable; second, that variable is assigned from nothing but the
+# raw payload and the parsed view. Bypassing the sanitiser on either path — or
+# introducing a third source, a decoded buffer, an unparsed remainder — fails
+# here.
+src_args = [b.split(",")[0].strip()
+            for b in re.findall(r"rns_text_sanitize\((.*?)\);", pickup_norm)]
+assert src_args and len(set(src_args)) == 1, (
+    "every sanitising pass in the pickup must read from one and the same "
+    "source variable; found %r" % sorted(set(src_args))
+)
+SRC = src_args[0]
+assert re.search(r"const uint8_t \*%s = g_rns_inbox_payload;" % SRC, pickup), (
+    "the sanitiser's source must START as the raw payload the pickup took, so "
+    "that a payload which is not an envelope is shown exactly as it arrived"
+)
+src_sets = re.findall(r"(?<![A-Za-z0-9_])%s\s*=\s*([^;]+);" % SRC, pickup)
+assert [re.sub(r"\s+", " ", s).strip() for s in src_sets] == [
+    "g_rns_inbox_payload", "(const uint8_t *)ev.text"], (
+    "the sanitiser's source may be assigned from exactly two things and in this "
+    "order: the raw payload, and the TEXT FIELD of a parsed envelope — which "
+    "points into that same payload. Anything else is a route around the "
+    "sanitiser or around the parser. Found: %r" % src_sets
+)
+# ...and the length travels with it. A source swapped to the envelope's text
+# while the length stayed the payload's would sanitise 36 bytes of somebody
+# else's memory onto the card.
+len_args = [b.split(",")[1].strip()
+            for b in re.findall(r"rns_text_sanitize\((.*?)\);", pickup_norm)]
+assert len(set(len_args)) == 1 and len_args[0] != "len", (
+    "the length passed to the sanitiser must travel with the source and must "
+    "not be the raw payload's `len`: an envelope contributes only its text. "
+    "Found: %r" % sorted(set(len_args))
+)
+assert re.search(r"size_t %s = len;" % len_args[0], pickup) and \
+       re.search(r"%s = ev\.text_len;" % len_args[0], pickup), (
+    "the sanitised length must start as the whole payload and become the "
+    "envelope's text length when one parsed"
 )
 # ...AND ITS OUTPUT MUST BE THE THING THAT GOES ON THE CARD. Feeding
 # g_rns_inbox_payload straight to notify_ingest() calls the sanitiser and throws
@@ -964,10 +1021,11 @@ assert mark and mark.group(1).startswith("[+"), (
     "shipped a marker nobody could see. Found: %r"
     % (mark.group(1) if mark else None)
 )
-assert pickup.count("rns_text_sanitize(") == 2, (
+assert pickup.count("rns_text_sanitize(") == 3, (
     "the count on the marker must come from a SECOND sanitising pass with the "
     "marker's room already held back — computing it before the marker displaces "
-    "text undercounts by exactly the marker's length"
+    "text undercounts by exactly the marker's length — and the room router gets "
+    "a THIRD, uncut pass of its own"
 )
 # COUNTING THE CALLS IS NOT ENOUGH: the bug was the BUDGET, not the arity.
 # Reverting the first pass to sizeof(g_rns_card_body) restores the original
@@ -976,8 +1034,8 @@ assert pickup.count("rns_text_sanitize(") == 2, (
 # the first decides WHETHER anything was cut, the second holds back the marker's
 # room so the count is of text that genuinely did not make it.
 budgets = re.findall(r"rns_text_sanitize\((.*?)\);", pickup_norm)
-assert len(budgets) == 2, "expected two sanitising passes, found %d" % len(budgets)
-first, second = (re.sub(r"\s+", "", b) for b in budgets)
+assert len(budgets) == 3, "expected three sanitising passes, found %d" % len(budgets)
+first, second, third = (re.sub(r"\s+", "", b) for b in budgets)
 assert first.endswith("sizeof(g_rns_card_body),RNS_CARD_VISIBLE_CHARS"), (
     "the first pass must measure against the CARD's character budget, not "
     "notify's storage: sizing the cut at 240 bytes is the bug that put the "
@@ -989,6 +1047,29 @@ assert second.endswith(
     "the second pass must hold the marker's room back in BOTH budgets, or the "
     "count is measured against text the marker then overwrites. Found: %r"
     % second
+)
+# THE THIRD PASS IS THE ROOM'S, AND IT IS UNCUT. The card's budget is what the
+# screen paints; a conversation is the durable copy and gets the whole text, in
+# a buffer of its own so the marker prefix and the ~185-codepoint cut cannot
+# end up stored as if the sender had written them.
+assert third.endswith("g_rns_room_text,sizeof(g_rns_room_text),0"), (
+    "the room router's text must be sanitised into its own buffer with NO "
+    "character cap (a max_chars of 0): handing it the card body would store a "
+    "message cut to the screen and prefixed with a marker meant for the "
+    "screen. Found: %r" % third
+)
+assert re.search(r"^static char g_rns_room_text\[RNS_INBOX_PAYLOAD_MAX \+ 1\];",
+                 rns, re.M), (
+    "the room text buffer must be a fixed static sized at the payload ceiling "
+    "plus a terminator — the loop task's stack is shared with the drain"
+)
+# ...and NOTHING may write it but the sanitiser, for the same reason nothing
+# but the sanitiser may write the card body: it is where a stranger's bytes go.
+room_writes = re.findall(r"\b(?:memcpy|memmove|strcpy|strncpy|snprintf|sprintf|"
+                         r"memset)\s*\(\s*g_rns_room_text", pickup_norm)
+assert not room_writes, (
+    "g_rns_room_text may only be written by rns_text_sanitize(): a raw copy "
+    "into it hands unfiltered, un-terminated network bytes to another skill"
 )
 # The guard is bounded by the RESERVATION, not by sizeof(mark). They differ, and
 # the larger one is unsafe: the memmove below moves the text to offset mn, so any
@@ -1002,6 +1083,205 @@ assert "mn <= RNS_CARD_CUT_RESERVE" in pickup, (
 assert "sizeof(mark)" not in pickup.split("if (mn")[1].split("}")[0], (
     "sizeof(mark) is not the safe bound for the marker guard"
 )
+
+# 9d-ter. THE ENVELOPE IS READ BY THE CODE THAT WRITES IT, and the card shows
+# the message rather than the framing. Until this commit the pickup sanitised
+# the whole payload onto the screen, so a peer answering in the agreed format
+# produced a card reading "1|<32 hex>|<session>|<text>" — the plumbing on
+# display, and the text pushed off the bottom by it.
+outbox_h = (ROOT / "src" / "rns" / "outbox.h").read_text(encoding="utf-8")
+assert rns_code.count("rns_envelope_parse(") == 1, (
+    "there is exactly one parse site, in the loop-task pickup"
+)
+assert "rns_envelope_parse(" in pickup and "rns_envelope_parse" in outbox_h, (
+    "the parser must live in rns/outbox.h next to the builder — one owner for "
+    "the format, so emit and parse cannot drift — and be called from the pickup"
+)
+# A SECOND PARSER IS THE FAILURE MODE THIS PINS AGAINST. The format's rules are
+# the version digit, the 32-hex address, the session charset and the "first
+# three separators" reading; a hand-rolled split in rns.cpp would be a copy of
+# them that nothing forces to stay a copy.
+for hand_rolled in ("strchr(", "strtok(", "strrchr(", "strsep(", "sscanf("):
+    assert hand_rolled not in pickup, (
+        "the pickup must not take the payload apart itself (%s): the envelope "
+        "has one owner, rns/outbox.h, and a second reading of it drifts"
+        % hand_rolled
+    )
+# THE PARSE IS FED THE WHOLE PAYLOAD AND ITS VERDICT IS WHAT BRANCHES. Pinned
+# as statements rather than as a call somewhere in the function: a parse whose
+# result nothing tests is a parse that has been switched off, and every other
+# assertion in this section still passes with the envelope branch made
+# unreachable.
+parse_stmt = re.search(
+    r"rns_envin_result (\w+) = rns_envelope_parse\("
+    r"g_rns_inbox_payload, len, &(\w+)\);", pickup_norm)
+assert parse_stmt, (
+    "the pickup must parse the payload it just took, whole, into a view it "
+    "owns — and keep the verdict"
+)
+ER, EV = parse_stmt.groups()
+assert re.search(r"if \(%s == RNS_ENVIN_OK\) \{" % ER, pickup), (
+    "the envelope branch must be guarded on the parse result itself: a verdict "
+    "nothing tests is a parser that has been switched off"
+)
+assert re.search(r"%s\.text_len;" % EV, pickup) and \
+       re.search(r"%s\.session, %s\.session_len\);" % (EV, EV), pickup), (
+    "the fields must come out of the view, which points into the payload — "
+    "nothing is copied out of the network buffer twice"
+)
+# PARSING IS SOFT. Not every payload is an envelope — tools/rns-send sends bare
+# text and so does any peer predating the format — so a payload that does not
+# match the shape is SHOWN AS IT ARRIVED and counted, never dropped and never
+# blanked. The two counters are what makes the split visible; the else branch is
+# what makes it harmless.
+assert "g_rns_env_parsed++" in pickup and "g_rns_env_raw++" in pickup, (
+    "both outcomes must be counted: a payload read as an envelope and a payload "
+    "shown raw are both ordinary, and which one is happening decides what the "
+    "screen looks like"
+)
+assert "g_rns_env_raw_why = rns_envin_reason(" in pickup, (
+    "the reason a payload was not an envelope must be kept: the counter cannot "
+    "answer 'my peer says it sent one, so why is the framing on my screen?'"
+)
+# ...AND A SECOND SLOT THAT PLAIN TEXT CANNOT OVERWRITE. Last-reason-wins is
+# the wrong policy for the case worth seeing: tools/rns-send is in ordinary use
+# and every one of its packets writes NO_FRAME, so a single probe with a bad
+# address or a bad session name — the shapes the field exists to surface — is
+# gone by the next ordinary message.
+assert "if (er != RNS_ENVIN_NO_FRAME) g_rns_env_bad_why = g_rns_env_raw_why;" \
+       in pickup, (
+    "the last MALFORMED reason must be kept apart from the last reason: bare "
+    "text is constant and ordinary, and it would otherwise mask every probe"
+)
+assert "notify_ingest(" in pickup and "return" not in pickup.split("g_rns_env_raw++")[1].split("}")[0], (
+    "a payload that is not an envelope must fall through to the card, not out "
+    "of the loop: the one outcome that must never happen is a lost message"
+)
+# THE CARD IS UNCONDITIONAL, and this is the assertion that says so rather than
+# implying it. Every message the pickup takes raises one — envelope or not,
+# routed or not — so the card site sits at the top level of the loop body and
+# its only condition is notify_ingest()'s own return value. Gating it on the
+# parse result (`er != RNS_ENVIN_OK && notify_ingest(...)`) leaves EVERY
+# envelope with no card at all, which is precisely the outcome this file's
+# header promises can never happen, and every other assertion here survives it.
+assert re.search(r'if \(notify_ingest\("info", "rns", title, g_rns_card_body, '
+                 r'NULL\) != 0\) g_rns_cards\+\+;', pickup_norm), (
+    "the card must be raised for every message taken, conditioned on nothing "
+    "but whether the notify store accepted it"
+)
+_body = pickup[pickup.index("{", pickup.index("while (rns_inbox_take(")):
+                pickup.index("notify_ingest(")]
+assert _body.count("{") - _body.count("}") == 1, (
+    "the card site must be at the top level of the pickup loop, not nested "
+    "inside a branch: a message that reaches the pickup always reaches the "
+    "screen"
+)
+# THE SESSION IDENTIFIES THE CONVERSATION AND GOES IN THE TITLE; the address
+# does not go on the screen at all. And the byte count stays, because it is the
+# only evidence of truncation the card carries besides the marker.
+title = re.findall(r'snprintf\(title, sizeof\(title\), "([^"]*)"', pickup)
+assert len(title) == 2 and title[0] == "RNS %s %u B" and title[1] == "RNS %u B", (
+    "the title must carry the session name when there is one and read exactly "
+    "as it did before when there is not — with the byte count in both. "
+    "Found: %r" % title
+)
+# ...AND THE %s MUST BE THE TERMINATED COPY, NEVER THE VIEW. ev.session points
+# into g_rns_inbox_payload and is NOT NUL-terminated: snprintf bounds the WRITE,
+# not the read, so "%s" on it walks past session_len through the rest of the
+# payload and on into whatever .bss follows. The copy exists for that reason.
+title_args = re.search(
+    r'snprintf\(title, sizeof\(title\), "RNS %s %u B", ([^,]+),', pickup_norm)
+assert title_args and title_args.group(1).strip() == "session", (
+    "the title's %%s must be the terminated `session` copy, not the parser's "
+    "view: ev.session has no terminator and %%s reads until it finds one. "
+    "Found: %r" % (title_args.group(1) if title_args else None)
+)
+assert "g_rns_card_body" not in pickup.split("char title")[1].split("notify_ingest")[0], (
+    "the title must be built from the session and the length, not from the body"
+)
+for plumbing in ("ev.from", "g_rns_env_from"):
+    assert plumbing not in pickup.split("char title")[1].split("notify_ingest")[0], (
+        "the sender address is carried for REPLYING, not for reading: 32 hex "
+        "characters on a card are 32 characters of message the screen does not "
+        "show. Found %s on the way to the card" % plumbing
+    )
+
+# 9d-quater. THE ROOM ROUTER: ONE CALL SITE, THROUGH A POINTER, ON THE LOOP
+# TASK. The skill that owns the conversations decides where a message lands and
+# its helper does not exist in this tree yet, so this side calls through a
+# pointer rather than naming a symbol nobody has written — a direct call would
+# be a build break dressed up as a design, and it would also make the two sides
+# land in a fixed order.
+assert "typedef bool (*rns_room_router)(const char *session, const char *text," \
+       in outbox_h, (
+    "the router's type is part of the contract and belongs in the header both "
+    "sides include"
+)
+assert re.search(r"^void rns_set_room_router\(rns_room_router fn\) \{", rns, re.M), (
+    "the setter must be defined in rns.cpp (which owns the pointer) and must "
+    "NOT be static: the caller is another skill in this build"
+)
+assert re.search(r"^static rns_room_router g_rns_room_router = nullptr;", rns, re.M), (
+    "the router defaults to null, and null is not a degraded mode: it is the "
+    "behaviour that shipped before the hook existed — a card and nothing else"
+)
+assert rns_code.count("g_rns_room_router(") == 1, (
+    "the router is called from exactly ONE site. Two would put a message into "
+    "a conversation twice, and there is nothing downstream that could tell"
+)
+assert "g_rns_room_router(" in pickup, (
+    "the one call site is the loop-task pickup, after rns_stack.loop() — the "
+    "router's contract (no synchronous SD, no blocking) is written against "
+    "that task and that position in the tick"
+)
+# ITS TWO ARGUMENTS ARE PINNED BY NAME, because the transformations above can
+# all exist while their outputs go unused — and each wrong argument is a
+# different defect:
+#   ev.session / ev.text  point into g_rns_inbox_payload and are NOT
+#       NUL-terminated, while rns/outbox.h promises the router two C strings.
+#       A router that calls strlen() on them reads past the payload.
+#   g_rns_card_body       is cut to what the screen paints and may carry the
+#       "[+N B]" marker, so a conversation would store a truncated message with
+#       a marker meant for the panel inside its text.
+# The third sanitising pass is pinned above; this is what makes it consumed.
+route_args = re.search(r"g_rns_room_router\(([^;]*?)\)", pickup_norm)
+assert route_args, "the router call must be readable"
+route_args = [a.strip() for a in route_args.group(1).split(",")]
+assert route_args == ["session", "g_rns_room_text", "&reason"], (
+    "the router takes the TERMINATED session copy and the UNCUT sanitised text "
+    "— never the parser's views (no terminator; the contract promises C "
+    "strings) and never the card body (cut, and prefixed with a marker meant "
+    "for the screen). Found: %r" % route_args
+)
+# ...and only for a payload that WAS an envelope: a bare-text packet has no
+# session to route by and no sender to answer.
+route_guard = re.search(r"if \(er == RNS_ENVIN_OK && g_rns_room_router\)", pickup)
+assert route_guard, (
+    "the router must be called only for a parsed envelope AND only when it is "
+    "set, in one guard: a null pointer is the default and a non-envelope has "
+    "nothing to route"
+)
+# THE CARD IS RAISED FIRST, WHATEVER THE ROUTER DOES. A router that throws its
+# work away — or a bad pointer somebody set — must not be able to swallow the
+# message on the way to the screen.
+assert pickup.index("notify_ingest(") < pickup.index("g_rns_room_router("), (
+    "the card must be raised BEFORE the router runs: the screen is the outcome "
+    "that must happen whatever else does"
+)
+# A REFUSAL IS NOT ALLOWED TO BE SILENT. The card went up either way, so
+# nothing on the screen says the conversation never received the message.
+assert "g_rns_env_routed++" in pickup and "g_rns_env_refused++" in pickup and \
+       "g_rns_env_refuse_reason = reason;" in pickup, (
+    "both outcomes of the router must be counted and the refusal must keep the "
+    "router's reason: a message that did not reach a room is invisible "
+    "everywhere else"
+)
+for banned in ("SD.", "SPIFFS", "delay(", "vTaskDelay"):
+    assert banned not in pickup, (
+        "the pickup — and the router called from it — runs on the loop task, "
+        "which is what drains the Reticulum socket; %s in it stops packets "
+        "arriving" % banned
+    )
 
 # 9e. THE PICKUP RUNS AFTER THE STACK. The drain that fills the inbox is inside
 # rns_stack.loop(), so a pickup ahead of it serves last tick's message and turns
@@ -1025,6 +1305,34 @@ for key in ('"data_dropped"', '"data_last_len"', '"data_oversize"',
 assert 'doc["data_rx"] = (unsigned long)g_rns_inbox.received;' in json_builder, (
     "data_rx keeps its meaning — payloads the callback was handed — and now "
     "comes from the inbox's own counter"
+)
+# ...and the envelope's own keys, published through the loop-side snapshot like
+# everything else the handler serves. The counters would be single-copy atomic
+# to read directly; the address is a char array the loop task rewrites in place
+# and the reason is a pointer it reassigns, and those two have no choice.
+for key in ('"data_envelopes"', '"data_raw"', '"data_raw_why"',
+            '"data_malformed_why"', '"data_from"', '"data_routed"',
+            '"data_route_refused"', '"data_route_reason"'):
+    assert key in json_builder, (
+        "GET /rns/status must publish %s: a message shown raw, or one a room "
+        "refused, is invisible on the screen — the card looks the same" % key
+    )
+for field in ("env_parsed", "env_raw", "env_routed", "env_refused",
+              "env_reason", "env_raw_why", "env_bad_why", "env_from"):
+    assert "g_rns_snap.%s" % field in publish, (
+        "g_rns_snap.%s must be filled on the loop task in rns_status_publish()"
+        % field
+    )
+    assert "g_rns_snap.%s" % field in json_builder, (
+        "the handler must read %s from the snapshot, never from the live "
+        "counter" % field
+    )
+assert "memcpy(g_rns_snap.env_from, g_rns_env_from,\n" \
+       "           sizeof(g_rns_snap.env_from) - 1);" in publish, (
+    "the address copy must stop one byte short of the end, like send_error and "
+    "last_error: that last byte is never written after the initialiser, so a "
+    "reader crossing the copy can see mixed characters but never an "
+    "unterminated array"
 )
 
 # 9g. The host test drives the real header, including the overflow policy: the

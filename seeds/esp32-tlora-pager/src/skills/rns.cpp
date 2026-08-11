@@ -688,6 +688,14 @@ static bool rns_packet_filter(const RNS::Packet &packet) {
 static rns_inbox g_rns_inbox;
 static uint8_t g_rns_inbox_payload[RNS_INBOX_PAYLOAD_MAX];
 static char g_rns_card_body[NOTIFY_BODY_LEN];
+/* The message as the ROOM sees it, and the reason it is a second buffer rather
+ * than the card body: the card is cut to what the screen paints — about 185
+ * codepoints — and may carry a "[+N B]" prefix, and a room that stored THAT
+ * would be a conversation with the ends of its messages missing and a marker
+ * for the screen inside its text. A room is the durable copy, so it gets the
+ * whole text, sanitised but uncut. Sized at the payload ceiling plus a
+ * terminator, because the sanitiser never writes more bytes than it reads. */
+static char g_rns_room_text[RNS_INBOX_PAYLOAD_MAX + 1];
 /* Cards raised, and cards whose body could not hold the whole message. The
  * second one is not optional bookkeeping: a payload can be 383 bytes and the
  * card paints far less than that, so without this a long message would lose its
@@ -697,6 +705,92 @@ static char g_rns_card_body[NOTIFY_BODY_LEN];
  * that shipped a truncation marker at an offset the renderer never reaches. */
 static uint32_t g_rns_cards = 0;
 static uint32_t g_rns_card_cut = 0;
+
+/* ---- the inbound envelope ----
+ *
+ * WHAT THESE COUNT, and why "not an envelope" is a first-class outcome rather
+ * than a failure. The peer answers in the agreed format and those payloads are
+ * taken apart; tools/rns-send and every sender that predates the format send
+ * bare text, and those are shown exactly as they arrive. Both are normal, so
+ * both are counted, and the pair is what tells an operator which kind of sender
+ * is on the other end of a card they are looking at.
+ *
+ * g_rns_env_raw_why is the last reason a payload was not read as an envelope.
+ * It is a pointer to a static literal out of rns_envin_reason() — never
+ * formatted, never owned — and it answers the one question the counter cannot:
+ * "my peer says it sent an envelope, so why is the framing on my screen?".
+ *
+ * g_rns_env_raw_why IS LAST-REASON-WINS, which is exactly wrong for the case
+ * worth seeing. tools/rns-send is in ordinary use and every one of its packets
+ * writes "not an envelope: plain text", so a single BAD_FROM or BAD_SESSION
+ * from a probing sender — the shapes this field exists to surface — is
+ * overwritten by the next ordinary message and never seen. So the malformed
+ * shapes get a slot of their own that plain text cannot overwrite. Four bytes,
+ * and it is the difference between a diagnostic and a decoration.
+ *
+ * g_rns_env_from is the sender address of the last envelope, and it is HELD
+ * FOR REPLYING, not for reading: a packet to a SINGLE destination carries no
+ * source field, so this string is the only thing that makes an answer possible,
+ * and it is exactly what POST /rns/send takes as `to`. It is deliberately NOT
+ * on the card — 32 hex characters of address are 32 characters of message the
+ * screen does not show — and it is published in GET /rns/status instead, which
+ * is where something that intends to answer will look for it.
+ *
+ * ⚠ AND IT IS WHATEVER THE SENDER TYPED. THIS COMMENT IS THE CONTRACT ANY
+ * REPLY FEATURE WILL BE BUILT AGAINST, so it says the dangerous half plainly: a
+ * DATA packet to a SINGLE destination carries no source field and no signature,
+ * and the parser proves only that these 32 characters are HEXADECIMAL. Nothing
+ * anywhere ties them to the node that sent the packet. This device announces
+ * its address every 30 minutes, so anyone who has heard that announce can send
+ * `1|<somebody else's address>|beacon|ok`, and the first thing that answers
+ * data_from would encrypt a reply to a node the user has never talked to —
+ * addressed by an attacker, at a time of the attacker's choosing. Treat this
+ * field as a HINT the user confirms, never as provenance. The card's own
+ * caveat is the same one from the other side: anyone who knows this address can
+ * raise a card on this screen.
+ *
+ * ⚠ AND IT CAN TEAR, differently from every other string in the snapshot. The
+ * rule everywhere else is that a reader crossing a copy sees mixed characters,
+ * which is ugly and detectable. Two ADDRESSES that interleave produce a third
+ * address that is still 32 valid hex characters — a well-formed hash belonging
+ * to nobody, which no consumer can tell from a real one. Nothing auto-replies
+ * today, so it is left as it is; anything that starts replying without a human
+ * in the loop needs the address carried with the message rather than read from
+ * this slot afterwards. */
+static uint32_t g_rns_env_parsed = 0;   /* payloads read as an envelope */
+static uint32_t g_rns_env_raw = 0;      /* payloads shown exactly as they came */
+static const char *g_rns_env_raw_why = nullptr;
+/* ...and the last reason that was NOT "plain text", kept where the common case
+ * cannot overwrite it. */
+static const char *g_rns_env_bad_why = nullptr;
+static char g_rns_env_from[RNS_OUTBOX_ADDR_HEX + 1] = {0};
+
+/* ---- the room router ----
+ *
+ * A FUNCTION POINTER, NULL UNTIL SOMEBODY SETS IT. The skill that owns the
+ * conversations is what decides where a message lands, and its helper does not
+ * exist in this tree yet — so this side calls through a pointer instead of
+ * naming a symbol nobody has written. Null is not a degraded mode: it is the
+ * behaviour that shipped before the hook existed, a card and nothing else.
+ * The contract (loop task, no synchronous SD, no blocking, called once per
+ * parsed envelope) is written out in rns/outbox.h next to the typedef.
+ *
+ * g_rns_env_refuse_reason is whatever the router wrote on its last false
+ * return. Its meaning belongs to the router; this file only carries it to
+ * GET /rns/status, because a message that did not reach a room is invisible
+ * everywhere else — the card still appears, so nothing on the screen says the
+ * conversation never got it. */
+static rns_room_router g_rns_room_router = nullptr;
+static uint32_t g_rns_env_routed = 0;    /* the router accepted the message */
+static uint32_t g_rns_env_refused = 0;   /* ...and these it refused */
+static int g_rns_env_refuse_reason = 0;
+
+/* Set once at init by the skill that owns the rooms. Not static: the caller is
+ * another translation-unit-in-name-only included elsewhere in this build, and a
+ * setter it cannot name is a hook that does not exist. */
+void rns_set_room_router(rns_room_router fn) {
+    g_rns_room_router = fn;
+}
 
 static void rns_data_callback(const RNS::Bytes &data, const RNS::Packet &packet) {
     (void)packet;
@@ -902,12 +996,25 @@ struct RnsStatusSnap {
      * last byte is never written after this initialiser, so a reader crossing
      * the copy can see mixed characters but never an unterminated array. */
     char send_error[96];
+    /* The inbound envelope, published under the same rule as the prefilter
+     * counters above: the four counters would be single-copy atomic to read
+     * directly, and they are copied here anyway so the handler has one source.
+     * The last two are not scalars at all and have no choice — `env_raw_why` is
+     * a pointer the loop task reassigns and `env_from` is a char array it
+     * rewrites in place, which is exactly the hazard send_error is copied for.
+     * env_reason is the ROUTER's own code, carried and not interpreted. */
+    uint32_t env_parsed, env_raw, env_routed, env_refused;
+    int env_reason;
+    const char *env_raw_why;
+    const char *env_bad_why;
+    char env_from[RNS_OUTBOX_ADDR_HEX + 1];
     uint16_t port;
     char host[RNS_TCP_HOST_MAX];
     char last_error[64];
 };
 static RnsStatusSnap g_rns_snap = {"off", false, 0, 0, 0, 0, 0, 0, 0, 0, 0,
                                    0, {0},
+                                   0, 0, 0, 0, 0, nullptr, nullptr, {0},
                                    RNS_TCP_PORT_DEFAULT, {0}, {0}};
 
 /* ---- configuration ---- */
@@ -1429,6 +1536,22 @@ static void rns_status_publish() {
     memcpy(g_rns_snap.send_error, g_rns_send_error,
            sizeof(g_rns_snap.send_error) - 1);
 
+    /* The inbound envelope: how many payloads were read as one, how many were
+     * shown raw and why, and what a room router did with them. All written by
+     * rns_inbox_poll() a few lines earlier in the same tick. The address copy
+     * stops one byte short for the reason send_error's does — that last byte is
+     * never written after the initialiser, so a reader crossing this memcpy can
+     * see mixed characters but never an unterminated array. */
+    g_rns_snap.env_parsed = g_rns_env_parsed;
+    g_rns_snap.env_raw = g_rns_env_raw;
+    g_rns_snap.env_routed = g_rns_env_routed;
+    g_rns_snap.env_refused = g_rns_env_refused;
+    g_rns_snap.env_reason = g_rns_env_refuse_reason;
+    g_rns_snap.env_raw_why = g_rns_env_raw_why;
+    g_rns_snap.env_bad_why = g_rns_env_bad_why;
+    memcpy(g_rns_snap.env_from, g_rns_env_from,
+           sizeof(g_rns_snap.env_from) - 1);
+
     g_rns_snap.port = g_rns_port;
     memcpy(g_rns_snap.host, g_rns_host, sizeof(g_rns_snap.host) - 1);
     memcpy(g_rns_snap.last_error, g_rns_last_error,
@@ -1558,8 +1681,9 @@ static void rns_status_json(JsonDocument &doc) {
      * the 8 ms drain, and nothing on this board had measured the sign side.
      * Read announce_us_max against iface.drain_us_max.
      *
-     * THE SIX data_* KEYS ARE THE RECEIVE PATH MADE DIAGNOSABLE, and each one
-     * answers a question the others cannot:
+     * THE FIRST SIX data_* KEYS ARE THE RECEIVE PATH MADE DIAGNOSABLE, and
+     * each one answers a question the others cannot (the envelope's own keys
+     * follow them, with their own note):
      *   data_rx          payloads the packet callback was handed. Still counts
      *                    packets that DECRYPTED, not packets that arrived — see
      *                    the blind spot above.
@@ -1594,6 +1718,53 @@ static void rns_status_json(JsonDocument &doc) {
     doc["data_oversize"] = (unsigned long)g_rns_inbox.oversize;
     doc["data_cards"] = (unsigned long)g_rns_cards;
     doc["data_card_cut"] = (unsigned long)g_rns_card_cut;
+
+    /* THE ENVELOPE MADE VISIBLE, and the pair at the top of it is the point:
+     * a payload is either read as `1|<address>|<session>|<text>` or shown
+     * exactly as it arrived, and both are ordinary. Which one is happening
+     * decides what the screen looks like, so it cannot be left to be guessed
+     * from a card.
+     *   data_envelopes   payloads taken apart as a version-1 envelope.
+     *   data_raw         payloads shown as they came. tools/rns-send sends bare
+     *                    text, so this counting up is not a fault on its own.
+     *   data_raw_why     the last reason one was not an envelope — an unknown
+     *                    version, a bad address, a bad session name, no framing
+     *                    at all. Null until it has happened.
+     *   data_malformed_why  the same, but ignoring "plain text". Bare-text
+     *                    senders are ordinary and constant, so they would
+     *                    otherwise keep the field above pinned to their own
+     *                    reason and hide the single malformed probe it exists
+     *                    to show.
+     *   data_from        sender address of the last envelope, 32 hex
+     *                    characters: what POST /rns/send takes as `to`. A
+     *                    packet to a SINGLE destination carries no source, so
+     *                    the envelope is the only place an answer can come
+     *                    from, and this is that field kept where something
+     *                    replying can read it. It is NOT on the card.
+     *                    ⚠ IT IS ALSO UNAUTHENTICATED — no source field, no
+     *                    signature, and the parser proves only that the
+     *                    characters are hex. Anyone who has heard this node's
+     *                    announce can put SOMEBODY ELSE'S address in it, so a
+     *                    reply sent here on trust is a packet encrypted to a
+     *                    node the user never talked to. A hint to confirm, not
+     *                    a provenance; see g_rns_env_from for the whole note.
+     *   data_routed      envelopes a room router accepted.
+     *   data_route_refused  envelopes it refused. The card still went up, so
+     *                    this counter is the only place a message that never
+     *                    reached its conversation shows at all.
+     *   data_route_reason   the router's own code from that last refusal,
+     *                    carried and not interpreted. Zero until then.
+     * The four counters and both strings come from the loop-side snapshot, for
+     * the reason the whole snapshot exists. */
+    doc["data_envelopes"] = (unsigned long)g_rns_snap.env_parsed;
+    doc["data_raw"] = (unsigned long)g_rns_snap.env_raw;
+    doc["data_raw_why"] = g_rns_snap.env_raw_why;
+    doc["data_malformed_why"] = g_rns_snap.env_bad_why;
+    doc["data_from"] = g_rns_snap.env_from[0] ? g_rns_snap.env_from
+                                              : (const char *)nullptr;
+    doc["data_routed"] = (unsigned long)g_rns_snap.env_routed;
+    doc["data_route_refused"] = (unsigned long)g_rns_snap.env_refused;
+    doc["data_route_reason"] = (long)g_rns_snap.env_reason;
 
     /* THE SEND PATH MADE VISIBLE, and this is the reason the keys exist rather
      * than a habit of publishing counters. A send to a peer this node cannot
@@ -1793,6 +1964,32 @@ static const char *rns_describe() {
            "`/rns/status` are the receive path's counters. The card cannot\n"
            "name the sender: a packet to a SINGLE destination carries no\n"
            "source, so anyone who knows the address can raise one.\n"
+           "AN INBOUND PAYLOAD IS READ AS THE SAME ENVELOPE THIS NODE EMITS,\n"
+           "by the same code in `rns/outbox.h` — one owner for the format, so\n"
+           "the two halves cannot drift. A payload that parses contributes\n"
+           "only its TEXT to the card; the session name goes in the title\n"
+           "next to the byte count, and the sender address is kept for\n"
+           "replying rather than shown. PARSING IS SOFT: anything that is not\n"
+           "an envelope — bare text, an unknown version digit, a bad address\n"
+           "or session name, a frame with no text — is shown exactly as it\n"
+           "arrived and counted separately, because senders that predate the\n"
+           "format exist and a message is never worth dropping over its\n"
+           "shape. `data_envelopes`, `data_raw`, `data_raw_why`,\n"
+           "`data_malformed_why` (the last reason that was not simply plain\n"
+           "text, which bare-text senders would otherwise mask) and\n"
+           "`data_from` report that split; `data_from` is the 32-hex address\n"
+           "of the last envelope and is what `POST /rns/send` takes as `to`.\n"
+           "IT IS NOT PROOF OF ANYTHING. The packet carries no source field\n"
+           "and no signature, so the address is whatever the sender typed:\n"
+           "anyone who has heard this node's announce can name a THIRD PARTY\n"
+           "there, and a reply sent on trust is encrypted to a node the user\n"
+           "never talked to. Confirm it before answering.\n"
+           "A parsed envelope is also offered ONCE to a room router — a\n"
+           "function pointer another skill sets at init, null by default,\n"
+           "which runs on the loop task and may not block or touch SD. The\n"
+           "card is raised either way; `data_routed`, `data_route_refused`\n"
+           "and `data_route_reason` are where a message that never reached a\n"
+           "conversation shows up, since the screen cannot say so.\n"
            "Inbound packets pass a filter registered on Transport before the\n"
            "stack starts: it drops announces not marked as a path response,\n"
            "before the Ed25519 signature is checked — a verification that\n"
@@ -2141,18 +2338,27 @@ static void rns_announce_poll() {
  * are counters; /events does not. Anyone diagnosing this reaches for data_rx and
  * data_dropped, not the ring.
  *
- * THE RECEIVE PATH KNOWS NOTHING ABOUT THE ENVELOPE, and as of the commit that
- * added POST /rns/send that is an asymmetry rather than a simple omission. This
- * function sanitises the whole payload into the card exactly as it arrives, so
- * when the peer ANSWERS in the agreed format the card reads
- * "1|<32 hex>|<session>|<text>" with the framing visible on screen. That is
- * ugly and it is deliberately not fixed here: splitting inbound payloads means
- * deciding what to do with a payload that is not an envelope at all (every
- * sender that predates the format, including tools/rns-send), where the sender
- * address should be shown, and whether the session belongs on the card — none
- * of which is a send-side question. rns/outbox.h holds the format; a future
- * commit that teaches this side to read it should take the builder's rules from
- * there rather than write a second parser.
+ * THE RECEIVE PATH READS THE ENVELOPE THE SEND PATH EMITS, using the parser in
+ * rns/outbox.h rather than a second copy of the rules. Until it did, this
+ * function sanitised the whole payload onto the card, so a peer answering in
+ * the agreed format produced a card reading "1|<32 hex>|<session>|<text>" with
+ * the framing on display and the text pushed off the bottom by it. The three
+ * questions that deferral was waiting on are answered here and nowhere else:
+ *
+ *   - A PAYLOAD THAT IS NOT AN ENVELOPE is shown exactly as it arrived and
+ *     counted. tools/rns-send sends bare text and so does any peer predating
+ *     the format, so this is an ordinary outcome and not a failure; the same
+ *     goes for an unknown version, a bad address, a bad session name and a
+ *     frame with no text. Nothing is ever dropped or blanked over its shape.
+ *   - THE SESSION GOES IN THE TITLE, where it names the conversation without
+ *     spending body the message needs.
+ *   - THE SENDER ADDRESS IS NOT SHOWN AT ALL. It is kept for replying and
+ *     published in GET /rns/status; see the caveat on g_rns_env_from, which is
+ *     the part of this that a reply feature must not skip.
+ *
+ * The format still has exactly one owner, and it is rns/outbox.h. Nothing here
+ * may take a payload apart itself: the rules would drift the first time one of
+ * them moved, and the failure would be silent in both directions.
  *
  * THE CARD CANNOT HOLD THE WHOLE MESSAGE, and the cut is sized against WHAT THE
  * SCREEN PAINTS rather than against what notify can store. Those are different
@@ -2203,19 +2409,61 @@ static void rns_inbox_poll() {
 
     while (rns_inbox_take(&g_rns_inbox, g_rns_inbox_payload,
                           sizeof(g_rns_inbox_payload), &len)) {
+        /* WHAT THE CARD IS BUILT FROM. An envelope contributes its TEXT and
+         * nothing else — the version digit, the 32-character address and the
+         * session name are plumbing, and they were on the screen until this
+         * commit. Anything that is not an envelope contributes the whole
+         * payload, exactly as it arrived, which is what it did before the
+         * parser existed and what tools/rns-send still relies on.
+         *
+         * BOTH POINT INTO g_rns_inbox_payload. The view carries pointers and
+         * lengths into the buffer the pickup just filled; nothing is copied and
+         * nothing is allocated, and the sanitiser below is still the only thing
+         * standing between a stranger's bytes and the renderer. */
+        rns_envelope_view ev;
+        rns_envin_result er = rns_envelope_parse(g_rns_inbox_payload, len, &ev);
+        const uint8_t *src = g_rns_inbox_payload;
+        size_t src_len = len;
+        char session[RNS_OUTBOX_SESSION_MAX + 1];
+
+        session[0] = '\0';
+        if (er == RNS_ENVIN_OK) {
+            g_rns_env_parsed++;
+            src = (const uint8_t *)ev.text;
+            src_len = ev.text_len;
+            /* Both lengths are bounded by the parser — 32 for the address, 23
+             * for the session — and both buffers are sized from the same
+             * constants, so the terminator lands inside them by construction. */
+            memcpy(session, ev.session, ev.session_len);
+            session[ev.session_len] = '\0';
+            memcpy(g_rns_env_from, ev.from, ev.from_len);
+            g_rns_env_from[ev.from_len] = '\0';
+        } else {
+            /* NOT AN ERROR AND NOT A DROP: the payload is shown as it came and
+             * the reason is kept for GET /rns/status. See READING THE ENVELOPE
+             * in rns/outbox.h for why every non-OK outcome ends up here. */
+            g_rns_env_raw++;
+            g_rns_env_raw_why = rns_envin_reason(er);
+            /* A SHAPE THAT TRIED TO BE AN ENVELOPE gets a slot plain text
+             * cannot overwrite: with tools/rns-send in ordinary use the field
+             * above reads "plain text" permanently, and the one probe with a
+             * bad address is exactly what it was supposed to show. */
+            if (er != RNS_ENVIN_NO_FRAME) g_rns_env_bad_why = g_rns_env_raw_why;
+        }
+
         /* The return value is bytes written AND input bytes consumed — one
-         * number, by construction (see rns/inbox.h). So `kept < len` is exactly
-         * "something did not fit". */
-        size_t kept = rns_text_sanitize(g_rns_inbox_payload, len,
+         * number, by construction (see rns/inbox.h). So `kept < src_len` is
+         * exactly "something did not fit". */
+        size_t kept = rns_text_sanitize(src, src_len,
                                         g_rns_card_body,
                                         sizeof(g_rns_card_body),
                                         RNS_CARD_VISIBLE_CHARS);
 
-        if (kept < (size_t)len) {
+        if (kept < src_len) {
             g_rns_card_cut++;
             /* Second pass, with the marker's room held back in BOTH budgets, so
              * the count is of input the card genuinely does not carry. */
-            kept = rns_text_sanitize(g_rns_inbox_payload, len,
+            kept = rns_text_sanitize(src, src_len,
                                      g_rns_card_body + RNS_CARD_CUT_RESERVE,
                                      sizeof(g_rns_card_body) -
                                          RNS_CARD_CUT_RESERVE,
@@ -2223,7 +2471,7 @@ static void rns_inbox_poll() {
                                          RNS_CARD_CUT_RESERVE);
             char mark[RNS_CARD_CUT_MARK_MAX];
             int mn = snprintf(mark, sizeof(mark), "[+%u B] ",
-                              (unsigned)((size_t)len - kept));
+                              (unsigned)(src_len - kept));
             /* snprintf returns what it WOULD have written, so an upper bound is
              * the clause that matters — but the bound is the RESERVATION, not
              * the size of `mark`. Those differ today (12 against 16) and the
@@ -2250,12 +2498,28 @@ static void rns_inbox_poll() {
             }
         }
 
-        /* The byte count is in the title on EVERY card, not only a truncated
-         * one: it is the number to compare against what the sender says it
-         * sent, and it is the only place the original length survives once the
-         * body has been sanitised and possibly cut. */
-        char title[32];
-        snprintf(title, sizeof(title), "RNS %u B", (unsigned)len);
+        /* THE TITLE IS WHERE THE SESSION GOES. It names the conversation this
+         * message belongs to, which is the one piece of the envelope a reader
+         * needs and the one piece a body cannot carry without becoming
+         * plumbing again; a card from an unnamed session, and a card that was
+         * never an envelope, read exactly as they did before.
+         *
+         * The byte count stays on EVERY card, not only a truncated one: it is
+         * the number to compare against what the sender says it sent, and it is
+         * the only place the length survives once the body has been sanitised
+         * and possibly cut. It counts the TEXT for an envelope and the whole
+         * payload for anything else — the same bytes the card is built from, so
+         * it stays comparable with the "[+N B]" marker, which is measured
+         * against exactly that.
+         *
+         * 48 bytes: "RNS " + 23 of session + ' ' + 3 digits + " B" is 34, and
+         * snprintf truncates rather than overflows in any case. */
+        char title[48];
+        if (session[0])
+            snprintf(title, sizeof(title), "RNS %s %u B", session,
+                     (unsigned)src_len);
+        else
+            snprintf(title, sizeof(title), "RNS %u B", (unsigned)src_len);
 
         /* notify_ingest() returns 0 when the store refused the card, and that is
          * not given its own counter: data_cards falling behind
@@ -2263,6 +2527,40 @@ static void rns_inbox_poll() {
          * to keep in step. */
         if (notify_ingest("info", "rns", title, g_rns_card_body, NULL) != 0)
             g_rns_cards++;
+
+        /* ---- and then, at most once, the room ----
+         *
+         * AFTER THE CARD, DELIBERATELY. The card is the outcome that must
+         * happen whatever else does; a router that throws its work away, or
+         * that somebody sets to a bad pointer, must not be able to swallow the
+         * message on the way to the screen.
+         *
+         * ONLY FOR A PARSED ENVELOPE. A bare-text payload has no session to
+         * route by and no sender to answer, so there is nothing to place.
+         *
+         * THE ROOM GETS THE WHOLE TEXT, sanitised into its own buffer with no
+         * character cap: the card's budget is what the screen paints and has
+         * nothing to do with what a conversation should store. Same sanitiser,
+         * because the bytes are just as arbitrary here.
+         *
+         * The router runs ON THIS TASK, right here, after rns_stack.loop() —
+         * so it may not touch SD synchronously and may not block. That contract
+         * is written out next to the typedef in rns/outbox.h. */
+        if (er == RNS_ENVIN_OK && g_rns_room_router) {
+            int reason = 0;
+            rns_text_sanitize(src, src_len, g_rns_room_text,
+                              sizeof(g_rns_room_text), 0);
+            if (g_rns_room_router(session, g_rns_room_text, &reason)) {
+                g_rns_env_routed++;
+            } else {
+                /* A REFUSAL IS NOT ALLOWED TO BE SILENT. The card went up
+                 * either way, so nothing on the screen says the conversation
+                 * never received this message; the counter and the router's own
+                 * reason code in GET /rns/status are the only place it shows. */
+                g_rns_env_refused++;
+                g_rns_env_refuse_reason = reason;
+            }
+        }
     }
 }
 

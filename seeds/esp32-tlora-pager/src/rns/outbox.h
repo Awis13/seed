@@ -2,9 +2,14 @@
 
 /*
  * rns/outbox.h — the handoff between POST /rns/send and the loop task that
- * actually encrypts and transmits, plus the wire envelope the peer agreed to
- * and the retry decision that keeps an unresolvable address from being a
- * silent failure.
+ * actually encrypts and transmits, plus the wire envelope the peer agreed to —
+ * BOTH HALVES OF IT, emitted and read — and the retry decision that keeps an
+ * unresolvable address from being a silent failure.
+ *
+ * THE PARSER IS IN HERE AND NOT IN THE RECEIVE PATH, even though it is the
+ * receive path that calls it, because the format has to have exactly one owner.
+ * See READING THE ENVELOPE further down for what that buys and for the rule
+ * that keeps a payload which is not an envelope from becoming a lost message.
  *
  * WHY THIS EXISTS. Sending is the mirror image of receiving and it is harder in
  * exactly one way: the producer is a DIFFERENT TASK. The HTTP handler runs on
@@ -188,6 +193,28 @@ static inline const char *rns_env_reason(rns_env_result r) {
     return "unknown";
 }
 
+/* The single digit the first field carries. It is a CONSTANT rather than a
+ * literal in two places because the builder and the reader below are the two
+ * halves that must never disagree: a version bumped in the emitter alone would
+ * put a payload on the wire that this same firmware then reads as ordinary
+ * text, and nothing would say so. */
+#define RNS_ENVELOPE_VERSION '1'
+
+/* n hexadecimal characters, with NO opinion about what follows them. Split out
+ * of rns_addr_valid() because the reader below has a length and not a
+ * terminator: an inbound address field is 32 bytes in the middle of a payload
+ * that is not NUL-terminated anywhere. */
+static inline bool rns_hex_n(const char *p, size_t n) {
+    if (!p) return false;
+    for (size_t i = 0; i < n; i++) {
+        char c = p[i];
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') ||
+              (c >= 'A' && c <= 'F')))
+            return false;
+    }
+    return true;
+}
+
 /* Exactly RNS_OUTBOX_ADDR_HEX hexadecimal characters and nothing else.
  *
  * Both ends of a send go through this: the `to` a caller posted and this node's
@@ -196,25 +223,21 @@ static inline const char *rns_env_reason(rns_env_result r) {
  * only length handling is a truncation to an even count — so an address with a
  * typo would decode to a DIFFERENT hash and the packet would be encrypted and
  * sent into the void. Case is accepted either way; the device's own address is
- * always lowercase. */
+ * always lowercase.
+ *
+ * The scan stops at the first character that is not a hex digit, so a string
+ * shorter than 32 characters is refused on its terminator rather than read
+ * past it. */
 static inline bool rns_addr_valid(const char *hex) {
-    size_t i;
-    if (!hex) return false;
-    for (i = 0; i < (size_t)RNS_OUTBOX_ADDR_HEX; i++) {
-        char c = hex[i];
-        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') ||
-              (c >= 'A' && c <= 'F')))
-            return false;
-    }
-    return hex[i] == '\0';
+    if (!rns_hex_n(hex, (size_t)RNS_OUTBOX_ADDR_HEX)) return false;
+    return hex[RNS_OUTBOX_ADDR_HEX] == '\0';
 }
 
-/* [A-Za-z0-9._-], at most RNS_OUTBOX_SESSION_MAX bytes, and EMPTY IS LEGAL —
- * the peer routes an empty session to its newest one. */
-static inline bool rns_session_valid(const char *session) {
-    size_t n;
+/* [A-Za-z0-9._-] over n bytes, length checked against RNS_OUTBOX_SESSION_MAX,
+ * and n == 0 IS LEGAL — the peer routes an empty session to its newest one.
+ * The length-carrying form, for the same reason rns_hex_n() exists. */
+static inline bool rns_session_valid_n(const char *session, size_t n) {
     if (!session) return false;
-    n = strlen(session);
     if (n > (size_t)RNS_OUTBOX_SESSION_MAX) return false;
     for (size_t i = 0; i < n; i++) {
         char c = session[i];
@@ -225,12 +248,22 @@ static inline bool rns_session_valid(const char *session) {
     return true;
 }
 
+/* The NUL-terminated form, which is what POST /rns/send has. */
+static inline bool rns_session_valid(const char *session) {
+    if (!session) return false;
+    return rns_session_valid_n(session, strlen(session));
+}
+
+/* Bytes of text a session name of this LENGTH leaves room for. */
+static inline size_t rns_envelope_text_budget_n(size_t session_len) {
+    if (session_len >= (size_t)RNS_OUTBOX_TEXT_MAX) return 0;
+    return (size_t)RNS_OUTBOX_TEXT_MAX - session_len;
+}
+
 /* Bytes of text this session name leaves room for: 347 with an empty session,
  * one fewer for each character of a named one. */
 static inline size_t rns_envelope_text_budget(const char *session) {
-    size_t n = session ? strlen(session) : 0;
-    if (n >= (size_t)RNS_OUTBOX_TEXT_MAX) return 0;
-    return (size_t)RNS_OUTBOX_TEXT_MAX - n;
+    return rns_envelope_text_budget_n(session ? strlen(session) : 0);
 }
 
 /*
@@ -270,7 +303,7 @@ static inline rns_env_result rns_envelope_build(const char *from_hex,
     tlen = strlen(text);
     if (tlen > rns_envelope_text_budget(session)) return RNS_ENV_TOO_LONG;
 
-    out[o++] = '1';
+    out[o++] = RNS_ENVELOPE_VERSION;
     out[o++] = '|';
     memcpy(out + o, from_hex, (size_t)RNS_OUTBOX_ADDR_HEX);
     o += (size_t)RNS_OUTBOX_ADDR_HEX;
@@ -284,6 +317,200 @@ static inline rns_env_result rns_envelope_build(const char *from_hex,
     if (out_len) *out_len = (uint16_t)o;
     return RNS_ENV_OK;
 }
+
+/*
+ * ---- READING THE ENVELOPE ------------------------------------------------
+ *
+ * THIS LIVES NEXT TO THE BUILDER AND NOWHERE ELSE. The format has exactly one
+ * owner, so that emit and parse cannot drift: a second parser in the receive
+ * path would be a copy of these rules that nothing forces to stay a copy, and
+ * the first time a rule moved — the version digit, the session charset, the
+ * "first three separators" reading — one half would follow it and the other
+ * would not. tools/test_rns_outbox.cpp closes the loop by feeding this
+ * function what rns_envelope_build() emitted and requiring the inputs back.
+ *
+ * PARSING IS SOFT, AND THAT IS THE WHOLE DESIGN. A payload arrives from the
+ * network before anything has authenticated it, and NOT EVERY PAYLOAD IS AN
+ * ENVELOPE: tools/rns-send sends bare text, and so does every peer that
+ * predates the format. So this function has exactly two outcomes for the
+ * caller — "here are the three fields" and "this is not an envelope" — and the
+ * second one is not an error condition. The caller shows a non-envelope
+ * exactly as it arrived and counts it. THE ONE OUTCOME THAT MUST NEVER HAPPEN
+ * IS A DROPPED OR BLANKED MESSAGE: nothing here refuses a payload, it only
+ * declines to take it apart.
+ *
+ * WHICH IS WHY THE RULES ARE STRICT EVEN THOUGH THE OUTCOME IS SOFT. Every
+ * field is validated against the same constants the builder emits under — the
+ * version digit, 32 hexadecimal characters, [A-Za-z0-9._-] within 23 bytes,
+ * and a text that fits the budget — because a field that is nearly right is
+ * more dangerous than one that is obviously wrong: a 40-byte "session" would
+ * become a title, a non-hex "address" would become a reply target. Anything
+ * that does not match the shape is not an envelope, and the whole payload is
+ * shown raw instead. That includes an UNKNOWN VERSION DIGIT: '2' is a format
+ * this firmware cannot read, so the honest thing is to put the bytes on the
+ * screen rather than guess that the fields behind it are still in this order.
+ *
+ * AN EMPTY TEXT IS ALSO NOT AN ENVELOPE, and that is the same rule seen from
+ * the other side. rns_envelope_build() refuses to emit one, so a frame with
+ * nothing after the third separator was not built here; showing it raw puts
+ * 36 bytes of visible frame on the screen, which is evidence, where taking it
+ * apart would produce a card with an empty body — the blank message this file
+ * exists to prevent.
+ *
+ * NOTHING IS COPIED AND NOTHING IS ALLOCATED. The view points INTO the
+ * caller's buffer and its fields are NOT NUL-terminated, exactly like the
+ * payload they point at; every one carries its own length. The caller owns the
+ * buffer and must not let the view outlive it.
+ */
+typedef enum {
+    RNS_ENVIN_OK = 0,
+    RNS_ENVIN_NO_FRAME,      /* fewer than three separators: bare text */
+    RNS_ENVIN_BAD_VERSION,   /* the first field is not the one digit we read */
+    RNS_ENVIN_BAD_FROM,      /* the address field is not 32 hex characters */
+    RNS_ENVIN_BAD_SESSION,   /* outside [A-Za-z0-9._-], or over 23 bytes */
+    RNS_ENVIN_EMPTY_TEXT,    /* a frame with no message inside it */
+    RNS_ENVIN_TOO_LONG       /* more bytes than one packet can carry */
+} rns_envin_result;
+
+/* A static literal for each, so the firmware can publish the last one without
+ * formatting anything. They are DIAGNOSTICS ONLY: every value but
+ * RNS_ENVIN_OK means the same thing to the caller — show the payload as it
+ * arrived — and they are distinguished so that GET /rns/status can say which
+ * shape keeps turning up. */
+static inline const char *rns_envin_reason(rns_envin_result r) {
+    switch (r) {
+        case RNS_ENVIN_OK:          return "ok";
+        case RNS_ENVIN_NO_FRAME:    return "not an envelope: plain text";
+        case RNS_ENVIN_BAD_VERSION: return "unknown envelope version";
+        case RNS_ENVIN_BAD_FROM:    return "sender address is not 32 hex";
+        case RNS_ENVIN_BAD_SESSION: return "bad session name";
+        case RNS_ENVIN_EMPTY_TEXT:  return "envelope with no text";
+        case RNS_ENVIN_TOO_LONG:    return "longer than one packet carries";
+    }
+    return "unknown";
+}
+
+/* Where the three fields are, as pointers and lengths into the caller's
+ * payload. Valid only when rns_envelope_parse() returned RNS_ENVIN_OK; zeroed
+ * on every other outcome, so a caller that ignores the return value reads
+ * nulls rather than stale pointers from the message before. */
+typedef struct {
+    const char *from;      /* 32 hex characters, no terminator */
+    size_t from_len;
+    const char *session;   /* may be EMPTY, which is a documented value */
+    size_t session_len;
+    const char *text;      /* the remainder, verbatim, separators and all */
+    size_t text_len;
+} rns_envelope_view;
+
+/*
+ * Read `1|<from>|<session>|<text>` out of a payload, or say it is not one.
+ *
+ * SPLIT ON THE FIRST THREE SEPARATORS ONLY. The text is everything after the
+ * third '|', byte for byte, and a '|' inside it is an ordinary character — the
+ * scan below stops the moment it has three, which is what makes that true.
+ * A parser that split on every '|' would be correct for every message anybody
+ * tests by hand and wrong for the first one that quotes a shell pipeline, and
+ * it would be wrong by CORRUPTING the message rather than by refusing it.
+ *
+ * The payload is arbitrary bytes and may contain NUL, so nothing here uses a
+ * string function on it: the length bounds every read, and the sanitiser in
+ * rns/inbox.h is still what makes the text safe to put on a screen. This
+ * function decides where the text IS; it does not decide that the text is
+ * clean, and it must never be read as having done so.
+ */
+static inline rns_envin_result rns_envelope_parse(const uint8_t *payload,
+                                                  size_t len,
+                                                  rns_envelope_view *out) {
+    const char *p = (const char *)payload;
+    size_t sep[3];
+    size_t found = 0;
+    size_t slen, tlen;
+
+    if (out) memset(out, 0, sizeof(*out));
+    if (!p || len == 0) return RNS_ENVIN_NO_FRAME;
+    /* Bounded before anything is indexed. A payload past the ceiling cannot
+     * have come through one encrypted packet, so its shape proves nothing. */
+    if (len > (size_t)RNS_OUTBOX_PAYLOAD_MAX) return RNS_ENVIN_TOO_LONG;
+
+    for (size_t i = 0; i < len && found < 3; i++)
+        if (p[i] == '|') sep[found++] = i;
+    if (found < 3) return RNS_ENVIN_NO_FRAME;
+
+    /* The version is ONE byte, so the first separator is at index 1 and a
+     * longer first field is not a version we can read. */
+    if (sep[0] != 1 || p[0] != RNS_ENVELOPE_VERSION) return RNS_ENVIN_BAD_VERSION;
+
+    if (sep[1] - sep[0] - 1 != (size_t)RNS_OUTBOX_ADDR_HEX ||
+        !rns_hex_n(p + sep[0] + 1, (size_t)RNS_OUTBOX_ADDR_HEX))
+        return RNS_ENVIN_BAD_FROM;
+
+    slen = sep[2] - sep[1] - 1;
+    if (!rns_session_valid_n(p + sep[1] + 1, slen)) return RNS_ENVIN_BAD_SESSION;
+
+    tlen = len - sep[2] - 1;
+    if (tlen == 0) return RNS_ENVIN_EMPTY_TEXT;
+    /* Redundant while len is bounded above — the arithmetic cannot produce a
+     * text over budget — and kept because it is the same ceiling the builder
+     * refuses at, and because "the caller passed a longer len than it should
+     * have" is not a case worth discovering downstream in a fixed buffer. */
+    if (tlen > rns_envelope_text_budget_n(slen)) return RNS_ENVIN_TOO_LONG;
+
+    if (out) {
+        out->from = p + sep[0] + 1;
+        out->from_len = (size_t)RNS_OUTBOX_ADDR_HEX;
+        out->session = p + sep[1] + 1;
+        out->session_len = slen;
+        out->text = p + sep[2] + 1;
+        out->text_len = tlen;
+    }
+    return RNS_ENVIN_OK;
+}
+
+/*
+ * ---- WHERE A PARSED ENVELOPE GOES NEXT -----------------------------------
+ *
+ * A ROOM ROUTER IS A FUNCTION POINTER AND NOT A DIRECT CALL, and the reason is
+ * ownership rather than taste. Placing a message into a conversation belongs to
+ * the skill that owns the conversations; that skill's helper DOES NOT EXIST IN
+ * THIS TREE YET, and a direct call to a name nobody has written is a build
+ * break dressed up as a design. So the receive path calls through a pointer
+ * that is null until somebody sets it, and a null pointer is not a degraded
+ * mode: it is exactly the behaviour that shipped before this hook existed —
+ * the payload becomes a card and nothing else happens. The two sides can
+ * therefore land in either order, and neither has to know the other's
+ * internals.
+ *
+ * IT RUNS ON THE LOOP TASK, after rns_stack.loop(), from the same pickup that
+ * raises the card. That is the whole contract and it is a tight one:
+ *
+ *   - NO SYNCHRONOUS SD, no SPIFFS, no filesystem of any kind. The loop task
+ *     is what drains the Reticulum socket; a card that waits on a card reader
+ *     stops packets arriving. The agreed split is RAM first, persist off-loop
+ *     — the same shape skills/history.cpp already uses for its archive.
+ *   - NO BLOCKING of any other sort: no delay(), no network, no waiting on
+ *     another task.
+ *   - It is called ONCE per parsed envelope, and never for a payload that was
+ *     not an envelope.
+ *
+ * `session` and `text` are NUL-terminated C strings the caller owns for the
+ * duration of the call and reuses afterwards: copy what you keep. `text` has
+ * already been through rns/inbox.h's sanitiser, so it is printable and valid
+ * UTF-8; it is the message, not the envelope.
+ *
+ * RETURNING false MUST BE VISIBLE. It means the message did not reach a room,
+ * which is a message the user cannot see anywhere else, so the caller counts
+ * it and publishes the reason. `reason` is an int the router writes for that
+ * purpose — its meaning belongs to the router, which is why this file does not
+ * enumerate it — and it must be written on every false return.
+ *
+ * The setter is defined in skills/rns.cpp, which owns the pointer; it is
+ * declared here because this header is the contract both sides include.
+ */
+typedef bool (*rns_room_router)(const char *session, const char *text,
+                                int *reason);
+
+void rns_set_room_router(rns_room_router fn);
 
 /*
  * The queue. The firmware owns one at file scope — fixed size, sized once,
