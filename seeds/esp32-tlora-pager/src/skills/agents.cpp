@@ -42,6 +42,8 @@
 #include <SD.h>
 #include <SPI.h>
 
+#include "../agents_chat_route.h"  // chat-route seam: claude_route_incoming + pure planner
+
 #define AGENTS_N            5
 #define AGENT_ID_LEN        12
 #define AGENT_NAME_LEN      16
@@ -1080,6 +1082,130 @@ static void agents_on_inbound(const char *agent_id, const char *text,
     display_force = true;
 }
 
+/* ---- chat-route seam: claude_route_incoming() ----------------------------- *
+ *
+ * A transport session (skills/rns.cpp) parses an incoming chat reply out of its
+ * envelope and hands it here to land in the correct on-screen "room" (session)
+ * of the `claude` agent, selected by name. The declaration + the pure planner
+ * (agents_route_plan / agents_route_sanitize) live in ../agents_chat_route.h.
+ *
+ * LOOP-SAFETY (non-negotiable): the transport calls this on the LOOP task right
+ * after rns_stack.loop(). A synchronous SD write there would seize the shared
+ * FSPI bus the history writer and the panel paint also live on. So the caller
+ * does ONLY RAM work (sanitise + registry snapshot + reason code under
+ * agents_mux) and hands the cleaned message to a dedicated off-loop FreeRTOS
+ * drain task via a by-value queue, then returns. The drain task
+ * (agents_route_task) is the ONLY place the route path touches SD: it
+ * selects/creates the room (manifest write), reloads the room view from SD, and
+ * appends the message (JSONL append) — all off the loop task. The screen
+ * updates when the drain task folds the line into the RAM view and raises
+ * display_force; it is never gated on the SD write. */
+
+/* One queued incoming reply, copied into the FreeRTOS queue by value so the
+ * caller never shares memory with the drain task. text is already cleaned and
+ * bounded (agents_clean_text) — the third untrusted-input barrier after the mac
+ * and the transport receiver. */
+struct AgentRouteItem {
+    bool newest;                        /* empty name => newest-active room */
+    char session[AGENT_SESSION_LEN];    /* resolved sanitised room (when !newest) */
+    char text[AGENT_TEXT_LEN];          /* cleaned incoming reply */
+};
+
+#define AGENT_ROUTE_QUEUE_DEPTH  8      /* by-value queue: 8 x ~537 B ~= 4.3 KB */
+#define AGENT_ROUTE_TASK_STACK   8192   /* drain task does SD scans (sync_view lbuf) */
+#define AGENT_ROUTE_TASK_PRIO    1      /* same low prio as the history write task */
+
+static QueueHandle_t g_route_q    = nullptr;
+static TaskHandle_t  g_route_task = nullptr;
+
+/* The off-loop drain: the ONLY SD I/O on the route path. Drains the queue
+ * forever, resolves the target room, reloads its view from SD and appends the
+ * reply — everything the caller must NOT do on the loop task. */
+static void agents_route_task(void *arg) {
+    (void)arg;
+    AgentRouteItem item;
+    int idx = agents_find("claude");
+    for (;;) {
+        if (xQueueReceive(g_route_q, &item, portMAX_DELAY) != pdTRUE) continue;
+        if (idx < 0 || !item.text[0]) continue;
+        agents_lock();
+        AgentSlot &a = g_agents[idx];
+        bool created = false;
+        if (item.newest) {
+            /* newest-active room. active_idx already points at the most-recently
+             * selected/created room; if the registry is somehow empty, mint a
+             * default. Re-pin its window to the tail so the append shows in
+             * context (matches agents_session_select's view semantics). */
+            if (a.n_sessions == 0) agents_session_create(idx, nullptr, created);
+            else                   agents_thread_goto_tail(idx);
+        } else {
+            /* Named room: switch to it (reloading its view from SD) if it
+             * exists, else create it. Both run here off the loop task, so the
+             * manifest write and the view scan are safe. A brand-new name with
+             * the registry full returns -1 and leaves active_idx unchanged; the
+             * header contract says DROP the line then rather than mis-route it
+             * into the previously-active room. */
+            if (agents_session_exists(idx, item.session) >= 0) {
+                agents_session_select(idx, item.session);
+            } else if (agents_session_create(idx, item.session, created) < 0) {
+                Serial.printf("[agents] chat-route drop: registry full for %s\n",
+                              item.session);
+                agents_unlock();
+                continue;
+            }
+        }
+        agents_push_line(idx, false, item.text);   /* view append + SD append */
+        g_agents_real_inbound = true;
+        display_force = true;
+        agents_unlock();
+    }
+}
+
+/* Transport entry point (declared in ../agents_chat_route.h). Land `text` into
+ * the `claude` agent's room `session` (empty/NULL => newest-active room).
+ * Loop-safe: RAM-only here, SD deferred to agents_route_task. `reason` may be
+ * NULL. Returns true when the reply was queued for the off-loop persist; false
+ * on a bad name (reason 2), a full registry (reason 1), an empty message, or a
+ * dead/full route queue (the bool is authoritative; reason carries 1/2 only for
+ * the two resolution rejects — never a synchronous SD fallback). */
+bool claude_route_incoming(const char *session, const char *text, int *reason) {
+    if (reason) *reason = AGENT_ROUTE_OK;
+    int idx = agents_find("claude");
+    if (idx < 0) return false;
+
+    /* Resolve name + reason against a RAM snapshot of the registry (no I/O). */
+    char resolved[AGENT_ROUTE_NAME_CAP];
+    int newest = 0;
+    int r;
+    agents_lock();
+    {
+        AgentSlot &a = g_agents[idx];
+        const char *names[AGENT_SESSIONS_MAX];
+        int n = a.n_sessions;
+        if (n > AGENT_SESSIONS_MAX) n = AGENT_SESSIONS_MAX;
+        for (int i = 0; i < n; i++) names[i] = a.sessions[i];
+        r = agents_route_plan(session, names, n, AGENT_SESSIONS_MAX,
+                              resolved, &newest);
+    }
+    agents_unlock();
+    if (r != AGENT_ROUTE_OK) { if (reason) *reason = r; return false; }
+
+    /* Clean the untrusted reply (third barrier) and bound it. Nothing left to
+     * show => nothing to land. */
+    AgentRouteItem item;
+    memset(&item, 0, sizeof(item));
+    agents_clean_text(text, item.text, sizeof(item.text));
+    if (!item.text[0]) return false;
+    item.newest = (newest != 0);
+    if (!item.newest) snprintf(item.session, sizeof(item.session), "%s", resolved);
+
+    /* Hand off to the drain task; 0-tick send never blocks the loop. A dead or
+     * full queue drops (false) rather than falling back to a synchronous SD
+     * write on the caller's task. */
+    if (!g_route_q || xQueueSend(g_route_q, &item, 0) != pdTRUE) return false;
+    return true;
+}
+
 /* Clear a session's history. Single agent → the ACTIVE session only (UI path);
  * "*"/empty → every session file + per-session counter for an agent (or all
  * agents). The session stays registered either way; the active one restarts
@@ -1423,6 +1549,15 @@ static void skill_agents_init() {
             agents_push_line(i, false, intro);
         agents_thread_goto_tail(i);
     }
+
+    /* Off-loop chat-route drain: the transport (rns.cpp) enqueues incoming
+     * replies from the loop task; this task performs all the route's SD I/O. */
+    g_route_q = xQueueCreate(AGENT_ROUTE_QUEUE_DEPTH, sizeof(AgentRouteItem));
+    if (g_route_q)
+        xTaskCreate(agents_route_task, "agt_route", AGENT_ROUTE_TASK_STACK,
+                    nullptr, AGENT_ROUTE_TASK_PRIO, &g_route_task);
+    Serial.printf("[agents] chat-route queue=%s depth=%d\n",
+                  g_route_q ? "ok" : "FAILED", AGENT_ROUTE_QUEUE_DEPTH);
 
     skill_register(&agents_skill);
     Serial.printf("[agents] session=%s bridge=%s store=%s/%s\n",
