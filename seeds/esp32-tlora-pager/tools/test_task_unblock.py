@@ -41,6 +41,14 @@ Eight sites, one rule each:
     by nothing but an announce: the transition lasts one tick, so a floor
     applied to the raw sample discards every reconnect it refuses instead of
     deferring it.
+  - That callback now DEFERS instead of counting: an inbound payload becomes a
+    notification card, and notify_ingest() calls time(NULL), takes the
+    notify_mux critical section and appends to the event ring — three things
+    the callback may not do. So it copies into a fixed buffer and the loop task
+    raises the card, after rns_stack.loop() rather than before it. The queue's
+    rules live in a pure header like every other decision in this file, and the
+    pickup's position in the tick is pinned: ahead of the stack it would serve
+    last tick's message.
 """
 
 import re
@@ -480,11 +488,16 @@ assert "set_packet_callback([" not in rns, (
 # like section 6d and for exactly the reasons given there. The two things a
 # denylist of forbidden identifiers missed on the filter callback apply here
 # verbatim and then some: `log_e("rx")` is not spelled Serial. but blocks on the
-# UART just the same, and this callback is handed a `const Bytes&` whose whole
-# payload a single dropped `&` would copy onto the heap on the loop task. Both
-# arguments are deliberately consumed by a cast to void and nothing else: there
-# is no application on top of this destination yet, so the honest body is a
-# counter, and anything more has to be argued for by editing this list.
+# UART just the same, and a single dropped `&` on the Bytes argument buys
+# refcount traffic, a pinned heap block and — the moment such a local is
+# reassigned — a free() inside the drain.
+#
+# The body grew by exactly one statement in the delivery commit: the payload is
+# handed to rns_inbox_put(), which is a memcpy into a fixed buffer plus scalar
+# stores and nothing else (rns/inbox.h, host-tested). What it must NOT grow into
+# is the card itself — notify_ingest() calls time(NULL), takes the notify_mux
+# critical section and appends to the event ring, all forbidden here — so the
+# list stays a list and anything new in it has to be argued for by editing it.
 dcb = rns[rns.index("static void rns_data_callback") :]
 dcb = dcb[: dcb.index("\n}\n") + 2]
 dcb = re.sub(r"/\*.*?\*/", " ", dcb, flags=re.S)
@@ -493,9 +506,8 @@ dcb_body = [re.sub(r"\s+", " ", line).strip() for line in dcb.splitlines()]
 dcb_body = [line for line in dcb_body if line]
 DCB_ALLOWED = [
     "static void rns_data_callback(const RNS::Bytes &data, const RNS::Packet &packet) {",
-    "(void)data;",
     "(void)packet;",
-    "g_rns_data_rx++;",
+    "rns_inbox_put(&g_rns_inbox, data.data(), data.size());",
     "}",
 ]
 assert dcb_body == DCB_ALLOWED, (
@@ -723,5 +735,320 @@ for key in ('"address"', '"announced"', '"announces_sent"', '"announce_us_last"'
         "GET /rns/status must publish %s — the address and its announce cost "
         "are the point of the destination" % key
     )
+
+# --- 9. rns.cpp: the deferral that turns a packet into a card ----------------
+# The callback may not raise the card: notify_ingest() calls time(NULL), takes
+# the notify_mux critical section, appends to the event ring and write-throughs
+# the card to the off-loop history archive, and it would do all of it on the
+# loop task inside the 8 ms drain with Transport::_jobs_locked set. So the
+# callback hands off and the loop task consumes — the same deferral cluster as
+# g_rns_cfg_dirty above and as skills/wg.cpp's request flags. This section pins
+# the handoff, its rules and its position in the tick.
+inbox = (ROOT / "src" / "rns" / "inbox.h").read_text(encoding="utf-8")
+assert '#include "rns/inbox.h"' in rns
+
+# 9a. The rules live in a pure header, like pktfilter.h and annsched.h, so the
+# host test compiles the real code rather than a copy of it.
+inbox_code = re.sub(r"/\*.*?\*/", " ", inbox, flags=re.S)
+inbox_code = re.sub(r"//[^\n]*", " ", inbox_code)
+assert not re.search(r"^\s*static\s+(?!inline\b)", inbox_code, re.M), (
+    "rns/inbox.h must hold no state of its own; the firmware owns the storage "
+    "and passes it in, which is what lets the host test drive the real rules"
+)
+for banned in ("millis(", "micros(", "esp_timer", "printf", "new ", "malloc",
+               "Serial", "time("):
+    assert banned not in inbox_code, (
+        "rns/inbox.h must not reach for %s: half of it runs inside the drain, "
+        "and all of it has to compile on the host" % banned
+    )
+assert "#define RNS_INBOX_PAYLOAD_MAX 383" in inbox_code, (
+    "the buffer is sized once at the 383-byte ceiling — "
+    "floor((464-48-32)/16)*16-1, the largest plaintext one encrypted packet to "
+    "a SINGLE destination carries"
+)
+# The ring is deep enough for ONE WHOLE DRAIN PASS. The drain admits
+# RNS_TCP_DRAIN_FRAMES_MAX frames in a tick and the pickup runs once per tick, so
+# a shallower ring answers an ordinary burst — the pieces of a message too long
+# for one packet, say — with drops, by construction. The relationship is pinned
+# in the firmware itself so it cannot drift; this checks the pin exists.
+slots = re.search(r"#define RNS_INBOX_SLOTS (\d+)", inbox_code)
+frames = re.search(r"#define RNS_TCP_DRAIN_FRAMES_MAX (\d+)", rns_code)
+assert slots and frames, "both the ring depth and the frame budget must be named"
+assert int(slots.group(1)) >= int(frames.group(1)), (
+    "the inbox ring (%s) is shallower than one drain pass (%s): a burst that "
+    "the interface accepts in a single tick would be dropped by the inbox"
+    % (slots.group(1), frames.group(1))
+)
+assert "static_assert(RNS_INBOX_SLOTS >= RNS_TCP_DRAIN_FRAMES_MAX" in rns_code, (
+    "the ring depth must be static_asserted against the frame budget, so that "
+    "growing the drain without growing the ring fails the build"
+)
+# PUBLISH-LAST is a contract a single-threaded host test cannot check, so it is
+# pinned in the source text: the count that makes a message visible must be the
+# final statement of put(). Today both sides are the loop task and the ordering
+# is defensive; the day the pickup moves to another task it stops being.
+put_body = inbox_code[inbox_code.index("bool rns_inbox_put(") :]
+put_body = put_body[: put_body.index("\n}\n")]
+put_stmts = [ln.strip() for ln in put_body.splitlines() if ln.strip()]
+assert put_stmts[-1] == "return true;" and put_stmts[-2] == "bx->count++;", (
+    "rns_inbox_put() must publish the message LAST — `bx->count++;` immediately "
+    "before the return, after every byte is in place. Found: %r" % put_stmts[-2:]
+)
+assert "RNS_INBOX_PAYLOAD_MAX == (size_t)RNS::Type::Packet::ENCRYPTED_MDU" in rns, (
+    "the buffer size must be static_asserted against the library's own value; "
+    "the host test cannot see the library, so this is the only place a drift "
+    "can be caught, and it must break the build rather than the device"
+)
+
+# 9b. Fixed storage, sized once, at file scope. The receive path allocates
+# nothing of its own — see the file header for what the library allocates
+# underneath it, which is a different and unavoidable thing.
+assert "static rns_inbox g_rns_inbox;" in rns, (
+    "the firmware owns exactly one inbox, at file scope"
+)
+assert re.search(r"^static uint8_t g_rns_inbox_payload\[RNS_INBOX_PAYLOAD_MAX\];",
+                 rns, re.M), (
+    "the pickup scratch must be a fixed static too: the loop task's stack is "
+    "shared with the drain and with Transport::inbound()"
+)
+assert re.search(r"^static char g_rns_card_body\[NOTIFY_BODY_LEN\];", rns, re.M), (
+    "the card body buffer must be sized from notify's own limit"
+)
+
+# 9c. Exactly one producer and exactly one consumer, and each is where it
+# belongs. Comments are stripped first: the prose names both functions.
+assert rns_code.count("rns_inbox_put(") == 1, (
+    "rns_inbox_put() belongs in the packet callback and nowhere else"
+)
+assert rns_code.count("rns_inbox_take(") == 1, (
+    "rns_inbox_take() belongs in the loop-task pickup and nowhere else"
+)
+# THE SLICE IS COMMENT-STRIPPED, and that is not tidiness. The first version of
+# this section tested the raw text, and the prose inside rns_inbox_poll() names
+# rns_text_sanitize() — so a reviewer replaced the sanitiser call with a bare
+# memcpy into g_rns_card_body and the whole suite still passed. The one guard
+# between a stranger's arbitrary bytes and the card body was pinned by a comment
+# about it. Every assertion below runs against code.
+pickup_raw = rns[rns.index("static void rns_inbox_poll") :
+                 rns.index("static void skill_rns_poll")]
+pickup = re.sub(r"/\*.*?\*/", " ", pickup_raw, flags=re.S)
+pickup = re.sub(r"//[^\n]*", " ", pickup)
+assert "rns_inbox_take(" in pickup and "notify_ingest(" in pickup, (
+    "the pickup is what takes the messages and what raises the cards"
+)
+assert rns_code.count("notify_ingest(") == 1, (
+    "there is exactly one card site, and it is on the loop task outside the "
+    "drain — a notify_ingest() reachable from the callback would take the "
+    "notify_mux critical section inside Transport::inbound()"
+)
+for banned in ("new ", "malloc", "String "):
+    assert banned not in pickup, (
+        "the pickup runs every tick on the loop task; %s does not belong in it"
+        % banned
+    )
+# It DRAINS the ring rather than taking one message per tick, or the ring would
+# only postpone the drops it exists to prevent.
+assert re.search(r"while \(rns_inbox_take\(", pickup), (
+    "the pickup must drain until the ring is empty: one drain pass can admit "
+    "RNS_TCP_DRAIN_FRAMES_MAX frames and the pickup runs once per tick"
+)
+
+# 9d. The payload is sanitised before it reaches the screen. notify_ingest()
+# filters nothing, the body is stored as a C string, and a peer can send any 383
+# bytes it likes — a NUL in the middle would end the card silently and a stray
+# 0xFF is not UTF-8 at all. The card body may be written by nothing else.
+assert "rns_text_sanitize(" in pickup, (
+    "an arbitrary payload must be sanitised before it becomes a card body"
+)
+assert "rns_text_sanitize" in inbox_code, (
+    "the sanitiser lives in the pure header so the host test can drive it"
+)
+# NOTHING may write the card body except the sanitiser and the marker. A raw
+# copy of the payload into it is the mutation this section was rewritten for:
+# it puts a stranger's unfiltered bytes on the screen, and every other assertion
+# here would still pass.
+pickup_norm = re.sub(r"\s+", " ", pickup)
+writes = re.findall(r"\b(?:memcpy|memmove|strcpy|strncpy|snprintf|memset)\s*"
+                    r"\(\s*g_rns_card_body[^,]*,\s*([A-Za-z_][A-Za-z0-9_]*)",
+                    pickup_norm)
+assert set(writes) <= {"mark", "g_rns_card_body"}, (
+    "the card body may only be written by rns_text_sanitize(), by the marker "
+    "prefix (`mark`) and by the memmove that closes the gap in front of it. "
+    "Found a copy from %r — a raw copy of the payload puts unfiltered bytes on "
+    "the screen" % sorted(set(writes) - {"mark", "g_rns_card_body"})
+)
+assert "rns_text_sanitize(g_rns_inbox_payload," in pickup_norm, (
+    "the sanitiser must be fed the payload the pickup just took, not something "
+    "assembled around it"
+)
+# ...AND ITS OUTPUT MUST BE THE THING THAT GOES ON THE CARD. Feeding
+# g_rns_inbox_payload straight to notify_ingest() calls the sanitiser and throws
+# the result away: unsanitised control bytes reach the renderer, and the payload
+# is NOT NUL-terminated, so notify_copy_text()'s snprintf("%s") reads past the
+# end of a 383-byte buffer. Every other assertion in this section passes with
+# that edit in place, which is why the argument itself is pinned.
+ingest = re.search(r"notify_ingest\(([^;]*)\)", pickup_norm)
+assert ingest, "the pickup must raise the card through notify_ingest()"
+ingest_args = [a.strip() for a in ingest.group(1).split(",")]
+assert len(ingest_args) == 5 and ingest_args[3] == "g_rns_card_body", (
+    "the card body argument must be g_rns_card_body — the sanitiser's output — "
+    "and never g_rns_inbox_payload, which is raw, arbitrary and not "
+    "NUL-terminated. Found: %r" % ingest_args
+)
+assert "g_rns_inbox_payload" not in ingest.group(1), (
+    "the raw payload may not reach notify_ingest() in any argument"
+)
+
+# 9d-bis. THE CUT IS SIZED AGAINST WHAT THE SCREEN PAINTS, not against notify's
+# storage. hw_ui_show_notify() draws at most max_rows rows of max_cols columns
+# and then stops — there is no scroll on that card — so a body cut at notify's
+# 240-byte limit puts its "+N bytes" marker at an offset the renderer never
+# reaches, which is exactly the bug this pins. The budget is in CODEPOINTS
+# because the renderer counts codepoints, not bytes.
+hw_ui = (ROOT / "src" / "hw_ui.cpp").read_text(encoding="utf-8")
+assert "RNS_CARD_VISIBLE_CHARS" in pickup, (
+    "the cut must be sized against the renderer's character budget"
+)
+assert re.search(r"#define RNS_CARD_ROWS 5\b", rns) and \
+       re.search(r"#define RNS_CARD_COLS 37\b", rns), (
+    "the card geometry must be stated as constants that can be checked against "
+    "the renderer"
+)
+# ...and those two numbers are only true while the renderer's own constants are.
+# If any of these moves, RNS_CARD_ROWS/RNS_CARD_COLS has to be recomputed.
+notify_render = hw_ui[hw_ui.index("void hw_ui_show_notify(") :]
+notify_render = notify_render[: notify_render.index("\nvoid hw_ui_show_agent_invite")]
+assert "const int max_rows = 5;" in notify_render, (
+    "hw_ui_show_notify() no longer paints 5 body rows; RNS_CARD_ROWS in rns.cpp "
+    "was sized against it"
+)
+assert "const uint8_t body_scale = 2;" in notify_render, (
+    "the card body scale decides the column count RNS_CARD_COLS was sized from"
+)
+assert "const int max_cols = (int)((PANEL_W - MARGIN - 4 - MARGIN) / body_adv);" \
+    in notify_render, (
+    "the card's column arithmetic changed; recompute RNS_CARD_COLS in rns.cpp"
+)
+assert "static const int MARGIN   = 12;" in hw_ui, (
+    "MARGIN feeds the column count RNS_CARD_COLS was sized from"
+)
+# There is no scroll on the notify card, which is why text past the budget is
+# lost rather than merely off-screen. If that ever changes, the cut can relax.
+assert "scroll" not in notify_render, (
+    "the notify card gained a scroll: text past RNS_CARD_VISIBLE_CHARS is no "
+    "longer unreachable, so the cut can be sized against notify's storage again"
+)
+
+# A truncated card must say so, and the marker must be somewhere the renderer
+# actually paints. Word wrap decides how much of the LAST row is used, so the
+# marker goes in FRONT, where row one is always drawn.
+assert "g_rns_card_cut++" in pickup, (
+    "a card that could not hold the whole message must be counted"
+)
+mark = re.search(r'snprintf\(mark, sizeof\(mark\), "([^"]*)"', pickup)
+assert mark and mark.group(1).startswith("[+"), (
+    "the truncation marker must be a PREFIX: a suffix can be pushed off the "
+    "bottom of the card by word wrap alone, which is how the previous version "
+    "shipped a marker nobody could see. Found: %r"
+    % (mark.group(1) if mark else None)
+)
+assert pickup.count("rns_text_sanitize(") == 2, (
+    "the count on the marker must come from a SECOND sanitising pass with the "
+    "marker's room already held back — computing it before the marker displaces "
+    "text undercounts by exactly the marker's length"
+)
+# COUNTING THE CALLS IS NOT ENOUGH: the bug was the BUDGET, not the arity.
+# Reverting the first pass to sizeof(g_rns_card_body) restores the original
+# defect for every payload between the card's character budget and notify's
+# 240-byte storage, with two calls still on the page. So both budgets are pinned:
+# the first decides WHETHER anything was cut, the second holds back the marker's
+# room so the count is of text that genuinely did not make it.
+budgets = re.findall(r"rns_text_sanitize\((.*?)\);", pickup_norm)
+assert len(budgets) == 2, "expected two sanitising passes, found %d" % len(budgets)
+first, second = (re.sub(r"\s+", "", b) for b in budgets)
+assert first.endswith("sizeof(g_rns_card_body),RNS_CARD_VISIBLE_CHARS"), (
+    "the first pass must measure against the CARD's character budget, not "
+    "notify's storage: sizing the cut at 240 bytes is the bug that put the "
+    "marker where the renderer never reaches. Found: %r" % first
+)
+assert second.endswith(
+    "sizeof(g_rns_card_body)-RNS_CARD_CUT_RESERVE,"
+    "RNS_CARD_VISIBLE_CHARS-RNS_CARD_CUT_RESERVE"), (
+    "the second pass must hold the marker's room back in BOTH budgets, or the "
+    "count is measured against text the marker then overwrites. Found: %r"
+    % second
+)
+# The guard is bounded by the RESERVATION, not by sizeof(mark). They differ, and
+# the larger one is unsafe: the memmove below moves the text to offset mn, so any
+# mn past the reservation moves it UP and past the end of the body. Bounding by
+# sizeof(mark) leaves that three characters from a constant whose comment invites
+# tuning — ASAN reaches it by lowering the reservation alone.
+assert "mn <= RNS_CARD_CUT_RESERVE" in pickup, (
+    "the marker length must be bounded by RNS_CARD_CUT_RESERVE (the room the "
+    "memmove assumes), not by sizeof(mark)"
+)
+assert "sizeof(mark)" not in pickup.split("if (mn")[1].split("}")[0], (
+    "sizeof(mark) is not the safe bound for the marker guard"
+)
+
+# 9e. THE PICKUP RUNS AFTER THE STACK. The drain that fills the inbox is inside
+# rns_stack.loop(), so a pickup ahead of it serves last tick's message and turns
+# every delivery into an extra RNS_TICK_MS of latency — and makes the overflow
+# policy fire on message pairs a prompt pickup would have kept apart.
+assert "rns_inbox_poll();" in tick, "the tick must drive the pickup"
+assert tick.index("rns_stack.loop();") < tick.index("rns_inbox_poll();"), (
+    "the inbox pickup must run AFTER Reticulum::loop(), which is what runs the "
+    "drain that fills it"
+)
+
+# 9f. The receive path is diagnosable from GET /rns/status: how many arrived,
+# how many were dropped by the overflow policy, how big the last one was.
+# A silently lost message is the one outcome that is not acceptable.
+for key in ('"data_dropped"', '"data_last_len"', '"data_oversize"',
+            '"data_cards"', '"data_card_cut"'):
+    assert key in json_builder, (
+        "GET /rns/status must publish %s: the receive path drops messages by "
+        "policy, and a drop nobody can see is a drop nobody can fix" % key
+    )
+assert 'doc["data_rx"] = (unsigned long)g_rns_inbox.received;' in json_builder, (
+    "data_rx keeps its meaning — payloads the callback was handed — and now "
+    "comes from the inbox's own counter"
+)
+
+# 9g. The host test drives the real header, including the overflow policy: the
+# first message survives, the refusal is counted, and neither is a comment.
+inbox_test = (ROOT / "tools" / "test_rns_inbox.cpp").read_text(encoding="utf-8")
+for call in ("rns_inbox_put(", "rns_inbox_take(", "rns_text_sanitize("):
+    assert call in inbox_test, (
+        "tools/test_rns_inbox.cpp must drive %s — the point of the pure header "
+        "is that the test runs the shipping code" % call
+    )
+assert ".dropped ==" in inbox_test, (
+    "the overflow policy is only a policy if the test pins the counter: keep "
+    "the oldest, COUNT the drop"
+)
+assert "RNS_INBOX_PAYLOAD_MAX + 1" in inbox_test, (
+    "one byte over the ceiling must be exercised"
+)
+# The two guards that a well-behaved test misses unless it is written for them:
+# the output boundary (a one-byte write past the caller's buffer) and the
+# multi-byte length check (a read past the end of the payload). Both were live
+# mutations that survived the first version of that file.
+assert "canary" in inbox_test, (
+    "the out_cap boundary needs a canary after the destination: `>=` relaxed to "
+    "`>` writes the terminator one byte past it and nothing else notices"
+)
+assert re.search(r"rns_text_sanitize\(\s*truncated,\s*1,", inbox_test), (
+    "the read-past-end guard needs a payload whose LENGTH is shorter than the "
+    "sequence its lead byte announces, with real continuation bytes behind it — "
+    "a lead at the end of an array is decided by whatever follows the array"
+)
+# And the invariant the "+N bytes" count rests on: bytes written == input bytes
+# consumed, on every branch.
+assert "== 1);" in inbox_test and "for (int b = 0; b < 256; b++)" in inbox_test, (
+    "the length-preserving invariant must be pinned over a corpus that reaches "
+    "every branch of the mapping, or an expanding escape would silently corrupt "
+    "the count on the card"
+)
 
 print("Task unblock policy tests: OK")
