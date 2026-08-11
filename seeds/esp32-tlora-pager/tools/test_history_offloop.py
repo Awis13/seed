@@ -140,7 +140,9 @@ assert re.search(r"bool\s+history_on_sd\(void\)", hist), (
     "a pure history_on_sd() getter must expose the SD-vs-SPIFFS store tier (C4 /health)"
 )
 live = fn_body(hist, "static uint32_t history_index_live_count(void)")
-assert "xSemaphoreTake(g_hist_mux" in live and "g_hist_index.count" in live, (
+# g_hist_index is a PSRAM-backed pointer (moved off internal RAM), so the count
+# read is g_hist_index->count under the mux.
+assert "xSemaphoreTake(g_hist_mux" in live and "g_hist_index->count" in live, (
     "history_index_live_count() must read the RAM index count under g_hist_mux"
 )
 assert "HwSpiBusGuard" not in live, (

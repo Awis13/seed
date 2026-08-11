@@ -41,6 +41,7 @@
 #include <SPI.h>
 
 #include "../micron/history_store.h"
+#include "../psram_alloc.h"   // psram_calloc_pref: index + queue storage in PSRAM
 
 /* Single flat, short archive path (SPIFFS 32-byte object-name limit): no
  * directory, no extension games — "/hist.log" is 9 bytes. */
@@ -79,7 +80,11 @@ static uint32_t          g_hist_drops    = 0;        /* records dropped on a ful
  * Seeded from the mount scan, advanced by the write task on each append, all
  * mutation under g_hist_mux. The wheel navigates it in O(1) instead of scanning
  * the whole archive per detent; a page body is fetched from SD only on open. */
-static history_index     g_hist_index;
+/* Parked in PSRAM (~3 KB, HISTORY_INDEX_MAX entries): allocated once by
+ * history_begin() before the write task or any reader runs; internal-DRAM
+ * fallback if PSRAM is absent. Mutated by the write task, read by nav/getters,
+ * all under g_hist_mux — task context only, never an ISR. */
+static history_index    *g_hist_index   = nullptr;
 
 static const char *history_store_name() { return g_hist_is_sd ? "sd" : "spiffs"; }
 
@@ -181,9 +186,9 @@ static void history_write_task(void *arg) {
          * can now wait on; it never waits on the SD burst above. The append burst
          * takes only the bus and this publish takes only the mux, so the two are
          * no longer nested and cannot invert the mux->bus order held elsewhere. */
-        if (wrote) {
+        if (wrote && g_hist_index) {
             if (g_hist_mux) xSemaphoreTake(g_hist_mux, portMAX_DELAY);
-            history_index_observe(&g_hist_index, &rec, rec_off);
+            history_index_observe(g_hist_index, &rec, rec_off);
             if (g_hist_mux) xSemaphoreGive(g_hist_mux);
         }
     }
@@ -274,8 +279,9 @@ static bool history_on_sd(void) { return g_hist_is_sd; }
  * risk on the AsyncTCP task (mux-only, never mux->bus here). Wired to /health by C4. */
 static uint32_t history_index_live_count(void) {
     uint32_t n = 0;
+    if (!g_hist_index) return 0;
     if (g_hist_mux) xSemaphoreTake(g_hist_mux, portMAX_DELAY);
-    n = (uint32_t)g_hist_index.count;
+    n = (uint32_t)g_hist_index->count;
     if (g_hist_mux) xSemaphoreGive(g_hist_mux);
     return n;
 }
@@ -446,9 +452,10 @@ static bool history_read_at(uint32_t offset, history_record *out) {
 static bool history_restore_at(uint8_t ns, int rank, history_record *out) {
     uint32_t offset = 0;
     bool have = false;
+    if (!g_hist_index) return false;
 
     if (g_hist_mux) xSemaphoreTake(g_hist_mux, portMAX_DELAY);
-    const history_index_entry *e = history_index_ns_at(&g_hist_index, ns, rank);
+    const history_index_entry *e = history_index_ns_at(g_hist_index, ns, rank);
     if (e) { offset = e->offset; have = true; }
     if (g_hist_mux) xSemaphoreGive(g_hist_mux);
 
@@ -468,8 +475,9 @@ static bool history_restore_at(uint8_t ns, int rank, history_record *out) {
  */
 static int history_nav_page_count(const micron_store *st, uint8_t ns) {
     int n;
+    if (!g_hist_index) return 0;
     if (g_hist_mux) xSemaphoreTake(g_hist_mux, portMAX_DELAY);
-    n = history_nav_count(&g_hist_index, st, ns);
+    n = history_nav_count(g_hist_index, st, ns);
     if (g_hist_mux) xSemaphoreGive(g_hist_mux);
     return n;
 }
@@ -477,8 +485,9 @@ static int history_nav_page_count(const micron_store *st, uint8_t ns) {
 static history_nav_result history_nav_page_at(const micron_store *st, uint8_t ns,
                                               int ordinal) {
     history_nav_result r;
+    if (!g_hist_index) { memset(&r, 0, sizeof(r)); return r; }
     if (g_hist_mux) xSemaphoreTake(g_hist_mux, portMAX_DELAY);
-    r = history_nav_at(&g_hist_index, st, ns, ordinal);
+    r = history_nav_at(g_hist_index, st, ns, ordinal);
     if (g_hist_mux) xSemaphoreGive(g_hist_mux);
     return r;
 }
@@ -495,7 +504,7 @@ struct HistorySeedCtx {
 static void history_seed_cb(void *ctx, const history_record *rec, uint32_t offset) {
     HistorySeedCtx *c = (HistorySeedCtx *)ctx;
     history_seq_scan_observe(&c->seq, rec);
-    history_index_observe(c->ix, rec, offset);   /* build the nav index in the same pass */
+    if (c->ix) history_index_observe(c->ix, rec, offset);   /* build the nav index in the same pass */
 }
 
 /*
@@ -513,21 +522,42 @@ static void history_seed_cb(void *ctx, const history_record *rec, uint32_t offse
 static void history_seed_seq() {
     HistorySeedCtx c;
     history_seq_scan_init(&c.seq);
-    c.ix = &g_hist_index;
+    c.ix = g_hist_index;   /* may be null (alloc failed) — seed_cb skips the index then */
     history_scan_chunked(history_seed_cb, &c);
     g_hist_seq = history_seq_scan_result(&c.seq);
     Serial.printf("[history] seq reseeded from archive: max=%u, index entries=%d\n",
-                  (unsigned)g_hist_seq, g_hist_index.count);
+                  (unsigned)g_hist_seq, g_hist_index ? g_hist_index->count : 0);
 }
 
 /* --- boot: mount + create the queue and the write task --------------------- */
 
+/* Static control block for the write queue when its storage lives in PSRAM
+ * (xQueueCreateStatic). Small (~sizeof(StaticQueue_t)) and kept in internal RAM;
+ * only the ~8.8 KB item storage moves to PSRAM. */
+static StaticQueue_t g_hist_q_cb;
+
 static void history_begin() {
     history_mount();
     g_hist_mux = xSemaphoreCreateMutex();
-    history_index_init(&g_hist_index);
+    /* Nav/read index in PSRAM (~3 KB), internal-DRAM fallback. */
+    g_hist_index = (history_index *)psram_calloc_pref(sizeof(*g_hist_index));
+    if (g_hist_index) history_index_init(g_hist_index);
+    else Serial.println("[history] index alloc FAILED — nav index disabled");
     history_seed_seq();   /* max stored seq -> g_hist_seq + nav index, before the writer starts */
-    g_hist_q = xQueueCreate(HISTORY_WRITE_QUEUE_DEPTH, sizeof(HistoryWriteItem));
+
+    /* Write-queue storage (~8.8 KB = depth x sizeof(item)) in PSRAM via
+     * xQueueCreateStatic; the queue is task-context only (enqueue from loop/
+     * AsyncTCP, drain on the write task, NEVER an ISR), so PSRAM-backed storage
+     * is safe. Fall back to a heap (internal) queue if the PSRAM alloc fails. */
+    const size_t q_bytes = (size_t)HISTORY_WRITE_QUEUE_DEPTH * sizeof(HistoryWriteItem);
+    uint8_t *q_store = (uint8_t *)heap_caps_malloc(q_bytes, MALLOC_CAP_SPIRAM);
+    if (q_store) {
+        g_hist_q = xQueueCreateStatic(HISTORY_WRITE_QUEUE_DEPTH, sizeof(HistoryWriteItem),
+                                      q_store, &g_hist_q_cb);
+    }
+    if (!g_hist_q) {   /* PSRAM absent/failed, or static create failed: heap queue */
+        g_hist_q = xQueueCreate(HISTORY_WRITE_QUEUE_DEPTH, sizeof(HistoryWriteItem));
+    }
     if (g_hist_q) {
         xTaskCreate(history_write_task, "hist_wq", HISTORY_WRITE_TASK_STACK,
                     nullptr, HISTORY_WRITE_TASK_PRIO, &g_hist_task);
