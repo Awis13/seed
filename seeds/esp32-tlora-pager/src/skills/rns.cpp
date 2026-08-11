@@ -448,6 +448,15 @@ static char rns_dest_addr[RNS_DEST_ADDR_MAX] = {0};
 static RNS::Destination rns_lxmf_destination{RNS::Type::NONE};
 static bool rns_lxmf_dest_ok = false;
 static char rns_lxmf_dest_addr[RNS_DEST_ADDR_MAX] = {0};
+/* OUR lxmf.delivery destination's raw 16-byte hash, cached once at bring-up.
+ * The opportunistic receive path (rns_lxmf_inbox_poll) prepends it to every
+ * inbound wire payload to reconstruct the full-packed message before the codec
+ * parses at its fixed offsets — see lxmf_wire_prepend_dest() and LXMessage.py:
+ * 633-634 / LXMRouter.py:1930-1934. Reading rns_lxmf_destination.hash() per
+ * message would re-render an RNS::Bytes on the loop task inside the pickup; this
+ * is the byte copy taken once, when the address string is rendered. */
+static uint8_t rns_lxmf_dest_hash[LXMF_HASH_LEN] = {0};
+static bool rns_lxmf_dest_hash_ok = false;
 
 /* ---- TCP interface state ----
  *
@@ -893,6 +902,14 @@ static void rns_data_callback(const RNS::Bytes &data, const RNS::Packet &packet)
  * (LxmfMsg) is ~1 KB and the loop task's stack is shared with the drain. */
 static rns_inbox g_rns_lxmf_inbox;
 static uint8_t g_rns_lxmf_payload[RNS_INBOX_PAYLOAD_MAX];
+/* The reconstructed full-packed message: our 16-byte lxmf.delivery hash
+ * prepended to the opportunistic wire payload (which arrives WITHOUT a dest hash
+ * — the RNS packet addressing carried it; LXMessage.py:633-634). Sized for the
+ * worst case, a full 383-byte inbox slot plus the 16-byte prepend, so the
+ * prepend can never overrun. A separate static (not g_rns_lxmf_payload in place)
+ * because the pickup already holds the raw wire there and the reconstruction
+ * needs 16 bytes of headroom in front of it; loop-task scratch like the rest. */
+static uint8_t g_rns_lxmf_recon[LXMF_HASH_LEN + RNS_INBOX_PAYLOAD_MAX];
 static LxmfMsg g_rns_lxmf_msg;
 /* Disjoint from the three seed.pager receive outcomes (env_parsed/control/raw):
  * data_lxmf_ok is a payload that parsed as LXMF, data_lxmf_bad one that reached
@@ -1252,6 +1269,18 @@ bool rns_send_lxmf_reply(const uint8_t *dest, const char *text,
         return false;
     }
 
+    /* OPPORTUNISTIC WIRE: strip the leading 16-byte destination hash from the
+     * full-packed bytes and send only source(16)+sig(64)+msgpack — the RNS
+     * packet's addressing to the peer's lxmf.delivery SINGLE destination carries
+     * the dest, so a real client (Retichat/Sideband) reconstructs it by prepend
+     * on ingest, exactly as we do above (LXMessage.py:633-634). */
+    const uint8_t *wire = nullptr;
+    size_t wire_len = 0;
+    if (lxmf_wire_strip_dest(scratch, wlen, &wire, &wire_len) != LXMF_OK) {
+        if (why) *why = "reply too short";
+        return false;
+    }
+
     /* dest hash -> the 32-hex address the outbox validates and the ladder sends
      * to (the peer's lxmf.delivery SINGLE destination). */
     char to_hex[RNS_OUTBOX_ADDR_HEX + 1];
@@ -1264,7 +1293,7 @@ bool rns_send_lxmf_reply(const uint8_t *dest, const char *text,
 
     bool queued;
     portENTER_CRITICAL(&g_rns_tx_mux);
-    queued = rns_outbox_put(&g_rns_outbox, to_hex, scratch, wlen);
+    queued = rns_outbox_put(&g_rns_outbox, to_hex, wire, wire_len);
     portEXIT_CRITICAL(&g_rns_tx_mux);
     if (!queued) { if (why) *why = "outbox full"; return false; }
 
@@ -2949,7 +2978,21 @@ static void rns_lxmf_inbox_poll() {
     uint16_t len = 0;
     while (rns_inbox_take(&g_rns_lxmf_inbox, g_rns_lxmf_payload,
                           sizeof(g_rns_lxmf_payload), &len)) {
-        LxmfReason rr = lxmf_parse(g_rns_lxmf_payload, len, &g_rns_lxmf_msg);
+        /* OPPORTUNISTIC WIRE -> FULL-PACKED. What the callback captured is the
+         * bare packet payload a real client sends: source(16)+sig(64)+msgpack,
+         * with NO leading destination hash — the RNS packet's addressing carried
+         * it (LXMessage.py:633-634). Reconstruct the full dest(16)+source(16)+
+         * sig(64)+msgpack the codec parses (and a later commit verifies over) by
+         * prepending OUR OWN lxmf.delivery hash, the true destination the sender
+         * signed against (LXMRouter.py:1930-1934, LXMessage.py:762-764/809). Off
+         * the drain, on this task, into g_rns_lxmf_recon (16 B headroom). Without
+         * a cached hash we cannot place the fields, so treat it as unparseable. */
+        if (!rns_lxmf_dest_hash_ok) { g_rns_lxmf_bad++; continue; }
+        size_t rlen = 0;
+        if (lxmf_wire_prepend_dest(rns_lxmf_dest_hash, g_rns_lxmf_payload, len,
+                                   g_rns_lxmf_recon, sizeof(g_rns_lxmf_recon),
+                                   &rlen) != LXMF_OK) { g_rns_lxmf_bad++; continue; }
+        LxmfReason rr = lxmf_parse(g_rns_lxmf_recon, rlen, &g_rns_lxmf_msg);
         if (rr != LXMF_OK) { g_rns_lxmf_bad++; continue; }
         g_rns_lxmf_ok++;
 
@@ -3709,8 +3752,17 @@ static void skill_rns_init() {
      * as the destination not existing. */
     if (rns_lxmf_dest_ok) {
         try {
+            const RNS::Bytes h = rns_lxmf_destination.hash();
             snprintf(rns_lxmf_dest_addr, sizeof(rns_lxmf_dest_addr), "%s",
-                     rns_lxmf_destination.hash().toHex().c_str());
+                     h.toHex().c_str());
+            /* Cache the raw 16-byte hash the opportunistic receive prepends to
+             * every inbound wire payload (see rns_lxmf_dest_hash). Same handle,
+             * so it costs no extra recall; guarded by size so a short/empty hash
+             * never leaves a partial buffer marked ready. */
+            if (h.size() >= LXMF_HASH_LEN && h.data()) {
+                memcpy(rns_lxmf_dest_hash, h.data(), LXMF_HASH_LEN);
+                rns_lxmf_dest_hash_ok = true;
+            }
         } catch (const std::exception &e) {
             rns_error = "lxmf destination created but its address could not be rendered";
             Serial.printf("[rns] lxmf address render failed: %s\n", e.what());

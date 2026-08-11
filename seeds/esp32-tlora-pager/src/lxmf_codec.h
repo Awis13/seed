@@ -571,3 +571,63 @@ static inline LxmfReason lxmf_encode_packed(const LxmfMsg *m,
     if (out_len) *out_len = w.off;
     return w.overflow ? LXMF_TOO_LONG : LXMF_OK;
 }
+
+/* ======================================================================== *
+ *  opportunistic single-packet wire  (strip / prepend the destination hash)
+ * ======================================================================== *
+ *
+ * A Reticulum LXMF message delivered OPPORTUNISTICALLY (a single encrypted
+ * packet, the plain-client / Retichat / Sideband default) does NOT carry the
+ * 16-byte destination hash in the packet payload — the RNS packet's own
+ * addressing carries it. The reference library proves this both ways:
+ *
+ *   SEND    LXMF/LXMessage.py:633-634  __as_packet(): for OPPORTUNISTIC it puts
+ *           self.packed[LXMessage.DESTINATION_LENGTH:] on the wire, i.e. the
+ *           full packed dest(16)+source(16)+sig(64)+msgpack with the LEADING
+ *           16-byte dest hash STRIPPED.
+ *   RECEIVE LXMF/LXMRouter.py:1930-1934  delivery_packet(): for a non-LINK
+ *           packet it reconstructs lxmf_data = packet.destination.hash + data,
+ *           i.e. it PREPENDS the delivery-destination's own 16-byte hash back on
+ *           before LXMessage.unpack_from_bytes() reads dest/source/sig/payload at
+ *           their fixed offsets (LXMessage.py:748-751) and validates the Ed25519
+ *           signature, which is over dest+source+msgpack (+message hash)
+ *           (LXMessage.py:762-764, 809) — so the prepended hash MUST be the true
+ *           destination or the signature will not validate.
+ *
+ * These two helpers are that strip and that prepend, kept in the pure codec so
+ * they are host-testable; the codec's parse/encode API stays full-packed and the
+ * RNS layer applies these at the wire boundary. */
+
+/* The opportunistic wire payload: full-packed with the leading dest hash gone.
+ * `packed`/`packed_len` is a buffer produced by lxmf_encode_packed(); on success
+ * *wire and *wire_len point INTO it (packed+16, packed_len-16). No copy. */
+static inline LxmfReason lxmf_wire_strip_dest(const uint8_t *packed,
+                                              size_t packed_len,
+                                              const uint8_t **wire,
+                                              size_t *wire_len) {
+    if (!packed || !wire || !wire_len) return LXMF_BAD_SHAPE;
+    if (packed_len < LXMF_HASH_LEN) return LXMF_TRUNCATED;
+    *wire = packed + LXMF_HASH_LEN;
+    *wire_len = packed_len - LXMF_HASH_LEN;
+    return LXMF_OK;
+}
+
+/* Reconstruct full-packed from an opportunistic wire payload by prepending the
+ * receiver's own delivery-destination hash: out = dest(16) + wire. `out` must be
+ * a distinct buffer of at least LXMF_HASH_LEN + wire_len bytes; LXMF_TOO_LONG if
+ * it is not. The result is what lxmf_parse() expects. */
+static inline LxmfReason lxmf_wire_prepend_dest(const uint8_t dest[LXMF_HASH_LEN],
+                                                const uint8_t *wire,
+                                                size_t wire_len,
+                                                uint8_t *out, size_t out_cap,
+                                                size_t *out_len) {
+    if (!dest || !wire || !out) return LXMF_BAD_SHAPE;
+    /* form the requirement without overflow: subtract from the cap rather than
+     * add to wire_len (which an attacker could carry high). */
+    if (out_cap < LXMF_HASH_LEN || wire_len > out_cap - LXMF_HASH_LEN)
+        return LXMF_TOO_LONG;
+    memcpy(out, dest, LXMF_HASH_LEN);
+    memcpy(out + LXMF_HASH_LEN, wire, wire_len);
+    if (out_len) *out_len = LXMF_HASH_LEN + wire_len;
+    return LXMF_OK;
+}

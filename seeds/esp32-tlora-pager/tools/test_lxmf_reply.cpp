@@ -114,6 +114,103 @@ static void test_build_exact_ceiling_not_truncated() {
     assert(wlen <= 383);
 }
 
+/* TLORA-LXMF C5 — OPPORTUNISTIC WIRE INTEROP (strip on send / prepend on recv).
+ *
+ * A real client (Retichat/Sideband) delivering opportunistically puts
+ * source(16)+sig(64)+msgpack on the wire, WITHOUT the leading destination hash
+ * (LXMessage.py:633-634); the receiver reconstructs the full-packed message by
+ * prepending its own delivery-destination hash (LXMRouter.py:1930-1934) before
+ * parsing at the fixed offsets. These tests pin both halves against the pure
+ * codec helpers the RNS layer uses. */
+
+/* The Retichat case: a wire payload that never carried a dest, plus the
+ * receiver's own dest, reconstructs and parses to the right title/content. */
+static void test_opportunistic_ingest_prepends_dest() {
+    uint8_t dest[16], src[16];
+    for (int i = 0; i < 16; i++) { dest[i] = (uint8_t)(0xC0 + i); src[i] = (uint8_t)(0x30 + i); }
+
+    /* Build the sender's full-packed bytes, then STRIP the dest to get exactly
+     * what a real client transmits: source(16)+sig(64)+msgpack, no dest. */
+    LxmfMsg m;
+    assert(lxmf_reply_build(&m, dest, src, 1699999999.0, "from a real client") == 0);
+    uint8_t sig[LXMF_SIG_LEN]; fill_sig(sig);
+    uint8_t packed[512]; size_t plen = 0;
+    assert(lxmf_encode_packed(&m, sig, packed, sizeof(packed), &plen) == LXMF_OK);
+
+    const uint8_t *wire = NULL; size_t wire_len = 0;
+    assert(lxmf_wire_strip_dest(packed, plen, &wire, &wire_len) == LXMF_OK);
+    assert(wire_len == plen - LXMF_HASH_LEN);
+    assert(wire == packed + LXMF_HASH_LEN);
+    /* the wire begins with the SOURCE hash, not the dest — the dest is gone */
+    assert(memcmp(wire, src, 16) == 0);
+
+    /* Receiver prepends its OWN delivery-destination hash (== the message's dest,
+     * because the client addressed the packet to us) and parses. */
+    uint8_t recon[LXMF_HASH_LEN + 383]; size_t rlen = 0;
+    assert(lxmf_wire_prepend_dest(dest, wire, wire_len, recon, sizeof(recon), &rlen) == LXMF_OK);
+    assert(rlen == wire_len + LXMF_HASH_LEN);
+    assert(memcmp(recon, dest, 16) == 0);          /* dest restored at offset 0 */
+
+    LxmfMsg out;
+    assert(lxmf_parse(recon, rlen, &out) == LXMF_OK);
+    assert(memcmp(out.dest_hash, dest, 16) == 0);
+    assert(memcmp(out.source_hash, src, 16) == 0);
+    assert(out.content_len == 18 && strcmp(out.content, "from a real client") == 0);
+    assert(out.title_len == 0);
+}
+
+/* Device<->device stays self-consistent under the new wire: our encode, then
+ * strip-on-send, then prepend-on-receive with the SAME dest, round-trips. This
+ * is the C4 device<->device reply flow, now over the stripped opportunistic wire
+ * instead of the old full-packed one. */
+static void test_stripped_wire_roundtrip() {
+    uint8_t dest[16], src[16];
+    for (int i = 0; i < 16; i++) { dest[i] = (uint8_t)(0xA0 + i); src[i] = (uint8_t)(0xB0 + i); }
+
+    LxmfMsg m;
+    assert(lxmf_reply_build(&m, dest, src, 1700000000.0, "hello back") == 0);
+    uint8_t sig[LXMF_SIG_LEN]; fill_sig(sig);
+    uint8_t packed[512]; size_t plen = 0;
+    assert(lxmf_encode_packed(&m, sig, packed, sizeof(packed), &plen) == LXMF_OK);
+
+    const uint8_t *wire = NULL; size_t wire_len = 0;
+    assert(lxmf_wire_strip_dest(packed, plen, &wire, &wire_len) == LXMF_OK);
+
+    uint8_t recon[LXMF_HASH_LEN + 383]; size_t rlen = 0;
+    assert(lxmf_wire_prepend_dest(dest, wire, wire_len, recon, sizeof(recon), &rlen) == LXMF_OK);
+    /* the reconstruction is byte-identical to the original full-packed bytes */
+    assert(rlen == plen);
+    assert(memcmp(recon, packed, plen) == 0);
+
+    LxmfMsg out;
+    assert(lxmf_parse(recon, rlen, &out) == LXMF_OK);
+    assert(memcmp(out.dest_hash, dest, 16) == 0);
+    assert(memcmp(out.source_hash, src, 16) == 0);
+    assert(out.content_len == 10 && strcmp(out.content, "hello back") == 0);
+}
+
+/* The bounds the RNS layer relies on: a scratch smaller than 16 + wire refuses
+ * rather than overrunning, and a packed buffer shorter than a dest hash cannot
+ * be stripped. */
+static void test_wire_bounds_guarded() {
+    uint8_t dest[16] = {0};
+    uint8_t wire[8]; memset(wire, 0x11, sizeof(wire));
+    uint8_t out[LXMF_HASH_LEN + 8];
+    size_t olen = 0;
+    /* exactly enough fits */
+    assert(lxmf_wire_prepend_dest(dest, wire, sizeof(wire), out, sizeof(out), &olen) == LXMF_OK);
+    assert(olen == LXMF_HASH_LEN + sizeof(wire));
+    /* one byte short refuses */
+    assert(lxmf_wire_prepend_dest(dest, wire, sizeof(wire), out, sizeof(out) - 1, &olen) == LXMF_TOO_LONG);
+    /* a cap below the dest hash itself refuses (no underflow) */
+    assert(lxmf_wire_prepend_dest(dest, wire, sizeof(wire), out, 4, &olen) == LXMF_TOO_LONG);
+
+    /* strip: a buffer shorter than one dest hash cannot be stripped */
+    const uint8_t *w = NULL; size_t wl = 0;
+    uint8_t tiny[LXMF_HASH_LEN - 1] = {0};
+    assert(lxmf_wire_strip_dest(tiny, sizeof(tiny), &w, &wl) == LXMF_TRUNCATED);
+}
+
 static void test_origin_set_lookup_clear() {
     LxmfOriginTable t; lxmf_origin_init(&t);
     uint8_t a[16], b[16], out[16];
@@ -181,6 +278,9 @@ int main() {
     test_build_short_roundtrip();
     test_build_truncates_on_utf8_boundary();
     test_build_exact_ceiling_not_truncated();
+    test_opportunistic_ingest_prepends_dest();
+    test_stripped_wire_roundtrip();
+    test_wire_bounds_guarded();
     test_origin_set_lookup_clear();
     test_origin_overcap_name_ignored();
     test_origin_evicts_when_full();

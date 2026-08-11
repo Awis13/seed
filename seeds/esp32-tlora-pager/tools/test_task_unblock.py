@@ -865,8 +865,20 @@ assert rns_code.count("lxmf_parse(") == 1, (
 )
 lxmf_poll = rns[rns.index("static void rns_lxmf_inbox_poll") :]
 lxmf_poll = lxmf_poll[: lxmf_poll.index("\n}\n") + 2]
-assert "lxmf_parse(g_rns_lxmf_payload, len, &g_rns_lxmf_msg)" in lxmf_poll, (
-    "the poll parses the payload it just took out of its ring"
+# TLORA-LXMF C5: the wire is OPPORTUNISTIC (LXMessage.py:633-634) — the sender
+# strips the 16-byte destination hash and the RNS packet addressing carries it,
+# so the poll first RECONSTRUCTS the full-packed message by prepending our own
+# lxmf.delivery hash (the true dest the sender signed against, LXMRouter.py:
+# 1930-1934) into a 16-byte-headroom scratch, THEN parses that. The parse target
+# is g_rns_lxmf_recon, not the raw g_rns_lxmf_payload.
+assert "lxmf_wire_prepend_dest(rns_lxmf_dest_hash, g_rns_lxmf_payload, len," \
+       in lxmf_poll, (
+    "the poll must prepend our real lxmf.delivery hash to the opportunistic wire "
+    "payload before parsing — real clients (Retichat/Sideband) omit the dest hash"
+)
+assert "lxmf_parse(g_rns_lxmf_recon, rlen, &g_rns_lxmf_msg)" in lxmf_poll, (
+    "the poll parses the RECONSTRUCTED full-packed buffer (dest prepended), not "
+    "the raw wire payload it took out of its ring"
 )
 assert "lxmf_parse(" not in lcb, (
     "the parse must never appear in the callback: it is tens of ms in the drain"
