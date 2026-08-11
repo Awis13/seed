@@ -62,8 +62,12 @@ assert "WiFi.status()" not in confirm, "OTA confirmation must work mesh-only"
 
 send = agents[agents.index("static bool agents_send") :]
 send = send[: send.index("static void agents_on_inbound")]
-assert 'strcmp(agent_id, "codex") == 0' in send
-assert 'strcmp(agent_id, "opencode") == 0' in send
-assert "mesh_owned || !wifi_ok" in send
+# grok/opencode/codex retired: only claude/hermes remain and neither is
+# mesh-owned, so the send path is a plain WiFi-bridge-first / mesh-fallback.
+assert 'strcmp(agent_id, "codex")' not in send
+assert 'strcmp(agent_id, "opencode")' not in send
+assert "mesh_owned" not in send
+assert "bool wifi_ok = agents_bridge_post(agent_id, agents_active_session(idx), cleaned);" in send
+assert "if (!wifi_ok && g_agents_mesh_uplink)" in send
 
 print("Wi-Fi/mesh boot policy tests: OK")

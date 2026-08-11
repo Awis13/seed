@@ -60,7 +60,7 @@
 #include "psram_alloc.h"          // psram_calloc_pref: park big buffers in PSRAM
 
 // ===== Configuration =====
-#define SEED_VERSION        "0.9.66"
+#define SEED_VERSION        "0.9.67"
 // Core clock: datasheet puts 240 vs 80 ~11.5mA apart on WAITI. Periph bus holds
 // at 80 for every PLL-fed core clock; go lower and RMT/I2S retimes. Same floor
 // as tembed idle policy (no light sleep — notify latency is the job).
@@ -1646,7 +1646,7 @@ enum {
 // Card action sheet (click / Enter on a notification)
 enum { CARD_ACT_ACK = 0, CARD_ACT_REPLY, CARD_ACT_BACK, CARD_ACT_COUNT };
 // Agents list: 0..4 = agents, 5 = BACK
-enum { AGENTS_BACK = 5, AGENTS_LIST_COUNT = 6 };
+enum { AGENTS_BACK = 2, AGENTS_LIST_COUNT = 3 };
 // In-chat menu (click while in agent chat room)
 enum { AGENT_ACT_CLEAR = 0, AGENT_ACT_BACK, AGENT_ACT_COUNT };
 // Layout picker: 0=ABC 1=PHON 2=RU 3=BACK
@@ -2804,13 +2804,13 @@ static void ui_open_agents() {
 
 static int agents_index_from_source(const char *src) {
     if (!src || !src[0]) return -1;
-    // notify source is short: "hermes", "grok", "claude", "opencode", "codex"
+    // notify source is short: "claude", "hermes"
     return agents_find(src);
 }
 
 /* Chat-door vs real message:
  *   door  = client id ends with "-chat" (bridge posts "hermes-chat",
- *           "opencode-chat", "codex-chat" etc.)
+ *           "claude-chat" etc.)
  *   page  = everything else — full severity card (info/warn/crit colours),
  *           from any service/agent; reply works as before.
  * Chat rooms (AGENTS menu) are separate from the message queue. */
@@ -2823,7 +2823,7 @@ static bool notify_is_chat_door(const NotifyView &v) {
 static int agents_index_from_door(const NotifyView &v) {
     if (!notify_is_chat_door(v)) return -1;
     // Prefer source; fall back to key prefix "hermes-chat" → "hermes",
-    // "opencode-chat" → "opencode", "codex-chat" → "codex"
+    // "claude-chat" → "claude"
     int ax = agents_index_from_source(v.source);
     if (ax >= 0) return ax;
     char id[AGENT_ID_LEN];

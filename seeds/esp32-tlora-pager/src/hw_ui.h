@@ -62,7 +62,7 @@ enum HwUiScreen : uint8_t {
     HW_UI_NOTIFY,
     HW_UI_CARD_ACT,  // Ack / Reply / Back after click-Enter on a card
     HW_UI_MENU,
-    HW_UI_AGENTS,      // Grok / Claude / Hermes list
+    HW_UI_AGENTS,      // Claude / Hermes list
     HW_UI_AGENT_CHAT,  // one agent thread
     HW_UI_AGENT_ACT,   // CLEAR / BACK inside a chat room
     HW_UI_AGENT_SESSIONS,  // session list inside one agent
@@ -195,7 +195,7 @@ void hw_ui_show_wifi_list(const char *header,
 // Multi-line WiFi/WG status (click = back).
 void hw_ui_show_wifi_info(const char *const *lines, int n_lines);
 
-// Agents list: GROK / CLAUDE / HERMES / BACK. selected is 0..3.
+// Agents list: CLAUDE / HERMES / BACK. selected is 0..2.
 void hw_ui_show_agents(int selected, bool bridge_ok);
 
 // Session list inside one agent: N existing sessions + "NEW SESSION" + "BACK".
