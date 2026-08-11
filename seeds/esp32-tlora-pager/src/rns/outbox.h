@@ -649,6 +649,30 @@ bool rns_peer_addr(char *out, size_t cap);
 bool rns_link_up(void);
 
 /*
+ * ---- REPLYING TO AN LXMF-ORIGIN ROOM AS LXMF (TLORA-LXMF C4) --------------
+ *
+ * A room that last received an LXMF message answers its sender AS LXMF, not
+ * over the seed.pager envelope. These are the two hooks a chat room uses,
+ * declared here for the same reason the pair above is — this header is the
+ * contract both skills/agents.cpp (compiled first) and skills/rns.cpp include.
+ *
+ * rns_lxmf_reply_target() reports whether `room` (the resolved/sanitised room
+ * name) owes its reply to an LXMF sender; on true it writes that sender's
+ * 16-byte lxmf.delivery hash into `out` (at least 16 bytes). A false means the
+ * room has no LXMF origin and the caller takes the old seed.pager path.
+ *
+ * rns_send_lxmf_reply() builds, signs and enqueues an LXMF reply to that hash.
+ * Safe from any task and it NEVER blocks on the network: like rns_send_envelope
+ * it validates, encodes, signs (software SHA-256 + Ed25519, off the drain) and
+ * enqueues — the loop task resolves the path and encrypts. A true means
+ * "queued", not "delivered"; the outcome is in GET /rns/status (data_lxmf_tx and
+ * the send counters). On false, *why (nullable) is a SHORT static literal.
+ */
+bool rns_lxmf_reply_target(const char *room, uint8_t *out /* >= 16 bytes */);
+bool rns_send_lxmf_reply(const uint8_t *dest /* 16 bytes */, const char *text,
+                         const char **why = nullptr);
+
+/*
  * The queue. The firmware owns one at file scope — fixed size, sized once,
  * never allocated — and passes it to every function below.
  *

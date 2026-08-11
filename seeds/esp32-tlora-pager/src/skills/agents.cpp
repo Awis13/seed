@@ -1129,6 +1129,32 @@ static bool agents_send(const char *agent_id, const char *text) {
     agents_unlock();
     display_force = true;
 
+    /* LXMF-ORIGIN ROOMS ANSWER AS LXMF (TLORA-LXMF C4), and BEFORE the seed.pager
+     * uplink below. If this room last received an LXMF message, its reply goes
+     * back to THAT sender over lxmf.delivery, not to the configured seed.pager
+     * peer — which is a different node. Only `claude` has an inbound RNS half, so
+     * only it can carry an LXMF origin; every other agent takes the check as a
+     * cheap miss. A build/enqueue failure does NOT fall through to seed.pager:
+     * that peer is not the LXMF sender and would misdeliver, so the fault is put
+     * in the room (one short line) and the reply stops here. A non-LXMF `claude`
+     * room drops straight through to the unchanged seed.pager path below. */
+    if (strcmp(agent_id, "claude") == 0) {
+        uint8_t lxmf_dest[16];
+        if (rns_lxmf_reply_target(session, lxmf_dest)) {
+            const char *lx_why = nullptr;
+            if (rns_send_lxmf_reply(lxmf_dest, cleaned, &lx_why)) {
+                event_add("agent %s lxmf reply", agent_id);
+            } else {
+                char line[64];
+                snprintf(line, sizeof(line), "(lxmf: %s)",
+                         lx_why ? lx_why : "not sent");
+                agents_push_line(idx, false, line);
+                display_force = true;
+            }
+            return true;
+        }
+    }
+
     /* RETICULUM FIRST FOR `claude`, and it is a real first: the bridge below is
      * the fallback now, not the primary. `rns_why` doubles as "RNS was tried
      * and did not take it", which is what makes the fallback visible instead of

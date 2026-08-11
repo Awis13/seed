@@ -264,6 +264,7 @@
 #include "../agents_chat_route.h"
 #include "../lxmf_codec.h"
 #include "../lxmf_route.h"
+#include "../lxmf_reply.h"
 
 /* The two wire constants rns/pktfilter.h mirrors, checked against the library's
  * own enums here — this is the only translation unit that sees both. A value
@@ -908,6 +909,21 @@ static uint32_t g_rns_lxmf_bad = 0;
  * above. */
 static uint32_t g_rns_lxmf_cards = 0;
 static uint32_t g_rns_lxmf_rooms = 0;
+/* LXMF replies built, signed and handed to the send ladder (C4). Disjoint from
+ * every other counter: it is the OUT side, the mirror of data_lxmf_rooms on the
+ * IN side. Loop-task- OR AsyncTCP-written (rns_send_lxmf_reply runs on whichever
+ * task the reply came from) but a plain uint32_t is safe here — the increment is
+ * a single naturally-aligned store and GET /rns/status reads it single-copy. */
+static uint32_t g_rns_lxmf_tx = 0;
+
+/* The room -> last-LXMF-sender map. Set by rns_lxmf_inbox_poll() when a message
+ * routes into a room, cleared by rns_inbox_poll() when a seed.pager envelope
+ * lands in one, read by rns_lxmf_reply_target() from the reply path. Guarded by
+ * g_rns_tx_mux: the set/clear run on the loop task and the lookup can run on the
+ * AsyncTCP task (POST /agents/send), so it is a two-task structure like the
+ * outbox. The critical sections are a strcmp over 8 short names and a 16-byte
+ * copy — short enough for the same spinlock the outbox producer uses. */
+static LxmfOriginTable g_rns_lxmf_origin;
 
 static void rns_lxmf_data_callback(const RNS::Bytes &data, const RNS::Packet &packet) {
     (void)packet;
@@ -1135,6 +1151,125 @@ bool rns_peer_addr(char *out, size_t cap) {
     portEXIT_CRITICAL(&g_rns_tx_mux);
     if (!ok) out[0] = '\0';
     return ok;
+}
+
+/* ---- LXMF-origin reply (TLORA-LXMF C4) ----------------------------------- *
+ *
+ * The IN half (rns_lxmf_inbox_poll) records which room last received an LXMF
+ * message and from whom; these are the OUT half a chat room uses to answer that
+ * sender AS LXMF instead of over the seed.pager envelope. Declared in
+ * rns/outbox.h for the reason rns_send_envelope() is: the header is the contract
+ * skills/agents.cpp (compiled first) and skills/rns.cpp both include.
+ *
+ * rns_lxmf_reply_target() answers "does this room owe its reply to an LXMF
+ * sender?" — true plus the 16-byte destination when so. It takes g_rns_tx_mux
+ * because the map is written by the loop task and this runs on either the loop
+ * task (a keyboard reply) or the AsyncTCP task (POST /agents/send). */
+bool rns_lxmf_reply_target(const char *room, uint8_t out[LXMF_HASH_LEN]) {
+    if (!room || !room[0]) return false;
+    bool found;
+    portENTER_CRITICAL(&g_rns_tx_mux);
+    found = lxmf_origin_lookup(&g_rns_lxmf_origin, room, out) != 0;
+    portEXIT_CRITICAL(&g_rns_tx_mux);
+    return found;
+}
+
+/*
+ * Build, sign and enqueue an LXMF reply to `dest` (the original sender's 16-byte
+ * lxmf.delivery hash, from rns_lxmf_reply_target). Returns true when the packed
+ * message was handed to the send ladder (g_rns_outbox) — NOT delivered; the
+ * outcome is GET /rns/status, like every other send. On false, *why (nullable)
+ * names the one fault a caller can act on.
+ *
+ * WHERE THE WORK RUNS. Everything here is RAM plus software crypto: the C1
+ * encode, one SHA-256 (Identity::full_hash) and one Ed25519 sign
+ * (rns_identity.sign), then a spinlock-guarded rns_outbox_put(). It NEVER
+ * touches the Reticulum stack and NEVER blocks on the network — the loop task
+ * resolves the path and encrypts in rns_send_poll(), exactly as for a seed.pager
+ * envelope. The sign (tens of ms) runs on the CALLER's task: the loop task for a
+ * keyboard reply (ui_reply_submit runs OUTSIDE rns_stack.loop()'s 8 ms drain —
+ * the same placement class as the announce sign) and the AsyncTCP task for POST
+ * /agents/send (crypto only, no shared stack state). It is never in the drain,
+ * and the sign is done BEFORE the spinlock, never inside it.
+ *
+ * FULL-PACKED ON THE WIRE, dest hash included: that is what this port's C3
+ * receive parser consumes (nothing prepends the destination hash to the callback
+ * plaintext here). Standard LXMF opportunistic omits the 16 leading bytes and
+ * the receiver prepends its own destination hash; making the two interoperate is
+ * a coordinated receive+send change and a separate ticket. Full-packed keeps the
+ * reply consistent with C1/C3 and round-trips device<->device.
+ *
+ * REUSES the seed.pager send ring, which is payload-agnostic: it carries bytes
+ * to a 32-hex SINGLE destination and rns_send_poll() recall()s the identity,
+ * builds an OUT/SINGLE Destination and sends. The peer's lxmf.delivery
+ * destination is announced (C2 announces ours; a peer does likewise), so recall
+ * resolves it. If it is not yet announced the ladder retries and gives up with a
+ * reason — the graceful drop this path wants, for free. */
+bool rns_send_lxmf_reply(const uint8_t *dest, const char *text,
+                         const char **why) {
+    if (why) *why = nullptr;
+    if (!dest || !text || !text[0]) { if (why) *why = "empty reply"; return false; }
+    if (!rns_started || !rns_identity_ok) { if (why) *why = "rns not ready"; return false; }
+    if (!rns_lxmf_dest_ok) { if (why) *why = "no lxmf address"; return false; }
+
+    /* OUR OWN lxmf.delivery hash is the reply's source, so the peer can answer. */
+    uint8_t src[LXMF_HASH_LEN];
+    try {
+        const RNS::Bytes h = rns_lxmf_destination.hash();
+        if (h.size() < LXMF_HASH_LEN || !h.data()) { if (why) *why = "no lxmf address"; return false; }
+        memcpy(src, h.data(), LXMF_HASH_LEN);
+    } catch (...) { if (why) *why = "no lxmf address"; return false; }
+
+    /* Build the bounded single-packet reply (empty title, no fields). Stack
+     * locals, not statics: this can be entered from two tasks at once, so a
+     * shared scratch would race. `scratch` is reused for the sign input and then
+     * the packed wire (the sign input is copied into a Bytes before the reuse),
+     * which keeps the frame to one LxmfMsg plus one 400-byte buffer. */
+    LxmfMsg m;
+    lxmf_reply_build(&m, dest, src, (double)time(nullptr), text);
+
+    uint8_t scratch[400];   /* >= max(sign-input 320, wire 368) for a 256B body */
+    size_t slen = 0;
+    if (lxmf_encode_sign_input(&m, scratch, sizeof(scratch), &slen) != LXMF_OK) {
+        if (why) *why = "reply too long";
+        return false;
+    }
+
+    uint8_t sig[LXMF_SIG_LEN];
+    try {
+        /* signed_part = hashed_part + full_hash(hashed_part); Ed25519 sign it. */
+        RNS::Bytes signed_part(scratch, slen);
+        RNS::Bytes mhash = RNS::Identity::full_hash(RNS::Bytes(scratch, slen));
+        signed_part.append(mhash);
+        RNS::Bytes s = rns_identity.sign(signed_part);
+        if (s.size() < LXMF_SIG_LEN || !s.data()) { if (why) *why = "sign failed"; return false; }
+        memcpy(sig, s.data(), LXMF_SIG_LEN);
+    } catch (...) { if (why) *why = "sign failed"; return false; }
+
+    size_t wlen = 0;
+    if (lxmf_encode_packed(&m, sig, scratch, sizeof(scratch), &wlen) != LXMF_OK) {
+        if (why) *why = "reply too long";
+        return false;
+    }
+
+    /* dest hash -> the 32-hex address the outbox validates and the ladder sends
+     * to (the peer's lxmf.delivery SINGLE destination). */
+    char to_hex[RNS_OUTBOX_ADDR_HEX + 1];
+    static const char HEXD[] = "0123456789abcdef";
+    for (int i = 0; i < LXMF_HASH_LEN; i++) {
+        to_hex[i * 2]     = HEXD[dest[i] >> 4];
+        to_hex[i * 2 + 1] = HEXD[dest[i] & 0x0F];
+    }
+    to_hex[RNS_OUTBOX_ADDR_HEX] = '\0';
+
+    bool queued;
+    portENTER_CRITICAL(&g_rns_tx_mux);
+    queued = rns_outbox_put(&g_rns_outbox, to_hex, scratch, wlen);
+    portEXIT_CRITICAL(&g_rns_tx_mux);
+    if (!queued) { if (why) *why = "outbox full"; return false; }
+
+    g_rns_lxmf_tx++;
+    return true;
 }
 
 /* ---- announce state ----
@@ -2011,6 +2146,9 @@ static void rns_status_json(JsonDocument &doc) {
      * shortfall against it is a message that parsed but whose card was refused. */
     doc["data_lxmf_cards"] = (unsigned long)g_rns_lxmf_cards;
     doc["data_lxmf_rooms"] = (unsigned long)g_rns_lxmf_rooms;
+    /* The OUT mirror of data_lxmf_rooms (C4): LXMF replies built, signed and
+     * handed to the send ladder. Disjoint from every other counter. */
+    doc["data_lxmf_tx"] = (unsigned long)g_rns_lxmf_tx;
 
     /* THE ENVELOPE MADE VISIBLE, and the pair at the top of it is the point:
      * a payload is either read as `1|<address>|<session>|<text>` or shown
@@ -2829,8 +2967,24 @@ static void rns_lxmf_inbox_poll() {
                 rns_text_sanitize((const uint8_t *)g_rns_lxmf_msg.content,
                                   g_rns_lxmf_msg.content_len,
                                   g_rns_room_text, sizeof(g_rns_room_text), 0);
-                if (g_rns_room_router(route.room, g_rns_room_text, &reason))
+                if (g_rns_room_router(route.room, g_rns_room_text, &reason)) {
                     g_rns_lxmf_rooms++;
+                    /* REMEMBER WHO TO ANSWER (C4). The reply path keys the origin
+                     * map by the RESOLVED room name — the same sanitised string
+                     * the router stored as the session — so a reply typed here
+                     * finds it; route.room is the raw thread bytes, so sanitise
+                     * with the router's own filter (agents_route_sanitize, the
+                     * byte-for-byte twin of agents_session_sanitize). Guarded by
+                     * g_rns_tx_mux because the reply lookup can run on AsyncTCP. */
+                    char rkey[AGENT_ROUTE_NAME_CAP];
+                    agents_route_sanitize(route.room, rkey, sizeof(rkey));
+                    if (rkey[0]) {
+                        portENTER_CRITICAL(&g_rns_tx_mux);
+                        lxmf_origin_set(&g_rns_lxmf_origin, rkey,
+                                        g_rns_lxmf_msg.source_hash);
+                        portEXIT_CRITICAL(&g_rns_tx_mux);
+                    }
+                }
             }
             continue;
         }
@@ -3035,6 +3189,17 @@ static void rns_inbox_poll() {
                               sizeof(g_rns_room_text), 0);
             if (g_rns_room_router(session, g_rns_room_text, &reason)) {
                 g_rns_env_routed++;
+                /* THIS ROOM'S ORIGIN IS NOW SEED.PAGER (C4): forget any LXMF
+                 * sender so a reply here reverts to the seed.pager envelope.
+                 * Keyed by the resolved (sanitised) room name, exactly as the
+                 * LXMF set is, so the same room clears the same slot. */
+                char rkey[AGENT_ROUTE_NAME_CAP];
+                agents_route_sanitize(session, rkey, sizeof(rkey));
+                if (rkey[0]) {
+                    portENTER_CRITICAL(&g_rns_tx_mux);
+                    lxmf_origin_clear(&g_rns_lxmf_origin, rkey);
+                    portEXIT_CRITICAL(&g_rns_tx_mux);
+                }
             } else {
                 /* A REFUSAL IS NOT ALLOWED TO BE SILENT. The card went up
                  * either way, so nothing on the screen says the conversation
@@ -3356,6 +3521,7 @@ static void skill_rns_init() {
      * so "it is a static, therefore it is zero" is an argument about the
      * linker rather than about the type. Stating it costs one memset at boot. */
     rns_outbox_init(&g_rns_outbox);
+    lxmf_origin_init(&g_rns_lxmf_origin);
 
     try {
         /* The adapter's init() calls SPIFFS.begin(true, "") — formatOnFail with

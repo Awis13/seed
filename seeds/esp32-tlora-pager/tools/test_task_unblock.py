@@ -932,6 +932,79 @@ for key in ('"lxmf_address"', '"data_lxmf_rx"', '"data_lxmf_ok"',
         "counters are how C2's pipe is shown to work" % key
     )
 
+# 8i.8 REPLYING TO AN LXMF-ORIGIN ROOM AS LXMF (TLORA-LXMF C4). The receive
+# poll records who to answer; the reply path signs off the drain and reuses the
+# seed.pager send ladder. This section pins the placement and the routing
+# decision — the parts a host test cannot see at runtime.
+
+# The build+sign lives in rns_send_lxmf_reply, and its EXPENSIVE crypto (the
+# software SHA-256 and Ed25519 sign) must NOT be in the drain-run callback: the
+# callback is a bare memcpy (pinned in 8i.3), so the sign and the pack appear
+# only in the reply builder, never in the callback body.
+assert "bool rns_send_lxmf_reply(" in rns, (
+    "the LXMF reply builder must exist — it is the OUT half of the lxmf pipe"
+)
+reply_fn = rns[rns.index("bool rns_send_lxmf_reply(") :]
+reply_fn = reply_fn[: reply_fn.index("\n}\n") + 2]
+assert "rns_identity.sign(" in reply_fn and "Identity::full_hash(" in reply_fn, (
+    "the reply must sign per the C1 sign-injection contract: full_hash then "
+    "Ed25519 sign, in the builder"
+)
+for banned in ("rns_identity.sign(", "Identity::full_hash(", "lxmf_encode_packed("):
+    assert banned not in lcb, (
+        "%s must NOT appear in the lxmf packet callback — the callback runs "
+        "inside the 8 ms drain and the sign/pack are tens of ms" % banned
+    )
+# It reuses the payload-agnostic seed.pager ring rather than a second send state
+# machine, and the enqueue is under the producer spinlock like every other put.
+assert "rns_outbox_put(&g_rns_outbox," in reply_fn, (
+    "the reply must reuse the seed.pager outbox ring — one send ladder, one "
+    "recall/resolve/encrypt path in rns_send_poll()"
+)
+assert "portENTER_CRITICAL(&g_rns_tx_mux);" in reply_fn, (
+    "the outbox put must be under g_rns_tx_mux, the producer spinlock — the "
+    "reply can be enqueued from the AsyncTCP task too"
+)
+
+# The origin map is SET when a message routes into a room and CLEARED when a
+# seed.pager envelope lands in one, both keyed by the resolved (sanitised) room
+# name so the reply lookup finds the same slot, both under the tx spinlock.
+assert "lxmf_origin_set(&g_rns_lxmf_origin," in lxmf_poll, (
+    "the lxmf room route must record the sender so the room can answer as LXMF"
+)
+assert "agents_route_sanitize(route.room" in lxmf_poll, (
+    "the origin key must be the sanitised room name — the same string the "
+    "router stored as the session, or the reply lookup misses"
+)
+env_poll = rns[rns.index("static void rns_inbox_poll") :]
+env_poll = env_poll[: env_poll.index("\n}\n") + 2]
+assert "lxmf_origin_clear(&g_rns_lxmf_origin," in env_poll, (
+    "a seed.pager message into a room must clear its LXMF origin — its reply "
+    "reverts to the seed.pager envelope"
+)
+
+# The reply lookup + the disjoint OUT counter reach the room and the status.
+assert "bool rns_lxmf_reply_target(" in rns, (
+    "the room asks rns_lxmf_reply_target() whether it owes an LXMF reply"
+)
+assert '"data_lxmf_tx"' in json_builder, (
+    "GET /rns/status must publish data_lxmf_tx, the OUT mirror of data_lxmf_rooms"
+)
+
+# skills/agents.cpp gates the LXMF reply on `claude` and takes it BEFORE the
+# seed.pager uplink; a non-LXMF room falls through to the unchanged old path.
+agents = (ROOT / "src" / "skills" / "agents.cpp").read_text(encoding="utf-8")
+send_fn = agents[agents.index("static bool agents_send(") :]
+send_fn = send_fn[: send_fn.index("\n/* Inject an agent reply")]
+assert "rns_lxmf_reply_target(session, lxmf_dest)" in send_fn, (
+    "agents_send must ask whether this room owes an LXMF reply"
+)
+assert send_fn.index("rns_lxmf_reply_target(") < send_fn.index(
+    "agents_rns_uplink("), (
+    "the LXMF-origin reply must be decided BEFORE the seed.pager uplink, or an "
+    "LXMF room would answer the wrong (configured) peer"
+)
+
 # --- 9. rns.cpp: the deferral that turns a packet into a card ----------------
 # The callback may not raise the card: notify_ingest() calls time(NULL), takes
 # the notify_mux critical section, appends to the event ring and write-throughs
@@ -1924,9 +1997,20 @@ assert 'resp["accepted"] = true;' in sendh_code, (
 # count of one is now a stronger statement than it was: it says there is a
 # single place that turns text into a queued envelope, which is what stops a
 # second address check and a second builder drifting from these.
-assert rns_impl.count("rns_outbox_put(") == 1, (
-    "rns_outbox_put() belongs in rns_tx_offer() and nowhere else: a second call "
-    "site would be a second copy of the validate-build-enqueue rules"
+# TWO producer call sites now, and they are DELIBERATELY distinct wire formats,
+# not two copies of one: rns_tx_offer() enqueues a seed.pager ENVELOPE, and
+# rns_send_lxmf_reply() (TLORA-LXMF C4) enqueues a signed LXMF packet. Both put
+# under the same g_rns_tx_mux and both feed the one send poll; what must not
+# drift is the ENVELOPE builder, pinned to one site just below.
+assert rns_impl.count("rns_outbox_put(") == 2, (
+    "rns_outbox_put() belongs in exactly two producers: rns_tx_offer() (the "
+    "seed.pager envelope) and rns_send_lxmf_reply() (the LXMF reply) — no third "
+    "call site, and each is a distinct, deliberate wire format under one spinlock"
+)
+reply_put = rns[rns.index("bool rns_send_lxmf_reply(") :]
+reply_put = reply_put[: reply_put.index("\n}\n") + 2]
+assert "rns_outbox_put(&g_rns_outbox," in reply_put, (
+    "the LXMF reply is the second — and only other — producer call site"
 )
 assert rns_impl.count("rns_outbox_take(") == 1, (
     "rns_outbox_take() belongs in the loop-task send poll and nowhere else"
