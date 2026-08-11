@@ -1558,16 +1558,8 @@ SEND_HANDLER_CALLS = [
     "deserializeJson",
     "free",                     # ...released before the error branch too
     "notify_send_error",        #   (bad json)
-    "rns_addr_valid",           # this node has an address to put in the envelope
-    "notify_send_error",        #   (no address yet)
-    "rns_addr_valid",           # ...and the caller's `to` is 32 hex characters
-    "notify_send_error",        #   (bad to)
-    "rns_envelope_build",       # the agreed wire format, budget checked
-    "sizeof",
-    "notify_send_error",        #   (bad session / empty text / over budget)
-    "rns_env_reason",
-    "rns_outbox_put",           # THE HANDOFF, and the last thing it does
-    "notify_send_error",        #   (queue full)
+    "rns_tx_offer",             # THE HANDOFF: validate, build, enqueue — shared
+    "notify_send_error",        #   (every refusal, with the offer's own reason)
     "rns_outbox_depth",
     "notify_send_json",
 ]
@@ -1608,15 +1600,72 @@ assert 'resp["accepted"] = true;' in sendh_code, (
     "from GET /rns/status, exactly as POST /rns/config already documents"
 )
 
-# 10e. Exactly one producer and exactly one consumer, and each is where it
-# belongs. Comments are stripped first: the prose names both functions.
+# 10e. Exactly one producer CALL SITE and exactly one consumer, and each is
+# where it belongs. Comments are stripped first: the prose names both functions.
+#
+# The producer used to be POST /rns/send itself. It is not any more — a line
+# typed in a chat room is offered too — and the way that stayed safe is that
+# BOTH callers reach the ring through one static helper, rns_tx_offer(). So the
+# count of one is now a stronger statement than it was: it says there is a
+# single place that turns text into a queued envelope, which is what stops a
+# second address check and a second builder drifting from these.
 assert rns_impl.count("rns_outbox_put(") == 1, (
-    "rns_outbox_put() belongs in the POST handler and nowhere else"
+    "rns_outbox_put() belongs in rns_tx_offer() and nowhere else: a second call "
+    "site would be a second copy of the validate-build-enqueue rules"
 )
 assert rns_impl.count("rns_outbox_take(") == 1, (
     "rns_outbox_take() belongs in the loop-task send poll and nowhere else"
 )
-assert "rns_outbox_put(" in sendh_code, "the handler is the producer"
+offer = rns[rns.index("static rns_tx_result rns_tx_offer(") :
+            rns.index("bool rns_send_envelope(")]
+offer_code = re.sub(r"/\*.*?\*/", " ", offer, flags=re.S)
+offer_code = re.sub(r"//[^\n]*", " ", offer_code)
+assert "rns_outbox_put(" in offer_code, "rns_tx_offer() is the producer"
+assert "rns_envelope_build(" in offer_code, "...and it is the only builder"
+assert rns_impl.count("rns_envelope_build(") == 1, (
+    "the envelope must be built in exactly one place; the emitter and the "
+    "parser already have one owner each and this keeps the emitter's callers "
+    "from growing a second set of rules"
+)
+assert "rns_tx_offer(" in sendh_code, "the handler goes through the shared offer"
+
+# 10e-bis. THE RING NOW HAS TWO PRODUCER TASKS, AND THE HEADER SAYS THAT IS THE
+# CALLER'S PROBLEM. rns_send_envelope() is reached from skills/agents.cpp, whose
+# agents_send() runs on the LOOP task when the line was typed on the keyboard
+# (main.cpp's ui_reply_submit) and on the AsyncTCP task when it arrived through
+# POST /agents/send. Two tasks inside rns_outbox_put() would both read `wr`,
+# both fill the same slot and both publish wr+1 — one message overwritten
+# unread, one delivered twice. Nothing in a single-threaded host test can fail
+# on that, so the serialisation is pinned as source text, exactly like the
+# acquire/release pairing above.
+assert "static portMUX_TYPE g_rns_tx_mux = portMUX_INITIALIZER_UNLOCKED;" in rns, (
+    "the second producer needs a lock; a spinlock because the section is two "
+    "bounded memcpys with nothing in it that can block, throw or allocate"
+)
+assert offer_code.index("portENTER_CRITICAL(&g_rns_tx_mux);") < \
+       offer_code.index("rns_envelope_build(") < \
+       offer_code.index("rns_outbox_put(") < \
+       offer_code.index("portEXIT_CRITICAL(&g_rns_tx_mux);"), (
+    "the critical section must cover the build AND the enqueue: at any instant "
+    "exactly one task may be inside the ring's producer"
+)
+# Nothing that can block, yield or allocate may appear inside it — that is what
+# makes a spinlock the right primitive rather than a mutex.
+crit = offer_code[offer_code.index("portENTER_CRITICAL(&g_rns_tx_mux);") :
+                  offer_code.index("portEXIT_CRITICAL(&g_rns_tx_mux);")]
+for banned in ("Serial", "event_add", "malloc", "new ", "delay(", "String",
+               "xSemaphore", "RNS::", "Transport::", "notify_"):
+    assert banned not in crit, (
+        "%s cannot appear inside a spinlock: the section runs with interrupts "
+        "off on this core" % banned
+    )
+# The other reader of the peer crosses the same boundary and takes the same lock.
+peer_fn = rns[rns.index("bool rns_peer_addr(") :]
+peer_fn = peer_fn[: peer_fn.index("\n}\n")]
+assert "portENTER_CRITICAL(&g_rns_tx_mux);" in peer_fn, (
+    "rns_peer_addr() reads a 33-byte array the loop task rewrites in place, "
+    "from whichever task is sending — it takes the same lock"
+)
 
 # 10f. THE SEND RUNS ON THE LOOP TASK, AFTER THE STACK. The path response the
 # send is waiting for arrives through the drain inside rns_stack.loop(), so a
@@ -1942,6 +1991,128 @@ assert "(RNS_OUTBOX_ATTEMPTS_MAX - 1) * RNS_OUTBOX_RETRY_MS == 60000UL" in \
     "the ladder's real bound must be pinned as arithmetic: the first attempt is "
     "immediate and the last is not followed by a dwell, so it is 60 s and not "
     "ATTEMPTS_MAX * RETRY_MS"
+)
+
+# --- 11. the chat room's OUTGOING half, which is what closes the loop --------
+# The inbound half already worked: an envelope arrives, claude_route_incoming()
+# lands it in a room by session name. The outgoing half did not — agents_send()
+# posted `claude` to the dead /v1/chat bridge and the room printed a bridge
+# error. This section pins that it now goes over Reticulum, that it does so
+# through the SAME entry point POST /rns/send uses, and that the failures are
+# visible rather than silent.
+uplink = agents[agents.index("static bool agents_rns_uplink") :]
+uplink = uplink[: uplink.index("\n}\n")]
+# Sliced forward from the definition, not between two absolute indices: the
+# forward declaration of agents_on_inbound sits ABOVE agents_send.
+send = agents[agents.index("static bool agents_send") :]
+send = send[: send.index("static void agents_on_inbound")]
+
+# 11a. It is the RNS entry point that is called, and it is the one declared in
+# the ring's own header — not a private copy, not an HTTP POST to ourselves.
+assert '#include "../rns/outbox.h"' in agents, (
+    "agents.cpp must include the contract header, the same one skills/rns.cpp "
+    "includes: the declaration has to have one owner"
+)
+assert "rns_send_envelope(peer, session, text, why)" in uplink, (
+    "the room's outgoing message must go through rns_send_envelope()"
+)
+assert "bool rns_send_envelope(" in outbox, (
+    "rns_send_envelope() must be declared in rns/outbox.h, next to the room "
+    "router hook, because that header is the contract both sides include"
+)
+# ...and that entry point is a thin wrapper over the SHARED offer, not a second
+# copy of the send. This is the assertion that would fail if somebody
+# reimplemented validate-build-enqueue for the room.
+wrapper = rns[rns.index("bool rns_send_envelope(") :]
+wrapper = wrapper[: wrapper.index("\n}\n")]
+assert "rns_tx_offer(" in wrapper, (
+    "rns_send_envelope() must delegate to the same rns_tx_offer() POST "
+    "/rns/send calls; a second implementation is a second set of rules"
+)
+for banned in ("rns_envelope_build(", "rns_outbox_put(", "rns_addr_valid("):
+    assert banned not in wrapper, (
+        "rns_send_envelope() must not re-do %s — that is exactly the "
+        "duplication rns_tx_offer() exists to prevent" % banned
+    )
+# Nothing in agents.cpp may reach around it into the ring or the stack. Against
+# the CODE, not the prose: the loop-safety note in the chat-route seam names
+# rns_stack.loop() to explain what it is deferring off, which is documentation
+# and not a reach.
+agents_code = re.sub(r"/\*.*?\*/", " ", agents, flags=re.S)
+agents_code = re.sub(r"//[^\n]*", " ", agents_code)
+for banned in ("rns_outbox_put(", "rns_envelope_build(", "g_rns_outbox",
+               "RNS::", "rns_stack"):
+    assert banned not in agents_code, (
+        "skills/agents.cpp must reach Reticulum only through rns_send_envelope(); "
+        "%s is the transport's business" % banned
+    )
+
+# 11b. `claude` ONLY. Codex and OpenCode own their mesh inboxes and Hermes has
+# its own chat door; a second uplink for them would be a second consumer of the
+# same conversation, which is the reason the legacy bridge is already skipped
+# for them.
+assert 'if (strcmp(agent_id, "claude") != 0) return false;' in uplink, (
+    "the RNS uplink is the `claude` room's reply path and nobody else's"
+)
+# 11c. THE ROOM'S OWN NAME IS THE SESSION FIELD. Without it the peer answers
+# into whichever room is newest, and a reply typed in one room lands in another.
+assert "agents_rns_uplink(agent_id, session, cleaned, &rns_why)" in send, (
+    "the active session name must be the envelope's session field, so the "
+    "answer comes back to the room the message was typed in"
+)
+# 11d. RNS IS FIRST, the bridge is the fallback — not the other way round.
+assert send.index("agents_rns_uplink(") < send.index("agents_bridge_post("), (
+    "RNS must be tried before the bridge; the bridge is the fallback now"
+)
+assert send.index("agents_rns_uplink(") < send.index("g_agents_mesh_uplink"), (
+    "RNS must be tried before the mesh uplink too"
+)
+# 11e. NO PEER IS ITS OWN REASON, because it is the one the user can fix.
+assert "rns_peer_addr(peer, sizeof(peer))" in uplink, (
+    "the uplink must read the configured peer rather than inventing a "
+    "destination"
+)
+assert '*why = "no peer address";' in uplink, (
+    "an unconfigured peer must say so by name, not fall into a generic refusal"
+)
+# ...and a dead link is the room's own precondition, checked HERE and not inside
+# the send: the ring's ladder is built to hold a message while a path resolves,
+# so POST /rns/send is right to accept one over a link that is momentarily down.
+# A room is the caller that has somewhere else to go.
+assert "rns_link_up()" in uplink and '*why = "link down";' in uplink, (
+    "the room must check the link before choosing RNS over the bridge, and name "
+    "it when it falls back"
+)
+assert "rns_link_up(" not in wrapper and "rns_link_up(" not in offer_code, (
+    "the link check must NOT be inside the shared send path: refusing every "
+    "offer made over a resolving link would make POST /rns/send flaky"
+)
+# 11f. EVERY FAILURE IS ONE SHORT LINE IN THE ROOM. This is the whole point of
+# the commit: the room used to print a bridge error for a path it was not even
+# trying. Silence would be worse.
+assert 'snprintf(line, sizeof(line), "(rns: %s%s)", rns_why,' in send, (
+    "an RNS refusal must be printed in the room, prefixed so the user can see "
+    "WHICH path refused"
+)
+assert '" - sent via bridge"' in send, (
+    "a fallback that succeeded must still be visible: the message went out on a "
+    "path the user did not choose"
+)
+assert send.index("if (rns_why) {") < send.index("} else if (!wifi_ok && !mesh_ok) {"), (
+    "the RNS reason must REPLACE the bridge's complaint rather than join it: "
+    "two lines per keystroke would push the typed message off the screen"
+)
+# The `why` values are static literals, so the room line needs no allocation and
+# the buffer is a small stack array on the 8 KB loop task.
+assert "char line[64];" in send, (
+    "the room line must be a small fixed buffer: this runs on the loop task "
+    "from the keyboard path, which is where the old oversized buffers overran"
+)
+# 11g. AND IT MUST NOT PRINT THE OLD LIE. The room said "(bridge: claude not
+# wired yet)"-shaped things for a path that was dead; a bare bridge complaint
+# for `claude` is now wrong by construction.
+assert "not wired yet" not in agents, (
+    "the placeholder that told the user claude had no transport must be gone"
 )
 
 print("Task unblock policy tests: OK")

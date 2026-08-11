@@ -43,6 +43,7 @@
 #include <SPI.h>
 
 #include "../agents_chat_route.h"  // chat-route seam: claude_route_incoming + pure planner
+#include "../rns/outbox.h"         // the OTHER half of that seam: rns_send_envelope + rns_peer_addr
 
 #define AGENTS_N            5
 #define AGENT_ID_LEN        12
@@ -1019,11 +1020,64 @@ void agents_gps_pending(const char *agent_id) {
     }
 }
 
+/* Try to put this line on the wire as a Reticulum envelope. `claude` only.
+ *
+ * WHY `claude` AND NOT EVERY AGENT. The room this closes the loop for is the
+ * one whose INBOUND half already works: claude_route_incoming() above lands a
+ * peer's envelope in a `claude` room by session name, and this is the reply
+ * path for exactly that. Codex and OpenCode own their mesh inboxes and Hermes
+ * has its own chat door; giving them an RNS uplink as well would be a second,
+ * ambiguous consumer — the same reason the legacy bridge is skipped for them.
+ *
+ * THE SESSION FIELD IS THE ROOM'S OWN NAME, which is the whole reason this is
+ * not just "send some text": the peer routes its answer back by that name, so a
+ * message typed in room `claude-pager-channel` is answered into
+ * `claude-pager-channel` and not into whichever room happened to be newest.
+ * Room names are already sanitised to [A-Za-z0-9._-] within 23 usable bytes,
+ * which is exactly what the envelope accepts; a name that somehow is not comes
+ * back as "bad session name" rather than going out mislabelled.
+ *
+ * NOTHING HERE BLOCKS AND NOTHING HERE TOUCHES THE STACK. rns_send_envelope()
+ * validates, builds and enqueues under the producer spinlock and returns; the
+ * loop task resolves the path and encrypts. That is what makes it safe to call
+ * from here, which is the keyboard path on the loop task in one caller
+ * (ui_reply_submit) and the AsyncTCP task in the other (POST /agents/send).
+ *
+ * Returns true when the message is QUEUED, not when it is delivered — the
+ * outcome is in GET /rns/status. On false, *why is a short static literal
+ * naming the one thing that is wrong. */
+static bool agents_rns_uplink(const char *agent_id, const char *session,
+                              const char *text, const char **why) {
+    char peer[RNS_OUTBOX_ADDR_HEX + 1];
+    *why = nullptr;
+    if (strcmp(agent_id, "claude") != 0) return false;
+    /* The failure the user can actually fix, so it is named on its own rather
+     * than folded into whatever rns_send_envelope() would say about an empty
+     * destination. */
+    if (!rns_peer_addr(peer, sizeof(peer))) {
+        *why = "no peer address";
+        return false;
+    }
+    /* ASKED HERE AND NOT INSIDE THE SEND, because a room is the one caller that
+     * has somewhere else to go. The ring's retry ladder is built to hold a
+     * message while a path resolves, so POST /rns/send is right to accept one
+     * over a link that is momentarily down; a room would rather fall back to
+     * the bridge and say which path it used. */
+    if (!rns_link_up()) {
+        *why = "link down";
+        return false;
+    }
+    return rns_send_envelope(peer, session, text, why);
+}
+
 /* Public: send a line as the user, into the agent's ACTIVE session.
- * Path: local thread/history → owned transport. OpenCode and Codex have
- * dedicated gateway inboxes and always use C1; the legacy /v1/chat bridge
- * would create a second, ambiguous consumer while WiFi is up.
- * Downlink reply uses the same C1 (or WiFi /agents/inbound). One chat loop. */
+ * Path: local thread/history → owned transport. `claude` goes over Reticulum
+ * (see agents_rns_uplink) and falls back to the bridge/mesh only when RNS
+ * cannot take it, saying so in the room. OpenCode and Codex have dedicated
+ * gateway inboxes and always use C1; the legacy /v1/chat bridge would create a
+ * second, ambiguous consumer while WiFi is up.
+ * Downlink reply uses the same transport (or WiFi /agents/inbound). One chat
+ * loop. */
 static bool agents_send(const char *agent_id, const char *text) {
     int idx = agents_find(agent_id);
     if (idx < 0 || !text || !text[0]) return false;
@@ -1042,6 +1096,16 @@ static bool agents_send(const char *agent_id, const char *text) {
     agents_unlock();
     display_force = true;
 
+    /* RETICULUM FIRST FOR `claude`, and it is a real first: the bridge below is
+     * the fallback now, not the primary. `rns_why` doubles as "RNS was tried
+     * and did not take it", which is what makes the fallback visible instead of
+     * a silent downgrade to a path the user did not choose. */
+    const char *rns_why = nullptr;
+    if (agents_rns_uplink(agent_id, session, cleaned, &rns_why)) {
+        event_add("agent %s rns uplink", agent_id);
+        return true;
+    }
+
     bool mesh_owned = strcmp(agent_id, "codex") == 0 ||
                       strcmp(agent_id, "opencode") == 0;
     bool wifi_ok = mesh_owned
@@ -1052,7 +1116,19 @@ static bool agents_send(const char *agent_id, const char *text) {
         mesh_ok = g_agents_mesh_uplink(agent_id, cleaned);
         if (mesh_ok) event_add("agent %s mesh uplink", agent_id);
     }
-    if (!wifi_ok && !mesh_ok) {
+    if (rns_why) {
+        /* ONE SHORT LINE, ALWAYS, and it replaces the bridge's own complaint
+         * rather than joining it: for `claude` the peer address is the path the
+         * user configured, so naming what is wrong with THAT is more use than
+         * naming what is wrong with the path they did not pick. Two lines for
+         * one keystroke would also push the message they just typed off a
+         * seven-row screen. */
+        char line[64];
+        snprintf(line, sizeof(line), "(rns: %s%s)", rns_why,
+                 (wifi_ok || mesh_ok) ? " - sent via bridge" : "");
+        agents_push_line(idx, false, line);
+        display_force = true;
+    } else if (!wifi_ok && !mesh_ok) {
         if (g_bridge[0] && WiFi.status() != WL_CONNECTED)
             agents_push_line(idx, false, "(offline - mesh failed)");
         else if (g_bridge[0])

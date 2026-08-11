@@ -33,6 +33,25 @@
  *   consumer: wr.load(acquire), read the bytes, then rd.store(release)
  *   producer: rd.load(acquire) to see how much room it has
  *
+ * THERE IS NOW MORE THAN ONE PRODUCER TASK, AND THE RING DOES NOT ABSORB THAT
+ * BY ITSELF. POST /rns/send is no longer the only way a message is offered:
+ * rns_send_envelope() below is called from the chat room's outgoing path, and
+ * that path runs on the LOOP task when the message was typed on the keyboard
+ * and on the AsyncTCP task when it arrived through POST /agents/send. Two tasks
+ * inside rns_outbox_put() would both read `wr`, both fill the SAME slot and both
+ * publish wr+1: one message overwritten unread, one delivered twice — the exact
+ * failure the power-of-two note further down describes, arriving from a
+ * different direction.
+ *
+ * SO THE SERIALISATION IS THE CALLER'S, AND IT IS NAMED: skills/rns.cpp funnels
+ * every offer through one static helper and holds a portMUX spinlock across the
+ * build-and-enqueue, so at any instant exactly one task is inside put(). That
+ * keeps `wr` single-writer, which is all the ordering below assumes; the
+ * consumer is still the loop task alone, so nothing about the acquire/release
+ * pairing changes. The lock is NOT in this header because this header is pure —
+ * it holds no state, reaches for no Arduino and compiles on the host — and
+ * because the mutual exclusion belongs to whoever owns the storage.
+ *
  * That is the textbook single-producer/single-consumer ring, and it is written
  * with TWO MONOTONIC COUNTERS rather than a head and a shared count for the
  * reason that makes SPSC work at all: every variable has exactly one writer.
@@ -513,6 +532,46 @@ typedef bool (*rns_room_router)(const char *session, const char *text,
 void rns_set_room_router(rns_room_router fn);
 
 /*
+ * ---- SENDING FROM SOMEWHERE THAT IS NOT AN HTTP HANDLER -------------------
+ *
+ * The chat room on this device has to be able to answer, and the keyboard is
+ * not a POST. These two are the whole entry point for that, declared HERE for
+ * the reason the router hook above is: this header is the contract both sides
+ * include, and skills/agents.cpp is compiled before skills/rns.cpp.
+ *
+ * rns_send_envelope() IS NOT A SECOND COPY OF THE SEND. It and POST /rns/send
+ * call the same static helper in skills/rns.cpp — same address check, same
+ * rns_envelope_build(), same rns_outbox_put(), same spinlock — because a second
+ * builder is a second set of rules that nothing forces to stay a copy. It
+ * returns false for every refusal the caller can act on and writes a SHORT
+ * static literal into *why when it does, so a room can put the reason on screen
+ * in one line instead of failing silently. `why` may be NULL.
+ *
+ * It is safe from any task and it NEVER BLOCKS on the network: like the POST
+ * handler, all it does is validate, build and enqueue — the loop task resolves
+ * the path and encrypts. A true return therefore means "queued", not
+ * "delivered"; the outcome is in GET /rns/status.
+ *
+ * rns_peer_addr() copies the configured peer address — /rns.json's `peer`, the
+ * node this device talks to — into a caller buffer of at least
+ * RNS_OUTBOX_ADDR_HEX + 1 bytes, and returns false when none is configured.
+ * That false is the FIRST thing a room should report, because it is the one
+ * failure the user can fix.
+ *
+ * rns_link_up() is the OTHER precondition a room has to check, and it is
+ * deliberately not folded into rns_send_envelope(): the ring's retry ladder
+ * exists precisely so a message can be queued while a path is still resolving,
+ * so refusing every offer made over a momentarily dead link would make POST
+ * /rns/send flaky for no gain. A ROOM is different — it has a second transport
+ * to fall back to and a screen to say so on — so it asks first and takes the
+ * old path when the answer is no.
+ */
+bool rns_send_envelope(const char *to_hex, const char *session,
+                       const char *text, const char **why = nullptr);
+bool rns_peer_addr(char *out, size_t cap);
+bool rns_link_up(void);
+
+/*
  * The queue. The firmware owns one at file scope — fixed size, sized once,
  * never allocated — and passes it to every function below.
  *
@@ -521,11 +580,15 @@ void rns_set_room_router(rns_room_router fn);
  * writer, which is what makes this safe across two tasks; see THE MEMORY
  * ORDERING HERE IS LOAD-BEARING at the top of this file for the pairing.
  *
- * `refused` counts offers the ring had no room for. Both its writer and its
- * reader are the AsyncTCP task — it is incremented in POST /rns/send and served
- * by GET /rns/status, which is the same task — so it is the one counter here
- * that crosses nothing and needs no snapshot. It is a plain uint32_t for that
- * reason and not by omission.
+ * `refused` counts offers the ring had no room for. It used to be the one
+ * counter here that crossed no task boundary — incremented in POST /rns/send
+ * and served by GET /rns/status, both AsyncTCP — and IT NO LONGER IS: a message
+ * typed on the keyboard is offered from the loop task, so the increment happens
+ * on either. It stays a plain uint32_t because every increment is inside the
+ * producer spinlock described at the top, which leaves it single-writer at any
+ * instant — and the READ takes that same spinlock. Publishing it from the loop
+ * task instead would not have been enough on its own: that only changes WHICH
+ * task is racing the increment, not that one is.
  */
 typedef struct {
     uint8_t buf[RNS_OUTBOX_SLOTS][RNS_OUTBOX_PAYLOAD_MAX];
@@ -555,18 +618,21 @@ static inline uint32_t rns_outbox_depth(const rns_outbox *bx) {
 }
 
 /*
- * Producer side, called from the HTTP handler on the AsyncTCP task. Everything
- * it does is two memcpys and a handful of scalar stores: no allocation, no
- * clock, no logging, nothing that can throw and nothing that touches the
- * Reticulum stack — the whole point of the queue is that the AsyncTCP task
- * never reaches Transport.
+ * Producer side, called from the AsyncTCP task (POST /rns/send, POST
+ * /agents/send) and from the loop task (a line typed in a chat room) — one at a
+ * time, under the caller's spinlock; see THERE IS NOW MORE THAN ONE PRODUCER
+ * TASK at the top. Everything it does is two memcpys and a handful of scalar
+ * stores: no allocation, no clock, no logging, nothing that can throw and
+ * nothing that touches the Reticulum stack — the whole point of the queue is
+ * that neither producer ever reaches Transport, and it is also what makes the
+ * critical section short enough to be a spinlock.
  *
  * `to` is the 32-hex destination the caller posted; it is copied because the
  * caller's JSON document is freed when the handler returns. `payload` is the
  * built envelope, likewise copied.
  *
- * IT RE-VALIDATES `to` RATHER THAN TRUSTING IT. The one call site validates it
- * first, so this is redundant today — and it is here anyway, because the copy
+ * IT RE-VALIDATES `to` RATHER THAN TRUSTING IT. The single call site validates
+ * it first, so this is redundant today — and it is here anyway, because the copy
  * below reads exactly RNS_OUTBOX_ADDR_HEX bytes and a shorter string would read
  * past its terminator. Every other function in this header checks what it is
  * handed; the one that memcpys a fixed length out of a caller's pointer is a

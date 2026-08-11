@@ -23,7 +23,7 @@
  *                         identity — the address this node answers to. A packet
  *                         sent to it becomes a notification card; tools/rns-send
  *                         is the host side of that
- *   /rns.json (SPIFFS)    {enabled, host, port} — gitignored, it names a host
+ *   /rns.json (SPIFFS)    {enabled, host, port, peer} — gitignored, it names a host
  *                         behind the tunnel
  *   GET  /rns/status      stack + interface state, counters, last error, the
  *                         destination address and its announce timings, plus
@@ -449,6 +449,36 @@ static bool g_rns_cfg_enabled = false; /* ...and the operator wants it up */
 static volatile bool g_rns_cfg_dirty = false; /* raised by POST /rns/config */
 static char g_rns_host[RNS_TCP_HOST_MAX] = "";
 static uint16_t g_rns_port = RNS_TCP_PORT_DEFAULT;
+
+/* THE PEER: the node this device talks to, as 32 hex characters, or empty.
+ *
+ * It is in /rns.json beside the endpoint and not in the chat skill's own
+ * storage, because it is an RNS address and this file is where an RNS address
+ * is validated, applied and published. It is DELIBERATELY NOT part of the
+ * endpoint change detection in rns_cfg_load(): the host and port decide which
+ * socket to hold open, and changing them drops a live link, while the peer only
+ * decides where the next message is addressed. Restarting the interface for a
+ * new peer would be a reconnect nobody asked for.
+ *
+ * WRITTEN by the loop task in rns_cfg_load(), READ by rns_peer_addr() on
+ * whichever task typed or posted the message — so both sides go through
+ * g_rns_tx_mux below rather than trusting a 33-byte array to be copied
+ * atomically. GET /rns/status reads it from the loop-side snapshot, like every
+ * other string here. */
+static char g_rns_peer[RNS_OUTBOX_ADDR_HEX + 1] = "";
+
+/* The producer lock the ring's header names as the caller's job.
+ *
+ * A SPINLOCK AND NOT A MUTEX, because of what it guards: the critical section
+ * is one rns_envelope_build() and one rns_outbox_put(), i.e. bounded memcpys of
+ * at most RNS_OUTBOX_PAYLOAD_MAX bytes with no call that can block, throw,
+ * allocate or log. Microseconds. A FreeRTOS mutex would add a scheduler round
+ * trip and a priority-inheritance dance to protect a memcpy; portENTER_CRITICAL
+ * cannot deadlock here (nothing inside it takes another lock) and cannot invert
+ * priority (nothing inside it yields).
+ *
+ * It also covers g_rns_peer, whose reader may be either task. */
+static portMUX_TYPE g_rns_tx_mux = portMUX_INITIALIZER_UNLOCKED;
 
 static char g_rns_last_error[64] = "";
 static uint32_t g_rns_attempts = 0;    /* connect attempts since boot */
@@ -929,6 +959,106 @@ static uint32_t g_rns_send_us_max = 0;
  * through the snapshot. Empty until something has actually failed. */
 static char g_rns_send_error[96] = {0};
 
+/* ---- offering a message: the ONE producer path ----
+ *
+ * THERE IS EXACTLY ONE OF THESE AND THERE MUST BE. POST /rns/send used to hold
+ * the validate-build-enqueue sequence inline, and it was the only way to send.
+ * It is not any more: a line typed in a chat room goes out over Reticulum too,
+ * and that call arrives from skills/agents.cpp. Giving the room its own copy of
+ * the three steps would be a second set of rules — a second address check, a
+ * second envelope builder, a second ceiling — that nothing forces to stay a
+ * copy of the first, and rns/outbox.h opens by explaining what a drifting
+ * emitter costs. So the sequence lives here and both callers reach it.
+ *
+ * IT MAY RUN ON EITHER TASK, which is the other reason it is one function.
+ * POST /rns/send and POST /agents/send answer on AsyncTCP; the keyboard path
+ * runs on the loop task. The ring underneath is single-producer, so the
+ * spinlock is what makes "either task" true — see THERE IS NOW MORE THAN ONE
+ * PRODUCER TASK in rns/outbox.h. The section covers the build as well as the
+ * put, and not because the build touches shared state (it does not, `env` is on
+ * the caller's stack): it costs nothing to include and it keeps the rule
+ * readable as "one task is inside the producer at a time" rather than as a
+ * subtlety about which statements count.
+ *
+ * IT REACHES NOTHING IN THE STACK. No Transport, no Identity, no Destination,
+ * no allocation, no logging, no clock — exactly the constraints the HTTP
+ * handler was already written under, now enforced for both callers by there
+ * being one body to read. */
+typedef enum {
+    RNS_TX_OK = 0,
+    RNS_TX_NO_ADDR,  /* this node has no address of its own to sign the envelope with */
+    RNS_TX_BAD_TO,   /* the destination is not 32 hex characters */
+    RNS_TX_BUILD,    /* rns_envelope_build() refused; its reason is carried out */
+    RNS_TX_FULL      /* the ring is full: four messages are already waiting */
+} rns_tx_result;
+
+/* `why` receives a SHORT STATIC LITERAL on every failure — short because its
+ * destination is a chat line on a 320-pixel screen, static because there is
+ * nothing on this path allowed to allocate. `out_len` is the envelope size, for
+ * the HTTP handler's reply. Both may be NULL. */
+static rns_tx_result rns_tx_offer(const char *to_hex, const char *session,
+                                  const char *text, const char **why,
+                                  uint16_t *out_len) {
+    uint8_t env[RNS_OUTBOX_PAYLOAD_MAX];
+    uint16_t len = 0;
+    rns_env_result r;
+    bool queued;
+
+    if (why) *why = nullptr;
+    if (out_len) *out_len = 0;
+
+    /* The envelope carries THIS node's address so the peer can answer, and
+     * without it there is nothing worth sending: a packet to a SINGLE
+     * destination has no source field, so a message from an unaddressed node is
+     * one the recipient can read and never reply to. */
+    if (!rns_dest_ok || !rns_addr_valid(rns_dest_addr)) {
+        if (why) *why = "no address yet";
+        return RNS_TX_NO_ADDR;
+    }
+    if (!rns_addr_valid(to_hex)) {
+        if (why) *why = "bad peer address";
+        return RNS_TX_BAD_TO;
+    }
+
+    portENTER_CRITICAL(&g_rns_tx_mux);
+    r = rns_envelope_build(rns_dest_addr, session, text, env, sizeof(env), &len);
+    queued = (r == RNS_ENV_OK) && rns_outbox_put(&g_rns_outbox, to_hex, env, len);
+    portEXIT_CRITICAL(&g_rns_tx_mux);
+
+    if (r != RNS_ENV_OK) {
+        if (why) *why = rns_env_reason(r);
+        return RNS_TX_BUILD;
+    }
+    if (!queued) {
+        if (why) *why = "outbox full";
+        return RNS_TX_FULL;
+    }
+    if (out_len) *out_len = len;
+    return RNS_TX_OK;
+}
+
+/* Declared in rns/outbox.h. The room's way in, and a thin one on purpose: the
+ * decision about what "available" means belongs to the offer above, so a caller
+ * that has a peer address and a line of text needs to know nothing else. */
+bool rns_send_envelope(const char *to_hex, const char *session,
+                       const char *text, const char **why) {
+    return rns_tx_offer(to_hex, session, text, why, nullptr) == RNS_TX_OK;
+}
+
+/* Declared in rns/outbox.h. False — and an empty buffer — when no peer is
+ * configured, which is the failure a user can actually fix and therefore the
+ * one a room reports first. */
+bool rns_peer_addr(char *out, size_t cap) {
+    bool ok;
+    if (!out || cap == 0) return false;
+    portENTER_CRITICAL(&g_rns_tx_mux);
+    ok = g_rns_peer[0] != '\0' && strlen(g_rns_peer) < cap;
+    if (ok) memcpy(out, g_rns_peer, strlen(g_rns_peer) + 1);
+    portEXIT_CRITICAL(&g_rns_tx_mux);
+    if (!ok) out[0] = '\0';
+    return ok;
+}
+
 /* ---- announce state ----
  *
  * The schedule itself is rns_announce_due() in rns/annsched.h — pure, host
@@ -999,6 +1129,12 @@ struct RnsStatusSnap {
      * which the AsyncTCP task writes, so it is sampled on the loop task like
      * everything else here rather than computed inside the handler. */
     uint32_t send_queued;
+    /* Offers the ring had no room for. This USED to be read straight out of
+     * g_rns_outbox.refused by the handler, on the argument that the AsyncTCP
+     * task was the only thing that ever incremented it. That argument died with
+     * the second producer: a line typed on the keyboard is offered from the loop
+     * task, so the counter is now published from the loop side like the rest. */
+    uint32_t send_refused;
     /* Why the last message was given up on, empty if none ever was. A char
      * array the loop task rewrites in place, so it is copied here under the
      * same rule as last_error below: the copy stops one byte short and that
@@ -1019,12 +1155,28 @@ struct RnsStatusSnap {
     char env_from[RNS_OUTBOX_ADDR_HEX + 1];
     uint16_t port;
     char host[RNS_TCP_HOST_MAX];
+    /* The configured peer, copied under the same one-byte-short rule as host:
+     * the loop task rewrites g_rns_peer in place when /rns.json changes. */
+    char peer[RNS_OUTBOX_ADDR_HEX + 1];
     char last_error[64];
 };
 static RnsStatusSnap g_rns_snap = {"off", false, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                                   0, {0},
+                                   0, 0, {0},
                                    0, 0, 0, 0, 0, nullptr, nullptr, {0},
-                                   RNS_TCP_PORT_DEFAULT, {0}, {0}};
+                                   RNS_TCP_PORT_DEFAULT, {0}, {0}, {0}};
+
+/* Declared in rns/outbox.h, and defined HERE rather than beside rns_tx_offer()
+ * because this is the first line at which the snapshot exists.
+ *
+ * The link as the loop task last published it: the socket is connected AND the
+ * interface reports itself online, which is the same pair GET /rns/status calls
+ * `iface.online`. It reads the SNAPSHOT rather than g_rns_iface because the
+ * caller may be the AsyncTCP task and the Interface object is the loop task's;
+ * a bool the loop task stores is a single-copy-atomic read, and one tick of
+ * staleness is nothing against a send that can take a minute. */
+bool rns_link_up(void) {
+    return g_rns_snap.online;
+}
 
 /* ---- configuration ---- */
 
@@ -1056,6 +1208,12 @@ static bool rns_cfg_load() {
     g_rns_host[0] = '\0';
     g_rns_port = RNS_TCP_PORT_DEFAULT;
 
+    /* Built locally and published in ONE locked store at the end, rather than
+     * cleared here and filled later: a reader crossing the middle of that would
+     * see no peer at all and report "no peer address" for a device that has
+     * one. */
+    char peer[RNS_OUTBOX_ADDR_HEX + 1] = "";
+
     String json = read_spiffs_file(RNS_CFG_FILE);
     JsonDocument doc;
     if (json.length() > 0 &&
@@ -1070,8 +1228,23 @@ static bool rns_cfg_load() {
              * an endpoint was written to be used. */
             g_rns_cfg_enabled = doc["enabled"] | true;
         }
+        /* The peer is read OUTSIDE the host branch on purpose: it is a
+         * destination address, not part of the endpoint, and a node whose
+         * /rns.json has a bad host still has a valid peer to address. Validated
+         * with the same rns_addr_valid() POST /rns/send puts a caller's `to`
+         * through — a peer that is not 32 hex characters is no peer, because
+         * Bytes::assignHex() would decode the typo to a DIFFERENT hash and
+         * every message would be encrypted into the void. */
+        const char *p = doc["peer"] | "";
+        if (rns_addr_valid(p)) snprintf(peer, sizeof(peer), "%s", p);
     }
 
+    portENTER_CRITICAL(&g_rns_tx_mux);
+    memcpy(g_rns_peer, peer, sizeof(g_rns_peer));
+    portEXIT_CRITICAL(&g_rns_tx_mux);
+
+    /* The peer is NOT in this comparison. See g_rns_peer: the return value is
+     * "drop the live link and redial", and a new peer address is no reason to. */
     return (g_rns_cfg_enabled != prev_enabled) || (g_rns_port != prev_port) ||
            (strcmp(g_rns_host, prev_host) != 0);
 }
@@ -1542,6 +1715,14 @@ static void rns_status_publish() {
      * as everything above — the depth reads two atomics the AsyncTCP task also
      * writes, and the reason pointer is reassigned by this task. */
     g_rns_snap.send_queued = rns_outbox_depth(&g_rns_outbox);
+    /* UNDER THE PRODUCER LOCK, and moving the read to this task is not what
+     * makes it safe — that would only swap which task was racing which. The
+     * counter is incremented inside rns_outbox_put(), which is inside the
+     * spinlock, so the lock is the only thing that makes this read ordered
+     * against it. It is one aligned uint32_t and the section is a load. */
+    portENTER_CRITICAL(&g_rns_tx_mux);
+    g_rns_snap.send_refused = g_rns_outbox.refused;
+    portEXIT_CRITICAL(&g_rns_tx_mux);
     memcpy(g_rns_snap.send_error, g_rns_send_error,
            sizeof(g_rns_snap.send_error) - 1);
 
@@ -1563,6 +1744,7 @@ static void rns_status_publish() {
 
     g_rns_snap.port = g_rns_port;
     memcpy(g_rns_snap.host, g_rns_host, sizeof(g_rns_snap.host) - 1);
+    memcpy(g_rns_snap.peer, g_rns_peer, sizeof(g_rns_snap.peer) - 1);
     memcpy(g_rns_snap.last_error, g_rns_last_error,
            sizeof(g_rns_snap.last_error) - 1);
 
@@ -1809,11 +1991,21 @@ static void rns_status_json(JsonDocument &doc) {
      *                    115200-baud console flush as the cost of encryption.
      * send_queued and send_error come from the loop-side snapshot; sent,
      * send_failed and the two timings are naturally aligned scalars written by
-     * the loop task, exactly like announce_us_last. send_refused is the one
-     * counter this handler may read at its source, because THIS task is the one
-     * that writes it — rns_outbox_put() runs in POST /rns/send. */
+     * the loop task, exactly like announce_us_last. send_refused USED to be
+     * read at its source here, on the argument that this task was the only one
+     * that ever wrote it; that stopped being true when a line typed on the
+     * keyboard became a send, so it is now sampled on the loop task UNDER THE
+     * PRODUCER SPINLOCK — the snapshot alone would only have moved the race.
+     *
+     *   peer             the node a message typed on this device is addressed
+     *                    to — /rns.json's `peer`, 32 hex characters, null when
+     *                    none is set. It is the FIRST thing to look at when the
+     *                    chat room says it cannot send: without it the room has
+     *                    nowhere to put a message and says so instead of
+     *                    guessing a destination. Set it with POST /rns/config. */
     doc["send_queued"] = (unsigned long)g_rns_snap.send_queued;
-    doc["send_refused"] = (unsigned long)g_rns_outbox.refused;
+    doc["send_refused"] = (unsigned long)g_rns_snap.send_refused;
+    doc["peer"] = g_rns_snap.peer[0] ? g_rns_snap.peer : (const char *)nullptr;
     doc["sent"] = (unsigned long)g_rns_sent;
     doc["send_failed"] = (unsigned long)g_rns_send_failed;
     doc["send_error"] = g_rns_snap.send_error[0] ? g_rns_snap.send_error
@@ -1908,7 +2100,7 @@ static void rns_status_json(JsonDocument &doc) {
 
 static const SkillEndpoint rns_endpoints[] = {
     {"GET", "/rns/status", "Reticulum stack, identity, destination address, TCP interface and counters"},
-    {"POST", "/rns/config", "Set TCP interface {host, port, enabled}"},
+    {"POST", "/rns/config", "Set TCP interface {host, port, enabled} and the chat peer {peer}"},
     {"POST", "/rns/send", "Send one text to a peer: {to, session, text}"},
     {NULL, NULL, NULL}
 };
@@ -2042,6 +2234,31 @@ static const char *rns_describe() {
            "but it encrypts with a fresh ephemeral X25519 keypair per packet\n"
            "and nothing is cached between sends — the two timings are what\n"
            "that costs on this chip.\n"
+           "A LINE TYPED IN THE `claude` CHAT ROOM GOES OUT THE SAME WAY, and\n"
+           "not through a second copy of it: the room calls\n"
+           "`rns_send_envelope()`, which is `POST /rns/send`'s own\n"
+           "validate-build-enqueue with the HTTP taken off. It is addressed to\n"
+           "`peer` — a 32-hex destination in `/rns.json` beside the endpoint,\n"
+           "set with `POST /rns/config {\"peer\":\"<32 hex>\"}` (an empty string\n"
+           "clears it), reported as `peer` in `/rns/status`, and empty by\n"
+           "default. That upsert still needs a `host`, stored or in the same\n"
+           "body, because `/rns.json` without an endpoint is not a\n"
+           "configuration — send both on a device that has never been\n"
+           "configured. Changing the peer does not drop the link; only the\n"
+           "endpoint does.\n"
+           "The envelope carries THE ROOM'S OWN NAME as its session, so the\n"
+           "peer's answer comes back to the room the message was typed in\n"
+           "rather than to whichever room is newest.\n"
+           "With no peer set, a link that is down, no address of our own, a\n"
+           "text over the budget or a full queue, the room prints one short\n"
+           "`(rns: ...)` line saying which and the message falls back to the\n"
+           "old bridge/mesh path — a fallback that SUCCEEDS says so too, since\n"
+           "it went out somewhere the user did not choose.\n"
+           "THE OUTBOX RING NOW HAS TWO PRODUCER TASKS — AsyncTCP for the\n"
+           "POSTs and the loop task for the keyboard — so every offer goes\n"
+           "through one spinlocked helper; the ring itself is still\n"
+           "single-producer at any instant, and its consumer is still the loop\n"
+           "task alone.\n"
            "If bring-up fails the endpoint stays up and answers `ready:false`\n"
            "with a reason.\n\n"
            "| GET | /rns/status |\n"
@@ -2117,6 +2334,22 @@ static void rns_register_routes(AsyncWebServer &server) {
         } else if (!cfg["enabled"].is<bool>()) {
             cfg["enabled"] = true;
         }
+        /* The peer, validated by the SAME rns_addr_valid() POST /rns/send puts
+         * a caller's `to` through — an address with a typo is not an error
+         * anywhere downstream, it is a different destination, so it has to be
+         * refused at the door or never. An explicit empty string clears it,
+         * which is the only way to unset a field in a merging upsert. */
+        if (!input["peer"].isNull()) {
+            String peer = input["peer"].as<String>();
+            if (peer.length() == 0) {
+                cfg.remove("peer");
+            } else if (!rns_addr_valid(peer.c_str())) {
+                notify_send_error(req, 400, "peer must be 32 hex characters");
+                return;
+            } else {
+                cfg["peer"] = peer;
+            }
+        }
         if (cfg["host"].as<String>().length() == 0) {
             notify_send_error(req, 400, "host required");
             return;
@@ -2137,6 +2370,7 @@ static void rns_register_routes(AsyncWebServer &server) {
         resp["host"] = cfg["host"].as<String>();
         resp["port"] = cfg["port"].as<long>();
         resp["enabled"] = cfg["enabled"].as<bool>();
+        resp["peer"] = cfg["peer"].isNull() ? String("") : cfg["peer"].as<String>();
         notify_send_json(req, 200, resp);
     }, NULL, handle_body_collect);
 
@@ -2186,29 +2420,20 @@ static void rns_register_routes(AsyncWebServer &server) {
         const char *session = input["session"] | "";
         const char *text = input["text"] | "";
 
-        /* The envelope carries THIS node's address so the peer can answer, and
-         * without it there is nothing worth sending: a packet to a SINGLE
-         * destination has no source field, so a message from an unaddressed
-         * node is one the recipient can read and never reply to. */
-        if (!rns_dest_ok || !rns_addr_valid(rns_dest_addr)) {
-            notify_send_error(req, 503, "this node has no address yet");
-            return;
-        }
-        if (!rns_addr_valid(to)) {
-            notify_send_error(req, 400, "to must be 32 hex characters");
-            return;
-        }
-
-        uint8_t env[RNS_OUTBOX_PAYLOAD_MAX];
+        /* VALIDATE, BUILD AND ENQUEUE ARE NOT INLINE HERE ANY MORE. They are
+         * rns_tx_offer(), because the chat room's outgoing path needs the same
+         * three steps and a second copy of them would be a second set of rules;
+         * see the comment on that function. What stays in the handler is the
+         * only thing that is HTTP's business — turning each refusal into the
+         * status code and the sentence the caller can act on. */
+        const char *why = nullptr;
         uint16_t len = 0;
-        rns_env_result r = rns_envelope_build(rns_dest_addr, session, text,
-                                              env, sizeof(env), &len);
-        if (r != RNS_ENV_OK) {
-            notify_send_error(req, 400, rns_env_reason(r));
-            return;
-        }
-        if (!rns_outbox_put(&g_rns_outbox, to, env, len)) {
-            notify_send_error(req, 503, "outbox full");
+        rns_tx_result tx = rns_tx_offer(to, session, text, &why, &len);
+        if (tx != RNS_TX_OK) {
+            /* 503 for the two conditions that are the device's state and will
+             * pass, 400 for the two that are the request's shape and will not. */
+            int code = (tx == RNS_TX_NO_ADDR || tx == RNS_TX_FULL) ? 503 : 400;
+            notify_send_error(req, code, why);
             return;
         }
 
