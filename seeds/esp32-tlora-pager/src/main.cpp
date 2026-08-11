@@ -45,6 +45,7 @@
 #include <esp_ota_ops.h>
 #include <esp_system.h>
 #include <esp_attr.h>
+#include <esp_timer.h>   // esp_timer_get_time() for the loop-timing diagnostics
 #include <HTTPClient.h>
 #include "board_pins.h"
 #include "hw_ui.h"
@@ -54,7 +55,7 @@
 #include "hw_kb.h"
 
 // ===== Configuration =====
-#define SEED_VERSION        "0.9.51"
+#define SEED_VERSION        "0.9.52"
 // Core clock: datasheet puts 240 vs 80 ~11.5mA apart on WAITI. Periph bus holds
 // at 80 for every PLL-fed core clock; go lower and RMT/I2S retimes. Same floor
 // as tembed idle policy (no light sleep — notify latency is the job).
@@ -232,6 +233,56 @@ static int skill_register(const Skill *skill) {
     if (g_skill_count >= MAX_SKILLS) return -1;
     g_skills[g_skill_count++] = skill;
     return 0;
+}
+
+// ===== loop-task timing instrumentation =====
+//
+// Per-skill and per-hand-placed-poll rolling-max microseconds, plus a
+// whole-pass max, surfaced in GET /health. This is MEASUREMENT ONLY: the loop
+// task may carry blocking calls (a wg HTTP probe, reply_upstream_poll on Enter,
+// SPIFFS writes, SPI) far heavier than any single "worst pass" number reveals,
+// because that number is the SUM of every skill in a pass and gets
+// misattributed to whoever measured last. Breaking it down per skill and per
+// poll is what makes a specific blocker provable before it can be bounded.
+//
+// Cross-task safety mirrors rns.cpp's drain_us_max exactly: every value below is
+// WRITTEN only on the loop task (single writer, in loop()) and READ on the
+// AsyncTCP task by handle_health(). No lock is taken — a torn read of one
+// naturally aligned uint32 on Xtensa is at worst one stale sample, the same
+// hazard class the RNS diagnostics already accept. GET /health?reset=1 zeroes
+// all of these maxes (and only these) after the response is serialized; the
+// reset write also runs on AsyncTCP and can only cost one lost sample.
+//
+// The wrappers add no delay and change no control flow: esp_timer_get_time() is
+// a cheap IRAM read and each poll/tick call site keeps its exact original
+// statement, timed by a t0 taken just before and a rolling-max note just after.
+
+// Hand-placed poll labels — fixed order, index into g_tick_poll_us_max.
+enum LoopPollId {
+    LP_WIFI_RECONNECT = 0,
+    LP_HW_INPUT,
+    LP_BACKLIGHT,
+    LP_REPLY_UPSTREAM,
+    LP_HW_SOUND,       // two call sites (cue prime + refill), same rolling max
+    LP_UI_MESH_PING,
+    LP_COUNT
+};
+static const char *g_loop_poll_names[LP_COUNT] = {
+    "wifi_reconnect", "hw_input", "backlight",
+    "reply_upstream", "hw_sound", "ui_mesh_ping",
+};
+static uint32_t g_tick_poll_us_max[LP_COUNT] = {0};
+// Per-skill dispatcher timing, indexed by skill index i; the name for each slot
+// is g_skills[i]->name, emitted into /health's tick_us object.
+static uint32_t g_skill_tick_us_max[MAX_SKILLS] = {0};
+// The whole instrumented tick/poll region of loop(), rolling max µs per pass.
+static uint32_t g_loop_pass_us_max = 0;
+
+// Note one sample: dt = now - t0 (µs), keep the rolling max at *slot. Inline so
+// it costs a couple of instructions on the loop task and never alters flow.
+static inline void loop_time_note(uint32_t *slot, uint64_t t0) {
+    uint32_t dt = (uint32_t)((uint64_t)esp_timer_get_time() - t0);
+    if (dt > *slot) *slot = dt;
 }
 
 // ===== Hardware Probe (run once at boot, cached) =====
@@ -789,9 +840,38 @@ static void handle_health(AsyncWebServerRequest *request) {
     doc["boots_since_panic"] = (unsigned long)boots_since_panic;
     doc["panic_count"] = (unsigned long)panic_count;
     doc["storage_ok"] = storage_ok;
+
+    // Loop-task timing (measurement only; see the instrumentation block).
+    // loop_pass_us_max is the worst total µs the whole instrumented tick/poll
+    // region of loop() has ever taken in one pass; tick_us breaks that down per
+    // instrumented entry — every skill by name (g_skills[i]->name) plus the
+    // hand-placed polls (wifi_reconnect, hw_input, backlight, reply_upstream,
+    // hw_sound, ui_mesh_ping). All read here on the AsyncTCP task without a lock:
+    // single-writer-on-loop, plain read, at worst one stale uint32 sample — the
+    // rns.cpp drain_us_max pattern. Values are captured into the doc FIRST; the
+    // ?reset=1 zeroing happens only after the response is serialized (below).
+    doc["loop_pass_us_max"] = (unsigned long)g_loop_pass_us_max;
+    JsonObject tick = doc["tick_us"].to<JsonObject>();
+    for (int i = 0; i < g_skill_count; i++)
+        tick[g_skills[i]->name] = (unsigned long)g_skill_tick_us_max[i];
+    for (int i = 0; i < LP_COUNT; i++)
+        tick[g_loop_poll_names[i]] = (unsigned long)g_tick_poll_us_max[i];
+
     String response;
     serializeJson(doc, response);
     request->send(200, "application/json", response);
+
+    // GET /health?reset=1 zeroes ALL loop-timing maxes (and only these) AFTER
+    // the response has been serialized, so a caller can open a fresh worst-case
+    // window — mirrors rns.cpp's ?reset=1 (the value is already captured in the
+    // response above). This reset runs on the AsyncTCP task; against the loop
+    // task's single-writer updates it can cost at most one lost sample.
+    if (request->hasParam("reset") &&
+        request->getParam("reset")->value() == "1") {
+        g_loop_pass_us_max = 0;
+        for (int i = 0; i < LP_COUNT; i++) g_tick_poll_us_max[i] = 0;
+        for (int i = 0; i < MAX_SKILLS; i++) g_skill_tick_us_max[i] = 0;
+    }
 }
 
 static void handle_capabilities(AsyncWebServerRequest *request) {
@@ -3280,9 +3360,15 @@ void loop() {
         if (err == ESP_OK) event_add("firmware auto-confirmed");
     }
 
+    // ---- instrumented tick/poll region begins (loop_pass_us_max) ----
+    // Rolling max of the whole region below, timed on the loop task only.
+    uint64_t _loop_pass_t0 = esp_timer_get_time();
+
     // Deferred STA sequence raised by HTTP handlers (mode → disconnect →
     // begin, millis() settle gaps) — the AsyncTCP task never touches WiFi.
+    uint64_t _t_wifi = esp_timer_get_time();
     wifi_reconnect_poll();
+    loop_time_note(&g_tick_poll_us_max[LP_WIFI_RECONNECT], _t_wifi);
 
     // WiFi reconnect — one non-blocking attempt per ladder rung while offline
     // (the driver's own auto-reconnect stays off: its retries underneath the
@@ -3334,7 +3420,9 @@ void loop() {
     // Front panel: encoder + click (must run before screens consume edges).
     // Pocket lock (long CAPS): swallow wheel + click — keys already silent in
     // hw_kb. Still poll+drain so detents don't queue and fire after unlock.
+    uint64_t _t_input = esp_timer_get_time();
     hw_input_poll();
+    loop_time_note(&g_tick_poll_us_max[LP_HW_INPUT], _t_input);
     int steps = hw_input_steps();
     bool click = hw_input_click();
     if (!hw_kb_locked()) {
@@ -3377,7 +3465,9 @@ void loop() {
     // decision) and precede the notify-arrival block below, so a blanked
     // panel is awake and repainted before an arriving card paints (C3).
     ui_backlight_idle();
+    uint64_t _t_bl = esp_timer_get_time();
     backlight_poll();
+    loop_time_note(&g_tick_poll_us_max[LP_BACKLIGHT], _t_bl);
 
     // Idle → clock (longer while typing a reply).
     {
@@ -3398,7 +3488,9 @@ void loop() {
     // Typed reply on its way to the gateway. ORDER: hand-placed — after the
     // keyboard drain above, so an Enter is carried on the pass that produced
     // it, and after the card has already painted its way back to the clock.
+    uint64_t _t_reply = esp_timer_get_time();
     reply_upstream_poll();
+    loop_time_note(&g_tick_poll_us_max[LP_REPLY_UPSTREAM], _t_reply);
 
     // Speaker + haptic FIRST — before any full-screen SPI paint can delay the
     // cue. (Boot tone worked; notify was silent when paint ran first.)
@@ -3408,7 +3500,9 @@ void loop() {
         if (notify_take_sound_arrival(&lvl, src, sizeof(src))) {
             hw_sound_notify(lvl);   // amp + queue before haptic I2C
             hw_haptic_notify(lvl);
+            uint64_t _t_snd = esp_timer_get_time();
             hw_sound_poll();        // prime DMA immediately
+            loop_time_note(&g_tick_poll_us_max[LP_HW_SOUND], _t_snd);
         }
     }
 
@@ -3473,7 +3567,9 @@ void loop() {
     // ORDER: hand-placed — refill the sound DMA after the arrival paints and
     // before the 1 Hz clock repaint below, so a long paint cannot starve an
     // in-flight cue (hw_sound is a hardware module, not a Skill).
+    uint64_t _t_snd2 = esp_timer_get_time();
     hw_sound_poll();
+    loop_time_note(&g_tick_poll_us_max[LP_HW_SOUND], _t_snd2);
 
     // Progress job reaping (TTL) runs in the progress skill tick.
 
@@ -3497,12 +3593,22 @@ void loop() {
     // Skill ticks: notify (expiry + snapshot), progress (reaping), meshcore
     // (radio), wireguard, gps — registration order.
     for (int i = 0; i < g_skill_count; i++) {
-        if (g_skills[i]->tick) g_skills[i]->tick();
+        if (g_skills[i]->tick) {
+            // Per-skill rolling max, keyed by index (name is g_skills[i]->name).
+            uint64_t _t_skill = esp_timer_get_time();
+            g_skills[i]->tick();
+            loop_time_note(&g_skill_tick_us_max[i], _t_skill);
+        }
     }
 
     // PING screen sequence — after the skill ticks so the meshcore poll above
     // has already had its chance to receive the pong this pass.
+    uint64_t _t_ping = esp_timer_get_time();
     ui_mesh_ping_poll();
+    loop_time_note(&g_tick_poll_us_max[LP_UI_MESH_PING], _t_ping);
+
+    // ---- instrumented tick/poll region ends ----
+    loop_time_note(&g_loop_pass_us_max, _loop_pass_t0);
 
     delay(10);
 }
