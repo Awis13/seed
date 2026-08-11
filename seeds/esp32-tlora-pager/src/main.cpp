@@ -46,7 +46,9 @@
 #include <esp_system.h>
 #include <esp_attr.h>
 #include <esp_core_dump.h>
+#include <Preferences.h>          // NVS-backed panic counter that survives poweron
 #include <HTTPClient.h>
+#include "boot_diag_decide.h"     // pure, host-tested NVS panic-counter decision
 #include "board_pins.h"
 #include "hw_ui.h"
 #include "hw_input.h"
@@ -58,7 +60,7 @@
 #include "psram_alloc.h"          // psram_calloc_pref: park big buffers in PSRAM
 
 // ===== Configuration =====
-#define SEED_VERSION        "0.9.64"
+#define SEED_VERSION        "0.9.66"
 // Core clock: datasheet puts 240 vs 80 ~11.5mA apart on WAITI. Periph bus holds
 // at 80 for every PLL-fed core clock; go lower and RMT/I2S retimes. Same floor
 // as tembed idle policy (no light sleep — notify latency is the job).
@@ -127,6 +129,20 @@ RTC_NOINIT_ATTR static uint32_t boots_since_panic;
 RTC_NOINIT_ATTR static uint32_t panic_count;
 static esp_reset_reason_t reset_reason = ESP_RST_UNKNOWN;
 static bool storage_ok = false;
+
+// NVS-backed companions to the RTC counters above. Flash is NOT wiped on poweron,
+// so these survive a manual reset (the button reports ESP_RST_POWERON, which
+// wipes RTC_NOINIT). panics_since_flash is cleared only on a genuine reflash
+// (build signature change); poweron_count tallies button+power events together.
+// These are RAM mirrors of the NVS values, loaded once in boot_diag_init().
+static uint32_t panics_since_flash = 0;
+static uint32_t poweron_count = 0;
+
+// The build signature stored in NVS. SEED_VERSION plus the compiler's build stamp
+// both vary per build, so any reflash changes it and clears panics_since_flash;
+// a bare poweron/button leaves it identical and preserves the count.
+#define BOOT_DIAG_BUILD_SIG (SEED_VERSION " " __DATE__ " " __TIME__)
+#define BOOT_DIAG_NVS_NS    "bootdiag"
 
 static const char *reset_reason_str(esp_reset_reason_t r) {
     switch (r) {
@@ -203,10 +219,46 @@ static void boot_diag_init() {
     } else {
         boots_since_panic++;
     }
-    Serial.printf("[boot] reset: %s, boots since panic: %lu, panics: %lu\n",
+    // NVS-persistent panic counter (survives poweron, unlike the RTC counter
+    // above). Reuses the SAME is_panic decision, not a re-derived one. The pure
+    // decision (boot_diag_decide.h) is host-tested; only the flash read/write is
+    // here. Writes happen only on a panic, a fresh flash, or a poweron — never on
+    // a plain boot — so there is no flash-wear concern. This runs early in setup()
+    // on the single-task main core, so the NVS access needs no extra locking.
+    {
+        Preferences prefs;
+        if (prefs.begin(BOOT_DIAG_NVS_NS, false)) {   // read-write namespace
+            char stored_sig[64] = {0};
+            size_t sig_len = prefs.getString("sig", stored_sig, sizeof(stored_sig));
+            uint32_t stored_panics = prefs.getULong("panics", 0);
+            boot_diag_nvs_decision nd = boot_diag_nvs_decide(
+                sig_len > 0 ? stored_sig : nullptr, BOOT_DIAG_BUILD_SIG,
+                stored_panics, is_panic);
+            panics_since_flash = nd.panics_since_flash;
+            if (nd.sig_changed) {
+                prefs.putString("sig", BOOT_DIAG_BUILD_SIG);
+            }
+            if (nd.write_needed) {
+                prefs.putULong("panics", panics_since_flash);
+            }
+            // poweron_count: button presses and real power-cycles combined — both
+            // report ESP_RST_POWERON and cannot be told apart. Written only when a
+            // poweron actually happened, so normal boots leave flash untouched.
+            poweron_count = prefs.getULong("poweron", 0);
+            if (reset_reason == ESP_RST_POWERON) {
+                poweron_count++;
+                prefs.putULong("poweron", poweron_count);
+            }
+            prefs.end();
+        }
+    }
+    Serial.printf("[boot] reset: %s, boots since panic: %lu, panics: %lu, "
+                  "panics since flash: %lu, powerons: %lu\n",
                   reset_reason_str(reset_reason),
                   (unsigned long)boots_since_panic,
-                  (unsigned long)panic_count);
+                  (unsigned long)panic_count,
+                  (unsigned long)panics_since_flash,
+                  (unsigned long)poweron_count);
 }
 
 // ===== Storage bring-up =====
@@ -837,6 +889,12 @@ static void handle_health(AsyncWebServerRequest *request) {
     doc["reset_reason"] = reset_reason_str(reset_reason);
     doc["boots_since_panic"] = (unsigned long)boots_since_panic;
     doc["panic_count"] = (unsigned long)panic_count;
+    // panics_since_flash lives in NVS (flash), so it survives a manual reset —
+    // unlike panic_count/boots_since_panic (RTC), which the reset button wipes
+    // (it reports ESP_RST_POWERON). It is cleared only by a reflash. poweron_count
+    // is the combined button+power tally.
+    doc["panics_since_flash"] = (unsigned long)panics_since_flash;
+    doc["poweron_count"] = (unsigned long)poweron_count;
     doc["storage_ok"] = storage_ok;
     // History archive observability (ticket C4, read-only): is the archive on the
     // SD card or the SPIFFS fallback, how many records have been dropped on a full
@@ -1294,7 +1352,7 @@ static void handle_skill(AsyncWebServerRequest *request) {
     s += "## API\n\n";
     s += "| Method | Path | Description |\n";
     s += "|--------|------|-------------|\n";
-    s += "| GET | /health | Alive (no auth); reset_reason, boots_since_panic, panic_count, storage_ok |\n";
+    s += "| GET | /health | Alive (no auth); reset_reason, boots_since_panic, panic_count, panics_since_flash, poweron_count, storage_ok |\n";
     s += "| GET | /capabilities | Hardware info |\n";
     s += "| GET | /config.md | Node config |\n";
     s += "| POST | /config.md | Update config |\n";
