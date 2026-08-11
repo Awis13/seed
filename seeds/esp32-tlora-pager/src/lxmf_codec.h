@@ -164,7 +164,12 @@ typedef struct {
 typedef struct { const uint8_t *p; size_t len; size_t off; } lxmf_mp_reader;
 
 static inline int lxmf_mp_avail(const lxmf_mp_reader *r, size_t n) {
-    return r->off + n <= r->len;   /* off/len are size_t; no overflow for sane n */
+    /* NON-WRAPPING: never form r->off + n (an attacker-controlled length prefix
+     * can carry n up to 0xFFFFFFFF, and on a 32-bit size_t that sum wraps and the
+     * check wrongly passes). The invariant off <= len holds throughout (every
+     * advance is gated by a prior lxmf_mp_avail / lxmf_mp_peek), so len - off is a
+     * safe non-negative remaining-bytes count and this form cannot overflow. */
+    return n <= r->len - r->off;
 }
 
 /* Read a big-endian unsigned of `n` bytes (n in 1,2,4,8) into *v. */
@@ -314,9 +319,14 @@ static inline LxmfReason lxmf_mp_skip(lxmf_mp_reader *r, int depth) {
         case 0xc4: case 0xd9: { uint64_t n; if (!lxmf_mp_be(r, 1, &n)) return LXMF_TRUNCATED; if (!lxmf_mp_avail(r, (size_t)n)) return LXMF_TRUNCATED; r->off += (size_t)n; return LXMF_OK; }
         case 0xc5: case 0xda: { uint64_t n; if (!lxmf_mp_be(r, 2, &n)) return LXMF_TRUNCATED; if (!lxmf_mp_avail(r, (size_t)n)) return LXMF_TRUNCATED; r->off += (size_t)n; return LXMF_OK; }
         case 0xc6: case 0xdb: { uint64_t n; if (!lxmf_mp_be(r, 4, &n)) return LXMF_TRUNCATED; if (!lxmf_mp_avail(r, (size_t)n)) return LXMF_TRUNCATED; r->off += (size_t)n; return LXMF_OK; }
-        case 0xc7: { uint64_t n; if (!lxmf_mp_be(r, 1, &n)) return LXMF_TRUNCATED; if (!lxmf_mp_avail(r, (size_t)n + 1)) return LXMF_TRUNCATED; r->off += (size_t)n + 1; return LXMF_OK; } /* ext8 */
-        case 0xc8: { uint64_t n; if (!lxmf_mp_be(r, 2, &n)) return LXMF_TRUNCATED; if (!lxmf_mp_avail(r, (size_t)n + 1)) return LXMF_TRUNCATED; r->off += (size_t)n + 1; return LXMF_OK; } /* ext16 */
-        case 0xc9: { uint64_t n; if (!lxmf_mp_be(r, 4, &n)) return LXMF_TRUNCATED; if (!lxmf_mp_avail(r, (size_t)n + 1)) return LXMF_TRUNCATED; r->off += (size_t)n + 1; return LXMF_OK; } /* ext32 */
+        /* ext8/16/32: 1 ext-type byte then n payload bytes. NEVER form (size_t)n+1
+         * — with an attacker n of 0xFFFFFFFF that wraps to 0 on a 32-bit size_t,
+         * turning a malformed ext into a zero-length skip instead of TRUNCATED.
+         * Consume the type byte and the n payload separately, each checked against
+         * the remaining bytes via the non-wrapping lxmf_mp_avail. */
+        case 0xc7: { uint64_t n; if (!lxmf_mp_be(r, 1, &n)) return LXMF_TRUNCATED; if (!lxmf_mp_avail(r, 1)) return LXMF_TRUNCATED; r->off += 1; if (!lxmf_mp_avail(r, (size_t)n)) return LXMF_TRUNCATED; r->off += (size_t)n; return LXMF_OK; } /* ext8 */
+        case 0xc8: { uint64_t n; if (!lxmf_mp_be(r, 2, &n)) return LXMF_TRUNCATED; if (!lxmf_mp_avail(r, 1)) return LXMF_TRUNCATED; r->off += 1; if (!lxmf_mp_avail(r, (size_t)n)) return LXMF_TRUNCATED; r->off += (size_t)n; return LXMF_OK; } /* ext16 */
+        case 0xc9: { uint64_t n; if (!lxmf_mp_be(r, 4, &n)) return LXMF_TRUNCATED; if (!lxmf_mp_avail(r, 1)) return LXMF_TRUNCATED; r->off += 1; if (!lxmf_mp_avail(r, (size_t)n)) return LXMF_TRUNCATED; r->off += (size_t)n; return LXMF_OK; } /* ext32 */
         case 0xdc: { uint64_t n; if (!lxmf_mp_be(r, 2, &n)) return LXMF_TRUNCATED; for (uint64_t i = 0; i < n; i++) { LxmfReason rr = lxmf_mp_skip(r, depth + 1); if (rr != LXMF_OK) return rr; } return LXMF_OK; } /* array16 */
         case 0xdd: { uint64_t n; if (!lxmf_mp_be(r, 4, &n)) return LXMF_TRUNCATED; for (uint64_t i = 0; i < n; i++) { LxmfReason rr = lxmf_mp_skip(r, depth + 1); if (rr != LXMF_OK) return rr; } return LXMF_OK; } /* array32 */
         case 0xde: { uint64_t n; if (!lxmf_mp_be(r, 2, &n)) return LXMF_TRUNCATED; for (uint64_t i = 0; i < 2 * n; i++) { LxmfReason rr = lxmf_mp_skip(r, depth + 1); if (rr != LXMF_OK) return rr; } return LXMF_OK; } /* map16 */

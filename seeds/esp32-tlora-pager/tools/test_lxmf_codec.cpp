@@ -251,6 +251,117 @@ static void test_encode_overflow() {
     assert(need > sizeof(tiny));              /* reports the length it needed */
 }
 
+/* Build a message: 96-byte zero header + the given raw msgpack payload bytes.
+ * Returns the total length. `buf` must have room for LXMF_HEADER_LEN + plen. */
+static size_t mk_msg(uint8_t *buf, const uint8_t *payload, size_t plen) {
+    memset(buf, 0, LXMF_HEADER_LEN);
+    memcpy(buf + LXMF_HEADER_LEN, payload, plen);
+    return LXMF_HEADER_LEN + plen;
+}
+
+/* A well-formed float64-zero timestamp, as raw msgpack bytes. */
+#define TS0 0xcb, 0, 0, 0, 0, 0, 0, 0, 0
+/* An empty bin8 (len 0) — used as a valid title/content placeholder. */
+#define BIN0 0xc4, 0x00
+
+/*
+ * str32 / bin32 length prefixes of 0xFFFFFFFF (and a mid 0x00100000) in the
+ * title and content positions must be rejected (TRUNCATED here — the declared
+ * bytes run off the end), never wrap-accepted. On a 32-bit size_t the old
+ * `r->off + n <= r->len` check wrapped for n≈2^32 and wrongly passed; the
+ * non-wrapping `n <= len - off` form rejects it by construction.
+ */
+static void test_hostile_str32_bin32_lengths() {
+    uint8_t buf[LXMF_HEADER_LEN + 64];
+    LxmfMsg m;
+
+    /* title str32, len 0xFFFFFFFF */
+    { const uint8_t p[] = { 0x94, TS0, 0xdb, 0xFF, 0xFF, 0xFF, 0xFF };
+      assert(lxmf_parse(buf, mk_msg(buf, p, sizeof(p)), &m) == LXMF_TRUNCATED); }
+    /* title bin32, len 0xFFFFFFFF */
+    { const uint8_t p[] = { 0x94, TS0, 0xc6, 0xFF, 0xFF, 0xFF, 0xFF };
+      assert(lxmf_parse(buf, mk_msg(buf, p, sizeof(p)), &m) == LXMF_TRUNCATED); }
+    /* title str32, mid length 0x00100000 (1 MiB) — still short of the buffer */
+    { const uint8_t p[] = { 0x94, TS0, 0xdb, 0x00, 0x10, 0x00, 0x00 };
+      assert(lxmf_parse(buf, mk_msg(buf, p, sizeof(p)), &m) == LXMF_TRUNCATED); }
+    /* content str32, len 0xFFFFFFFF (title consumed first as empty bin) */
+    { const uint8_t p[] = { 0x94, TS0, BIN0, 0xdb, 0xFF, 0xFF, 0xFF, 0xFF };
+      assert(lxmf_parse(buf, mk_msg(buf, p, sizeof(p)), &m) == LXMF_TRUNCATED); }
+    /* content bin32, mid length 0x00100000 */
+    { const uint8_t p[] = { 0x94, TS0, BIN0, 0xc6, 0x00, 0x10, 0x00, 0x00 };
+      assert(lxmf_parse(buf, mk_msg(buf, p, sizeof(p)), &m) == LXMF_TRUNCATED); }
+}
+
+/*
+ * map32 / array32 with a 0xFFFFFFFF element count must be rejected without a
+ * wrap and without an OOB read: the huge count never allocates or advances past
+ * the buffer — each iteration hits the end and stops.
+ */
+static void test_hostile_map32_array32_counts() {
+    uint8_t buf[LXMF_HEADER_LEN + 64];
+    LxmfMsg m;
+
+    /* fields = map32 with count 0xFFFFFFFF, no pairs follow -> TRUNCATED, no wrap. */
+    { const uint8_t p[] = { 0x94, TS0, BIN0, BIN0, 0xdf, 0xFF, 0xFF, 0xFF, 0xFF };
+      assert(lxmf_parse(buf, mk_msg(buf, p, sizeof(p)), &m) == LXMF_TRUNCATED); }
+
+    /* payload itself is an array32 with count 0xFFFFFFFF -> not 4/5 -> BAD_SHAPE. */
+    { const uint8_t p[] = { 0xdd, 0xFF, 0xFF, 0xFF, 0xFF };
+      assert(lxmf_parse(buf, mk_msg(buf, p, sizeof(p)), &m) == LXMF_BAD_SHAPE); }
+
+    /* array32 with count 0xFFFFFFFF as an unknown field's VALUE, skipped
+     * generically -> TRUNCATED (loop hits the end), no wrap. */
+    { const uint8_t p[] = { 0x94, TS0, BIN0, BIN0, 0x81, 0x63,   /* fixmap(1), key uint 0x63 */
+                            0xdd, 0xFF, 0xFF, 0xFF, 0xFF };
+      assert(lxmf_parse(buf, mk_msg(buf, p, sizeof(p)), &m) == LXMF_TRUNCATED); }
+}
+
+/*
+ * Nesting deeper than LXMF_MAX_DEPTH (8) in the generic skip must trip the
+ * recursion guard and return BAD_MSGPACK rather than blow the stack.
+ */
+static void test_hostile_deep_nesting() {
+    uint8_t buf[LXMF_HEADER_LEN + 64];
+    LxmfMsg m;
+    const uint8_t head[] = { 0x94, TS0, BIN0, BIN0, 0x81, 0x63 }; /* fixmap(1) key 0x63 */
+    uint8_t p[sizeof(head) + 40];
+    size_t o = 0;
+    memcpy(p, head, sizeof(head)); o = sizeof(head);
+    for (int i = 0; i < 40; i++) p[o++] = 0x91;                   /* 40 nested fixarray(1) */
+    assert(lxmf_parse(buf, mk_msg(buf, p, o), &m) == LXMF_BAD_MSGPACK);
+}
+
+/*
+ * A field key that is not a uint (a str key) is not standard LXMF but must be
+ * tolerated: key and value are generic-skipped and the message still parses OK
+ * (balanced consume — no desync).
+ */
+static void test_hostile_str_field_key() {
+    uint8_t buf[LXMF_HEADER_LEN + 64];
+    LxmfMsg m;
+    /* fields = fixmap(1): key = fixstr "x", value = nil -> skipped, OK. */
+    const uint8_t p[] = { 0x94, TS0, BIN0, BIN0, 0x81, 0xa1, 'x', 0xc0 };
+    LxmfReason r = lxmf_parse(buf, mk_msg(buf, p, sizeof(p)), &m);
+    assert(r == LXMF_OK);
+    assert(m.title_len == 0 && m.content_len == 0);
+    assert(!m.has_type && !m.has_data && !m.has_meta);
+}
+
+/*
+ * ext32 with a huge declared length must be TRUNCATED, not a zero-length skip.
+ * The old `(size_t)n + 1` wrapped to 0 on a 32-bit size_t for n=0xFFFFFFFF and
+ * silently consumed nothing; the split type-byte/payload checks reject it.
+ */
+static void test_hostile_ext32_huge() {
+    uint8_t buf[LXMF_HEADER_LEN + 64];
+    LxmfMsg m;
+    /* fields fixmap(1) key 0x63, value = ext32 len 0xFFFFFFFF + 1 type byte, no
+     * payload -> type byte consumed, huge payload runs off the end -> TRUNCATED. */
+    const uint8_t p[] = { 0x94, TS0, BIN0, BIN0, 0x81, 0x63,
+                          0xc9, 0xFF, 0xFF, 0xFF, 0xFF, 0x01 };
+    assert(lxmf_parse(buf, mk_msg(buf, p, sizeof(p)), &m) == LXMF_TRUNCATED);
+}
+
 int main() {
     test_full();
     test_plain();
@@ -263,6 +374,11 @@ int main() {
     test_oversized_content();
     test_sign_contract();
     test_encode_overflow();
+    test_hostile_str32_bin32_lengths();
+    test_hostile_map32_array32_counts();
+    test_hostile_deep_nesting();
+    test_hostile_str_field_key();
+    test_hostile_ext32_huge();
     printf("all lxmf codec tests passed\n");
     return 0;
 }
