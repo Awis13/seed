@@ -14,18 +14,24 @@
  *                         host-tested (tools/test_rns_filter.sh)
  *   rns/annsched.h        when to announce, same shape, host-tested by
  *                         tools/test_rns_annsched.sh
+ *   rns/inbox.h           the one-message handoff from the packet callback to
+ *                         the loop task, and the payload sanitiser; same shape
+ *                         again, host-tested by tools/test_rns_inbox.sh
  *   RnsTcpInterface       RNS::InterfaceImpl subclass; drain, framing and the
  *                         reconnect state machine all run on the loop task
  *   rns_destination       one IN/SINGLE destination, seed.pager, on the stored
- *                         identity — the address this node answers to
+ *                         identity — the address this node answers to. A packet
+ *                         sent to it becomes a notification card; tools/rns-send
+ *                         is the host side of that
  *   /rns.json (SPIFFS)    {enabled, host, port} — gitignored, it names a host
  *                         behind the tunnel
  *   GET  /rns/status      stack + interface state, counters, last error, the
  *                         destination address and its announce timings, plus
  *                         three loop-task health fields (loop_stack_free_bytes,
- *                         drain_us_max, path_hashes) and the prefilter's
- *                         announces_dropped / announces_kept; ?reset=1 zeroes
- *                         the drain_us_max rolling max after it has been read
+ *                         drain_us_max, path_hashes), the prefilter's
+ *                         announces_dropped / announces_kept and the receive
+ *                         path's six data_* counters; ?reset=1 zeroes the
+ *                         drain_us_max rolling max after it has been read
  *   POST /rns/config      upsert of the three fields above
  *
  * BEING ADDRESSABLE HAS A PRICE, and it is paid on the loop task. Once a
@@ -244,6 +250,7 @@
 
 #include "rns/annsched.h"
 #include "rns/hdlc.h"
+#include "rns/inbox.h"
 #include "rns/pktfilter.h"
 
 /* The two wire constants rns/pktfilter.h mirrors, checked against the library's
@@ -255,6 +262,15 @@ static_assert(RNS_PKT_TYPE_ANNOUNCE == (uint8_t)RNS::Type::Packet::ANNOUNCE,
 static_assert(RNS_PKT_CONTEXT_PATH_RESPONSE ==
                   (uint8_t)RNS::Type::Packet::PATH_RESPONSE,
               "rns/pktfilter.h PATH_RESPONSE does not match RNS::Type::Packet");
+
+/* And the third wire constant, for the same reason: rns/inbox.h sizes its one
+ * buffer at the largest plaintext a single encrypted packet can carry, and the
+ * host test that drives that buffer cannot see the library. If ENCRYPTED_MDU
+ * ever moves, this fails the firmware build instead of quietly truncating a
+ * message on the device. Both implementations derive 383 from the same
+ * arithmetic — RNS/Packet.py ENCRYPTED_MDU, microReticulum Type.h. */
+static_assert(RNS_INBOX_PAYLOAD_MAX == (size_t)RNS::Type::Packet::ENCRYPTED_MDU,
+              "rns/inbox.h payload ceiling does not match RNS::Type::Packet");
 
 /* ---- this node's own destination ----
  *
@@ -318,6 +334,15 @@ static_assert(RNS_PKT_CONTEXT_PATH_RESPONSE ==
 #define RNS_TCP_DRAIN_BYTES_MAX  1024
 #define RNS_TCP_DRAIN_FRAMES_MAX 8
 #define RNS_TCP_DRAIN_BUDGET_MS  8UL
+
+/* The inbound message ring must hold everything ONE drain pass can deliver: the
+ * drain runs to its frame budget inside a tick and the pickup runs once per
+ * tick, so a shallower ring turns a burst into drops by construction. This is
+ * the coupling that keeps the two numbers in step when either of them moves —
+ * the frame budget is the cause and the ring depth is the consequence, and the
+ * build is where that gets noticed rather than the device. */
+static_assert(RNS_INBOX_SLOTS >= RNS_TCP_DRAIN_FRAMES_MAX,
+              "rns/inbox.h ring is shallower than one drain pass");
 
 /* lwip_send() attempts per flush before the tail waits for the next tick. */
 #define RNS_TCP_TX_FLUSH_TRIES 4
@@ -528,9 +553,47 @@ static bool rns_packet_filter(const RNS::Packet &packet) {
  * away". Without it Destination::receive() unpacks the packet, verifies nothing
  * is listening and returns, so an inbound DATA packet would leave no trace at
  * all and the first thing anyone sent us would look identical to a packet that
- * never arrived. g_rns_data_rx is the evidence, and today it is the whole of
- * what this node does with an inbound packet — there is no application on top
- * yet, and inventing one here would be a different commit.
+ * never arrived.
+ *
+ * THE CALLBACK MAY NOT RAISE THE CARD, which is the whole shape of this file's
+ * receive path. notify_ingest() calls time(NULL) (notify.cpp), takes the
+ * notify_mux critical section (notify_push) and appends to the event ring
+ * (event_add, main.cpp) — three things on the forbidden list below, in a
+ * function that runs inside the drain with Transport::_jobs_locked set.
+ * Persistence is a FOURTH cost and no longer a dirty flag: notify_push()
+ * write-throughs the card to the history archive (notify_archive_put ->
+ * history_enqueue, skills/history.cpp), which is a 0-tick xQueueSend onto the
+ * archive's own write task. That one neither blocks nor touches SD on this
+ * task, but it does spend ~1.3 KB of stack on the record and queue-item
+ * temporaries — on a stack that is already deep inside Transport::inbound()
+ * here. So the callback stores the bytes in
+ * g_rns_inbox and returns, and rns_inbox_poll() raises the card from the loop
+ * task after rns_stack.loop() has come back. Same deferral cluster as
+ * g_rns_cfg_dirty further down and as skills/wg.cpp's request flags: the
+ * forbidden context raises, the permitted one consumes. The ring's rules —
+ * its depth, and what happens to a message that arrives with every slot full —
+ * live in rns/inbox.h and are host-tested by tools/test_rns_inbox.sh.
+ *
+ * THREE PROPERTIES OF THE PAYLOAD THAT A READER WILL OTHERWISE ASSUME WRONG:
+ *
+ *   - IT IS NOT NUL-TERMINATED and its pointer DANGLES once the callback
+ *     returns. Destination::receive() builds the plaintext as a local Bytes
+ *     (Destination.cpp) and Bytes::data() hands back the vector's storage
+ *     (Bytes.h), so the length has to be carried everywhere and `%s` on it is a
+ *     bug, not a shortcut.
+ *   - IT CAN NEVER BE EMPTY HERE, and that is a silent failure mode rather than
+ *     a convenience. Destination::receive() calls this callback only inside
+ *     `if (plaintext)`, and Bytes::operator bool is `_data && !_data->empty()`
+ *     (Bytes.h), so a peer sending a zero-length message produces no callback,
+ *     no counter, no card and no error — on either end. The sender sees a
+ *     successful send. tools/rns-send refuses an empty payload for exactly this
+ *     reason; anything else that ever talks to this destination has to as well.
+ *   - ITS BYTES ARE ARBITRARY. notify_ingest() filters nothing, so a control
+ *     byte reaches the screen renderer as-is and a NUL would end the card body
+ *     early, and there is no guarantee the payload is valid UTF-8. It is passed
+ *     through rns_text_sanitize() (rns/inbox.h) on the loop task before it
+ *     becomes a card: newline kept, every other control byte and 0x7F rendered
+ *     as '.', well-formed UTF-8 sequences copied whole, everything else '?'.
  *
  * WHAT AN INBOUND PACKET COSTS BEFORE THIS FUNCTION IS EVEN REACHED, because
  * the rest of this comment enumerates costs we avoid and that would be a
@@ -556,9 +619,24 @@ static bool rns_packet_filter(const RNS::Packet &packet) {
  *
  *   - Destination::Callbacks::packet is `void(*)(const Bytes&, const Packet&)`,
  *     a BARE FUNCTION POINTER, so there is nowhere for state to live except file
- *     scope. Both arguments are const references; taking either BY VALUE would
- *     be a heap copy of the packet payload on the loop task, which is exactly
- *     the kind of edit tools/test_task_unblock.py's allowlist exists to stop.
+ *     scope. Both arguments are const references and MUST STAY references, but
+ *     not for the reason an earlier version of this comment gave: it claimed a
+ *     by-value Bytes was "a heap copy of the packet payload", and it is not.
+ *     Bytes.h defines COW unconditionally (Bytes.h:62) and Bytes::assign() is a
+ *     shared_ptr copy — "shared_ptr copy only — O(1), no heap allocation"
+ *     (Bytes.h:247-251). Nor can such a local free anything on the way out:
+ *     Destination::receive()'s own plaintext outlives this callback and holds
+ *     the other reference, so the count goes 2 -> 1 and nothing is released.
+ *     What a by-value local DOES cost is an atomic increment and decrement on
+ *     the loop task, and one live hazard that is worth the rule on its own:
+ *     the copy is non-exclusive, so the first MUTATION of it — an append, a
+ *     resize, anything that is not a read — calls Bytes::exclusiveData(), which
+ *     is `new Data()` plus a reserve and a full copy of the payload
+ *     (Bytes.cpp), inside the drain, and which throws std::runtime_error after
+ *     logging an ERROR through Log.cpp's blocking Serial.flush() when the
+ *     allocation fails. A reference cannot be mutated by accident; a by-value
+ *     local invites exactly that edit. tools/test_task_unblock.py's allowlist is
+ *     what keeps the argument a reference.
  *   - It runs on the loop task, inside the 8 ms drain, reached from
  *     handle_incoming() -> Transport::inbound() -> Destination::receive().
  *     So: no logging (Log.cpp ends every emitted line with a blocking
@@ -574,14 +652,43 @@ static bool rns_packet_filter(const RNS::Packet &packet) {
  *     rest of the boot. The rule stands; the reason it stands is the second
  *     case, not the first.
  *
- * A plain uint32_t increment satisfies all of that and nothing else here does.
+ * A memcpy into a fixed buffer and a handful of scalar stores satisfy all of
+ * that. They all live in rns_inbox_put(), which is why the body below is one
+ * line.
+ *
+ * The Packet is deliberately unused. Nothing in it names the sender — a SINGLE
+ * destination packet carries the DESTINATION hash in its header, not a source —
+ * so the card cannot say who sent it, and this file will not guess. Anyone who
+ * knows the address can raise a card on this screen; that is a property of the
+ * address, and a display name belongs to LXMF rather than to a bare packet.
  */
-static uint32_t g_rns_data_rx = 0;
+
+/* The messages in flight, the pickup scratch and the card they become. All
+ * three are fixed-size statics: same rule as the interface buffers above, and
+ * the loop task's stack is shared with the drain and with Transport::inbound(),
+ * which is deep enough already without ~600 bytes of locals once per tick.
+ *
+ * The ring is exactly one drain pass deep — RNS_INBOX_SLOTS is checked against
+ * RNS_TCP_DRAIN_FRAMES_MAX by a static_assert above — because one tick can admit
+ * that many packets and the pickup runs once per tick, so anything shallower
+ * answers an ordinary burst with drops. See rns/inbox.h for the sizing and for
+ * what happens when even a whole pass is not enough. */
+static rns_inbox g_rns_inbox;
+static uint8_t g_rns_inbox_payload[RNS_INBOX_PAYLOAD_MAX];
+static char g_rns_card_body[NOTIFY_BODY_LEN];
+/* Cards raised, and cards whose body could not hold the whole message. The
+ * second one is not optional bookkeeping: a payload can be 383 bytes and the
+ * card paints far less than that, so without this a long message would lose its
+ * tail with nothing anywhere saying it had. The card itself carries the same
+ * fact — see rns_inbox_poll(), which is also where the limit that matters is
+ * explained. It is NOT notify's 240-byte storage: using that number was the bug
+ * that shipped a truncation marker at an offset the renderer never reaches. */
+static uint32_t g_rns_cards = 0;
+static uint32_t g_rns_card_cut = 0;
 
 static void rns_data_callback(const RNS::Bytes &data, const RNS::Packet &packet) {
-    (void)data;
     (void)packet;
-    g_rns_data_rx++;
+    rns_inbox_put(&g_rns_inbox, data.data(), data.size());
 }
 
 /* ---- announce state ----
@@ -1297,16 +1404,42 @@ static void rns_status_json(JsonDocument &doc) {
      * the 8 ms drain, and nothing on this board had measured the sign side.
      * Read announce_us_max against iface.drain_us_max.
      *
-     * data_rx is the packet callback's count — the only evidence that anything
-     * ever addressed us successfully. All of these are naturally aligned 32-bit
-     * scalars written by the loop task, read here exactly like iface.attempts;
-     * rns_dest_addr is written once during bring-up. */
+     * THE SIX data_* KEYS ARE THE RECEIVE PATH MADE DIAGNOSABLE, and each one
+     * answers a question the others cannot:
+     *   data_rx          payloads the packet callback was handed. Still counts
+     *                    packets that DECRYPTED, not packets that arrived — see
+     *                    the blind spot above.
+     *   data_dropped     messages refused because one was still waiting for the
+     *                    loop task. The overflow policy in rns/inbox.h is keep
+     *                    the first, count the drop; this is that count, and it
+     *                    is the difference between a message that was never sent
+     *                    and a message this node threw away.
+     *   data_last_len    length in bytes of the most recent payload OFFERED,
+     *                    accepted or dropped. It is what a sender compares
+     *                    against what it sent.
+     *   data_oversize    payloads longer than the 383-byte ceiling, stored short.
+     *                    Structurally impossible through a single packet; a
+     *                    non-zero value means an assumption in this file is
+     *                    wrong, which is why it is published rather than
+     *                    asserted.
+     *   data_cards       payloads that became a notification card.
+     *   data_card_cut    cards whose body could not hold the whole message.
+     *
+     * All of these are naturally aligned scalars written by the loop task and
+     * read here exactly like iface.attempts — 32-bit but for data_last_len,
+     * which is a 16-bit aligned load and single-copy atomic on this core just
+     * the same. rns_dest_addr is written once during bring-up. */
     doc["address"] = rns_dest_addr[0] ? rns_dest_addr : (const char *)nullptr;
     doc["announced"] = g_rns_announced;
     doc["announces_sent"] = (unsigned long)g_rns_ann_sent;
     doc["announce_us_last"] = (unsigned long)g_rns_ann_us_last;
     doc["announce_us_max"] = (unsigned long)g_rns_ann_us_max;
-    doc["data_rx"] = (unsigned long)g_rns_data_rx;
+    doc["data_rx"] = (unsigned long)g_rns_inbox.received;
+    doc["data_dropped"] = (unsigned long)g_rns_inbox.dropped;
+    doc["data_last_len"] = (unsigned long)g_rns_inbox.last_len;
+    doc["data_oversize"] = (unsigned long)g_rns_inbox.oversize;
+    doc["data_cards"] = (unsigned long)g_rns_cards;
+    doc["data_card_cut"] = (unsigned long)g_rns_card_cut;
 
     doc["transport"] = RNS::Reticulum::transport_enabled();
     doc["interfaces"] = (unsigned long)g_rns_snap.interfaces;
@@ -1440,8 +1573,25 @@ static const char *rns_describe() {
            "the loop task. The destination declines link requests and keeps\n"
            "the default PROVE_NONE proof strategy — nothing here terminates a\n"
            "link yet, and both would run public-key work inside the drain.\n"
-           "A packet callback counts what arrives as `data_rx`; there is no\n"
-           "application on top of it yet.\n"
+           "A packet addressed to it becomes a notification card. The callback\n"
+           "runs inside the socket drain, where raising a card is not allowed,\n"
+           "so it copies the payload into an eight-slot ring and the loop task\n"
+           "drains that ring into cards after the stack has run. The ring is one\n"
+           "whole drain pass deep, so a burst of eight frames is eight cards; a\n"
+           "message arriving with every slot full is refused, not overwritten,\n"
+           "and counted. Nothing rate-limits cards. The payload is at most 383\n"
+           "bytes (the largest plaintext one encrypted packet carries), is not\n"
+           "NUL-terminated, and may be any bytes at all: control bytes are\n"
+           "rendered as `.`, malformed UTF-8 as `?`, and a message longer than\n"
+           "the ~185 characters the card actually paints is cut and prefixed\n"
+           "with the count of what did not fit. A\n"
+           "zero-length message never arrives at all — the library skips the\n"
+           "callback on empty plaintext, so the sender sees success and the\n"
+           "device sees nothing. `data_rx`, `data_dropped`, `data_last_len`,\n"
+           "`data_oversize`, `data_cards` and `data_card_cut` in\n"
+           "`/rns/status` are the receive path's counters. The card cannot\n"
+           "name the sender: a packet to a SINGLE destination carries no\n"
+           "source, so anyone who knows the address can raise one.\n"
            "Inbound packets pass a filter registered on Transport before the\n"
            "stack starts: it drops announces not marked as a path response,\n"
            "before the Ed25519 signature is checked — a verification that\n"
@@ -1642,6 +1792,156 @@ static void rns_announce_poll() {
     g_rns_ann_was_online = online;
 }
 
+/* Take whatever the packet callback left in the inbox and put it on the screen.
+ *
+ * Loop task only, and deliberately AFTER rns_stack.loop() — see skill_rns_poll().
+ * The drain that fills the inbox runs INSIDE rns_stack.loop(), so a pickup ahead
+ * of it is a pickup of last tick's messages: every delivery would sit an extra
+ * RNS_TICK_MS on the shelf for no reason. rns_announce_poll() above documents
+ * the same ordering for the same reason.
+ *
+ * IT DRAINS THE RING, it does not take one. A single tick can admit
+ * RNS_TCP_DRAIN_FRAMES_MAX packets, and a pickup that took one per tick would
+ * turn a burst into one card and seven drops however deep the ring was. The loop
+ * is bounded by the ring itself — at most RNS_INBOX_SLOTS iterations, because
+ * nothing can refill it from here.
+ *
+ * WHAT THIS IS ALLOWED TO DO THAT THE CALLBACK IS NOT: everything. It runs after
+ * the stack has returned, outside the drain and outside Transport::inbound(), so
+ * notify_ingest()'s time(NULL), critical section, event-ring append and archive
+ * write-through are all ordinary work here. This is the entire point of the
+ * deferral.
+ *
+ * WHAT THIS DOES NOT DO IS RATE-LIMIT ANYTHING. Eight cards in one tick is eight
+ * buzzes, eight screen repaints and eight records queued to the history archive,
+ * and nothing above bounds how often that can be provoked by anyone who knows the
+ * address. That is a real gap and it is named here rather than papered over; it
+ * is not this commit's to close. The archive side of it degrades by DROPPING, not
+ * by blocking: HISTORY_WRITE_QUEUE_DEPTH is 16 (skills/history.cpp) and the
+ * enqueue is a 0-tick send, so a burst faster than the SD write task loses
+ * records into history_drops() while the cards themselves still reach the
+ * screen.
+ *
+ * AND THE FLOOD TAKES THE EVIDENCE WITH IT. notify_ingest() appends one line to
+ * the event ring per card, MAX_EVENTS is 64 (main.cpp), and eight cards per
+ * 20 ms tick is 64 lines in about 160 ms — so a sustained flood overwrites the
+ * ring faster than anyone can read it, including whatever the ring held about
+ * the flood starting. The counters in GET /rns/status survive it, because they
+ * are counters; /events does not. Anyone diagnosing this reaches for data_rx and
+ * data_dropped, not the ring.
+ *
+ * THE CARD CANNOT HOLD THE WHOLE MESSAGE, and the cut is sized against WHAT THE
+ * SCREEN PAINTS rather than against what notify can store. Those are different
+ * numbers and using the wrong one is how the previous revision made a marker
+ * nobody could ever see. notify's body holds 240 bytes, but
+ * hw_ui_show_notify() paints at most RNS_CARD_ROWS rows of RNS_CARD_COLS
+ * columns and then stops — there is no scroll on that card — so text past
+ * ~RNS_CARD_VISIBLE_CHARS codepoints is stored and never drawn. The budget is in
+ * CODEPOINTS because that is what the renderer counts: a byte budget would cut a
+ * Cyrillic message at half the text the screen could show.
+ *
+ * THE MARKER GOES IN FRONT, not at the end, and that is the other half of the
+ * same lesson. The renderer word-wraps by backing up to the last space in each
+ * row, so how much of the last row is actually used is not predictable from
+ * here; a marker at the end of the body can be pushed off the bottom by wrapping
+ * alone. The first row is always painted. So a truncated card opens with
+ * "[+N B] " and the count is exact: the second sanitising pass re-runs with the
+ * marker's room already held back, so N is measured against the text that
+ * actually stays rather than against a body the marker then overwrites. */
+/* What hw_ui_show_notify() draws for the card body: max_rows 5 at scale 2, and
+ * (PANEL_W 480 - MARGIN 12 - 4 - MARGIN 12) / (6 * 2) = 37 columns per row
+ * (src/hw_ui.cpp). This is an UPPER BOUND and the budget does not model rows, so
+ * cutting here never withholds a character the screen would have shown — but it
+ * can leave more hidden than N admits. A body of "ab\n" repeated ends every row
+ * after two characters: 383 bytes of it paints 19 characters while the card says
+ * "+210 B", because 164 of the characters we kept are on rows six and beyond.
+ * Space-heavy text wraps the same way, more mildly. N is honest about what the
+ * BODY does not contain and cannot be honest about what the panel does not
+ * paint; modelling wrap here would mean reimplementing hw_ui's line breaker
+ * against a font, and every other notify source on this device shares the same
+ * limitation. The "[+N B]" prefix is on row one either way, which is why it is
+ * a prefix. tools/test_task_unblock.py pins the renderer's own constants so this
+ * cannot drift out from under us silently. */
+#define RNS_CARD_ROWS 5
+#define RNS_CARD_COLS 37
+#define RNS_CARD_VISIBLE_CHARS (RNS_CARD_ROWS * RNS_CARD_COLS)
+/* The room held back for the marker in BOTH budgets. The longest marker is
+ * "[+383 B] " at 9 characters, since N can never exceed the payload ceiling;
+ * the reservation is 12 rather than 9 so the format string can gain a character
+ * without silently eating into the visible budget it was balanced against. The
+ * slack costs three characters of a truncated card and nothing on a whole one.
+ * RNS_CARD_CUT_MARK_MAX is the separate buffer the marker is formatted into. */
+#define RNS_CARD_CUT_RESERVE  12
+#define RNS_CARD_CUT_MARK_MAX 16
+
+static void rns_inbox_poll() {
+    uint16_t len = 0;
+
+    while (rns_inbox_take(&g_rns_inbox, g_rns_inbox_payload,
+                          sizeof(g_rns_inbox_payload), &len)) {
+        /* The return value is bytes written AND input bytes consumed — one
+         * number, by construction (see rns/inbox.h). So `kept < len` is exactly
+         * "something did not fit". */
+        size_t kept = rns_text_sanitize(g_rns_inbox_payload, len,
+                                        g_rns_card_body,
+                                        sizeof(g_rns_card_body),
+                                        RNS_CARD_VISIBLE_CHARS);
+
+        if (kept < (size_t)len) {
+            g_rns_card_cut++;
+            /* Second pass, with the marker's room held back in BOTH budgets, so
+             * the count is of input the card genuinely does not carry. */
+            kept = rns_text_sanitize(g_rns_inbox_payload, len,
+                                     g_rns_card_body + RNS_CARD_CUT_RESERVE,
+                                     sizeof(g_rns_card_body) -
+                                         RNS_CARD_CUT_RESERVE,
+                                     RNS_CARD_VISIBLE_CHARS -
+                                         RNS_CARD_CUT_RESERVE);
+            char mark[RNS_CARD_CUT_MARK_MAX];
+            int mn = snprintf(mark, sizeof(mark), "[+%u B] ",
+                              (unsigned)((size_t)len - kept));
+            /* snprintf returns what it WOULD have written, so an upper bound is
+             * the clause that matters — but the bound is the RESERVATION, not
+             * the size of `mark`. Those differ today (12 against 16) and the
+             * larger one is not safe: the memmove below moves the text down to
+             * offset mn, and any mn past the reservation moves it UP, past the
+             * end of the body by mn - RNS_CARD_CUT_RESERVE bytes. Bounding by
+             * sizeof(mark) leaves that overflow three characters away from a
+             * constant whose own comment invites tuning, and it was reachable by
+             * lowering the reservation alone. The else branch below already
+             * handles a marker that does not fit, so this is the whole fix. */
+            if (mn > 0 && mn <= RNS_CARD_CUT_RESERVE) {
+                /* Close the gap between the reservation and the marker's real
+                 * length. Overlapping and downward, hence memmove; +1 carries
+                 * the terminator the sanitiser wrote. */
+                memmove(g_rns_card_body + mn,
+                        g_rns_card_body + RNS_CARD_CUT_RESERVE, kept + 1);
+                memcpy(g_rns_card_body, mark, (size_t)mn);
+            } else {
+                /* The marker would not fit its own buffer. Show the truncated
+                 * body rather than a corrupted one; data_card_cut and the title
+                 * still record that this happened. */
+                memmove(g_rns_card_body,
+                        g_rns_card_body + RNS_CARD_CUT_RESERVE, kept + 1);
+            }
+        }
+
+        /* The byte count is in the title on EVERY card, not only a truncated
+         * one: it is the number to compare against what the sender says it
+         * sent, and it is the only place the original length survives once the
+         * body has been sanitised and possibly cut. */
+        char title[32];
+        snprintf(title, sizeof(title), "RNS %u B", (unsigned)len);
+
+        /* notify_ingest() returns 0 when the store refused the card, and that is
+         * not given its own counter: data_cards falling behind
+         * data_rx - data_dropped is the same information without a third number
+         * to keep in step. */
+        if (notify_ingest("info", "rns", title, g_rns_card_body, NULL) != 0)
+            g_rns_cards++;
+    }
+}
+
 /* The tick Reticulum finally gets. Gated on rns_started because
  * Reticulum::loop() opens with assert(_object) — a no-op under NDEBUG, so an
  * unstarted stack would dereference null rather than trip the assert. */
@@ -1653,6 +1953,9 @@ static void skill_rns_poll() {
     last = now;
     rns_stack.loop();
     rns_announce_poll();
+    /* After rns_stack.loop(), never before it: the drain that fills the inbox
+     * runs inside that call, so a pickup ahead of it is one tick stale. */
+    rns_inbox_poll();
     /* Loop task, right after the stack has run: everything GET /rns/status is
      * not allowed to read live is republished here. */
     rns_status_publish();
@@ -1660,7 +1963,7 @@ static void skill_rns_poll() {
 
 static const Skill rns_skill = {
     .name = "rns",
-    .version = "0.4.0",
+    .version = "0.5.0",
     .describe = rns_describe,
     .endpoints = rns_endpoints,
     .register_routes = rns_register_routes,
