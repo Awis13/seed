@@ -49,12 +49,14 @@
 #include "board_pins.h"
 #include "hw_ui.h"
 #include "hw_input.h"
+#include "micron/micron_store.h"
+#include "micron/micron_layout.h"  // micron_layout_apply_scroll for in-page scroll
 #include "hw_haptic.h"
 #include "hw_sound.h"
 #include "hw_kb.h"
 
 // ===== Configuration =====
-#define SEED_VERSION        "0.9.54"
+#define SEED_VERSION        "0.9.55"
 // Core clock: datasheet puts 240 vs 80 ~11.5mA apart on WAITI. Periph bus holds
 // at 80 for every PLL-fed core clock; go lower and RMT/I2S retimes. Same floor
 // as tembed idle policy (no light sleep — notify latency is the job).
@@ -1608,6 +1610,55 @@ static int msglist_count = 0;
 // Notify card currently shown (for ack-on-click / reply).
 static uint32_t notify_card_id = 0;
 static char reply_title[NOTIFY_TITLE_LEN];
+
+// --- Micron system-layer page store (ticket C4) -----------------------------
+// Eight-slot store of micron pages the wheel flips through from the home screen.
+// The store is PURE data; the clock is read here (loop task) and injected as
+// now_ms — the store never reads a clock itself. The namespace is set by the
+// PRODUCER (our own trusted boot code for a system page; an untrusted browser
+// transport would pass MICRON_NS_FOREIGN), never parsed from a page body.
+static micron_store g_page_store;
+// Wheel-paging view state. Two distinct input modes, never conflated:
+//   page_open == false → PAGING between pages: a wheel detent changes which
+//                        system page is shown (ordinal); a click OPENS it.
+//   page_open == true  → SCROLLING within the open page: a wheel detent drives
+//                        C3's in-page scroll; a click closes back to paging.
+static int    page_ordinal = -1;    // which system page (by ns order), -1 = none
+static int    page_scroll = 0;      // top-visible visual row inside the open page
+static size_t page_total_rows = 0;  // last render's bounded page height (scroll clamp)
+static bool   page_open = false;
+
+// Bring up the system-layer page store and seed our own data UI. The namespace
+// (MICRON_NS_SYSTEM) is chosen HERE, by trusted firmware — it is the delivery
+// account of a page WE produce, never a field any page body could set. The
+// monotonic clock is read at this hw call site and injected as now_ms; the
+// store itself never reads a clock. A later ticket wires the untrusted browser
+// transport, which will store under MICRON_NS_FOREIGN from its own transport
+// identity — and can never reach this namespace.
+static void ui_page_store_begin() {
+    micron_store_init(&g_page_store);
+    static const char kHelpPage[] =
+        ">System pages\n"
+        "\n"
+        "Turn the wheel from the clock to flip through stored pages. "
+        "Click to open one, then the wheel scrolls it.\n";
+    micron_store_put(&g_page_store, MICRON_NS_SYSTEM, "help",
+                     kHelpPage, sizeof(kHelpPage) - 1, 0, millis());
+}
+
+// Render the `ordinal`-th SYSTEM page (wheel-paging order) at page_scroll and
+// remember its height for the in-page scroll clamp. Namespace is fixed to
+// MICRON_NS_SYSTEM here, so paging from home can only ever surface system
+// pages — a foreign page is structurally unreachable from this call site.
+// Returns false when there is no such page (empty store / out of range).
+static bool ui_page_render(int ordinal) {
+    const micron_slot *s = micron_store_ns_at(&g_page_store,
+                                              MICRON_NS_SYSTEM, ordinal);
+    if (!s) return false;
+    page_ordinal = ordinal;
+    page_total_rows = hw_ui_render_page(s->src, s->len, page_scroll);
+    return true;
+}
 // UTF-8 draft: keep room for ~40 Cyrillic codepoints (2–3 bytes each).
 static char reply_buf[192];
 // Idle return to clock (Advisor: shelf is a clock). Longer while typing.
@@ -2965,6 +3016,19 @@ static void ui_on_click() {
     case HW_UI_INFO:
         ui_open_menu();
         break;
+    case HW_UI_PAGE:
+        // Click toggles the two input modes: OPEN the page for in-page scrolling,
+        // or (when already open) CLOSE back to paging between pages.
+        if (page_open) {
+            page_open = false;
+            page_scroll = 0;
+            if (!ui_page_render(page_ordinal)) ui_go_clock(NULL);
+        } else {
+            page_open = true;
+            page_scroll = 0;
+            if (!ui_page_render(page_ordinal)) ui_go_clock(NULL);
+        }
+        break;
     case HW_UI_REPLY:
         // Encoder click = send if draft non-empty, else cancel
         if (reply_buf[0]) {
@@ -3136,7 +3200,36 @@ static void ui_on_steps(int steps) {
         ui_agent_chat_refresh();
         break;
     }
-    case HW_UI_CLOCK:
+    case HW_UI_CLOCK: {
+        // Wheel from home enters page paging when the system store is non-empty.
+        // First detent lands on page 0 (CW) or the last page (CCW).
+        int n = micron_store_ns_count(&g_page_store, MICRON_NS_SYSTEM);
+        if (n <= 0) break;
+        page_open = false;
+        page_scroll = 0;
+        ui_page_render(steps > 0 ? 0 : n - 1);
+        break;
+    }
+    case HW_UI_PAGE: {
+        int n = micron_store_ns_count(&g_page_store, MICRON_NS_SYSTEM);
+        if (n <= 0) { ui_go_clock(NULL); break; }
+        if (page_open) {
+            // Scrolling WITHIN the open page (C3 in-page scroll). One detent
+            // advances MICRON_PAGE_SCROLL_STEP visual rows via the layout's own
+            // multiplier — the input constant stays 1.
+            page_scroll = micron_layout_apply_scroll(page_scroll, steps,
+                                                     page_total_rows);
+            ui_page_render(page_ordinal);
+        } else {
+            // Paging BETWEEN pages. Stepping before the first page returns home.
+            int next = page_ordinal + steps;
+            if (next < 0) { ui_go_clock(NULL); break; }
+            if (next >= n) next = n - 1;
+            page_scroll = 0;
+            ui_page_render(next);
+        }
+        break;
+    }
     case HW_UI_INFO:
     case HW_UI_REPLY:
         break;
@@ -3246,6 +3339,7 @@ void setup() {
     wifi_setup();     // non-blocking STA attempt; never raises an AP
     token_load();     // after wifi_setup(): needs RF up for a real hardware RNG
     skills_init();    // notify store load + route registration data
+    ui_page_store_begin();  // micron system-layer page store (wheel-paged from home)
     ui_go_clock(WiFi.status() == WL_CONNECTED ? "ready" : "click = menu");
     ui_note_input();
     setup_routes();

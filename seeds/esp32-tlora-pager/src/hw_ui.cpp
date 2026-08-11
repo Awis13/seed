@@ -2388,6 +2388,7 @@ void hw_ui_show_page(const micron_grid *g) {
 size_t hw_ui_render_page(const char *src, size_t len, int scroll) {
     micron_grid *back = hw_ui_page_back();
     micron_layout_result r = micron_layout_page(src, len, scroll, back);
+    screen = HW_UI_PAGE;  // the page view owns the panel now (wheel-paged from home)
     hw_ui_show_page(back);
     return r.total_rows;
 }

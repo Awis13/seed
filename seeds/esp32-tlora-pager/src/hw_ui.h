@@ -76,6 +76,7 @@ enum HwUiScreen : uint8_t {
     HW_UI_WIFI,        // WiFi menu: STATUS / SCAN / PROFILES
     HW_UI_WIFI_LIST,   // scan results or saved profiles list
     HW_UI_WIFI_INFO,   // multi-line WiFi/WG status
+    HW_UI_PAGE,        // micron page view (system-layer store, wheel-paged)
 };
 
 HwUiScreen hw_ui_screen();
