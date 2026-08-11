@@ -16,6 +16,19 @@ Five sites, one rule each:
     NetworkClient blocking call lives: connect() (3 s + DNS), write() (10 x a
     1 s select) and readBytes() (delay(2) until getTimeout()). None of them may
     appear on the loop task, and the socket drain must carry explicit caps.
+  - rns.cpp also hands Transport a packet filter callback that runs once per
+    inbound packet, on the loop task, inside that same drain budget. It must be
+    registered before the stack starts, must be a bare function pointer with no
+    state beyond file scope, and must publish its counters through the loop-task
+    snapshot like everything else GET /rns/status serves. Its body is pinned as
+    an allowlist rather than screened against a list of forbidden identifiers:
+    that list could not be completed, and the two things it missed (a log_e()
+    call, a by-value RNS::Bytes local) are exactly the allocating and blocking
+    work it existed to keep out.
+  - rns.cpp sets no microStore size caps of its own, and the known-destinations
+    store stays at the library default. The firmware that capped those stores
+    before Transport::start() was rolled back off the device; the caps went with
+    the flag that needed them, and neither may come back unnoticed.
 """
 
 import re
@@ -267,5 +280,162 @@ assert "begin_connect" not in cfg and "link_down" not in cfg, (
 # The tick is on, and it is throttled rather than free-running.
 assert ".tick = skill_rns_poll" in rns, "Reticulum::loop() needs a caller"
 assert "#define RNS_TICK_MS" in rns
+
+# --- 6. rns.cpp: the inbound announce prefilter ------------------------------
+# The filter callback is the single hottest piece of code this firmware hands to
+# a third-party stack: Transport::inbound() calls it once per inbound packet,
+# synchronously, on the loop task, inside the drain budget. Everything below
+# pins a property that makes that safe.
+pktfilter = (ROOT / "src" / "rns" / "pktfilter.h").read_text(encoding="utf-8")
+
+# 6a. The decision is a pure function in its own header, so the host test can
+# compile it directly and so the callback has nothing to decide.
+assert "rns_filter_keep_packet" in pktfilter and "rns_filter_keep_packet" in rns, (
+    "the keep/drop decision must live in rns/pktfilter.h and be called from here"
+)
+assert '#include "rns/pktfilter.h"' in rns
+# Pure means pure: no state of any kind in that header, or the same packet
+# arriving twice could be judged differently — and a dropped packet never enters
+# Transport's hashlist, so retransmissions DO reach the filter again.
+pktfilter_code = re.sub(r"/\*.*?\*/", " ", pktfilter, flags=re.S)
+pktfilter_code = re.sub(r"//[^\n]*", " ", pktfilter_code)
+assert not re.search(r"^\s*static\s+(?!inline\b)", pktfilter_code, re.M), (
+    "rns/pktfilter.h must hold no static state; the decision is a pure function"
+)
+for banned in ("millis(", "esp_timer", "printf", "new ", "malloc"):
+    assert banned not in pktfilter_code, (
+        "the decision function must not reach for %s" % banned
+    )
+
+# 6b. Registered BEFORE the stack starts. Transport reads the callback pointer
+# on every packet with no other guard, so a late registration is just a window
+# in which announces are verified at full price.
+init = rns[rns.index("static void skill_rns_init") :]
+assert "RNS::Transport::set_filter_packet_callback(rns_packet_filter);" in init, (
+    "the prefilter must be registered on Transport"
+)
+assert init.index("set_filter_packet_callback") < init.index("rns_stack.start()"), (
+    "the filter must be registered BEFORE reticulum start(), not after"
+)
+
+# 6c. A bare function pointer, not a lambda: Transport::Callbacks::filter_packet
+# is `bool(*)(const Packet&)`, so state can only live at file scope.
+assert re.search(r"^static bool rns_packet_filter\(const RNS::Packet ",
+                 rns, re.M), (
+    "the callback must be a file-scope function matching bool(*)(const Packet&)"
+)
+assert "set_filter_packet_callback([" not in rns, (
+    "the hook takes a bare function pointer; a capturing lambda cannot convert"
+)
+
+# 6d. The callback body, pinned statement by statement — an ALLOWLIST, not a
+# denylist. This section used to ban a list of identifiers (new, malloc, String,
+# Serial., delay, ...) and that list could not be finished: `log_e("filter")`
+# passed it, because arduino-esp32's logging macros are not spelled Serial. and
+# write to the UART just as blockingly; `RNS::Bytes h = packet.packet_hash();`
+# passed it too, because a by-value Bytes is a heap allocation with none of the
+# banned words in it. Guessing the next forbidden identifier is a losing game,
+# so the rule is inverted: comments are stripped, whitespace is normalised, and
+# what is left has to equal exactly what the callback is allowed to be, in
+# order. Anything added, removed, reworded or reordered fails here and has to be
+# argued for by editing this list.
+#
+# Why the body is allowed so little: Transport::inbound() calls it once per
+# inbound packet, synchronously, on the loop task, inside the drain budget, so
+# it must be O(1), must not allocate, must not block and must not be able to
+# throw. Fail-open covers only part of that last one — Transport.cpp wraps the
+# call in `catch (const std::exception&)`, and anything else escapes inbound()
+# with _jobs_locked left true, after which Transport::jobs() never runs again.
+# The list below also subsumes the positive assertions this section used to
+# carry (the two field reads, the delegation, the two counters): they are lines
+# in it.
+cb = rns[rns.index("static bool rns_packet_filter") :]
+cb = cb[: cb.index("\n}\n") + 2]
+cb = re.sub(r"/\*.*?\*/", " ", cb, flags=re.S)
+cb = re.sub(r"//[^\n]*", " ", cb)
+cb_body = [re.sub(r"\s+", " ", line).strip() for line in cb.splitlines()]
+cb_body = [line for line in cb_body if line]
+CB_ALLOWED = [
+    "static bool rns_packet_filter(const RNS::Packet &packet) {",
+    "uint8_t type = (uint8_t)packet.packet_type();",
+    "uint8_t context = (uint8_t)packet.context();",
+    "bool keep = rns_filter_keep_packet(type, context);",
+    "if (type == RNS_PKT_TYPE_ANNOUNCE) {",
+    "if (keep) {",
+    "g_rns_ann_kept++;",
+    "} else {",
+    "g_rns_ann_dropped++;",
+    "}",
+    "}",
+    "return keep;",
+    "}",
+]
+assert cb_body == CB_ALLOWED, (
+    "the filter callback body is pinned statement for statement; it runs once "
+    "per inbound packet inside the drain budget, so anything new in it has to "
+    "be argued for here first.\n  expected: %r\n  found:    %r"
+    % (CB_ALLOWED, cb_body)
+)
+
+# 6e. The constants the decision uses are checked against the library's enums at
+# compile time, so a drifting value fails the build and not the device.
+assert "static_assert(RNS_PKT_TYPE_ANNOUNCE == (uint8_t)RNS::Type::Packet::ANNOUNCE" in rns
+assert "RNS::Type::Packet::PATH_RESPONSE" in rns, (
+    "PATH_RESPONSE must be pinned to the library enum too"
+)
+
+# 6f. The counters reach GET /rns/status through the loop-task snapshot, like
+# every other number that handler serves — never read live from the AsyncTCP
+# task.
+publish = rns[rns.index("static void rns_status_publish") :
+              rns.index("static void rns_status_json")]
+json_builder = rns[rns.index("static void rns_status_json") :
+                   rns.index("static const SkillEndpoint")]
+assert "g_rns_snap.ann_dropped = g_rns_ann_dropped;" in publish
+assert "g_rns_snap.ann_kept = g_rns_ann_kept;" in publish
+assert '"announces_dropped"' in json_builder and '"announces_kept"' in json_builder, (
+    "the filter must be provable from /rns/status"
+)
+assert "g_rns_snap.ann_dropped" in json_builder and "g_rns_snap.ann_kept" in json_builder
+assert "g_rns_ann_dropped" not in json_builder and "g_rns_ann_kept" not in json_builder, (
+    "the status handler must serve the snapshot, not the live counters"
+)
+# The drain timing this filter exists to fix stays published alongside them.
+assert '"drain_us_max"' in json_builder, (
+    "drain_us_max must survive: it is the number the filter is judged by"
+)
+
+# --- 7. rns.cpp: nothing else runs between the filter and start() ------------
+# A previous revision capped two microStore heap stores here, by calling
+# Identity::known_destinations_maxsize() and Transport::path_table_maxsize()
+# before Transport::start() — i.e. on stores whose init() the library only runs
+# inside `if (Reticulum::transport_enabled())`, which is false on this node.
+# That firmware panic-looped on the device and was rolled back. The caps are gone
+# and so is the -DRNS_PERSIST_KNOWN_DESTINATIONS=0 flag that made them look
+# necessary; this pins that neither comes back by accident. It does NOT pin a
+# cause: set_max_recs() is a scalar assignment in both store flavours and cannot
+# fault, so what these lines are guilty of is being unnecessary, not being the
+# crash. Comments are stripped first, because the note at the call site names
+# both setters.
+init_code = re.sub(r"/\*.*?\*/", " ", init, flags=re.S)
+init_code = re.sub(r"//[^\n]*", " ", init_code)
+for setter in ("known_destinations_maxsize(", "path_table_maxsize("):
+    assert setter not in init_code, (
+        "%s...) was removed with the flag that needed it; it capped a store the "
+        "library never initialises on this node" % setter
+    )
+
+ini = (ROOT / "platformio.ini").read_text()
+assert "-DRNS_PERSIST_KNOWN_DESTINATIONS=0" not in ini, (
+    "the known-destinations store stays at the library default: at 0 it becomes "
+    "a live heap store that allocates on the receive path and has to be capped "
+    "from here, and the firmware that did that was rolled back off the device"
+)
+# The two that stay, and the reason they need nothing from us: the path store
+# has been live across every build that booted here, and the packet hashlist is
+# capped by the library at the top of Transport::start(), outside the
+# transport_enabled() block.
+assert "-DRNS_PERSIST_PATHS=0" in ini
+assert "-DRNS_PERSIST_HASHLIST=0" in ini
 
 print("Task unblock policy tests: OK")
