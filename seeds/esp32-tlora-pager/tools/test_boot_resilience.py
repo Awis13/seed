@@ -108,6 +108,15 @@ assert "Serial.printf" in diag, "reset reason must be printed at boot"
 health = fn_body(main, "static void handle_health(")
 for field in ("reset_reason", "boots_since_panic", "panic_count", "storage_ok"):
     assert f'doc["{field}"]' in health, f"/health must serve {field}"
+# History archive observability (ticket C4): the store tier, drop counter and the
+# indexed-identity count must surface on /health so the SD archive is verifiable
+# live. Read-only — no store selector, no behaviour change.
+for field in ("history_sd", "history_drops", "history_records"):
+    assert f'doc["{field}"]' in health, f"/health must serve {field}"
+assert "history_on_sd()" in health, "history_sd must come from the history_on_sd() getter"
+assert "history_index_live_count()" in health, (
+    "history_records must be the RAM index count (history_index_live_count), not an SD scan"
+)
 assert 'boot_diag_init()' in setup, "counters must be initialized in setup()"
 
 # --- 7b. s10 (C6): full S3 reset-reason coverage and its panic classing ------

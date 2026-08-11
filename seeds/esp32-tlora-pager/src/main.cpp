@@ -56,7 +56,7 @@
 #include "hw_kb.h"
 
 // ===== Configuration =====
-#define SEED_VERSION        "0.9.55"
+#define SEED_VERSION        "0.9.59"
 // Core clock: datasheet puts 240 vs 80 ~11.5mA apart on WAITI. Periph bus holds
 // at 80 for every PLL-fed core clock; go lower and RMT/I2S retimes. Same floor
 // as tembed idle policy (no light sleep — notify latency is the job).
@@ -777,6 +777,17 @@ static void wifi_setup() {
 
 // ===== HTTP Handlers =====
 
+// History archive health getters. Defined in skills/history.cpp, which is
+// #included far below this handler, so they are forward-declared here (same TU,
+// static). All three are cheap and AsyncTCP-safe: history_on_sd() is a lock-free
+// read of a boot-latched flag; history_drops() reads a plain writer-side counter;
+// history_index_live_count() takes ONLY g_hist_mux (no SPI bus) for a brief RAM
+// index read — no bus lock is taken on the /health handler (no history_bytes),
+// so no mux->bus order and no new deadlock hazard on this task.
+static bool     history_on_sd(void);
+static uint32_t history_drops(void);
+static uint32_t history_index_live_count(void);
+
 static void handle_health(AsyncWebServerRequest *request) {
     JsonDocument doc;
     doc["ok"] = true;
@@ -791,6 +802,15 @@ static void handle_health(AsyncWebServerRequest *request) {
     doc["boots_since_panic"] = (unsigned long)boots_since_panic;
     doc["panic_count"] = (unsigned long)panic_count;
     doc["storage_ok"] = storage_ok;
+    // History archive observability (ticket C4, read-only): is the archive on the
+    // SD card or the SPIFFS fallback, how many records have been dropped on a full
+    // write queue, and how many identities the RAM index knows. history_records is
+    // INDEXED IDENTITIES (the bounded MRU nav window), not the whole-archive total
+    // — an honest count with no SD scan on this handler. No store selector, no
+    // behaviour change: this only surfaces state C1-C3 already track.
+    doc["history_sd"] = history_on_sd();
+    doc["history_drops"] = (unsigned long)history_drops();
+    doc["history_records"] = (unsigned long)history_index_live_count();
     String response;
     serializeJson(doc, response);
     request->send(200, "application/json", response);
@@ -1415,6 +1435,7 @@ static void handle_wifi_networks_post(AsyncWebServerRequest *request) {
 // After notify: reuses notify_send_json / notify_send_error / notify_ingest_p1.
 #include "skills/progress.cpp"
 #include "skills/agents.cpp"
+#include "skills/history.cpp"  // append-only SD history archive + off-loop write queue
 #include "skills/meshcore.cpp"
 #include "skills/backlight.cpp"
 #include "skills/wg.cpp"
@@ -1628,6 +1649,26 @@ static int    page_scroll = 0;      // top-visible visual row inside the open pa
 static size_t page_total_rows = 0;  // last render's bounded page height (scroll clamp)
 static bool   page_open = false;
 
+// Store a page in the RAM hot-set and, when the insert DISPLACES a live slot,
+// FLUSH the displaced page to the SD archive so it is not lost — read-back
+// (wheel-paging past the hot window) pulls it back later. The flush is a single
+// off-loop history_enqueue(): the queue + write task own the SD append, so this
+// NEVER writes SD on the loop task. The displaced page's full body travels in the
+// put result (evicted_src/_len), captured before the slot was overwritten. The
+// namespace travels with it (evicted_ns), so a FOREIGN page archives under
+// FOREIGN and can never surface through a SYSTEM wheel walk. This is the single
+// producer seam every page insert goes through (C3 adds notify-card producers).
+static micron_put_result ui_page_put(uint8_t ns, const char *key,
+                                     const char *src, size_t len, uint32_t ttl_ms) {
+    micron_put_result r = micron_store_put(&g_page_store, ns, key, src, len,
+                                           ttl_ms, millis());
+    if (r.evicted) {
+        history_enqueue(r.evicted_ns, r.evicted_key,
+                        (const uint8_t *)r.evicted_src, r.evicted_len);
+    }
+    return r;
+}
+
 // Bring up the system-layer page store and seed our own data UI. The namespace
 // (MICRON_NS_SYSTEM) is chosen HERE, by trusted firmware — it is the delivery
 // account of a page WE produce, never a field any page body could set. The
@@ -1642,23 +1683,67 @@ static void ui_page_store_begin() {
         "\n"
         "Turn the wheel from the clock to flip through stored pages. "
         "Click to open one, then the wheel scrolls it.\n";
-    micron_store_put(&g_page_store, MICRON_NS_SYSTEM, "help",
-                     kHelpPage, sizeof(kHelpPage) - 1, 0, millis());
+    ui_page_put(MICRON_NS_SYSTEM, "help", kHelpPage, sizeof(kHelpPage) - 1, 0);
 }
 
-// Render the `ordinal`-th SYSTEM page (wheel-paging order) at page_scroll and
-// remember its height for the in-page scroll clamp. Namespace is fixed to
-// MICRON_NS_SYSTEM here, so paging from home can only ever surface system
-// pages — a foreign page is structurally unreachable from this call site.
-// Returns false when there is no such page (empty store / out of range).
+// Scratch record for an archive page body pulled from SD. File-scope (564 B) to
+// keep it off the loop task's stack; only ui_page_render touches it.
+static history_record g_page_fetch;
+
+// Render the `ordinal`-th SYSTEM page at page_scroll and remember its height for
+// the in-page scroll clamp. The ordinal spans the combined nav axis: RAM hot-set
+// first, then older archived pages (history_nav_page_at). A RAM page renders
+// straight from its slot; an archive page's body is fetched from SD with ONE
+// bounded record read (history_read_at) here on open/render — never a full scan.
+// Namespace is fixed to MICRON_NS_SYSTEM, so paging can only ever surface system
+// pages: a foreign page is structurally unreachable from this call site, through
+// the RAM hot-set AND the archive. Returns false when there is no such page
+// (empty store / out of range / archive body unreadable — graceful, no SD).
 static bool ui_page_render(int ordinal) {
-    const micron_slot *s = micron_store_ns_at(&g_page_store,
-                                              MICRON_NS_SYSTEM, ordinal);
-    if (!s) return false;
+    history_nav_result nav = history_nav_page_at(&g_page_store,
+                                                 MICRON_NS_SYSTEM, ordinal);
+    const char *src = NULL;
+    size_t len = 0;
+    if (nav.kind == HISTORY_NAV_RAM) {
+        src = nav.slot->src;
+        len = nav.slot->len;
+    } else if (nav.kind == HISTORY_NAV_ARCHIVE) {
+        if (!history_read_at(nav.offset, &g_page_fetch)) return false;
+        src = (const char *)g_page_fetch.payload;
+        len = g_page_fetch.len;
+    } else {
+        return false;   // out of range: paging stops at the last real page
+    }
     page_ordinal = ordinal;
-    page_total_rows = hw_ui_render_page(s->src, s->len, page_scroll);
+    page_total_rows = hw_ui_render_page(src, len, page_scroll);
     return true;
 }
+
+// Rebuild the notify RAM ring from the persistent history archive (ticket C3).
+// Runs in setup() AFTER history_begin() (archive mounted + index seeded) and
+// after skill_notify_init() memset the ring — single-threaded, before the web
+// server and mesh start, so it fills the ring without the notify spinlock (same
+// discipline as the old /notify.json restore). It walks the archive index for
+// MICRON_NS_NOTIFY entries NEWEST-FIRST (history_restore_at), decodes each card
+// body (notify_rec_decode), and inserts it (notify_restore_one, which dedups by
+// id and clamps like a POST body). Namespace isolation is structural: only
+// MICRON_NS_NOTIFY records are walked, so a SYSTEM/FOREIGN page can never enter
+// the notify ring. Graceful no-SD: an empty/absent archive yields nothing on the
+// first rank and the ring simply stays empty — notify still works in RAM.
+static void notify_restore_from_archive() {
+    time_t now = time(NULL);
+    unsigned long now_ms = millis();
+    int restored = 0;
+    for (int rank = 0; rank < NOTIFY_MAX; rank++) {
+        history_record rec;
+        if (!history_restore_at(MICRON_NS_NOTIFY, rank, &rec)) break;  // past the last
+        notify_rec nr;
+        if (!notify_rec_decode(rec.payload, rec.len, &nr)) continue;   // skip a bad body
+        if (notify_restore_one(&nr, now, now_ms)) restored++;
+    }
+    notify_restore_finish(restored);   // drop ttls that ran out while powered off
+}
+
 // UTF-8 draft: keep room for ~40 Cyrillic codepoints (2–3 bytes each).
 static char reply_buf[192];
 // Idle return to clock (Advisor: shelf is a clock). Longer while typing.
@@ -3201,9 +3286,17 @@ static void ui_on_steps(int steps) {
         break;
     }
     case HW_UI_CLOCK: {
-        // Wheel from home enters page paging when the system store is non-empty.
-        // First detent lands on page 0 (CW) or the last page (CCW).
-        int n = micron_store_ns_count(&g_page_store, MICRON_NS_SYSTEM);
+        // Wheel from home enters page paging when there is anything to show.
+        // First detent lands on page 0 (CW) or the last page (CCW). The count
+        // spans the RAM hot-set AND older archived pages, so a CCW step can land
+        // straight on a page pulled from the SD archive.
+        // NOTE: the ordinal axis is intentionally NOT snapshot-consistent across
+        // the separate nav_count->nav_at mux acquisitions here. The writer only
+        // GROWS the archive range and never touches g_page_store (micron_store),
+        // so a concurrent append can at worst land a fixed ordinal on an adjacent
+        // archive page — never OOB, never a foreign page — and it self-corrects on
+        // the next detent. No snapshot lock is needed.
+        int n = history_nav_page_count(&g_page_store, MICRON_NS_SYSTEM);
         if (n <= 0) break;
         page_open = false;
         page_scroll = 0;
@@ -3211,7 +3304,12 @@ static void ui_on_steps(int steps) {
         break;
     }
     case HW_UI_PAGE: {
-        int n = micron_store_ns_count(&g_page_store, MICRON_NS_SYSTEM);
+        // As in HW_UI_CLOCK: the nav_count->nav_at pair is deliberately not
+        // snapshot-consistent across its two mux takes. A concurrent append only
+        // grows the archive range (never mutates g_page_store), so at worst a fixed
+        // ordinal shifts onto an adjacent archive page — never OOB/foreign — and
+        // the next detent corrects it.
+        int n = history_nav_page_count(&g_page_store, MICRON_NS_SYSTEM);
         if (n <= 0) { ui_go_clock(NULL); break; }
         if (page_open) {
             // Scrolling WITHIN the open page (C3 in-page scroll). One detent
@@ -3340,6 +3438,8 @@ void setup() {
     token_load();     // after wifi_setup(): needs RF up for a real hardware RNG
     skills_init();    // notify store load + route registration data
     ui_page_store_begin();  // micron system-layer page store (wheel-paged from home)
+    history_begin();        // append-only SD archive + off-loop write-queue task
+    notify_restore_from_archive();  // rebuild the notify ring from the archive (after mount+seed)
     ui_go_clock(WiFi.status() == WL_CONNECTED ? "ready" : "click = menu");
     ui_note_input();
     setup_routes();

@@ -32,14 +32,15 @@
  * than the cap is cut on a whole UTF-8 code point (the layout decoder is
  * already robust to a truncated tail, but we keep the boundary honest anyway).
  *
- * ARCHIVE-TIER SEAM (a later ticket, NOT implemented here)
- * -------------------------------------------------------
+ * ARCHIVE-TIER SEAM (the SD archive under this hot set — wired by ticket C2)
+ * ------------------------------------------------------------------------
  * The board has PSRAM and a microSD (agents.cpp already uses SD as a graceful
- * overflow store). A future tier may keep a hot set in RAM and flush the rest
- * to an SD archive behind THIS SAME API. So the API does not assume
- * evicted == gone-forever: micron_store_put() reports the displaced slot's
- * identity in its result, and the eviction point is marked so a pre-overwrite
- * "flush to archive" hook can be added there without an API change.
+ * overflow store). The archive tier keeps this 8-slot hot set in RAM and flushes
+ * evicted pages to an append-only SD archive (micron/history_store.h) behind THIS
+ * SAME API. So the API does not assume evicted == gone-forever: micron_store_put()
+ * reports the displaced slot's identity AND its full body (evicted_ns/_key/_src/
+ * _len) at the marked pre-overwrite eviction point, and the CALLER (hw glue)
+ * flushes it off-loop. The store itself stays PURE — it never touches SD.
  */
 
 #include <stddef.h>
@@ -79,6 +80,9 @@
 typedef enum {
     MICRON_NS_SYSTEM  = 0,  /* our own data UI (trusted producer) */
     MICRON_NS_FOREIGN = 1,  /* untrusted browser pages */
+    MICRON_NS_NOTIFY  = 2,  /* persisted notify cards (ticket C3): isolated in the
+                               unified archive — a notify record can never surface
+                               as a SYSTEM/FOREIGN page and vice-versa */
 } micron_namespace;
 
 /* One stored page. */
@@ -112,14 +116,22 @@ typedef enum {
 
 /* Result of micron_store_put(). `evicted` is set when a NEW insert displaced a
  * still-occupied slot (all slots were full and none free/expired-cheap), and
- * then evicted_ns/evicted_key carry the displaced page's identity — the hook a
- * future SD-archive tier would use to flush it. */
+ * then evicted_ns/evicted_key carry the displaced page's identity AND
+ * evicted_src/evicted_len carry its FULL body — everything the caller needs to
+ * flush the victim to the SD archive (ticket C2). The body is captured here,
+ * before the slot is overwritten, precisely because the slot's src is about to
+ * be reused in place; without it the displaced page would be lost. The payload
+ * is only meaningful when evicted == 1 (it is zeroed otherwise). This is the
+ * archive-tier hook the header's ARCHIVE-TIER SEAM note promised: the PURE store
+ * still never touches SD — it only hands the caller the bytes to flush. */
 typedef struct {
     micron_put_status status;
     int      slot;                          /* index used, -1 when rejected */
     int      evicted;                       /* 1 = a NEW insert overwrote a live slot */
     uint8_t  evicted_ns;
     char     evicted_key[MICRON_STORE_KEY_CAP];
+    uint16_t evicted_len;                       /* displaced page body length (0 unless evicted) */
+    char     evicted_src[MICRON_STORE_SRC_CAP]; /* displaced page body (valid only when evicted==1) */
 } micron_put_result;
 
 /* --- init ------------------------------------------------------------------ */
@@ -286,11 +298,14 @@ static inline micron_put_result micron_store_put(micron_store *st, uint8_t ns,
     idx = micron_store__pick(st, now_ms);
     micron_slot *s = &st->slot[idx];
     if (s->used) {
-        /* A live slot is being displaced. Report its identity so a future
-         * archive tier can flush it (evicted != gone-forever). */
+        /* A live slot is being displaced. Capture its identity AND its full body
+         * BEFORE the overwrite below reuses the slot, so the caller can flush the
+         * victim to the SD archive (evicted != gone-forever). */
         r.evicted = 1;
         r.evicted_ns = s->ns;
         memcpy(r.evicted_key, s->key, MICRON_STORE_KEY_CAP);
+        r.evicted_len = s->len;
+        if (s->len) memcpy(r.evicted_src, s->src, s->len);
     }
 
     memset(s, 0, sizeof(*s));
