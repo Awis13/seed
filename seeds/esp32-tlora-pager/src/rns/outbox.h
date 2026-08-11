@@ -131,6 +131,32 @@
  * separator, cannot contain a control byte, and needs no quoting wherever the
  * peer puts it.
  *
+ * ...AND ONE SESSION VALUE IS NOT A NAME AT ALL. A session field of exactly one
+ * byte '*' marks a CONTROL FRAME: the payload behind it is not a message for a
+ * human, it is the peer telling this device something about the conversations
+ * themselves — today, which rooms are live, as a comma-separated list. The byte
+ * was chosen because it is OUTSIDE [A-Za-z0-9._-], so it cannot collide with a
+ * room name however the peer names its rooms; that is the whole reason a
+ * reserved value is safe here at all.
+ *
+ * THE ASYMMETRY IS DELIBERATE AND IT IS THE POINT: '*' IS READ, NEVER WRITTEN.
+ * rns_session_valid_in_n() — the RECEIVE side — accepts it; rns_session_valid_n()
+ * — the SEND side, and the only one rns_envelope_build() consults — still
+ * refuses it, so this device cannot emit a control frame even by accident.
+ * That is not tidiness. A control frame is an instruction about what the screen
+ * shows, and this node is the thing being instructed; a firmware that could
+ * build one could tell its peer to drop rooms, from a code path nobody wrote on
+ * purpose, and the refusal in the builder is what makes "we only receive these"
+ * a property of the code rather than a note in a comment. Loosening
+ * rns_session_valid_n() for both directions would delete that property and pass
+ * every test that only checks the receive side.
+ *
+ * NOTHING HERE INTERPRETS THE CONTROL PAYLOAD. This file decides that the field
+ * is the reserved byte and hands the session on VERBATIM — one byte, no
+ * substitution, no truncation — because the code that acts on a control frame
+ * branches on that exact value before its own name sanitiser runs. Reading the
+ * room list is the router's job, not the format's.
+ *
  * THE RETRY DECISION IS A PURE FUNCTION for the same reason rns/annsched.h's
  * schedule is: the caller cannot block. Transport::request_path() returns void,
  * this library has no await_path() and no path-response callback, so polling
@@ -273,6 +299,37 @@ static inline bool rns_session_valid(const char *session) {
     return rns_session_valid_n(session, strlen(session));
 }
 
+/* The reserved session of a CONTROL FRAME: one byte, 0x2A. It is a constant and
+ * not a literal spread over three files for the same reason
+ * RNS_ENVELOPE_VERSION is: the reader, the receive-side validator and the
+ * firmware that branches on it are three places that must never disagree. */
+#define RNS_ENVELOPE_CONTROL_SESSION '*'
+
+/* Is this session field the reserved control value — exactly one byte, exactly
+ * '*'? EXACTLY, and the length test is the whole function: "**", "*a" and "a*"
+ * are not control frames and are not names either, because '*' is outside the
+ * name charset, so they remain what they always were — not an envelope. */
+static inline bool rns_session_is_control_n(const char *session, size_t n) {
+    if (!session) return false;
+    return n == 1 && session[0] == RNS_ENVELOPE_CONTROL_SESSION;
+}
+
+/*
+ * THE RECEIVE SIDE'S SESSION RULE, and it is deliberately one byte wider than
+ * the send side's.
+ *
+ * rns_envelope_parse() calls THIS; rns_envelope_build() calls
+ * rns_session_valid_n() and must keep calling it. A device that accepts a
+ * control frame is a device its peer can tell about live rooms; a device that
+ * can BUILD one is a device that could tell its peer the same thing, which
+ * nothing in this firmware has any business doing. Two functions is how that
+ * distinction survives an edit — see THE ASYMMETRY IS DELIBERATE at the top.
+ */
+static inline bool rns_session_valid_in_n(const char *session, size_t n) {
+    if (rns_session_is_control_n(session, n)) return true;
+    return rns_session_valid_n(session, n);
+}
+
 /* Bytes of text a session name of this LENGTH leaves room for. */
 static inline size_t rns_envelope_text_budget_n(size_t session_len) {
     if (session_len >= (size_t)RNS_OUTBOX_TEXT_MAX) return 0;
@@ -360,7 +417,8 @@ static inline rns_env_result rns_envelope_build(const char *from_hex,
  *
  * WHICH IS WHY THE RULES ARE STRICT EVEN THOUGH THE OUTCOME IS SOFT. Every
  * field is validated against the same constants the builder emits under — the
- * version digit, 32 hexadecimal characters, [A-Za-z0-9._-] within 23 bytes,
+ * version digit, 32 hexadecimal characters, [A-Za-z0-9._-] within 23 bytes (or
+ * the single reserved '*' of a control frame, which the builder cannot emit),
  * and a text that fits the budget — because a field that is nearly right is
  * more dangerous than one that is obviously wrong: a 40-byte "session" would
  * become a title, a non-hex "address" would become a reply target. Anything
@@ -386,7 +444,8 @@ typedef enum {
     RNS_ENVIN_NO_FRAME,      /* fewer than three separators: bare text */
     RNS_ENVIN_BAD_VERSION,   /* the first field is not the one digit we read */
     RNS_ENVIN_BAD_FROM,      /* the address field is not 32 hex characters */
-    RNS_ENVIN_BAD_SESSION,   /* outside [A-Za-z0-9._-], or over 23 bytes */
+    RNS_ENVIN_BAD_SESSION,   /* outside [A-Za-z0-9._-] and not the reserved
+                              * one-byte '*', or over 23 bytes */
     RNS_ENVIN_EMPTY_TEXT,    /* a frame with no message inside it */
     RNS_ENVIN_TOO_LONG       /* more bytes than one packet can carry */
 } rns_envin_result;
@@ -416,7 +475,10 @@ static inline const char *rns_envin_reason(rns_envin_result r) {
 typedef struct {
     const char *from;      /* 32 hex characters, no terminator */
     size_t from_len;
-    const char *session;   /* may be EMPTY, which is a documented value */
+    const char *session;   /* may be EMPTY, which is a documented value, and
+                            * may be the reserved one-byte '*' of a control
+                            * frame — rns_session_is_control_n() tells them
+                            * apart */
     size_t session_len;
     const char *text;      /* the remainder, verbatim, separators and all */
     size_t text_len;
@@ -464,8 +526,13 @@ static inline rns_envin_result rns_envelope_parse(const uint8_t *payload,
         !rns_hex_n(p + sep[0] + 1, (size_t)RNS_OUTBOX_ADDR_HEX))
         return RNS_ENVIN_BAD_FROM;
 
+    /* THE RECEIVE-SIDE RULE, which is the send side's plus the one reserved
+     * value: a session of exactly '*' is a control frame and parses. The
+     * builder does not share this function and must not — see THE ASYMMETRY IS
+     * DELIBERATE at the top of this file. */
     slen = sep[2] - sep[1] - 1;
-    if (!rns_session_valid_n(p + sep[1] + 1, slen)) return RNS_ENVIN_BAD_SESSION;
+    if (!rns_session_valid_in_n(p + sep[1] + 1, slen))
+        return RNS_ENVIN_BAD_SESSION;
 
     tlen = len - sep[2] - 1;
     if (tlen == 0) return RNS_ENVIN_EMPTY_TEXT;
@@ -516,6 +583,16 @@ static inline rns_envin_result rns_envelope_parse(const uint8_t *payload,
  * duration of the call and reuses afterwards: copy what you keep. `text` has
  * already been through rns/inbox.h's sanitiser, so it is printable and valid
  * UTF-8; it is the message, not the envelope.
+ *
+ * `session` IS HANDED OVER VERBATIM, and that matters for exactly one value.
+ * A CONTROL FRAME arrives with `session` equal to the single byte '*'
+ * (rns_session_is_control_n()), and the caller passes it through unchanged —
+ * not sanitised, not substituted, not truncated — because a router branches on
+ * that exact byte BEFORE its own name sanitiser runs, and a sanitiser would
+ * turn the one value it must recognise into an ordinary-looking room name. Such
+ * a frame carries a room list rather than a message, so the caller raises NO
+ * CARD for it; the router is the only thing that sees it, and with no router
+ * installed a control frame is simply not shown at all — it is not a message.
  *
  * RETURNING false MUST BE VISIBLE. It means the message did not reach a room,
  * which is a message the user cannot see anywhere else, so the caller counts

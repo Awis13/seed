@@ -39,6 +39,13 @@
  * and NOTHING IS EVER DROPPED — a payload that is not an envelope is a normal
  * outcome with its own reason code, because bare-text senders exist and a
  * message is never worth losing over its shape.
+ *
+ * SECTION 18 IS THE ONE PLACE THE TWO HALVES ARE DELIBERATELY DIFFERENT. A
+ * session of exactly '*' marks a control frame — the peer naming its live rooms
+ * — and the receive side accepts it while the builder still refuses it, so this
+ * device can read one and can never emit one. Both directions are asserted on
+ * the same value, because a single loosened validator satisfies every parse
+ * assertion in the section and silently deletes the guarantee.
  */
 
 #include <assert.h>
@@ -738,6 +745,129 @@ int main() {
         assert(rns_envelope_build(SELF, "", "v", env, sizeof(env), &len) ==
                RNS_ENV_OK);
         assert(env[0] == RNS_ENVELOPE_VERSION);
+    }
+
+    /* ---- 18. THE CONTROL FRAME, AND THE ONE-WAY DOOR IT COMES THROUGH ------
+     * The peer sends `1|<32 hex>|*|main,sonata` to say which rooms are live.
+     * The session field is exactly one byte, '*', and the byte was chosen
+     * because it is OUTSIDE [A-Za-z0-9._-] and therefore cannot collide with a
+     * room name however the peer names its rooms.
+     *
+     * THE ASYMMETRY IS THE ASSERTION. The receive side takes it; the builder
+     * refuses it, and that refusal is what makes "this device never emits a
+     * control frame" a property of the code rather than a promise in a comment.
+     * A single loosened validator would pass every parse assertion below and
+     * quietly delete that property, which is why both directions are checked on
+     * the same value. */
+    {
+        rns_envelope_view v;
+        char p[128];
+        int n;
+
+        /* The three predicates, on their own, before any framing. */
+        assert(rns_session_is_control_n("*", 1));
+        assert(!rns_session_valid_n("*", 1));       /* SEND side refuses it */
+        assert(rns_session_valid_in_n("*", 1));     /* RECEIVE side takes it */
+        assert(RNS_ENVELOPE_CONTROL_SESSION == '*');
+        assert(RNS_ENVELOPE_CONTROL_SESSION == 0x2A);
+
+        /* EXACTLY ONE BYTE, and nothing near it. "**", "*a" and "a*" are not
+         * control frames and are not names either — '*' is outside the charset
+         * — so they stay exactly what they were before this existed. */
+        assert(!rns_session_is_control_n("**", 2));
+        assert(!rns_session_is_control_n("*a", 2));
+        assert(!rns_session_is_control_n("a*", 2));
+        assert(!rns_session_is_control_n("", 0));
+        assert(!rns_session_is_control_n(NULL, 1));
+        assert(!rns_session_valid_in_n("**", 2));
+        assert(!rns_session_valid_in_n("*a", 2));
+        assert(!rns_session_valid_in_n("a*", 2));
+        /* ...and the values that were legal stay legal on the receive side:
+         * an empty session, and the longest name the peer accepts. */
+        assert(rns_session_valid_in_n("", 0));
+        assert(rns_session_valid_in_n("main.2_a-B9", 11));
+        {
+            char s23[RNS_OUTBOX_SESSION_MAX + 2];
+            memset(s23, 'a', RNS_OUTBOX_SESSION_MAX + 1);
+            assert(rns_session_valid_in_n(s23, RNS_OUTBOX_SESSION_MAX));
+            assert(!rns_session_valid_in_n(s23, RNS_OUTBOX_SESSION_MAX + 1));
+        }
+
+        /* THE FRAME PARSES, and the session comes back as ONE byte pointing
+         * into the payload — not copied, not rewritten, not terminated. */
+        n = snprintf(p, sizeof(p), "1|%s|*|main,sonata", SELF);
+        assert(rns_envelope_parse((const uint8_t *)p, (size_t)n, &v) ==
+               RNS_ENVIN_OK);
+        assert(v.session_len == 1);
+        assert(v.session[0] == '*');
+        assert(v.session == (const char *)p + 35);
+        assert(v.text_len == 11 && memcmp(v.text, "main,sonata", 11) == 0);
+        assert(memcmp(v.from, SELF, RNS_OUTBOX_ADDR_HEX) == 0);
+
+        /* An empty room list is still an ordinary control frame: one character
+         * of text is enough, and a frame with NO text is refused exactly as
+         * every other empty envelope is. */
+        n = snprintf(p, sizeof(p), "1|%s|*|-", SELF);
+        assert(rns_envelope_parse((const uint8_t *)p, (size_t)n, &v) ==
+               RNS_ENVIN_OK);
+        assert(v.session_len == 1 && v.text_len == 1);
+        n = snprintf(p, sizeof(p), "1|%s|*|", SELF);
+        assert(rns_envelope_parse((const uint8_t *)p, (size_t)n, &v) ==
+               RNS_ENVIN_EMPTY_TEXT);
+
+        /* THE NEIGHBOURS OF '*' ARE NOT ENVELOPES. Each of these differs from
+         * the frame above by one byte, and each must stay a payload shown raw. */
+        {
+            const char *near[] = {"**", "*a", "a*", "*.", " *", "**a"};
+            for (size_t i = 0; i < sizeof(near) / sizeof(near[0]); i++) {
+                n = snprintf(p, sizeof(p), "1|%s|%s|hi", SELF, near[i]);
+                assert(rns_envelope_parse((const uint8_t *)p, (size_t)n, &v) ==
+                       RNS_ENVIN_BAD_SESSION);
+                assert(v.session == NULL && v.session_len == 0);
+            }
+        }
+
+        /* THE BUILDER REFUSES IT, which is the half that must not drift. This
+         * device is the thing a control frame instructs; being unable to build
+         * one is what keeps it from instructing anybody else. */
+        assert(rns_envelope_build(SELF, "*", "main,sonata", env, sizeof(env),
+                                  &len) == RNS_ENV_BAD_SESSION);
+        assert(len == 0);
+        assert(!rns_session_valid("*"));
+        assert(rns_envelope_build(SELF, "**", "hi", env, sizeof(env), &len) ==
+               RNS_ENV_BAD_SESSION);
+        assert(rns_envelope_build(SELF, "*a", "hi", env, sizeof(env), &len) ==
+               RNS_ENV_BAD_SESSION);
+        assert(rns_envelope_build(SELF, "a*", "hi", env, sizeof(env), &len) ==
+               RNS_ENV_BAD_SESSION);
+        /* ...and everything the builder took before, it still takes. */
+        assert(rns_envelope_build(SELF, "", "hi", env, sizeof(env), &len) ==
+               RNS_ENV_OK);
+        assert(rns_envelope_build(SELF, "main", "hi", env, sizeof(env), &len) ==
+               RNS_ENV_OK);
+
+        /* THE BUDGET IS THE ORDINARY ONE FOR A ONE-BYTE SESSION: 347 - 1. The
+         * control session is a session as far as the arithmetic is concerned,
+         * so a full-length room list is bounded like any other text and both
+         * sides agree on where the ceiling is. */
+        assert(rns_envelope_text_budget_n(1) == RNS_OUTBOX_TEXT_MAX - 1);
+        {
+            uint8_t big[RNS_OUTBOX_PAYLOAD_MAX + 2];
+            char rooms[RNS_OUTBOX_TEXT_MAX + 8];
+            size_t o = 0;
+            filltext(rooms, RNS_OUTBOX_TEXT_MAX - 1);
+            memcpy(big, "1|", 2); o = 2;
+            memcpy(big + o, SELF, RNS_OUTBOX_ADDR_HEX); o += RNS_OUTBOX_ADDR_HEX;
+            big[o++] = '|'; big[o++] = '*'; big[o++] = '|';
+            memcpy(big + o, rooms, RNS_OUTBOX_TEXT_MAX - 1);
+            o += RNS_OUTBOX_TEXT_MAX - 1;
+            assert(o == RNS_OUTBOX_PAYLOAD_MAX);
+            assert(rns_envelope_parse(big, o, &v) == RNS_ENVIN_OK);
+            assert(v.session_len == 1 && v.text_len == RNS_OUTBOX_TEXT_MAX - 1);
+            /* One byte more is past what a single packet carries. */
+            big[o] = 'x';
+            assert(rns_envelope_parse(big, o + 1, &v) == RNS_ENVIN_TOO_LONG);
+        }
     }
 
     printf("RNS outbox tests: OK\n");

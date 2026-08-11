@@ -796,7 +796,20 @@ static uint32_t g_rns_card_cut = 0;
  * today, so it is left as it is; anything that starts replying without a human
  * in the loop needs the address carried with the message rather than read from
  * this slot afterwards. */
-static uint32_t g_rns_env_parsed = 0;   /* payloads read as an envelope */
+/* ...AND A THIRD OUTCOME THAT IS NEITHER, which is why it gets a counter of its
+ * own rather than being folded into the pair above. A CONTROL FRAME — an
+ * envelope whose session is the reserved single byte '*' — is not a chat
+ * message and not a malformed packet: the peer is telling this device which
+ * rooms are live, and the payload is a room list. It raises no card, so
+ * data_cards cannot see it; it parses cleanly, so data_raw must not claim it;
+ * and counting it as an ordinary envelope would make data_envelopes climb while
+ * nothing appears on the screen, which is the confusing shape this counter
+ * exists to prevent. THE THREE ARE DISJOINT: every payload the pickup takes
+ * increments exactly one of env_parsed, env_control and env_raw, so
+ * "the node is talking to us and we ignore it" reads differently from "nothing
+ * arrives". */
+static uint32_t g_rns_env_parsed = 0;   /* payloads read as a chat envelope */
+static uint32_t g_rns_env_control = 0;  /* ...read as a control frame */
 static uint32_t g_rns_env_raw = 0;      /* payloads shown exactly as they came */
 static const char *g_rns_env_raw_why = nullptr;
 /* ...and the last reason that was NOT "plain text", kept where the common case
@@ -1142,13 +1155,17 @@ struct RnsStatusSnap {
      * the copy can see mixed characters but never an unterminated array. */
     char send_error[96];
     /* The inbound envelope, published under the same rule as the prefilter
-     * counters above: the four counters would be single-copy atomic to read
+     * counters above: the five counters would be single-copy atomic to read
      * directly, and they are copied here anyway so the handler has one source.
+     * env_control is the third of the disjoint outcomes — a frame whose session
+     * is the reserved '*', which raises no card — and it is published for the
+     * reason the pair is: nothing on the screen can say the peer is talking to
+     * this device about its rooms.
      * The last two are not scalars at all and have no choice — `env_raw_why` is
      * a pointer the loop task reassigns and `env_from` is a char array it
      * rewrites in place, which is exactly the hazard send_error is copied for.
      * env_reason is the ROUTER's own code, carried and not interpreted. */
-    uint32_t env_parsed, env_raw, env_routed, env_refused;
+    uint32_t env_parsed, env_control, env_raw, env_routed, env_refused;
     int env_reason;
     const char *env_raw_why;
     const char *env_bad_why;
@@ -1162,7 +1179,7 @@ struct RnsStatusSnap {
 };
 static RnsStatusSnap g_rns_snap = {"off", false, 0, 0, 0, 0, 0, 0, 0, 0, 0,
                                    0, 0, {0},
-                                   0, 0, 0, 0, 0, nullptr, nullptr, {0},
+                                   0, 0, 0, 0, 0, 0, nullptr, nullptr, {0},
                                    RNS_TCP_PORT_DEFAULT, {0}, {0}, {0}};
 
 /* Declared in rns/outbox.h, and defined HERE rather than beside rns_tx_offer()
@@ -1733,6 +1750,7 @@ static void rns_status_publish() {
      * never written after the initialiser, so a reader crossing this memcpy can
      * see mixed characters but never an unterminated array. */
     g_rns_snap.env_parsed = g_rns_env_parsed;
+    g_rns_snap.env_control = g_rns_env_control;
     g_rns_snap.env_raw = g_rns_env_raw;
     g_rns_snap.env_routed = g_rns_env_routed;
     g_rns_snap.env_refused = g_rns_env_refused;
@@ -1915,7 +1933,17 @@ static void rns_status_json(JsonDocument &doc) {
      * exactly as it arrived, and both are ordinary. Which one is happening
      * decides what the screen looks like, so it cannot be left to be guessed
      * from a card.
-     *   data_envelopes   payloads taken apart as a version-1 envelope.
+     *   data_envelopes   payloads taken apart as a version-1 envelope and shown
+     *                    as a message. Control frames are NOT in here.
+     *   data_control     envelopes whose session was the reserved single byte
+     *                    '*': the peer saying which rooms are live rather than
+     *                    sending a message. They raise NO CARD — a room list is
+     *                    not something to put on the screen — so this counter is
+     *                    the only place they appear, and it is what tells "the
+     *                    node is talking to us and we ignore it" apart from
+     *                    "nothing arrives". This device never SENDS one:
+     *                    rns_envelope_build() refuses the reserved session, on
+     *                    purpose (see rns/outbox.h).
      *   data_raw         payloads shown as they came. tools/rns-send sends bare
      *                    text, so this counting up is not a fault on its own.
      *   data_raw_why     the last reason one was not an envelope — an unknown
@@ -1945,9 +1973,10 @@ static void rns_status_json(JsonDocument &doc) {
      *                    reached its conversation shows at all.
      *   data_route_reason   the router's own code from that last refusal,
      *                    carried and not interpreted. Zero until then.
-     * The four counters and both strings come from the loop-side snapshot, for
+     * The five counters and both strings come from the loop-side snapshot, for
      * the reason the whole snapshot exists. */
     doc["data_envelopes"] = (unsigned long)g_rns_snap.env_parsed;
+    doc["data_control"] = (unsigned long)g_rns_snap.env_control;
     doc["data_raw"] = (unsigned long)g_rns_snap.env_raw;
     doc["data_raw_why"] = g_rns_snap.env_raw_why;
     doc["data_malformed_why"] = g_rns_snap.env_bad_why;
@@ -2185,6 +2214,14 @@ static const char *rns_describe() {
            "anyone who has heard this node's announce can name a THIRD PARTY\n"
            "there, and a reply sent on trust is encrypted to a node the user\n"
            "never talked to. Confirm it before answering.\n"
+           "ONE SESSION VALUE IS RESERVED: a session field of exactly `*`\n"
+           "marks a CONTROL FRAME, the peer saying which rooms are live as a\n"
+           "comma-separated list rather than sending a message. It is handed\n"
+           "to the room router verbatim and raises NO CARD — a room list is\n"
+           "not a message, and one card per refresh is exactly the clutter the\n"
+           "list exists to remove — so `data_control` in `/rns/status` is\n"
+           "where it shows. This device only READS them: the envelope builder\n"
+           "refuses the reserved session, so no code path here can emit one.\n"
            "A parsed envelope is also offered ONCE to a room router — a\n"
            "function pointer another skill sets at init, null by default,\n"
            "which runs on the loop task and may not block or touch SD. The\n"
@@ -2659,10 +2696,18 @@ static void rns_inbox_poll() {
         const uint8_t *src = g_rns_inbox_payload;
         size_t src_len = len;
         char session[RNS_OUTBOX_SESSION_MAX + 1];
+        /* A CONTROL FRAME IS NOT A MESSAGE, so it does not become a card. Its
+         * payload is the peer's list of live rooms, and a card per list would
+         * be a new piece of junk on the screen every time the peer refreshes —
+         * the opposite of what the list is for. The router is the only consumer
+         * it has; the counter is where it shows up for a human. */
+        bool control = false;
 
         session[0] = '\0';
         if (er == RNS_ENVIN_OK) {
-            g_rns_env_parsed++;
+            control = rns_session_is_control_n(ev.session, ev.session_len);
+            if (control) g_rns_env_control++;
+            else g_rns_env_parsed++;
             src = (const uint8_t *)ev.text;
             src_len = ev.text_len;
             /* Both lengths are bounded by the parser — 32 for the address, 23
@@ -2685,82 +2730,99 @@ static void rns_inbox_poll() {
             if (er != RNS_ENVIN_NO_FRAME) g_rns_env_bad_why = g_rns_env_raw_why;
         }
 
-        /* The return value is bytes written AND input bytes consumed — one
-         * number, by construction (see rns/inbox.h). So `kept < src_len` is
-         * exactly "something did not fit". */
-        size_t kept = rns_text_sanitize(src, src_len,
-                                        g_rns_card_body,
-                                        sizeof(g_rns_card_body),
-                                        RNS_CARD_VISIBLE_CHARS);
+        /* ---- the card, for everything that IS a message ----
+         *
+         * A CONTROL FRAME STOPS HERE AND THAT IS THE WHOLE POINT OF THE GUARD.
+         * Everything below builds a notification out of the payload, and a
+         * control frame's payload is a list of room names: on the screen it
+         * would be a card of plumbing arriving as often as the peer refreshes
+         * its list, which is more junk than the list was sent to remove. The
+         * frame is not lost by skipping the card — the router below is its
+         * consumer and data_control is where it shows for a human — and with no
+         * router installed it is shown nowhere at all, deliberately: it is not
+         * a message, so there is nothing a card could honestly say about it.
+         *
+         * EVERY OTHER PAYLOAD STILL RAISES ONE, envelope or not, routed or not.
+         * `control` is the only condition here, and it can only be true for a
+         * payload that parsed. */
+        if (!control) {
+            /* The return value is bytes written AND input bytes consumed — one
+             * number, by construction (see rns/inbox.h). So `kept < src_len` is
+             * exactly "something did not fit". */
+            size_t kept = rns_text_sanitize(src, src_len,
+                                            g_rns_card_body,
+                                            sizeof(g_rns_card_body),
+                                            RNS_CARD_VISIBLE_CHARS);
 
-        if (kept < src_len) {
-            g_rns_card_cut++;
-            /* Second pass, with the marker's room held back in BOTH budgets, so
-             * the count is of input the card genuinely does not carry. */
-            kept = rns_text_sanitize(src, src_len,
-                                     g_rns_card_body + RNS_CARD_CUT_RESERVE,
-                                     sizeof(g_rns_card_body) -
-                                         RNS_CARD_CUT_RESERVE,
-                                     RNS_CARD_VISIBLE_CHARS -
-                                         RNS_CARD_CUT_RESERVE);
-            char mark[RNS_CARD_CUT_MARK_MAX];
-            int mn = snprintf(mark, sizeof(mark), "[+%u B] ",
-                              (unsigned)(src_len - kept));
-            /* snprintf returns what it WOULD have written, so an upper bound is
-             * the clause that matters — but the bound is the RESERVATION, not
-             * the size of `mark`. Those differ today (12 against 16) and the
-             * larger one is not safe: the memmove below moves the text down to
-             * offset mn, and any mn past the reservation moves it UP, past the
-             * end of the body by mn - RNS_CARD_CUT_RESERVE bytes. Bounding by
-             * sizeof(mark) leaves that overflow three characters away from a
-             * constant whose own comment invites tuning, and it was reachable by
-             * lowering the reservation alone. The else branch below already
-             * handles a marker that does not fit, so this is the whole fix. */
-            if (mn > 0 && mn <= RNS_CARD_CUT_RESERVE) {
-                /* Close the gap between the reservation and the marker's real
-                 * length. Overlapping and downward, hence memmove; +1 carries
-                 * the terminator the sanitiser wrote. */
-                memmove(g_rns_card_body + mn,
-                        g_rns_card_body + RNS_CARD_CUT_RESERVE, kept + 1);
-                memcpy(g_rns_card_body, mark, (size_t)mn);
-            } else {
-                /* The marker would not fit its own buffer. Show the truncated
-                 * body rather than a corrupted one; data_card_cut and the title
-                 * still record that this happened. */
-                memmove(g_rns_card_body,
-                        g_rns_card_body + RNS_CARD_CUT_RESERVE, kept + 1);
+            if (kept < src_len) {
+                g_rns_card_cut++;
+                /* Second pass, with the marker's room held back in BOTH budgets, so
+                 * the count is of input the card genuinely does not carry. */
+                kept = rns_text_sanitize(src, src_len,
+                                         g_rns_card_body + RNS_CARD_CUT_RESERVE,
+                                         sizeof(g_rns_card_body) -
+                                             RNS_CARD_CUT_RESERVE,
+                                         RNS_CARD_VISIBLE_CHARS -
+                                             RNS_CARD_CUT_RESERVE);
+                char mark[RNS_CARD_CUT_MARK_MAX];
+                int mn = snprintf(mark, sizeof(mark), "[+%u B] ",
+                                  (unsigned)(src_len - kept));
+                /* snprintf returns what it WOULD have written, so an upper bound is
+                 * the clause that matters — but the bound is the RESERVATION, not
+                 * the size of `mark`. Those differ today (12 against 16) and the
+                 * larger one is not safe: the memmove below moves the text down to
+                 * offset mn, and any mn past the reservation moves it UP, past the
+                 * end of the body by mn - RNS_CARD_CUT_RESERVE bytes. Bounding by
+                 * sizeof(mark) leaves that overflow three characters away from a
+                 * constant whose own comment invites tuning, and it was reachable by
+                 * lowering the reservation alone. The else branch below already
+                 * handles a marker that does not fit, so this is the whole fix. */
+                if (mn > 0 && mn <= RNS_CARD_CUT_RESERVE) {
+                    /* Close the gap between the reservation and the marker's real
+                     * length. Overlapping and downward, hence memmove; +1 carries
+                     * the terminator the sanitiser wrote. */
+                    memmove(g_rns_card_body + mn,
+                            g_rns_card_body + RNS_CARD_CUT_RESERVE, kept + 1);
+                    memcpy(g_rns_card_body, mark, (size_t)mn);
+                } else {
+                    /* The marker would not fit its own buffer. Show the truncated
+                     * body rather than a corrupted one; data_card_cut and the title
+                     * still record that this happened. */
+                    memmove(g_rns_card_body,
+                            g_rns_card_body + RNS_CARD_CUT_RESERVE, kept + 1);
+                }
             }
+
+            /* THE TITLE IS WHERE THE SESSION GOES. It names the conversation this
+             * message belongs to, which is the one piece of the envelope a reader
+             * needs and the one piece a body cannot carry without becoming
+             * plumbing again; a card from an unnamed session, and a card that was
+             * never an envelope, read exactly as they did before.
+             *
+             * The byte count stays on EVERY card, not only a truncated one: it is
+             * the number to compare against what the sender says it sent, and it is
+             * the only place the length survives once the body has been sanitised
+             * and possibly cut. It counts the TEXT for an envelope and the whole
+             * payload for anything else — the same bytes the card is built from, so
+             * it stays comparable with the "[+N B]" marker, which is measured
+             * against exactly that.
+             *
+             * 48 bytes: "RNS " + 23 of session + ' ' + 3 digits + " B" is 34, and
+             * snprintf truncates rather than overflows in any case. */
+            char title[48];
+            if (session[0])
+                snprintf(title, sizeof(title), "RNS %s %u B", session,
+                         (unsigned)src_len);
+            else
+                snprintf(title, sizeof(title), "RNS %u B", (unsigned)src_len);
+
+            /* notify_ingest() returns 0 when the store refused the card, and that is
+             * not given its own counter: data_cards falling behind
+             * data_rx - data_dropped is the same information without a third number
+             * to keep in step. */
+            if (notify_ingest("info", "rns", title, g_rns_card_body, NULL) != 0)
+                g_rns_cards++;
         }
-
-        /* THE TITLE IS WHERE THE SESSION GOES. It names the conversation this
-         * message belongs to, which is the one piece of the envelope a reader
-         * needs and the one piece a body cannot carry without becoming
-         * plumbing again; a card from an unnamed session, and a card that was
-         * never an envelope, read exactly as they did before.
-         *
-         * The byte count stays on EVERY card, not only a truncated one: it is
-         * the number to compare against what the sender says it sent, and it is
-         * the only place the length survives once the body has been sanitised
-         * and possibly cut. It counts the TEXT for an envelope and the whole
-         * payload for anything else — the same bytes the card is built from, so
-         * it stays comparable with the "[+N B]" marker, which is measured
-         * against exactly that.
-         *
-         * 48 bytes: "RNS " + 23 of session + ' ' + 3 digits + " B" is 34, and
-         * snprintf truncates rather than overflows in any case. */
-        char title[48];
-        if (session[0])
-            snprintf(title, sizeof(title), "RNS %s %u B", session,
-                     (unsigned)src_len);
-        else
-            snprintf(title, sizeof(title), "RNS %u B", (unsigned)src_len);
-
-        /* notify_ingest() returns 0 when the store refused the card, and that is
-         * not given its own counter: data_cards falling behind
-         * data_rx - data_dropped is the same information without a third number
-         * to keep in step. */
-        if (notify_ingest("info", "rns", title, g_rns_card_body, NULL) != 0)
-            g_rns_cards++;
 
         /* ---- and then, at most once, the room ----
          *
@@ -2771,6 +2833,14 @@ static void rns_inbox_poll() {
          *
          * ONLY FOR A PARSED ENVELOPE. A bare-text payload has no session to
          * route by and no sender to answer, so there is nothing to place.
+         *
+         * A CONTROL FRAME COMES THROUGH HERE TOO, and it is the one case where
+         * "after the card" means there was no card. Its session is the single
+         * byte '*' and it is handed over EXACTLY AS IT ARRIVED — the copy above
+         * is a memcpy of the parsed field and nothing sanitises it — because
+         * the router branches on that byte before its own name sanitiser runs.
+         * Anything done to it here would be a room named after a control
+         * marker.
          *
          * THE ROOM GETS THE WHOLE TEXT, sanitised into its own buffer with no
          * character cap: the card's budget is what the screen paints and has

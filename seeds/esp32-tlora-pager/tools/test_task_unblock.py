@@ -1157,13 +1157,13 @@ assert "notify_ingest(" in pickup and "return" not in pickup.split("g_rns_env_ra
     "a payload that is not an envelope must fall through to the card, not out "
     "of the loop: the one outcome that must never happen is a lost message"
 )
-# THE CARD IS UNCONDITIONAL, and this is the assertion that says so rather than
-# implying it. Every message the pickup takes raises one — envelope or not,
-# routed or not — so the card site sits at the top level of the loop body and
-# its only condition is notify_ingest()'s own return value. Gating it on the
-# parse result (`er != RNS_ENVIN_OK && notify_ingest(...)`) leaves EVERY
-# envelope with no card at all, which is precisely the outcome this file's
-# header promises can never happen, and every other assertion here survives it.
+# THE CARD IS UNCONDITIONAL FOR EVERY MESSAGE, and it has exactly ONE exception
+# — the control frame, which is not a message. That is the assertion below
+# rather than something implied: the card site's only condition is `!control`
+# plus notify_ingest()'s own return value. Gating it on the parse result
+# (`er != RNS_ENVIN_OK && notify_ingest(...)`) leaves EVERY envelope with no
+# card at all, which is precisely the outcome this file's header promises can
+# never happen, and every other assertion here survives it.
 assert re.search(r'if \(notify_ingest\("info", "rns", title, g_rns_card_body, '
                  r'NULL\) != 0\) g_rns_cards\+\+;', pickup_norm), (
     "the card must be raised for every message taken, conditioned on nothing "
@@ -1171,10 +1171,19 @@ assert re.search(r'if \(notify_ingest\("info", "rns", title, g_rns_card_body, '
 )
 _body = pickup[pickup.index("{", pickup.index("while (rns_inbox_take(")):
                 pickup.index("notify_ingest(")]
-assert _body.count("{") - _body.count("}") == 1, (
-    "the card site must be at the top level of the pickup loop, not nested "
-    "inside a branch: a message that reaches the pickup always reaches the "
-    "screen"
+assert _body.count("{") - _body.count("}") == 2, (
+    "the card site must sit inside exactly ONE branch of the pickup loop — the "
+    "control-frame guard — and no other: a message that reaches the pickup "
+    "always reaches the screen unless it is not a message"
+)
+# ...and that one branch is `if (!control)`, tested by its own text. Any other
+# condition wrapping the card is a message that can silently fail to appear.
+assert re.search(r"if \(!control\) \{", pickup), (
+    "the only thing allowed to withhold a card is the control-frame guard, "
+    "written as `if (!control)`"
+)
+assert pickup.index("if (!control) {") < pickup.index("notify_ingest("), (
+    "the guard must open before the card is built, not after it is raised"
 )
 # THE SESSION IDENTIFIES THE CONVERSATION AND GOES IN THE TITLE; the address
 # does not go on the screen at all. And the byte count stays, because it is the
@@ -1315,6 +1324,136 @@ assert re.search(
     "the installation must sit at the end of the bring-up, outside every "
     "`if (rns_started)` scope: a hook that exists only when boot went well is "
     "a hook missing on the node that needed POST /rns/config to come up"
+)
+
+# 9d-sexies. THE CONTROL FRAME, AND THE ASYMMETRY THAT MAKES IT SAFE.
+#
+# The peer now sends `1|<32 hex>|*|main,sonata` — a session field of exactly one
+# byte, '*', meaning "these rooms are live" rather than "here is a message".
+# Three separate things have to hold, and each one fails differently:
+#
+#   1. THE RECEIVE SIDE ACCEPTS IT AND THE SEND SIDE DOES NOT. Loosening the one
+#      shared validator would pass every receive-side test and would also make
+#      this firmware able to EMIT control frames — instructions about what a
+#      screen shows, from a code path nobody wrote on purpose. Two functions is
+#      what keeps that impossible.
+#   2. IT REACHES THE ROUTER VERBATIM. The receiving side branches on the exact
+#      byte before its own sanitiser runs, so anything done to the field here —
+#      sanitising, substituting, truncating — silently breaks the other half.
+#   3. IT DOES NOT BECOME A CHAT MESSAGE. No card, and no card with a null
+#      router either; a room list on the screen every time the peer refreshes is
+#      more junk than the list was sent to remove.
+outbox_h_code = re.sub(r"/\*.*?\*/", " ", outbox_h, flags=re.S)
+outbox_h_code = re.sub(r"//[^\n]*", " ", outbox_h_code)
+
+assert "#define RNS_ENVELOPE_CONTROL_SESSION '*'" in outbox_h, (
+    "the reserved session is a named constant in the format's one owner, not a "
+    "'*' typed into three files that nothing keeps in step"
+)
+# The reserved byte is only safe BECAUSE it is outside the name charset: the
+# send-side charset must stay exactly as it was, or a real room could be named
+# '*' and the two meanings would collide.
+assert "(c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||" in outbox_h_code and \
+       "c == '.' || c == '_' || c == '-')" in outbox_h_code, (
+    "the session charset must stay [A-Za-z0-9._-]: the control byte is chosen "
+    "for being OUTSIDE it, so widening the charset would let a room name "
+    "collide with the marker"
+)
+build_body = outbox_h_code[outbox_h_code.index("rns_env_result rns_envelope_build("):
+                           outbox_h_code.index("rns_envin_result rns_envelope_parse(")]
+parse_body = outbox_h_code[outbox_h_code.index("rns_envin_result rns_envelope_parse("):]
+assert "rns_session_valid(session)" in build_body, (
+    "the BUILDER must keep the strict, send-side rule"
+)
+assert "rns_session_valid_in" not in build_body, (
+    "the builder must NOT take the receive-side rule: a device that can build a "
+    "control frame can tell its peer which rooms to drop, which is the one "
+    "thing this asymmetry exists to prevent"
+)
+assert "rns_session_valid_in_n(p + sep[1] + 1, slen)" in parse_body, (
+    "the PARSER must take the receive-side rule, which is the strict one plus "
+    "the single reserved value"
+)
+assert "rns_session_is_control_n" not in build_body, (
+    "the builder must not know about control frames at all"
+)
+# The receive-side rule is the send-side rule PLUS one value, expressed by
+# calling it rather than by copying the charset — a second charset would drift.
+valid_in = outbox_h_code[outbox_h_code.index("bool rns_session_valid_in_n("):
+                         outbox_h_code.index("size_t rns_envelope_text_budget_n(")]
+assert "rns_session_is_control_n(session, n)" in valid_in and \
+       "rns_session_valid_n(session, n)" in valid_in, (
+    "the receive-side validator must delegate to the send-side one and add the "
+    "control value, not restate the charset"
+)
+# EXACTLY ONE BYTE. "**", "*a" and "a*" are not control frames and are not names
+# either; the length test is what keeps them out.
+is_control = outbox_h_code[outbox_h_code.index("bool rns_session_is_control_n("):
+                           outbox_h_code.index("bool rns_session_valid_in_n(")]
+assert "n == 1 && session[0] == RNS_ENVELOPE_CONTROL_SESSION" in is_control, (
+    "a control session is EXACTLY one byte: without the length test '*a' and "
+    "'**' would become control frames too"
+)
+
+# ...and in the pickup: the frame is recognised from the parsed view, counted
+# apart from both other outcomes, and kept off the screen.
+assert "rns_session_is_control_n(ev.session, ev.session_len)" in pickup, (
+    "the pickup must recognise a control frame through the header's helper and "
+    "from the PARSED view — never by looking at the raw payload itself"
+)
+assert re.search(r"if \(control\) g_rns_env_control\+\+;\s*else g_rns_env_parsed\+\+;",
+                 pickup_norm), (
+    "the three outcomes must be DISJOINT: a control frame counts as a control "
+    "frame and not also as an ordinary envelope, or data_envelopes climbs while "
+    "nothing appears on the screen"
+)
+assert "g_rns_env_control" in rns_code.split("g_rns_env_raw++")[0], (
+    "the control counter belongs with the envelope counters it partitions"
+)
+# THE ROUTER STILL GETS IT. The guard is the parse result, NOT `!control`: a
+# control frame that reached the router is the entire feature.
+assert re.search(r"if \(er == RNS_ENVIN_OK && g_rns_room_router\)", pickup), (
+    "the router guard must stay the parse result: excluding control frames "
+    "there would deliver the card-less frame to nobody at all"
+)
+_route_block = pickup[pickup.index("if (er == RNS_ENVIN_OK && g_rns_room_router)"):]
+assert "control" not in _route_block.split("g_rns_room_router(")[0], (
+    "nothing may re-check `control` on the way to the router: the router is "
+    "the consumer a control frame has"
+)
+# VERBATIM. `session` is a memcpy of the parsed field and nothing between the
+# copy and the call touches it — no sanitiser, no substitution, no rewrite.
+_sess_copy = pickup[pickup.index("memcpy(session, ev.session, ev.session_len);"):
+                    pickup.index("g_rns_room_router(")]
+assert "session[ev.session_len] = '\\0';" in _sess_copy, (
+    "the session copy is a memcpy plus a terminator; that is the whole "
+    "treatment it gets"
+)
+assert "rns_text_sanitize(session" not in _sess_copy and \
+       "session[0] =" not in _sess_copy.split("session[ev.session_len]")[1], (
+    "the session must reach the router EXACTLY as it arrived: the receiving "
+    "side branches on the '*' before its own sanitiser runs, so a sanitiser "
+    "here turns the one value it must recognise into an ordinary name"
+)
+# NO CARD, AND THAT DOES NOT DEPEND ON A ROUTER BEING INSTALLED. The guard sits
+# around the card, not inside the router branch, so with g_rns_room_router null
+# a control frame is shown nowhere — which is correct, because it is not a
+# message.
+assert pickup.index("if (!control) {") < \
+       pickup.index("if (er == RNS_ENVIN_OK && g_rns_room_router)"), (
+    "the card guard must be independent of the router: a control frame must "
+    "not appear as a chat message on a device with no router installed either"
+)
+# And it is visible in the one place that can show it.
+assert '"data_control"' in json_builder, (
+    "GET /rns/status must publish data_control: a control frame raises no card, "
+    "so the counter is the only evidence the peer is talking to this device"
+)
+assert "g_rns_snap.env_control = g_rns_env_control;" in publish, (
+    "the counter must be sampled on the loop task like every other one"
+)
+assert "g_rns_snap.env_control" in json_builder, (
+    "the handler must read it from the snapshot, never from the live counter"
 )
 
 # 9e. THE PICKUP RUNS AFTER THE STACK. The drain that fills the inbox is inside
@@ -1970,6 +2109,21 @@ assert "split3(" in outbox_test, (
 assert ".refused ==" in outbox_test, (
     "the overflow policy is only a policy if the test pins the counter"
 )
+# AND BOTH DIRECTIONS OF THE CONTROL SESSION, on the same value. A test that
+# only parsed '*' would pass with one loosened validator — which would also let
+# this device BUILD a control frame, the one thing the asymmetry prevents.
+assert 'rns_envelope_build(SELF, "*", "main,sonata"' in outbox_test and \
+       "RNS_ENV_BAD_SESSION" in outbox_test, (
+    "the host test must pin that the BUILDER refuses the reserved session: "
+    "receiving a control frame and being able to send one are different "
+    "privileges and only one of them belongs to this device"
+)
+for pred in ("rns_session_valid_in_n(", "rns_session_is_control_n("):
+    assert pred in outbox_test, (
+        "the host test must drive %s directly: the receive-side rule and the "
+        "'exactly one byte' rule are where '**', '*a' and 'a*' are kept out"
+        % pred
+    )
 assert "0xFFFFFFFEu" in outbox_test and "0xFFFFFF00u" in outbox_test, (
     "both unsigned wraps must be pinned: the ring's monotonic counters at 2^32 "
     "and the retry throttle across the millis() rollover"
