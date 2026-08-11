@@ -2974,80 +2974,106 @@ static void rns_announce_poll() {
  * seed.pager pickup uses, the card body against the screen's character budget and
  * the room text uncut. This never rate-limits: like rns_inbox_poll(), a burst is
  * a buzz per message and that gap is named there, not closed here. */
+/* THE ONE LXMF ROUTER, shared by every transport. Takes an LXMF OPPORTUNISTIC
+ * WIRE — source(16)+sig(64)+msgpack, NO leading destination hash, exactly what a
+ * real client sends (LXMessage.py:633-634) — reconstructs the full-packed message,
+ * parses it, plans the route and lands it on the screen, moving the same disjoint
+ * counters throughout. Returns true iff the wire parsed cleanly (routed to a card
+ * or a room); false on a malformed / unplaceable wire (bad already bumped).
+ *
+ * Two callers hand it the SAME shape of bytes: rns_lxmf_inbox_poll() below, off
+ * the Reticulum drain (WiFi/Reticulum receive, C1-C5), and the MeshCore "L1"
+ * reassembler in skills/meshcore.cpp, off the radio (off-grid receive). Factoring
+ * it here keeps ONE parse site, ONE route decision and ONE set of counters no
+ * matter which transport carried the wire — the mesh path is a new DOOR onto this
+ * same router, not a second copy of it.
+ *
+ * MUST run on the loop task, after rns_stack.loop(): it calls notify_ingest() /
+ * the room router, which take critical sections and (for a card) write-through to
+ * the off-loop history archive — the same discipline the M1/C1 mesh branches and
+ * the seed.pager pickup already obey. */
+static bool lxmf_ingest_wire(const uint8_t *wire, size_t len) {
+    /* OPPORTUNISTIC WIRE -> FULL-PACKED. Reconstruct the full dest(16)+source(16)+
+     * sig(64)+msgpack the codec parses (and a later commit verifies over) by
+     * prepending OUR OWN lxmf.delivery hash, the true destination the sender
+     * signed against (LXMRouter.py:1930-1934, LXMessage.py:762-764/809), into
+     * g_rns_lxmf_recon (16 B headroom). Without a cached hash we cannot place the
+     * fields, so treat it as unparseable. */
+    if (!rns_lxmf_dest_hash_ok) { g_rns_lxmf_bad++; return false; }
+    size_t rlen = 0;
+    if (lxmf_wire_prepend_dest(rns_lxmf_dest_hash, wire, len,
+                               g_rns_lxmf_recon, sizeof(g_rns_lxmf_recon),
+                               &rlen) != LXMF_OK) { g_rns_lxmf_bad++; return false; }
+    LxmfReason rr = lxmf_parse(g_rns_lxmf_recon, rlen, &g_rns_lxmf_msg);
+    if (rr != LXMF_OK) { g_rns_lxmf_bad++; return false; }
+    g_rns_lxmf_ok++;
+
+    LxmfRoute route;
+    lxmf_route_plan(&g_rns_lxmf_msg, &route);
+
+    /* A THREAD ROUTES TO A ROOM, INSTEAD of a card — see lxmf_route.h. The
+     * router runs ON THIS TASK, after rns_stack.loop(), so it may not block
+     * or touch SD synchronously; with none installed the message is shown
+     * nowhere, exactly as a control frame is in rns_inbox_poll(). The content
+     * is sanitised uncut into the room's own buffer, the seed.pager way. */
+    if (route.kind == LXMF_ROUTE_ROOM) {
+        if (g_rns_room_router) {
+            int reason = 0;
+            rns_text_sanitize((const uint8_t *)g_rns_lxmf_msg.content,
+                              g_rns_lxmf_msg.content_len,
+                              g_rns_room_text, sizeof(g_rns_room_text), 0);
+            if (g_rns_room_router(route.room, g_rns_room_text, &reason)) {
+                g_rns_lxmf_rooms++;
+                /* REMEMBER WHO TO ANSWER (C4). The reply path keys the origin
+                 * map by the RESOLVED room name — the same sanitised string
+                 * the router stored as the session — so a reply typed here
+                 * finds it; route.room is the raw thread bytes, so sanitise
+                 * with the router's own filter (agents_route_sanitize, the
+                 * byte-for-byte twin of agents_session_sanitize). Guarded by
+                 * g_rns_tx_mux because the reply lookup can run on AsyncTCP. */
+                char rkey[AGENT_ROUTE_NAME_CAP];
+                agents_route_sanitize(route.room, rkey, sizeof(rkey));
+                if (rkey[0]) {
+                    portENTER_CRITICAL(&g_rns_tx_mux);
+                    lxmf_origin_set(&g_rns_lxmf_origin, rkey,
+                                    g_rns_lxmf_msg.source_hash);
+                    portEXIT_CRITICAL(&g_rns_tx_mux);
+                }
+            }
+        }
+        return true;
+    }
+
+    /* THE DEFAULT: a card. Title and content are sanitised the seed.pager
+     * way — control bytes stripped, the body cut to the screen's character
+     * budget — into a title scratch and g_rns_card_body. An empty title still
+     * makes a card; notify_ingest() supplies its own placeholder. */
+    char title[NOTIFY_TITLE_LEN];
+    rns_text_sanitize((const uint8_t *)g_rns_lxmf_msg.title,
+                      g_rns_lxmf_msg.title_len,
+                      title, sizeof(title), 0);
+    rns_text_sanitize((const uint8_t *)g_rns_lxmf_msg.content,
+                      g_rns_lxmf_msg.content_len,
+                      g_rns_card_body, sizeof(g_rns_card_body),
+                      RNS_CARD_VISIBLE_CHARS);
+    if (notify_ingest(route.level, route.source,
+                      title[0] ? title : "lxmf",
+                      g_rns_card_body, route.key) != 0)
+        g_rns_lxmf_cards++;
+    return true;
+}
+
 static void rns_lxmf_inbox_poll() {
     uint16_t len = 0;
     while (rns_inbox_take(&g_rns_lxmf_inbox, g_rns_lxmf_payload,
                           sizeof(g_rns_lxmf_payload), &len)) {
-        /* OPPORTUNISTIC WIRE -> FULL-PACKED. What the callback captured is the
-         * bare packet payload a real client sends: source(16)+sig(64)+msgpack,
-         * with NO leading destination hash — the RNS packet's addressing carried
-         * it (LXMessage.py:633-634). Reconstruct the full dest(16)+source(16)+
-         * sig(64)+msgpack the codec parses (and a later commit verifies over) by
-         * prepending OUR OWN lxmf.delivery hash, the true destination the sender
-         * signed against (LXMRouter.py:1930-1934, LXMessage.py:762-764/809). Off
-         * the drain, on this task, into g_rns_lxmf_recon (16 B headroom). Without
-         * a cached hash we cannot place the fields, so treat it as unparseable. */
-        if (!rns_lxmf_dest_hash_ok) { g_rns_lxmf_bad++; continue; }
-        size_t rlen = 0;
-        if (lxmf_wire_prepend_dest(rns_lxmf_dest_hash, g_rns_lxmf_payload, len,
-                                   g_rns_lxmf_recon, sizeof(g_rns_lxmf_recon),
-                                   &rlen) != LXMF_OK) { g_rns_lxmf_bad++; continue; }
-        LxmfReason rr = lxmf_parse(g_rns_lxmf_recon, rlen, &g_rns_lxmf_msg);
-        if (rr != LXMF_OK) { g_rns_lxmf_bad++; continue; }
-        g_rns_lxmf_ok++;
-
-        LxmfRoute route;
-        lxmf_route_plan(&g_rns_lxmf_msg, &route);
-
-        /* A THREAD ROUTES TO A ROOM, INSTEAD of a card — see lxmf_route.h. The
-         * router runs ON THIS TASK, after rns_stack.loop(), so it may not block
-         * or touch SD synchronously; with none installed the message is shown
-         * nowhere, exactly as a control frame is in rns_inbox_poll(). The content
-         * is sanitised uncut into the room's own buffer, the seed.pager way. */
-        if (route.kind == LXMF_ROUTE_ROOM) {
-            if (g_rns_room_router) {
-                int reason = 0;
-                rns_text_sanitize((const uint8_t *)g_rns_lxmf_msg.content,
-                                  g_rns_lxmf_msg.content_len,
-                                  g_rns_room_text, sizeof(g_rns_room_text), 0);
-                if (g_rns_room_router(route.room, g_rns_room_text, &reason)) {
-                    g_rns_lxmf_rooms++;
-                    /* REMEMBER WHO TO ANSWER (C4). The reply path keys the origin
-                     * map by the RESOLVED room name — the same sanitised string
-                     * the router stored as the session — so a reply typed here
-                     * finds it; route.room is the raw thread bytes, so sanitise
-                     * with the router's own filter (agents_route_sanitize, the
-                     * byte-for-byte twin of agents_session_sanitize). Guarded by
-                     * g_rns_tx_mux because the reply lookup can run on AsyncTCP. */
-                    char rkey[AGENT_ROUTE_NAME_CAP];
-                    agents_route_sanitize(route.room, rkey, sizeof(rkey));
-                    if (rkey[0]) {
-                        portENTER_CRITICAL(&g_rns_tx_mux);
-                        lxmf_origin_set(&g_rns_lxmf_origin, rkey,
-                                        g_rns_lxmf_msg.source_hash);
-                        portEXIT_CRITICAL(&g_rns_tx_mux);
-                    }
-                }
-            }
-            continue;
-        }
-
-        /* THE DEFAULT: a card. Title and content are sanitised the seed.pager
-         * way — control bytes stripped, the body cut to the screen's character
-         * budget — into a title scratch and g_rns_card_body. An empty title still
-         * makes a card; notify_ingest() supplies its own placeholder. */
-        char title[NOTIFY_TITLE_LEN];
-        rns_text_sanitize((const uint8_t *)g_rns_lxmf_msg.title,
-                          g_rns_lxmf_msg.title_len,
-                          title, sizeof(title), 0);
-        rns_text_sanitize((const uint8_t *)g_rns_lxmf_msg.content,
-                          g_rns_lxmf_msg.content_len,
-                          g_rns_card_body, sizeof(g_rns_card_body),
-                          RNS_CARD_VISIBLE_CHARS);
-        if (notify_ingest(route.level, route.source,
-                          title[0] ? title : "lxmf",
-                          g_rns_card_body, route.key) != 0)
-            g_rns_lxmf_cards++;
+        /* What the callback captured is the bare packet payload a real client
+         * sends: source(16)+sig(64)+msgpack, the OPPORTUNISTIC wire with NO
+         * leading destination hash (LXMessage.py:633-634). Hand it to the shared
+         * router, which prepends our lxmf.delivery hash, parses and routes it —
+         * the same router the MeshCore L1 path drives. Off the drain, on this
+         * task; the return value is folded into the counters inside. */
+        lxmf_ingest_wire(g_rns_lxmf_payload, len);
     }
 }
 

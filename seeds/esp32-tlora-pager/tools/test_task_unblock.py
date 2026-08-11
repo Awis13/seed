@@ -860,49 +860,65 @@ assert '#include "../lxmf_codec.h"' in rns, (
     "rns.cpp must include the C1 codec header that owns the parse"
 )
 assert rns_code.count("lxmf_parse(") == 1, (
-    "there is exactly one parse site, in the loop-task poll — never the callback "
-    "and never the drain"
+    "there is exactly one parse site, in the shared lxmf_ingest_wire() router — "
+    "never the callback and never the drain"
 )
+# TLORA-LXMF MESHCORE: the codec handoff (prepend dest -> parse -> route ->
+# counters) is FACTORED into the shared router lxmf_ingest_wire(), so BOTH the
+# Reticulum poll and the new MeshCore L1 reassembler drive ONE parse/route/counter
+# pipeline. The handoff assertions below therefore slice that function; the poll
+# assertions further down only pin that the poll DRAINS its ring into the router.
+ingest = rns[rns.index("static bool lxmf_ingest_wire") :]
+ingest = ingest[: ingest.index("\n}\n") + 2]
 lxmf_poll = rns[rns.index("static void rns_lxmf_inbox_poll") :]
 lxmf_poll = lxmf_poll[: lxmf_poll.index("\n}\n") + 2]
-# TLORA-LXMF C5: the wire is OPPORTUNISTIC (LXMessage.py:633-634) — the sender
-# strips the 16-byte destination hash and the RNS packet addressing carries it,
-# so the poll first RECONSTRUCTS the full-packed message by prepending our own
-# lxmf.delivery hash (the true dest the sender signed against, LXMRouter.py:
-# 1930-1934) into a 16-byte-headroom scratch, THEN parses that. The parse target
-# is g_rns_lxmf_recon, not the raw g_rns_lxmf_payload.
-assert "lxmf_wire_prepend_dest(rns_lxmf_dest_hash, g_rns_lxmf_payload, len," \
-       in lxmf_poll, (
-    "the poll must prepend our real lxmf.delivery hash to the opportunistic wire "
-    "payload before parsing — real clients (Retichat/Sideband) omit the dest hash"
+# The router takes the OPPORTUNISTIC wire (LXMessage.py:633-634) — the sender
+# strips the 16-byte destination hash and the RNS packet addressing carries it —
+# and RECONSTRUCTS the full-packed message by prepending our own lxmf.delivery
+# hash (the true dest the sender signed against, LXMRouter.py:1930-1934) into a
+# 16-byte-headroom scratch, THEN parses that. The parse target is g_rns_lxmf_recon,
+# not the raw wire; the wire is the router's own `wire` parameter now, so either
+# transport's bytes flow through the same reconstruction.
+assert "lxmf_wire_prepend_dest(rns_lxmf_dest_hash, wire, len," in ingest, (
+    "the shared router must prepend our real lxmf.delivery hash to the "
+    "opportunistic wire before parsing — real clients (Retichat/Sideband) omit it"
 )
-assert "lxmf_parse(g_rns_lxmf_recon, rlen, &g_rns_lxmf_msg)" in lxmf_poll, (
-    "the poll parses the RECONSTRUCTED full-packed buffer (dest prepended), not "
-    "the raw wire payload it took out of its ring"
+assert "lxmf_parse(g_rns_lxmf_recon, rlen, &g_rns_lxmf_msg)" in ingest, (
+    "the router parses the RECONSTRUCTED full-packed buffer (dest prepended), not "
+    "the raw wire it was handed"
 )
 assert "lxmf_parse(" not in lcb, (
     "the parse must never appear in the callback: it is tens of ms in the drain"
 )
-# The poll drains the ring, counts OK vs bad, and (TLORA-LXMF C3) ROUTES the
-# clean ones onto the screen; both counters must still move from it.
-assert "g_rns_lxmf_ok++" in lxmf_poll and "g_rns_lxmf_bad++" in lxmf_poll, (
-    "the poll must bump data_lxmf_ok on a clean parse and data_lxmf_bad on a "
+# The router counts OK vs bad, and (TLORA-LXMF C3) ROUTES the clean ones onto the
+# screen; both counters must move from it.
+assert "g_rns_lxmf_ok++" in ingest and "g_rns_lxmf_bad++" in ingest, (
+    "the router must bump data_lxmf_ok on a clean parse and data_lxmf_bad on a "
     "malformed one — the disjoint 'device alive but did not understand' signal"
+)
+# The poll is now a thin drain: it takes each opportunistic wire off its ring and
+# hands it to the shared router. It must still exist, still drive lxmf_ingest_wire,
+# and the parse must NOT have leaked back into the poll body.
+assert "lxmf_ingest_wire(g_rns_lxmf_payload, len)" in lxmf_poll, (
+    "the Reticulum poll must feed each wire it drains to the shared router — "
+    "one parse/route pipeline shared with the MeshCore L1 path"
+)
+assert "lxmf_parse(" not in lxmf_poll, (
+    "the parse lives in the shared router now, not the poll body"
 )
 # 8i.5-bis THE RECEIVE MILESTONE: a clean parse is ROUTED, not just counted. The
 # card-vs-room decision is the pure lxmf_route_plan() (src/lxmf_route.h), and the
-# poll raises a card through notify_ingest() or hands a thread to the room router,
-# with the same two off-loop calls the seed.pager pickup uses. Still after the
-# stack, still off the drain.
-assert "lxmf_route_plan(&g_rns_lxmf_msg" in lxmf_poll, (
+# router raises a card through notify_ingest() or hands a thread to the room
+# router, with the same two off-loop calls the seed.pager pickup uses.
+assert "lxmf_route_plan(&g_rns_lxmf_msg" in ingest, (
     "the clean-parse path must call the pure router lxmf_route_plan() — the "
     "card-vs-room / severity / key decision is factored out and host-tested"
 )
-assert "notify_ingest(" in lxmf_poll, (
+assert "notify_ingest(" in ingest, (
     "the DEFAULT (a plain client, no custom fields) must raise a card — without "
     "this the phone writes and nothing lands on the screen"
 )
-assert "g_rns_room_router(" in lxmf_poll, (
+assert "g_rns_room_router(" in ingest, (
     "a message carrying a thread must route to a room INSTEAD of a card"
 )
 assert '#include "../lxmf_route.h"' in rns, (
@@ -910,8 +926,8 @@ assert '#include "../lxmf_route.h"' in rns, (
 )
 # The text that reaches the screen is sanitised the seed.pager way — control
 # bytes stripped, length bounded — never the raw codec buffer straight to notify.
-assert "rns_text_sanitize(" in lxmf_poll and \
-       "g_rns_card_body" in lxmf_poll and "g_rns_room_text" in lxmf_poll, (
+assert "rns_text_sanitize(" in ingest and \
+       "g_rns_card_body" in ingest and "g_rns_room_text" in ingest, (
     "title/content must go through rns_text_sanitize() into the shared card/room "
     "buffers, exactly as the seed.pager pickup does"
 )
@@ -981,10 +997,10 @@ assert "portENTER_CRITICAL(&g_rns_tx_mux);" in reply_fn, (
 # The origin map is SET when a message routes into a room and CLEARED when a
 # seed.pager envelope lands in one, both keyed by the resolved (sanitised) room
 # name so the reply lookup finds the same slot, both under the tx spinlock.
-assert "lxmf_origin_set(&g_rns_lxmf_origin," in lxmf_poll, (
+assert "lxmf_origin_set(&g_rns_lxmf_origin," in ingest, (
     "the lxmf room route must record the sender so the room can answer as LXMF"
 )
-assert "agents_route_sanitize(route.room" in lxmf_poll, (
+assert "agents_route_sanitize(route.room" in ingest, (
     "the origin key must be the sanitised room name — the same string the "
     "router stored as the session, or the reply lookup misses"
 )

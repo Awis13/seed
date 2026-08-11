@@ -32,6 +32,15 @@
 #include <stdio.h>
 #include "mesh/mc_client.h"
 #include "mesh/utf8_chunk.h"
+#include "../l1_frame.h"    /* pure L1 frame parse + byte reassembler (host-tested) */
+
+/* THE SHARED LXMF ROUTER lives in skills/rns.cpp, which main.cpp #includes AFTER
+ * this file into the same translation unit. Forward-declare it so the MeshCore
+ * "L1" receive path can drive the SAME parse/route/counter pipeline the Reticulum
+ * poll does — one router, two transports (see lxmf_ingest_wire in rns.cpp). It
+ * takes an LXMF opportunistic wire (source+sig+msgpack, no dest hash) and returns
+ * true iff it parsed and routed; it owns the rns_lxmf_dest_hash_ok gate. */
+static bool lxmf_ingest_wire(const uint8_t *wire, size_t len);
 
 #define MESH_ID_PATH       "/mesh_identity.id"
 #define MESH_PAIR_PATH     "/mesh_pair.json"
@@ -454,6 +463,64 @@ static void mesh_reasm_append(MeshReasm *r, uint8_t part_i, uint8_t n_parts,
     if (part_i > r->got_count) r->got_count = part_i;
 }
 
+/* ---- L1: fragmented LXMF opportunistic wire over MeshCore ------------------
+ * The gateway splits an LXMF opportunistic wire (source+sig+msgpack, raw binary)
+ * into base64url chunks and sends them as text frames "L1|mid|i|n|<b64>" (see
+ * l1_frame.h for the format the fragmenter must match). The PARSE and the byte
+ * accumulation are the pure, host-tested l1_parse()/l1_reasm_feed(); this slot
+ * ring is only the TTL/lifecycle wrapper around L1Reasm, mirroring g_reasm above
+ * (millis() is why it is here and not in the pure header). On completion the whole
+ * LXMF wire goes to the ONE shared router, lxmf_ingest_wire() in rns.cpp — the
+ * same door the Reticulum poll uses. Separate slots (not the M1/C1 g_reasm) keep
+ * the byte-exact, gap-intolerant L1 policy off the text reassembler's best-effort
+ * path and leave the landed M1/C1 code untouched. */
+#define L1_SLOTS 2
+struct L1Slot {
+    bool     used;
+    char     mid[L1_MID_CAP];
+    uint32_t started_ms;
+    L1Reasm  r;
+};
+static L1Slot g_l1[L1_SLOTS];
+
+/* Disjoint MeshCore-LXMF counters (mesh status), mirroring rns.cpp's data_lxmf_*
+ * but never touching them: rx = wires reassembled AND accepted by the router,
+ * drop = a frame or reassembly rejected (bad parse/decode, forward gap, overflow,
+ * unplaceable wire). */
+static uint32_t g_mesh_lxmf_rx = 0;
+static uint32_t g_mesh_lxmf_drop = 0;
+
+static void l1_slot_gc() {
+    uint32_t now = millis();
+    for (int i = 0; i < L1_SLOTS; i++)
+        if (g_l1[i].used && (now - g_l1[i].started_ms) > MESH_REASM_TTL_MS)
+            g_l1[i].used = false;
+}
+
+/* Find or open the slot for `mid`; steals the oldest when full. */
+static L1Slot *l1_slot_get(const char *mid) {
+    l1_slot_gc();
+    for (int i = 0; i < L1_SLOTS; i++)
+        if (g_l1[i].used && strcmp(g_l1[i].mid, mid) == 0) return &g_l1[i];
+    for (int i = 0; i < L1_SLOTS; i++) {
+        if (!g_l1[i].used) {
+            memset(&g_l1[i], 0, sizeof(g_l1[i]));
+            g_l1[i].used = true;
+            snprintf(g_l1[i].mid, sizeof(g_l1[i].mid), "%s", mid);
+            g_l1[i].started_ms = millis();
+            return &g_l1[i];
+        }
+    }
+    int victim = 0;
+    for (int i = 1; i < L1_SLOTS; i++)
+        if (g_l1[i].started_ms < g_l1[victim].started_ms) victim = i;
+    memset(&g_l1[victim], 0, sizeof(g_l1[victim]));
+    g_l1[victim].used = true;
+    snprintf(g_l1[victim].mid, sizeof(g_l1[victim].mid), "%s", mid);
+    g_l1[victim].started_ms = millis();
+    return &g_l1[victim];
+}
+
 /* Called when MeshCore stack delivers a private text.
  * Also used by POST /mesh/inject for dry-run of the notify path. */
 static uint32_t mesh_on_private_text(const char *text) {
@@ -565,6 +632,26 @@ static uint32_t mesh_on_private_text(const char *text) {
             }
             r->used = false;
         }
+    } else if (strncmp(text, "L1|", 3) == 0) {
+        /* L1|mid|i|n|<base64url-chunk> — a fragment of an LXMF opportunistic wire.
+         * Parse + decode is pure (l1_frame.h); accumulate the bytes in this mid's
+         * slot; on the last part hand the whole wire to the shared LXMF router. */
+        L1Frame f;
+        if (!l1_parse(text, &f)) { g_mesh_lxmf_drop++; return 0; }
+        L1Slot *s = l1_slot_get(f.mid);
+        int rc = l1_reasm_feed(&s->r, &f);
+        if (rc < 0) {                     /* inconsistent n / gap / overflow */
+            s->used = false;
+            g_mesh_lxmf_drop++;
+            return 0;
+        }
+        if (rc == 1) {                    /* complete: the whole LXMF wire is in s->r.buf */
+            bool ok = lxmf_ingest_wire(s->r.buf, s->r.len);
+            s->used = false;
+            if (ok) { g_mesh_lxmf_rx++; id = 1; }   /* handled: bumps dm_rx below */
+            else    { g_mesh_lxmf_drop++; return 0; }
+        }
+        /* rc == 0: awaiting more parts (or a duplicate) — id stays 0, no dm_rx. */
     } else {
         id = notify_ingest("info", "mesh", "MESH", text, NULL);
     }
@@ -605,6 +692,10 @@ static void mesh_status_json(JsonDocument &doc) {
     doc["radio"] = g_mesh.radio_state;
     doc["radio_ready"] = g_mesh.radio_ready;
     doc["dm_rx"] = g_mesh.dm_rx_count;
+    /* MeshCore-LXMF receive rung: LXMF wires reassembled off the radio (rx) and
+     * frames/reassemblies rejected (drop). Disjoint from rns.cpp's data_lxmf_*. */
+    doc["data_lxmf_mesh_rx"] = (unsigned long)g_mesh_lxmf_rx;
+    doc["data_lxmf_mesh_drop"] = (unsigned long)g_mesh_lxmf_drop;
     doc["policy"] = "private_dm_only";
     doc["link"] = mesh_ui_state();
     doc["probe_interval_s"] = g_mesh.probe_interval_s;
