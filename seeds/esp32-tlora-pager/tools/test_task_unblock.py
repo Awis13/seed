@@ -573,13 +573,14 @@ assert "rns_identity," in dest, (
 )
 assert "RNS::Type::Destination::IN" in dest and "RNS::Type::Destination::SINGLE" in dest
 # The address is the app_name/aspects pair; changing either moves it, so pin
-# both. In particular this must NOT squat lxmf.delivery, which belongs to a
-# separate destination that does not exist yet.
+# both. This is the seed.pager destination and stays that — the LXMF delivery
+# destination is a SEPARATE address with its own app_name/aspects, pinned in
+# section 8i below; seed.pager must never be renamed to it.
 assert '#define RNS_DEST_APP_NAME "seed"' in rns
 assert '#define RNS_DEST_ASPECTS  "pager"' in rns
-assert "lxmf" not in rns_code.lower(), (
-    "the LXMF delivery destination is a later commit with its own address; "
-    "naming this one lxmf.delivery now would have to be undone"
+assert "RNS_DEST_APP_NAME" in dest and "RNS_DEST_ASPECTS" in dest, (
+    "the seed.pager destination must be built from its own app_name/aspects "
+    "macros, never the lxmf ones"
 )
 
 # 8f. The announce schedule is a pure function in its own header, so the host
@@ -762,6 +763,149 @@ for key in ('"address"', '"announced"', '"announces_sent"', '"announce_us_last"'
         "are the point of the destination" % key
     )
 
+# 8i. THE LXMF DELIVERY DESTINATION. A SECOND destination of ours, and therefore
+# a SECOND packet callback on the loop task inside the drain, reached the same
+# way as seed.pager's. It mirrors 8a-8h deliberately: same budget, same failure
+# modes, same "the callback only copies, the loop task does the work" deferral.
+#
+# 8i.1 Registered with its own callback, on its own address. app_name "lxmf" and
+# aspects "delivery" — a SEPARATE hash from seed.pager, so register_destination()
+# cannot collide.
+assert '#define RNS_LXMF_APP_NAME "lxmf"' in rns and \
+       '#define RNS_LXMF_ASPECTS  "delivery"' in rns, (
+    "the LXMF delivery address is its own app_name/aspects pair"
+)
+lxmf_dest = rns[rns.index("rns_lxmf_destination = RNS::Destination(") :
+                rns.index("rns_lxmf_dest_ok = true;")]
+assert "rns_identity," in lxmf_dest, (
+    "the lxmf destination must be built on the loaded identity too; a NONE "
+    "identity mints a throwaway keypair and the address moves every boot"
+)
+assert "RNS::Type::Destination::IN" in lxmf_dest and \
+       "RNS::Type::Destination::SINGLE" in lxmf_dest, (
+    "lxmf.delivery is an IN/SINGLE destination, like seed.pager"
+)
+assert "RNS_LXMF_APP_NAME" in lxmf_dest and "RNS_LXMF_ASPECTS" in lxmf_dest, (
+    "it must be built from its own app_name/aspects, not seed.pager's"
+)
+assert "rns_lxmf_destination.set_packet_callback(rns_lxmf_data_callback);" in rns, (
+    "the lxmf destination must register its own packet callback; without one an "
+    "inbound LXMF packet is decrypted and dropped without a trace"
+)
+assert "rns_lxmf_destination.accepts_links(false);" in rns, (
+    "accepts_links defaults to TRUE; an inbound link request would run an X25519 "
+    "handshake and an Ed25519 sign inside the drain — decline it here too"
+)
+# The proof strategy stays PROVE_NONE for lxmf too, and against the CODE
+# (comment-stripped): PROVE_APP would run Identity::prove() — an Ed25519 sign —
+# inside Transport::inbound() on the loop task, in the 8 ms drain. The prose at
+# the call site explains this; describing what must not be written may not fail
+# the test that forbids writing it. (PROVE_ALL is already forbidden file-wide in
+# 8d; set_proof_strategy() is what would opt into either.)
+assert "set_proof_strategy(" not in rns_code, (
+    "the lxmf destination must NOT set a proof strategy: this library proves "
+    "synchronously in the drain, so PROVE_APP/PROVE_ALL would sign an Ed25519 "
+    "proof there per recognised packet — a delivery receipt waits for an "
+    "off-loop prove a later commit adds"
+)
+
+# 8i.2 A bare function pointer, not a lambda, like rns_data_callback.
+assert re.search(r"^static void rns_lxmf_data_callback\(const RNS::Bytes ",
+                 rns, re.M), (
+    "the lxmf callback must be a file-scope function matching "
+    "void(*)(const Bytes&, const Packet&)"
+)
+
+# 8i.3 The callback body, pinned statement by statement — an ALLOWLIST, exactly
+# like 8c. It runs once per inbound LXMF packet inside the drain, so it may only
+# copy into its own ring: no parse (that is tens of ms and lives in the loop-task
+# poll), no log, no allocation, and the Bytes argument stays a reference.
+lcb = rns[rns.index("static void rns_lxmf_data_callback") :]
+lcb = lcb[: lcb.index("\n}\n") + 2]
+lcb = re.sub(r"/\*.*?\*/", " ", lcb, flags=re.S)
+lcb = re.sub(r"//[^\n]*", " ", lcb)
+lcb_body = [re.sub(r"\s+", " ", line).strip() for line in lcb.splitlines()]
+lcb_body = [line for line in lcb_body if line]
+LCB_ALLOWED = [
+    "static void rns_lxmf_data_callback(const RNS::Bytes &data, const RNS::Packet &packet) {",
+    "(void)packet;",
+    "rns_inbox_put(&g_rns_lxmf_inbox, data.data(), data.size());",
+    "}",
+]
+assert lcb_body == LCB_ALLOWED, (
+    "the lxmf packet callback body is pinned statement for statement; the parse "
+    "must NOT move into it (it is tens of ms in the drain).\n  expected: %r\n"
+    "  found:    %r" % (LCB_ALLOWED, lcb_body)
+)
+
+# 8i.4 Its ring and buffers are fixed statics at file scope, like the seed.pager
+# inbox, and the parsed message is a static too — sizeof(LxmfMsg) is ~1 KB and
+# the loop task's stack is shared with the drain.
+assert "static rns_inbox g_rns_lxmf_inbox;" in rns, (
+    "the lxmf ring is a fixed static, like g_rns_inbox"
+)
+assert re.search(r"^static uint8_t g_rns_lxmf_payload\[RNS_INBOX_PAYLOAD_MAX\];",
+                 rns, re.M), (
+    "the lxmf pickup scratch must be a fixed static of the same ceiling"
+)
+assert "static LxmfMsg g_rns_lxmf_msg;" in rns, (
+    "the parsed message must be a file-scope static, not a ~1 KB local on the "
+    "loop task's shared stack"
+)
+
+# 8i.5 The parse runs OFF the drain, after the stack, and is the tens-of-ms work
+# the callback was forbidden. lxmf_parse() is called from exactly one place, the
+# loop-task poll, never the callback.
+assert '#include "../lxmf_codec.h"' in rns, (
+    "rns.cpp must include the C1 codec header that owns the parse"
+)
+assert rns_code.count("lxmf_parse(") == 1, (
+    "there is exactly one parse site, in the loop-task poll — never the callback "
+    "and never the drain"
+)
+lxmf_poll = rns[rns.index("static void rns_lxmf_inbox_poll") :]
+lxmf_poll = lxmf_poll[: lxmf_poll.index("\n}\n") + 2]
+assert "lxmf_parse(g_rns_lxmf_payload, len, &g_rns_lxmf_msg)" in lxmf_poll, (
+    "the poll parses the payload it just took out of its ring"
+)
+assert "lxmf_parse(" not in lcb, (
+    "the parse must never appear in the callback: it is tens of ms in the drain"
+)
+# The three-line poll body (drain the ring, count OK, count bad) is where the
+# proof of the pipe lives; both counters must move from it.
+assert "g_rns_lxmf_ok++" in lxmf_poll and "g_rns_lxmf_bad++" in lxmf_poll, (
+    "the poll must bump data_lxmf_ok on a clean parse and data_lxmf_bad on a "
+    "malformed one — the disjoint 'device alive but did not understand' signal"
+)
+# It runs on the tick, after the stack, right after the seed.pager pickup.
+assert "rns_lxmf_inbox_poll();" in tick, "the tick must drive the lxmf poll"
+assert tick.index("rns_stack.loop();") < tick.index("rns_lxmf_inbox_poll();"), (
+    "the lxmf poll must run AFTER Reticulum::loop(), which runs the drain that "
+    "fills its ring — the parse must never sit ahead of the drain"
+)
+
+# 8i.6 It is ANNOUNCED, on the same schedule as seed.pager — create is not
+# reachable, so without an announce nothing can path to it. Its announce call is
+# its own (rns_lxmf_destination.announce()), leaving seed.pager's single site
+# from 8g intact.
+assert "rns_lxmf_destination.announce();" in ann, (
+    "lxmf.delivery must be announced, or no sender can path to it: create is not "
+    "reachable"
+)
+assert ann.index("rns_destination.announce(") < ann.index(
+    "rns_lxmf_destination.announce("), (
+    "both announces share the seed.pager timed window, so the lxmf one follows "
+    "inside the same try/catch"
+)
+
+# 8i.7 The address and the disjoint counters reach GET /rns/status.
+for key in ('"lxmf_address"', '"data_lxmf_rx"', '"data_lxmf_ok"',
+            '"data_lxmf_bad"'):
+    assert key in json_builder, (
+        "GET /rns/status must publish %s — the lxmf address and its receive "
+        "counters are how C2's pipe is shown to work" % key
+    )
+
 # --- 9. rns.cpp: the deferral that turns a packet into a card ----------------
 # The callback may not raise the card: notify_ingest() calls time(NULL), takes
 # the notify_mux critical section, appends to the event ring and write-throughs
@@ -843,11 +987,13 @@ assert re.search(r"^static char g_rns_card_body\[NOTIFY_BODY_LEN\];", rns, re.M)
 
 # 9c. Exactly one producer and exactly one consumer, and each is where it
 # belongs. Comments are stripped first: the prose names both functions.
-assert rns_code.count("rns_inbox_put(") == 1, (
-    "rns_inbox_put() belongs in the packet callback and nowhere else"
+assert rns_code.count("rns_inbox_put(") == 2, (
+    "rns_inbox_put() belongs in the two packet callbacks and nowhere else — "
+    "seed.pager's (g_rns_inbox) and lxmf.delivery's (g_rns_lxmf_inbox)"
 )
-assert rns_code.count("rns_inbox_take(") == 1, (
-    "rns_inbox_take() belongs in the loop-task pickup and nowhere else"
+assert rns_code.count("rns_inbox_take(") == 2, (
+    "rns_inbox_take() belongs in the two loop-task pickups and nowhere else — "
+    "the seed.pager card pickup and the lxmf.delivery parse poll"
 )
 # THE SLICE IS COMMENT-STRIPPED, and that is not tidiness. The first version of
 # this section tested the raw text, and the prose inside rns_inbox_poll() names

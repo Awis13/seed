@@ -61,7 +61,7 @@
 #include "psram_alloc.h"          // psram_calloc_pref: park big buffers in PSRAM
 
 // ===== Configuration =====
-#define SEED_VERSION        "0.9.72"
+#define SEED_VERSION        "0.9.73"
 // Core clock: datasheet puts 240 vs 80 ~11.5mA apart on WAITI. Periph bus holds
 // at 80 for every PLL-fed core clock; go lower and RMT/I2S retimes. Same floor
 // as tembed idle policy (no light sleep — notify latency is the job).

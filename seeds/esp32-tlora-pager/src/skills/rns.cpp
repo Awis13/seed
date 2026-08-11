@@ -262,6 +262,7 @@
  * this include does not lean on that: the header is #pragma once and pulls only
  * <string.h>/<stddef.h>, so it stands on its own wherever it lands. */
 #include "../agents_chat_route.h"
+#include "../lxmf_codec.h"
 
 /* The two wire constants rns/pktfilter.h mirrors, checked against the library's
  * own enums here — this is the only translation unit that sees both. A value
@@ -311,6 +312,18 @@ static_assert(RNS_OUTBOX_PAYLOAD_MAX == (size_t)RNS::Type::Packet::ENCRYPTED_MDU
 #define RNS_DEST_ASPECTS  "pager"
 /* 16-byte destination hash -> 32 hex chars + NUL. */
 #define RNS_DEST_ADDR_MAX 33
+
+/* ---- the LXMF delivery destination ----
+ *
+ * A SECOND IN/SINGLE destination, and a SEPARATE address from seed.pager: this
+ * is the one an LXMF client paths to and addresses a message at. app_name is
+ * "lxmf" and aspects is "delivery" — the single dot-joined aspects string this
+ * port takes (a dot in app_name would throw std::invalid_argument out of the
+ * constructor). It is registered, announced and served exactly like seed.pager
+ * above; because the (app_name, aspects) pair differs, its hash differs, so
+ * Transport::register_destination() cannot collide with our own seed.pager. */
+#define RNS_LXMF_APP_NAME "lxmf"
+#define RNS_LXMF_ASPECTS  "delivery"
 
 #define RNS_ID_PATH  "/rns_identity.id"
 #define RNS_ID_TMP   "/rns_identity.tmp"
@@ -424,6 +437,15 @@ static RNS::Identity rns_identity{RNS::Type::NONE};
 static RNS::Destination rns_destination{RNS::Type::NONE};
 static bool rns_dest_ok = false;
 static char rns_dest_addr[RNS_DEST_ADDR_MAX] = {0};
+
+/* The LXMF delivery destination. File scope and the same lifetime rules as
+ * rns_destination above, including the one that matters most: it is built ONLY
+ * from the loaded identity, never from a NONE identity — an IN/SINGLE
+ * destination handed NONE silently mints a throwaway keypair (Destination.cpp)
+ * and the address would move on every boot with nothing saying so. */
+static RNS::Destination rns_lxmf_destination{RNS::Type::NONE};
+static bool rns_lxmf_dest_ok = false;
+static char rns_lxmf_dest_addr[RNS_DEST_ADDR_MAX] = {0};
 
 /* ---- TCP interface state ----
  *
@@ -847,6 +869,39 @@ void rns_set_room_router(rns_room_router fn) {
 static void rns_data_callback(const RNS::Bytes &data, const RNS::Packet &packet) {
     (void)packet;
     rns_inbox_put(&g_rns_inbox, data.data(), data.size());
+}
+
+/* ---- the LXMF delivery inbox ----
+ *
+ * The lxmf.delivery destination's own receive path, and it obeys EXACTLY the
+ * discipline rns_data_callback documents above — this is a second callback on
+ * the loop task inside the same 8 ms drain, reached the same way
+ * (Transport::inbound() -> Destination::receive()). So the callback is a memcpy
+ * into a dedicated ring and nothing else: no logging, no String, no allocation,
+ * no SPIFFS, no clock, no mutex, and the RNS::Bytes argument stays a reference
+ * for the refcount/COW reason spelled out above. The LXMF parse — msgpack today,
+ * an Ed25519 verify in a later commit, tens of milliseconds either way — runs in
+ * rns_lxmf_inbox_poll() on the loop task AFTER rns_stack.loop() returns, never
+ * here and never in the drain.
+ *
+ * The ring is a second rns_inbox: same 383-byte slot (the LXMF message rides
+ * inside one encrypted single packet, so its plaintext shares the ENCRYPTED_MDU
+ * ceiling) and same "keep the first, count the drop" overflow policy. The parsed
+ * message is a file-scope static rather than a poll-stack local because sizeof
+ * (LxmfMsg) is ~1 KB and the loop task's stack is shared with the drain. */
+static rns_inbox g_rns_lxmf_inbox;
+static uint8_t g_rns_lxmf_payload[RNS_INBOX_PAYLOAD_MAX];
+static LxmfMsg g_rns_lxmf_msg;
+/* Disjoint from the three seed.pager receive outcomes (env_parsed/control/raw):
+ * data_lxmf_ok is a payload that parsed as LXMF, data_lxmf_bad one that reached
+ * the destination and did NOT — the "device alive but did not understand"
+ * signal. data_lxmf_rx (the packets that arrived) is g_rns_lxmf_inbox.received. */
+static uint32_t g_rns_lxmf_ok = 0;
+static uint32_t g_rns_lxmf_bad = 0;
+
+static void rns_lxmf_data_callback(const RNS::Bytes &data, const RNS::Packet &packet) {
+    (void)packet;
+    rns_inbox_put(&g_rns_lxmf_inbox, data.data(), data.size());
 }
 
 /* ---- outbound state ----
@@ -1928,6 +1983,21 @@ static void rns_status_json(JsonDocument &doc) {
     doc["data_cards"] = (unsigned long)g_rns_cards;
     doc["data_card_cut"] = (unsigned long)g_rns_card_cut;
 
+    /* The lxmf.delivery destination, published beside seed.pager's `address`.
+     *   lxmf_address   its 32-hex destination hash, or null if bring-up failed.
+     *   data_lxmf_rx   packets the lxmf callback was handed (inbox.received).
+     *   data_lxmf_ok   ...that then parsed as an LXMF message.
+     *   data_lxmf_bad  ...that reached the destination and did NOT parse — the
+     *                  "device alive but did not understand" signal, disjoint
+     *                  from the three seed.pager outcomes above. Direct reads,
+     *                  like data_cards: loop-task-written scalars, single-copy
+     *                  atomic to read here. */
+    doc["lxmf_address"] = rns_lxmf_dest_addr[0] ? rns_lxmf_dest_addr
+                                                : (const char *)nullptr;
+    doc["data_lxmf_rx"] = (unsigned long)g_rns_lxmf_inbox.received;
+    doc["data_lxmf_ok"] = (unsigned long)g_rns_lxmf_ok;
+    doc["data_lxmf_bad"] = (unsigned long)g_rns_lxmf_bad;
+
     /* THE ENVELOPE MADE VISIBLE, and the pair at the top of it is the point:
      * a payload is either read as `1|<address>|<session>|<text>` or shown
      * exactly as it arrived, and both are ordinary. Which one is happening
@@ -2228,6 +2298,19 @@ static const char *rns_describe() {
            "card is raised either way; `data_routed`, `data_route_refused`\n"
            "and `data_route_reason` are where a message that never reached a\n"
            "conversation shows up, since the screen cannot say so.\n"
+           "The node owns a SECOND IN/SINGLE destination, `lxmf.delivery`, a\n"
+           "separate address announced alongside `seed.pager` on the same\n"
+           "schedule; `lxmf_address` in `/rns/status` is its 32-hex hash. An\n"
+           "LXMF single packet addressed to it is copied off the drain into a\n"
+           "ring of its own and PARSED on the loop task after the stack has run\n"
+           "— never in the callback and never in the drain, because an LXMF\n"
+           "verify is tens of milliseconds. It declines link requests and keeps\n"
+           "PROVE_NONE for a sharper version of seed.pager's reason: this\n"
+           "library proves inside the drain, so a delivery receipt would sign an\n"
+           "Ed25519 there and is left for a later commit. `data_lxmf_rx` counts\n"
+           "the packets it received, `data_lxmf_ok` those that parsed and\n"
+           "`data_lxmf_bad` those that did not — the alive-but-did-not-\n"
+           "understand signal.\n"
            "Inbound packets pass a filter registered on Transport before the\n"
            "stack starts: it drops announces not marked as a path response,\n"
            "before the Ed25519 signature is checked — a verification that\n"
@@ -2543,6 +2626,14 @@ static void rns_announce_poll() {
         bool failed = false;
         try {
             rns_destination.announce();
+            /* CREATE IS NOT REACHABLE. Without an announce no sender can path to
+             * lxmf.delivery, so this is mandatory, not decorative. It is announced
+             * on the SAME schedule and inside the SAME timed window as seed.pager:
+             * announce() is synchronous and signs with software Ed25519, so the
+             * window now measures the pair, but both are off the drain and paced
+             * to the 30 min interval (plus the reconnect edge), never per packet.
+             * Empty app_data — an LXMF display-name announce is a later commit. */
+            if (rns_lxmf_dest_ok) rns_lxmf_destination.announce();
             ok = true;
         } catch (const std::exception &e) {
             failed = true;
@@ -2569,6 +2660,30 @@ static void rns_announce_poll() {
     /* Stamped every tick, not only when an announce fired: this is what makes
      * the offline->online edge a one-tick event rather than a permanent state. */
     g_rns_ann_was_online = online;
+}
+
+/* Take whatever the lxmf.delivery callback left and PARSE it off the drain.
+ *
+ * Loop task only, and after rns_stack.loop() for the same reason rns_inbox_poll()
+ * below is: the drain that fills this ring runs inside that call, so a pickup
+ * ahead of it is one tick stale. What this adds that the seed.pager pickup does
+ * not is the parse, and the parse is the whole reason it is HERE and not in the
+ * callback — lxmf_parse() walks hostile msgpack now and will run an Ed25519
+ * verify in a later commit, tens of milliseconds either way, which must never
+ * land in the 8 ms drain.
+ *
+ * C2 proves the pipe and no more: a clean parse bumps data_lxmf_ok, a malformed
+ * one bumps data_lxmf_bad, and the real card/chat routing (title/content onto a
+ * card, a reply) is a later commit. The counters plus data_lxmf_rx in
+ * /rns/status are how the receive path is shown to work end to end. */
+static void rns_lxmf_inbox_poll() {
+    uint16_t len = 0;
+    while (rns_inbox_take(&g_rns_lxmf_inbox, g_rns_lxmf_payload,
+                          sizeof(g_rns_lxmf_payload), &len)) {
+        LxmfReason rr = lxmf_parse(g_rns_lxmf_payload, len, &g_rns_lxmf_msg);
+        if (rr == LXMF_OK) g_rns_lxmf_ok++;
+        else g_rns_lxmf_bad++;
+    }
 }
 
 /* Take whatever the packet callback left in the inbox and put it on the screen.
@@ -3145,6 +3260,10 @@ static void skill_rns_poll() {
     /* After rns_stack.loop(), never before it: the drain that fills the inbox
      * runs inside that call, so a pickup ahead of it is one tick stale. */
     rns_inbox_poll();
+    /* The lxmf.delivery ring is drained and parsed on the same rule and for a
+     * sharper reason: the parse it runs is the tens-of-ms work the callback was
+     * forbidden, so it must be here, after the drain, never inside it. */
+    rns_lxmf_inbox_poll();
     /* Also after the stack, and for a sharper version of the same reason: the
      * path response the send is waiting for arrives through the drain inside
      * rns_stack.loop(), so a step taken ahead of it reads last tick's path
@@ -3314,6 +3433,59 @@ static void skill_rns_init() {
             Serial.printf("[rns] address render failed: %s\n", e.what());
         } catch (...) {
             rns_error = "destination created but its address could not be rendered";
+        }
+    }
+
+    /* The LXMF delivery destination, a SEPARATE address alongside seed.pager.
+     * Same gating (rns_started && rns_identity_ok) and the same construction
+     * rules as the seed.pager block above — built on the loaded identity, IN/
+     * SINGLE, links declined — because a different (app_name, aspects) pair only
+     * changes the hash, not the hazards. register_destination() cannot collide:
+     * two distinct hashes.
+     *
+     * THE PROOF STRATEGY IS LEFT AT THE LIBRARY DEFAULT, PROVE_NONE, ON PURPOSE,
+     * and not for seed.pager's reason. microReticulum 0.5.0 runs the proof
+     * strategy in Transport::inbound() ON THE LOOP TASK INSIDE THE DRAIN
+     * (Transport.cpp: after destination.receive(), a PROVE_APP destination calls
+     * its _proof_requested callback and, on true, packet.prove()), and
+     * packet.prove() is Identity::prove() — an Ed25519 SIGN plus a packet send,
+     * synchronous, tens of milliseconds. Setting PROVE_APP here would therefore
+     * drop that sign into the 8 ms drain for every message we recognise as ours,
+     * which is exactly the cost this file declines everywhere else. There is no
+     * off-loop prove hook in this library, so a delivery RECEIPT — which is what
+     * PROVE_APP buys — waits for a later commit that can prove after the drain.
+     * PROVE_ALL is worse still (a sign per inbound DATA packet, authenticated or
+     * not) and is never an option here. */
+    if (rns_started && rns_identity_ok) {
+        try {
+            rns_lxmf_destination = RNS::Destination(
+                rns_identity, RNS::Type::Destination::IN,
+                RNS::Type::Destination::SINGLE, RNS_LXMF_APP_NAME,
+                RNS_LXMF_ASPECTS);
+            rns_lxmf_destination.accepts_links(false);
+            rns_lxmf_destination.set_packet_callback(rns_lxmf_data_callback);
+            rns_lxmf_dest_ok = true;
+        } catch (const std::exception &e) {
+            rns_error = "exception creating the lxmf destination";
+            Serial.printf("[rns] lxmf destination failed: %s\n", e.what());
+        } catch (...) {
+            rns_error = "unknown exception creating the lxmf destination";
+        }
+    }
+
+    /* Its address string, in its own scope for the same reason seed.pager's is:
+     * from the constructor onwards the destination is registered and answering
+     * path requests whatever toHex() does, so a rendering failure must not read
+     * as the destination not existing. */
+    if (rns_lxmf_dest_ok) {
+        try {
+            snprintf(rns_lxmf_dest_addr, sizeof(rns_lxmf_dest_addr), "%s",
+                     rns_lxmf_destination.hash().toHex().c_str());
+        } catch (const std::exception &e) {
+            rns_error = "lxmf destination created but its address could not be rendered";
+            Serial.printf("[rns] lxmf address render failed: %s\n", e.what());
+        } catch (...) {
+            rns_error = "lxmf destination created but its address could not be rendered";
         }
     }
 
