@@ -1283,6 +1283,40 @@ for banned in ("SD.", "SPIFFS", "delay(", "vTaskDelay"):
         "arriving" % banned
     )
 
+# 9d-quinquies. AND THE POINTER IS ACTUALLY SET. Everything above describes a
+# call through a pointer that stayed null while the other half of the chat was
+# being written elsewhere — a hook nobody installs is a card and nothing else,
+# which is exactly what the null default means and exactly what it looked like
+# from the outside. This is the one line that closes the chat, so it is pinned:
+# the room owner's entry point, registered at bring-up, once.
+assert rns_code.count("rns_set_room_router(claude_route_incoming)") == 1, (
+    "the router must be installed exactly once, with the room owner's entry "
+    "point: no installation leaves the inbound half raising a card and "
+    "dropping the message, and two would only be a second chance to get the "
+    "same pointer wrong"
+)
+assert '#include "../agents_chat_route.h"' in rns, (
+    "rns.cpp must include the seam's header rather than re-declare "
+    "claude_route_incoming: the header is where the loop-safety contract the "
+    "router promises is written down"
+)
+rns_init_body = init[: init.index("skill_register(&rns_skill);")]
+assert "rns_set_room_router(claude_route_incoming);" in rns_init_body, (
+    "the registration belongs in skill_rns_init, with the rest of the RNS "
+    "bring-up, and before the skill is registered"
+)
+# Unconditionally: the router can only be reached from a packet the stack
+# delivered, so gating the installation on how bring-up went would only be able
+# to lose messages on a node that came up later through POST /rns/config.
+assert re.search(
+    r"rns_set_room_router\(claude_route_incoming\);\s*\n\s*Serial\.printf\(\"\[rns\] started=",
+    rns,
+), (
+    "the installation must sit at the end of the bring-up, outside every "
+    "`if (rns_started)` scope: a hook that exists only when boot went well is "
+    "a hook missing on the node that needed POST /rns/config to come up"
+)
+
 # 9e. THE PICKUP RUNS AFTER THE STACK. The drain that fills the inbox is inside
 # rns_stack.loop(), so a pickup ahead of it serves last tick's message and turns
 # every delivery into an extra RNS_TICK_MS of latency — and makes the overflow

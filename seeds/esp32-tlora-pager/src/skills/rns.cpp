@@ -254,6 +254,15 @@
 #include "rns/outbox.h"
 #include "rns/pktfilter.h"
 
+/* The other side of the room hook: claude_route_incoming(), the router this
+ * file installs at init. Declared in its own header rather than reached for as
+ * a bare extern, because the header is also where the loop-safety contract the
+ * router promises is written down. skills/agents.cpp, which defines it,
+ * includes the same header and is included by main.cpp BEFORE this file — but
+ * this include does not lean on that: the header is #pragma once and pulls only
+ * <string.h>/<stddef.h>, so it stands on its own wherever it lands. */
+#include "../agents_chat_route.h"
+
 /* The two wire constants rns/pktfilter.h mirrors, checked against the library's
  * own enums here — this is the only translation unit that sees both. A value
  * drifting in a future microReticulum breaks the firmware build instead of
@@ -3037,6 +3046,18 @@ static void skill_rns_init() {
             rns_error = "unknown exception registering the TCP interface";
         }
     }
+
+    /* THE ROOM. Until this line the router pointer was null and an inbound
+     * envelope became a card and nothing else — the behaviour that shipped
+     * before either half of the chat existed. One call is the whole wiring:
+     * from here a parsed envelope also lands in the `claude` agent's room named
+     * by its session field, and the two counters in GET /rns/status start
+     * moving. It is registered unconditionally, whatever the bring-up above
+     * concluded, because the router can only ever be reached from a packet the
+     * stack delivered — a node that failed to start delivers none, and a node
+     * that comes up later through POST /rns/config must not find the hook
+     * missing because of how boot went. */
+    rns_set_room_router(claude_route_incoming);
 
     Serial.printf("[rns] started=%d identity=%d hash=%s iface=%s:%u en=%d%s%s\n",
                   (int)rns_started, (int)rns_identity_ok,
