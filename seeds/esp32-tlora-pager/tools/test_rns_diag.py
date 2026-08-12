@@ -22,6 +22,7 @@ These asserts pin the shape so a later edit cannot quietly relabel the stack
 unit, drop the reset, or start iterating the live map from the HTTP handler.
 """
 
+import re
 from pathlib import Path
 
 ROOT = Path(__file__).parents[1]
@@ -56,8 +57,22 @@ route = slice_between(
 )
 
 # --- version bump so /health distinguishes this build ------------------------
-assert '#define SEED_VERSION        "0.9.77"' in main, (
-    "SEED_VERSION must bump to 0.9.77 for this build"
+# The intent is "the version moved for the build that added these fields", but
+# pinning the exact literal made that a fuse: the assert went red the moment a
+# LATER, unrelated commit bumped the version, blaming this diagnostic for
+# somebody else's edit. So the floor is pinned instead of the value — the
+# version must still parse and must not have regressed below the one these
+# fields shipped in, which is the part /health actually depends on. The sibling
+# pin in test_boot_resilience.py deliberately names no literal for the same
+# reason.
+DIAG_MIN_VERSION = (0, 9, 77)
+m = re.search(r'#define\s+SEED_VERSION\s+"(\d+)\.(\d+)\.(\d+)"', main)
+assert m, "SEED_VERSION must be a parseable dotted version in main.cpp"
+assert tuple(int(g) for g in m.groups()) >= DIAG_MIN_VERSION, (
+    "SEED_VERSION must not regress below the build that added these /rns/status "
+    "fields ({}); found {}".format(
+        ".".join(str(n) for n in DIAG_MIN_VERSION), m.group(0)
+    )
 )
 
 # --- 1. stack field: sampled on the loop task, unit baked into the name ------
