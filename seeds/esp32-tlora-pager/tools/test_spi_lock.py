@@ -275,9 +275,15 @@ for sig in ("static void agents_sync_view(",
 
 # agents_sync_view keeps the size-shrink → full-rebuild guard (external
 # truncation across calls; a concurrent writer is excluded by agents_mux).
+# The sync cursor moved into the one shared scrollback window (the per-
+# conversation window was 12.5 KB a slot), so the guard is pinned there; the
+# invariant is unchanged — a file that shrank between calls forces a rebuild.
 sync = fn_body(agents, "static void agents_sync_view(")
-assert "sz < a.file_sync" in sync, (
+assert "sz < g_win.file_sync" in sync, (
     "agents_sync_view must keep the shrink-detect full-rebuild path"
+)
+assert "agents_window_take(idx)" in sync, (
+    "the shrink-detect path must empty the window, not just reset a counter"
 )
 
 # agents_session_refresh_counts counts newlines in bounded bus chunks + yields.

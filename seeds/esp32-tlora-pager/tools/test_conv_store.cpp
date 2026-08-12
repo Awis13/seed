@@ -379,6 +379,75 @@ static void test_label_cannot_forge_a_record(void) {
     assert(got.dead == 1);
 }
 
+/* --- 7c. slot planning: who gets evicted when the table is full ------------- */
+
+static void test_slot_plan(void) {
+    /* Two seeded conversations, six free slots: a new one appends. */
+    uint8_t seeded[8] = {1, 1, 0, 0, 0, 0, 0, 0};
+    uint32_t use[8]   = {50, 51, 0, 0, 0, 0, 0, 0};
+    assert(conv_slot_plan(2, 8, seeded, use) == 2);
+    assert(conv_slot_plan(7, 8, seeded, use) == 7);
+
+    /* Full table: the least-recently-used NON-seeded slot goes. Slot 1 is the
+     * globally oldest but seeded, so it must survive; slot 5 is the oldest peer. */
+    uint32_t full_use[8] = {90, 1, 40, 70, 60, 20, 30, 80};
+    uint8_t full_seed[8] = {1, 1, 0, 0, 0, 0, 0, 0};
+    int victim = conv_slot_plan(8, 8, full_seed, full_use);
+    assert(victim == 5);
+    assert(full_seed[victim] == 0);          /* never a seeded slot */
+
+    /* Make that peer the most recent and the choice must move on — otherwise
+     * the "least recently used" claim is just the lowest index in disguise. */
+    full_use[5] = 99;
+    assert(conv_slot_plan(8, 8, full_seed, full_use) == 6);
+
+    /* Ties resolve to the lowest index, deterministically. */
+    uint32_t tie_use[8] = {9, 9, 5, 5, 5, 5, 5, 5};
+    assert(conv_slot_plan(8, 8, full_seed, tie_use) == 2);
+    assert(conv_slot_plan(8, 8, full_seed, tie_use) == 2);
+
+    /* A table of nothing but seeded conversations refuses rather than throwing
+     * one of the device's own doors away. */
+    uint8_t all_seeded[4] = {1, 1, 1, 1};
+    uint32_t any_use[4] = {1, 2, 3, 4};
+    assert(conv_slot_plan(4, 4, all_seeded, any_use) == -1);
+
+    /* Degenerate inputs are refused, not guessed at. */
+    assert(conv_slot_plan(0, 0, seeded, use) == -1);
+    assert(conv_slot_plan(8, 8, NULL, NULL) == -1);
+}
+
+/* --- 7d. a minted peer survives a reboot with its return address ------------ */
+
+static void test_peer_roundtrip(void) {
+    /* The shape a mesh peer gets: id from its address, no rooms, a 32-byte key.
+     * This is the whole point of the room-less manifest line — without it the
+     * store could describe a peer on disk and forget it on the next boot. */
+    uint8_t key[CONV_REPLY_MAX];
+    for (size_t i = 0; i < sizeof(key); i++) key[i] = (uint8_t)(i * 3 + 5);
+
+    char line[CONV_MANIFEST_LINE_LEN];
+    assert(conv_manifest_format(line, sizeof(line), PEER_ID, "", "night walk",
+                                (uint8_t)CONV_MESH, key, (uint8_t)sizeof(key), 0));
+
+    ConvManifestLine got;
+    assert(conv_manifest_parse(line, &got));
+    assert(strcmp(got.conv, PEER_ID) == 0);
+    assert(got.session[0] == '\0');            /* room-less, as minted */
+    assert(strcmp(got.label, "night walk") == 0);
+    assert(got.transport == (uint8_t)CONV_MESH);
+    assert(got.reply_len == CONV_REPLY_MAX);
+    assert(memcmp(got.reply, key, sizeof(key)) == 0);
+
+    /* The log it reopens after the reboot is the same file it wrote before —
+     * which is what makes evicting its RAM slot lossless. */
+    char p1[CONV_PATH_LEN], p2[CONV_PATH_LEN];
+    path_of(PEER_ID, "", p1, sizeof(p1));
+    path_of(got.conv, got.session, p2, sizeof(p2));
+    assert(strcmp(p1, p2) == 0);
+    assert_path_sane(p2);
+}
+
 /* --- 8. the manifest file names moved, and the old one is only a reader ------ */
 
 static void test_manifest_names(void) {
@@ -397,6 +466,8 @@ int main(void) {
     test_new_line_parse();
     test_malformed();
     test_label_cannot_forge_a_record();
+    test_slot_plan();
+    test_peer_roundtrip();
     test_manifest_names();
     printf("conversation store tests: OK\n");
     return 0;

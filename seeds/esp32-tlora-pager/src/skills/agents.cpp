@@ -61,12 +61,12 @@
 #include "../transport.h"          // the backend contract: transport_send + the inbox doors
 #include "../rns/outbox.h"         // the OTHER half of that seam: rns_send_envelope + rns_peer_addr
 
-/* Conversation slots. Still 2 for now — every slot costs a full AGENT_VIEW_MAX
- * viewport (~12.6 KB of static RAM), so growing the table is a memory decision
- * of its own and not part of laying the record down. g_conv_n is the LIVE count
- * so a later commit can register a peer conversation at runtime without another
- * pass over every loop in this file. */
-#define CONV_MAX            2
+/* Conversation slots. A slot used to carry its own AGENT_VIEW_MAX viewport, so
+ * the table cost 12.6 KB per conversation and could not grow without spending
+ * static RAM the board does not have. The window is shared now (see ConvWindow)
+ * and a slot is ~840 bytes, so eight of them cost less than the two used to.
+ * g_conv_n is the LIVE count; slots above it are free for minted peers. */
+#define CONV_MAX            8   /* seeded + minted peers; ~840 B each now */
 #define CONV_SEEDED_N       2       /* claude + hermes, pre-created below */
 /* Kept as the capacity spelling the rest of the tree already uses (main.cpp
  * sizes its UI copies with it; meshcore.cpp sizes its per-agent TX flags). */
@@ -125,17 +125,54 @@ struct Conversation {
     uint8_t n_sessions;
     uint8_t active_idx;         // into sessions[]
     uint32_t session_lines[AGENT_SESSIONS_MAX];  // persisted msg count per session
-    uint32_t file_sync;         // JSONL bytes already folded into view+lines
     uint32_t lines;             // total messages in the active session
-    uint8_t vn;                 // messages currently in the view window
-    uint32_t win_start;         // absolute line index of view[0] (tail or loaded page)
-    AgentLine view[AGENT_VIEW_MAX];   // window over the active session
+    /* Newest line of the active room, kept for the picker and GET /agents. This
+     * is ALL the RAM a conversation nobody is looking at needs: the scrollable
+     * window lives in g_win (one, shared) because only one conversation is ever
+     * on screen. Holding a 24-message window per conversation cost 12,480 of
+     * the record's 12,796 bytes and bought nothing — see ConvWindow below. */
+    AgentLine last;
+    /* Monotonic use stamp, for choosing an eviction victim (see conv_mint). */
+    uint32_t last_use;
     /* Per-session liveness (live-room roster, README). 0 = alive/shown,
      * 1 = dead/hidden from the room picker. MARK-NOT-DELETE: a dead room's
      * JSONL history file is never removed — hiding is reversible (a later
      * roster can un-mark it), deletion is not and is user-only. */
     uint8_t session_dead[AGENT_SESSIONS_MAX];
 };
+
+/*
+ * THE ONE SCROLLBACK WINDOW.
+ *
+ * Every viewport caller in main.cpp passes agent_focus — the chat screen draws
+ * exactly one conversation — so the window is a property of the SCREEN, not of
+ * each conversation. It used to be per-conversation, which meant every slot
+ * carried a 24-message buffer that only mattered while that slot was the one
+ * being looked at, and made each new conversation cost 12.5 KB of static RAM.
+ * With one shared window a conversation costs ~840 bytes, so the table can hold
+ * real peers for LESS total RAM than two conversations used to take.
+ *
+ * `owner` is the conversation the window is currently loaded for. It changes
+ * only on an explicit focus (agents_thread_goto_tail / _goto_page, and the
+ * lazy focus in agents_thread_view), never as a side effect of a message
+ * arriving — an inbound line for a conversation nobody is reading must not
+ * blank the chat that IS open. Those conversations take the line into `last`
+ * and their counters; the full window is rebuilt from the JSONL when the user
+ * actually opens them, which is the same disk work the old code did on every
+ * room switch anyway. The disk is the store; this is only a display cache.
+ */
+struct ConvWindow {
+    int      owner;             // conversation index loaded here, -1 = none
+    uint32_t file_sync;         // JSONL bytes already folded into view
+    uint8_t  vn;                // messages currently in the window
+    uint32_t win_start;         // absolute line index of view[0] (tail or page)
+    AgentLine view[AGENT_VIEW_MAX];
+};
+static ConvWindow g_win = { -1, 0, 0, 0, {} };
+
+/* Bumped on every append/select so eviction can find the least-recently-used
+ * conversation without a timestamp (the clock is not trustworthy at boot). */
+static uint32_t g_conv_clock = 0;
 
 /* The two bridge/C1 agents, pre-created as CONV_AGENT conversations. Their
  * return address is the agent id's own bytes, which is exactly what the bridge
@@ -189,7 +226,7 @@ static unsigned long agents_now_s() {
 }
 
 /* Forward decls (defined later in this TU; store section uses them early). */
-static void agents_view_append(Conversation &a, bool from_me, uint32_t ts,
+static void agents_view_append(ConvWindow &w, bool from_me, uint32_t ts,
                                const char *text);
 static int agents_find(const char *id);
 static int agents_session_add(int idx, const char *name);
@@ -288,7 +325,14 @@ static void agents_session_sanitize(const char *in, char *out, size_t out_n) {
 static void agents_store_append(int idx, bool from_me, const char *text) {
     Conversation &a = g_convs[idx];
     uint32_t ts = agents_now_s();
-    agents_view_append(a, from_me, ts, text);
+    /* The picker's cache is updated for EVERY conversation; the scrollback
+     * window only when this conversation is the one on screen. A line arriving
+     * for a conversation nobody is reading must not disturb the open chat. */
+    a.last.from_me = from_me;
+    a.last.ts = ts;
+    snprintf(a.last.text, sizeof(a.last.text), "%s", text ? text : "");
+    a.last_use = ++g_conv_clock;
+    if (g_win.owner == idx) agents_view_append(g_win, from_me, ts, text);
     if (!agents_store_ready()) return;
     String path = agents_log_path(a.id, a.sessions[a.active_idx]);
     /* Caller holds agents_mux (agents_push_line); bus lock second — order. */
@@ -328,25 +372,36 @@ static void agents_store_append(int idx, bool from_me, const char *text) {
     if (written > 0) {
         a.lines++;
         a.session_lines[a.active_idx]++;
-        a.file_sync += written;
+        if (g_win.owner == idx) g_win.file_sync += written;
     }
 }
 
-static void agents_view_append(Conversation &a, bool from_me, uint32_t ts,
+static void agents_view_append(ConvWindow &w, bool from_me, uint32_t ts,
                                const char *text) {
-    if (a.vn >= AGENT_VIEW_MAX) {
-        memmove(&a.view[0], &a.view[1], (AGENT_VIEW_MAX - 1) * sizeof(AgentLine));
-        a.view[AGENT_VIEW_MAX - 1].from_me = from_me;
-        a.view[AGENT_VIEW_MAX - 1].ts = ts;
-        snprintf(a.view[AGENT_VIEW_MAX - 1].text, sizeof(a.view[0].text),
+    if (w.vn >= AGENT_VIEW_MAX) {
+        memmove(&w.view[0], &w.view[1], (AGENT_VIEW_MAX - 1) * sizeof(AgentLine));
+        w.view[AGENT_VIEW_MAX - 1].from_me = from_me;
+        w.view[AGENT_VIEW_MAX - 1].ts = ts;
+        snprintf(w.view[AGENT_VIEW_MAX - 1].text, sizeof(w.view[0].text),
                  "%s", text ? text : "");
-        a.win_start++;
+        w.win_start++;
     } else {
-        a.view[a.vn].from_me = from_me;
-        a.view[a.vn].ts = ts;
-        snprintf(a.view[a.vn].text, sizeof(a.view[0].text), "%s", text ? text : "");
-        a.vn++;
+        w.view[w.vn].from_me = from_me;
+        w.view[w.vn].ts = ts;
+        snprintf(w.view[w.vn].text, sizeof(w.view[0].text), "%s", text ? text : "");
+        w.vn++;
     }
+}
+
+/* Hand the window to `idx` and empty it, so the next sync rebuilds from byte 0.
+ * The conversation's own line count is reset with it: the two are read back
+ * together by agents_sync_view and must not disagree. */
+static void agents_window_take(int idx) {
+    g_win.owner = idx;
+    g_win.file_sync = 0;
+    g_win.vn = 0;
+    g_win.win_start = 0;
+    if (idx >= 0 && idx < CONV_MAX) g_convs[idx].lines = 0;
 }
 
 /* Buffered JSONL line scanner. Reads the file in 512-byte blocks instead of
@@ -454,6 +509,11 @@ static void agents_scan_chunked(AgentJScanner &sc, char *lbuf, size_t lbuf_n,
 static void agents_sync_view(int idx) {
     Conversation &a = g_convs[idx];
     if (!agents_store_ready()) return;
+    /* Syncing a conversation the window is not loaded for would fold its lines
+     * into someone else's scrollback, so the window is taken first. Taking it
+     * empties the window, which turns the delta-sync below into a full rebuild
+     * — the same work the old per-conversation code did on every room switch. */
+    if (g_win.owner != idx) agents_window_take(idx);
     String path = agents_log_path(a.id, a.sessions[a.active_idx]);
     /* Open + size/seek under one short bus burst; the line scan below bounds
      * its own bus hold (mux held throughout — see agents_scan_chunked). */
@@ -463,17 +523,16 @@ static void agents_sync_view(int idx) {
     {
         HwSpiBusGuard bus;
         if (!g_store->exists(path.c_str())) {
-            a.file_sync = 0; a.lines = 0; a.vn = 0; a.win_start = 0;
+            agents_window_take(idx);
             return;
         }
         f = g_store->open(path.c_str(), "r");
-        if (!f) { a.file_sync = 0; a.lines = 0; a.vn = 0; a.win_start = 0; return; }
+        if (!f) { agents_window_take(idx); return; }
         size_t sz = f.size();
-        if (sz < a.file_sync) {      // file shrank between calls → full rebuild
-            a.file_sync = 0; a.lines = 0; a.vn = 0; a.win_start = 0;
-        }
+        if (sz < g_win.file_sync)    // file shrank between calls → full rebuild
+            agents_window_take(idx);
         final_size = (uint32_t)sz;
-        do_scan = (a.file_sync < sz && f.seek(a.file_sync));
+        do_scan = (g_win.file_sync < sz && f.seek(g_win.file_sync));
     }
     if (do_scan) {
         char lbuf[AGENT_JSONL_MAX];
@@ -483,14 +542,75 @@ static void agents_sync_view(int idx) {
             bool from_me;
             uint32_t ts;
             if (line[0] && agents_jsonl_parse(line, from_me, ts, text, sizeof(text))) {
-                agents_view_append(a, from_me, ts, text);
+                agents_view_append(g_win, from_me, ts, text);
                 a.lines++;
+                /* The newest line read is also the picker's cached line. */
+                a.last.from_me = from_me;
+                a.last.ts = ts;
+                snprintf(a.last.text, sizeof(a.last.text), "%s", text);
             }
         });
     }
-    a.file_sync = final_size;
+    g_win.file_sync = final_size;
     a.session_lines[a.active_idx] = a.lines;
     { HwSpiBusGuard bus; f.close(); }
+}
+
+/*
+ * Find a conversation by id, or MINT one.
+ *
+ * This is what C1's fixed table could not do and what a transport needs the
+ * moment a stranger's first message arrives: a peer has no slot until it
+ * speaks. The id is the caller's (for a peer, the first hex of its address);
+ * label, transport and return address come from the wire that met it.
+ *
+ * WHEN THE TABLE IS FULL, the least-recently-used NON-SEEDED conversation is
+ * evicted. Seeded conversations are the device's own doors — the user must
+ * always be able to reach them — so they are never candidates, and a table of
+ * nothing but seeded slots refuses (-1) instead of throwing one out.
+ *
+ * EVICTION IS NOT DELETION, which is what makes it safe: the slot is a RAM
+ * cache of a conversation whose history lives in its own /conv.<id> file, and
+ * that file is never touched here. If the evicted peer speaks again it is
+ * re-minted onto the same id, reopens the same log, and its history is still
+ * there — exactly the MARK-NOT-DELETE rule the dead-room roster already
+ * follows. Losing the slot costs a rebuild, not a conversation.
+ *
+ * Caller holds agents_mux. Returns the slot index, or -1.
+ */
+static int conv_mint(const char *id, const char *label, uint8_t transport,
+                     const uint8_t *addr, uint8_t addr_len) {
+    if (!id || !id[0]) return -1;
+    int idx = agents_find(id);
+    if (idx >= 0) return idx;                    /* find, before mint */
+
+    uint8_t seeded_of[CONV_MAX];
+    uint32_t use_of[CONV_MAX];
+    for (int i = 0; i < g_conv_n; i++) {
+        seeded_of[i] = g_convs[i].seeded;
+        use_of[i] = g_convs[i].last_use;
+    }
+    idx = conv_slot_plan(g_conv_n, CONV_MAX, seeded_of, use_of);
+    if (idx < 0) return -1;                      /* table is all seeded */
+    if (idx >= g_conv_n) {
+        g_conv_n = (uint8_t)(idx + 1);           /* took a free slot */
+    } else {
+        event_add("conv evict %s for %s", g_convs[idx].id, id);
+        if (g_win.owner == idx) agents_window_take(-1);
+    }
+
+    Conversation &a = g_convs[idx];
+    memset(&a, 0, sizeof(a));
+    snprintf(a.id, sizeof(a.id), "%s", id);
+    snprintf(a.label, sizeof(a.label), "%s", (label && label[0]) ? label : id);
+    a.transport = transport;
+    if (addr && addr_len) {
+        a.reply_len = (addr_len > CONV_REPLY_MAX) ? CONV_REPLY_MAX : addr_len;
+        memcpy(a.reply_addr, addr, a.reply_len);
+    }
+    a.seeded = 0;
+    a.last_use = ++g_conv_clock;
+    return idx;
 }
 
 /* Apply the conversation-level half of a manifest line: the fields that belong
@@ -520,6 +640,26 @@ static void agents_conv_apply(Conversation &a, const ConvManifestLine &ml) {
  * this used to do) meant the store could describe a peer conversation on disk
  * and then silently forget it on the next boot. */
 static void agents_manifest_apply(const ConvManifestLine &ml) {
+    /* THE LOADER CREATES NOTHING. It resolves against the conversations this
+     * build already has, and a line naming any other is skipped.
+     *
+     * WHY, given the store can now mint: /conversations.txt lives on a card a
+     * user can pull and edit, and a minted conversation is not seeded — so
+     * conv_route_resolve() would take its transport and return address from
+     * that file verbatim. Minting here would therefore let a hand-written line
+     * conjure a conversation whose replies go wherever the line says, which is
+     * exactly the re-pointing the seeded-route rule was written to stop, just
+     * through a different door. The legacy manifest makes it concrete: it can
+     * still name retired agent ids, and minting those would resurrect rooms
+     * that post to the bridge.
+     *
+     * A non-AGENT line is skipped for the same reason and one more: no peer
+     * conversation is created anywhere in this build, so a peer line on disk
+     * can only have been written by hand. conv_mint() and the room-less
+     * manifest line are built and tested for the receiver that will need them;
+     * loading a route from the card is a trust decision that belongs with the
+     * transport that can actually verify a peer. */
+    if (ml.transport != CONV_AGENT) return;
     int idx = agents_find(ml.conv);
     if (idx < 0) return;
     Conversation &a = g_convs[idx];
@@ -708,27 +848,38 @@ bool agents_session_refresh_counts(int idx) {
             { HwSpiBusGuard bus; f.close(); }
         }
         a.session_lines[j] = cnt;
-        if (j == a.active_idx && a.lines != cnt)
-            agents_sync_view(idx);   // re-anchor window + win_start to the file
+        if (j == a.active_idx && a.lines != cnt) {
+            /* Re-anchor the window to the file only when this conversation IS
+             * the window — otherwise taking it would blank the open chat, and
+             * an unfocused conversation needs nothing but an honest count. */
+            if (g_win.owner == idx) agents_sync_view(idx);
+            else                    a.lines = cnt;
+        }
     }
     agents_unlock();
     return true;
 }
 
-/* Select an existing session: rewind + reload the viewport from SD. */
+/* Select an existing session. Reloads the scrollback from SD when this
+ * conversation is the one on screen; for any other conversation only the active
+ * room and its count move, because reloading would hand the window away from
+ * the chat the user is actually reading. The off-loop route drain selects rooms
+ * on conversations nobody is looking at, which is exactly that case. */
 bool agents_session_select(int idx, const char *name) {
     if (idx < 0 || idx >= g_conv_n || !name || !name[0]) return false;
     agents_lock();
     int in_list = agents_session_exists(idx, name);
     if (in_list < 0) { agents_unlock(); return false; }
-    g_convs[idx].active_idx = (uint8_t)in_list;
-    g_convs[idx].file_sync = 0;
-    g_convs[idx].lines = 0;
-    g_convs[idx].vn = 0;
-    g_convs[idx].win_start = 0;
-    agents_sync_view(idx);
-    g_convs[idx].win_start = (g_convs[idx].lines > g_convs[idx].vn)
-        ? (g_convs[idx].lines - g_convs[idx].vn) : 0;
+    Conversation &a = g_convs[idx];
+    a.active_idx = (uint8_t)in_list;
+    a.last_use = ++g_conv_clock;
+    if (g_win.owner == idx) {
+        agents_window_take(idx);            // empty it: a different room now
+        agents_sync_view(idx);
+        g_win.win_start = (a.lines > g_win.vn) ? (a.lines - g_win.vn) : 0;
+    } else {
+        a.lines = a.session_lines[in_list];
+    }
     agents_unlock();
     return true;
 }
@@ -758,7 +909,9 @@ int agents_session_create(int idx, const char *wanted, bool &created) {
         in_list = agents_session_add(idx, name);
     }
     a.active_idx = (uint8_t)in_list;
-    a.file_sync = 0; a.lines = 0; a.vn = 0; a.win_start = 0;
+    a.last_use = ++g_conv_clock;
+    a.lines = 0;
+    if (g_win.owner == idx) agents_window_take(idx);
     if (created) agents_manifest_persist();
     event_add("agent %s session %s %s", a.id,
               created ? "new" : "select", name);
@@ -774,25 +927,26 @@ int agents_session_create(int idx, const char *wanted, bool &created) {
 static void agents_load_page(int idx, uint32_t end_line) {
     Conversation &a = g_convs[idx];
     if (!agents_store_ready()) return;
+    g_win.owner = idx;                  /* paging is an explicit focus */
     if (end_line > a.lines) end_line = a.lines;
     uint32_t keep_from = (end_line > AGENT_VIEW_MAX) ? (end_line - AGENT_VIEW_MAX) : 0;
     String path = agents_log_path(a.id, a.sessions[a.active_idx]);
     /* Page scan runs from byte 0; bound its bus hold in chunks (mux held). */
     File f;
     { HwSpiBusGuard bus; f = g_store->open(path.c_str(), "r"); }
-    if (!f) { a.vn = 0; a.win_start = 0; return; }
+    if (!f) { g_win.vn = 0; g_win.win_start = 0; return; }
     char lbuf[AGENT_JSONL_MAX];
     char text[AGENT_TEXT_LEN];
     uint32_t line_idx = 0;
-    a.vn = 0;
-    a.win_start = keep_from;
+    g_win.vn = 0;
+    g_win.win_start = keep_from;
     AgentJScanner sc(f);
     agents_scan_chunked(sc, lbuf, sizeof(lbuf), [&](char *line) {
         bool from_me;
         uint32_t ts;
         if (line[0] && line_idx >= keep_from && line_idx < end_line &&
             agents_jsonl_parse(line, from_me, ts, text, sizeof(text))) {
-            agents_view_append(a, from_me, ts, text);
+            agents_view_append(g_win, from_me, ts, text);
         }
         line_idx++;
     });
@@ -806,12 +960,15 @@ void agents_thread_goto_tail(int idx) {
     if (idx < 0 || idx >= g_conv_n) return;
     agents_lock();
     Conversation &a = g_convs[idx];
-    bool at_tail = ((uint32_t)a.win_start + a.vn) >= a.lines;
-    if (!at_tail) {
-        a.file_sync = 0; a.lines = 0; a.vn = 0;
-    }
+    /* This is THE focus point: opening a chat calls it, so it is where the
+     * window changes hands. A window loaded for someone else is stale by
+     * definition and rebuilds; so does a window parked on an older page. */
+    bool at_tail = (g_win.owner == idx) &&
+                   (((uint32_t)g_win.win_start + g_win.vn) >= a.lines);
+    if (!at_tail) agents_window_take(idx);
+    a.last_use = ++g_conv_clock;
     agents_sync_view(idx);
-    a.win_start = (a.lines > a.vn) ? (a.lines - a.vn) : 0;
+    g_win.win_start = (a.lines > g_win.vn) ? (a.lines - g_win.vn) : 0;
     agents_unlock();
 }
 
@@ -825,7 +982,7 @@ void agents_thread_goto_page(int idx, uint32_t end_line) {
     agents_lock();
     Conversation &a = g_convs[idx];
     if (end_line >= a.lines) {
-        a.vn = 0; a.win_start = a.lines;
+        g_win.owner = idx; g_win.vn = 0; g_win.win_start = a.lines;
     } else {
         agents_load_page(idx, end_line);
     }
@@ -836,20 +993,22 @@ uint32_t agents_thread_total(int idx) {
     return (idx >= 0 && idx < g_conv_n) ? g_convs[idx].lines : 0;
 }
 
+/* The three below describe the WINDOW, so they answer for the conversation the
+ * window is loaded for. Asked about any other conversation they report the
+ * harmless "nothing scrolled, at the tail" state rather than another
+ * conversation's scroll position. */
 uint32_t agents_thread_start(int idx) {
-    return (idx >= 0 && idx < g_conv_n) ? g_convs[idx].win_start : 0;
+    return (idx >= 0 && idx < g_conv_n && g_win.owner == idx) ? g_win.win_start : 0;
 }
 
 bool agents_thread_is_tail(int idx) {
-    if (idx < 0 || idx >= g_conv_n) return true;
-    const Conversation &a = g_convs[idx];
-    return ((uint32_t)a.win_start + a.vn) >= a.lines;
+    if (idx < 0 || idx >= g_conv_n || g_win.owner != idx) return true;
+    return ((uint32_t)g_win.win_start + g_win.vn) >= g_convs[idx].lines;
 }
 
 uint32_t agents_thread_line_ts(int idx, int i) {
-    if (idx < 0 || idx >= g_conv_n) return 0;
-    const Conversation &a = g_convs[idx];
-    return (i >= 0 && i < a.vn) ? a.view[i].ts : 0;
+    if (idx < 0 || idx >= g_conv_n || g_win.owner != idx) return 0;
+    return (i >= 0 && i < g_win.vn) ? g_win.view[i].ts : 0;
 }
 
 /* Read the very last message of the active session straight from the store
@@ -937,20 +1096,27 @@ static void agents_push_line(int idx, bool from_me, const char *text) {
 
 /* Chronological view (oldest first) for the scrollable chat. Synced from SD
  * first. Returns count. Caller may hold the lock (recursive + sync locks). */
-/* Copy the current window (oldest→newest) for the chat renderer. No disk
- * reads here — goto_tail / goto_page own the sync. ts_out[i] is the message
- * unix ts (0 = unknown). Returns count. Caller may hold the recursive lock. */
+/* Copy the current window (oldest→newest) for the chat renderer. goto_tail /
+ * goto_page own the sync, so this is normally a pure RAM copy. ts_out[i] is the
+ * message unix ts (0 = unknown). Returns count. Caller may hold the lock.
+ *
+ * The one disk case is a SAFETY NET: if the renderer asks for a conversation
+ * the window is not loaded for, it is loaded here rather than drawing an empty
+ * chat. Opening a chat calls agents_thread_goto_tail first, so this costs
+ * nothing in the normal path — and when it does fire it is the same scan that
+ * goto_tail would have run, on the same task. A blank thread is not an
+ * acceptable alternative. */
 int agents_thread_view(int idx, char out[][AGENT_TEXT_LEN], bool *from_me,
                        uint32_t *ts_out, int max_lines) {
     if (idx < 0 || idx >= g_conv_n || max_lines <= 0) return 0;
     int n = 0;
     agents_lock();
-    Conversation &a = g_convs[idx];
-    n = a.vn < max_lines ? a.vn : max_lines;
+    if (g_win.owner != idx) agents_thread_goto_tail(idx);
+    n = g_win.vn < max_lines ? g_win.vn : max_lines;
     for (int i = 0; i < n; i++) {
-        snprintf(out[i], AGENT_TEXT_LEN, "%s", a.view[i].text);
-        if (from_me) from_me[i] = a.view[i].from_me;
-        if (ts_out)  ts_out[i] = a.view[i].ts;
+        snprintf(out[i], AGENT_TEXT_LEN, "%s", g_win.view[i].text);
+        if (from_me) from_me[i] = g_win.view[i].from_me;
+        if (ts_out)  ts_out[i] = g_win.view[i].ts;
     }
     agents_unlock();
     return n;
@@ -1538,10 +1704,16 @@ static void agents_route_task(void *arg) {
         if (item.newest) {
             /* newest-active room. active_idx already points at the most-recently
              * selected/created room; if the registry is somehow empty, mint a
-             * default. Re-pin its window to the tail so the append shows in
-             * context (matches agents_session_select's view semantics). */
+             * default. Re-pin to the tail ONLY when this conversation already
+             * holds the shared window: goto_tail is the focus point, so calling
+             * it here unconditionally would hand the window to an arriving
+             * reply and take it away from whatever the user is reading —
+             * losing their scroll position mid-read and costing a full JSONL
+             * rebuild per message under a burst. An unfocused conversation
+             * needs nothing here; the append below keeps its cached line and
+             * counters current, and the window is rebuilt when it is opened. */
             if (a.n_sessions == 0) agents_session_create(idx, nullptr, created);
-            else                   agents_thread_goto_tail(idx);
+            else if (g_win.owner == idx) agents_thread_goto_tail(idx);
         } else {
             /* Named room: switch to it (reloading its view from SD) if it
              * exists, else create it. Both run here off the loop task, so the
@@ -1648,7 +1820,8 @@ static bool agents_clear(const char *agent_id) {
                 }
                 a.session_lines[j] = 0;
             }
-            a.file_sync = 0; a.lines = 0; a.vn = 0; a.win_start = 0;
+            a.lines = 0;
+            if (g_win.owner == i) agents_window_take(i);
             agents_push_line(i, false, "chat cleared - type to talk");
         } else {
             if (agents_store_ready()) {
@@ -1656,7 +1829,8 @@ static bool agents_clear(const char *agent_id) {
                 HwSpiBusGuard bus;
                 g_store->remove(path.c_str());
             }
-            a.file_sync = 0; a.lines = 0; a.vn = 0; a.win_start = 0;
+            a.lines = 0;
+            if (g_win.owner == i) agents_window_take(i);
             a.session_lines[a.active_idx] = 0;
             agents_push_line(i, false, "chat cleared - type to talk");
         }
@@ -1732,10 +1906,14 @@ static void agents_register_routes(AsyncWebServer &server) {
                 sess.add(a.sessions[j]);
                 smsg.add(a.session_lines[j]);
             }
-            if (a.vn > 0) {
-                o["last"] = a.view[a.vn - 1].text;
-                o["last_from_me"] = a.view[a.vn - 1].from_me;
-                o["last_ts"] = a.view[a.vn - 1].ts;
+            /* The per-conversation cached line, which is the newest one
+             * appended whether or not this conversation holds the window —
+             * strictly more honest than reading a scrollback that may be
+             * parked on an older page. */
+            if (a.last.text[0]) {
+                o["last"] = a.last.text;
+                o["last_from_me"] = a.last.from_me;
+                o["last_ts"] = a.last.ts;
             }
             /* Honest tail for GET even when the RAM window is a rewound page. */
             if (!agents_thread_is_tail(i)) {
@@ -1992,7 +2170,7 @@ static void skill_agents_init() {
 
     for (int i = 0; i < g_conv_n; i++) {
         Conversation &a = g_convs[i];
-        a.active_idx = 0; a.file_sync = 0; a.lines = 0; a.vn = 0; a.win_start = 0;
+        a.active_idx = 0; a.lines = 0;
         for (int j = 0; j < AGENT_SESSIONS_MAX; j++) {
             a.session_lines[j] = 0;
             a.session_dead[j] = 0;      // all rooms shown until a roster says otherwise
@@ -2005,12 +2183,23 @@ static void skill_agents_init() {
     agents_manifest_persist();
 
     for (int i = 0; i < g_conv_n; i++) {
+        /* One scan each: this fills lines / session_lines / the cached last
+         * line, which is all a conversation needs until it is opened. The
+         * window is left wherever the last scan put it and is rebuilt on the
+         * first draw (agents_thread_view's lazy focus), so the goto_tail that
+         * used to follow here is gone — after a long-history sync it saw a
+         * non-tail window and rebuilt the whole file a SECOND time, once per
+         * conversation, at boot. */
         agents_sync_view(i);
-        char intro[AGENT_TEXT_LEN];
-        snprintf(intro, sizeof(intro), "hi - type to talk to %s", g_convs[i].label);
-        if (g_convs[i].lines == 0)
+        /* The greeting belongs to the compiled-in doors only. A conversation
+         * minted for a peer must not have a line the device wrote to itself
+         * appear in its history. */
+        if (g_convs[i].seeded && g_convs[i].lines == 0) {
+            char intro[AGENT_TEXT_LEN];
+            snprintf(intro, sizeof(intro), "hi - type to talk to %s",
+                     g_convs[i].label);
             agents_push_line(i, false, intro);
-        agents_thread_goto_tail(i);
+        }
     }
 
     /* Off-loop chat-route drain: the transport (rns.cpp) enqueues incoming

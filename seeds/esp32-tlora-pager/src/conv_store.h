@@ -104,6 +104,46 @@ enum ConvTransport {
 /* key + label + "255" + 64 hex + flag + 4 tabs + NUL, with slack. */
 #define CONV_MANIFEST_LINE_LEN 160
 
+/*
+ * Pure slot planner: which slot should a NEW conversation take?
+ *
+ * A free slot if the table has one. Otherwise the least-recently-used
+ * conversation that is NOT seeded — the seeded ones are the device's own doors
+ * and the user must always be able to reach them, so they are never candidates
+ * and a table of nothing but seeded slots refuses (-1) rather than throwing one
+ * out. Ties go to the lowest index, so the choice is deterministic.
+ *
+ * Evicting a slot is not deleting a conversation: the slot is a RAM cache of a
+ * thread whose history lives in its own /conv.<id> file, which nothing here
+ * touches. A peer that comes back is re-minted onto the same id and reopens the
+ * same log. That is what makes reusing the slot safe rather than lossy.
+ *
+ *   n_live   conversations currently in the table
+ *   cap      table capacity
+ *   seeded   per-slot flag, non-zero = never evict
+ *   last_use per-slot monotonic use stamp (higher = more recent)
+ *
+ * Returns the slot index to use, or -1 when the table is full of seeded slots.
+ */
+static inline int conv_slot_plan(int n_live, int cap, const uint8_t *seeded,
+                                 const uint32_t *last_use) {
+    if (cap <= 0) return -1;
+    if (n_live < 0) n_live = 0;
+    if (n_live > cap) n_live = cap;
+    if (n_live < cap) return n_live;          /* a free slot at the end */
+    if (!seeded || !last_use) return -1;
+    int victim = -1;
+    uint32_t oldest = 0;
+    for (int i = 0; i < n_live; i++) {
+        if (seeded[i]) continue;
+        if (victim < 0 || last_use[i] < oldest) {
+            victim = i;
+            oldest = last_use[i];
+        }
+    }
+    return victim;
+}
+
 /* One parsed manifest line. `key` is the logical thread key; `conv`/`session`
  * are its two components (session empty for a conversation with no rooms). */
 struct ConvManifestLine {
