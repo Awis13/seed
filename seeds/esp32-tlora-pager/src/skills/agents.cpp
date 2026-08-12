@@ -287,6 +287,16 @@ void   agents_thread_goto_page(int idx, uint32_t end_line);  // load older page
 int    agents_thread_view(int idx, char out[][AGENT_TEXT_LEN], bool *from_me,
                           uint32_t *ts_out, int max_lines);
 
+/* CONTACTS SCREEN enumeration (foundation for the grouped Contacts view).
+ * The AI bucket of that screen is the seeded doors, and any bucket's row is
+ * marked when the contact already has a thread. These expose exactly those two
+ * facts and nothing else of the conversation table. */
+int    agents_seeded_count(void);                // number of seeded AI doors
+bool   agents_seeded_at(int i, const char **id, const char **label,
+                        const uint8_t **reply, uint8_t *reply_len);
+bool   agents_has_conversation(const char *id);  // literal-id join (AI door)
+bool   agents_peer_has_conversation(const uint8_t *addr, uint8_t addr_len);
+
 /* GPS location collaboration. gps.cpp is #include'd AFTER this file in the
  * same TU, so these are prototypes resolved to the gps.cpp section below.
  * agents.cpp answers a "where are you?" with the freshest fix instead of
@@ -2246,6 +2256,66 @@ static bool agents_is_seeded(int i) {
 }
 static bool agents_bridge_ok() { return g_bridge[0] != '\0'; }
 static const char *agents_bridge_url() { return g_bridge; }
+
+/* ---- contacts-screen enumeration ------------------------------------------ */
+
+/* The seeded doors are the Contacts screen's AI bucket. They are never evicted
+ * and never relocate (conv_mint only ever appends and only ever evicts a
+ * non-seeded slot), so a pointer to one stays valid after the lock is dropped —
+ * which is the only reason returning the fields by pointer is safe here. */
+int agents_seeded_count(void) {
+    agents_lock();
+    int c = 0;
+    for (int i = 0; i < g_conv_n; i++) if (g_convs[i].seeded) c++;
+    agents_unlock();
+    return c;
+}
+
+/* The i-th seeded door (0-based over the seeded ones only). Fills whichever of
+ * id/label/reply the caller asked for and returns true, or false past the end.
+ * reply is the door's return address bytes — the agent-id bytes the bridge and
+ * the MeshCore C1 DM answer to. */
+bool agents_seeded_at(int i, const char **id, const char **label,
+                      const uint8_t **reply, uint8_t *reply_len) {
+    if (i < 0) return false;
+    agents_lock();
+    int seen = 0;
+    for (int k = 0; k < g_conv_n; k++) {
+        if (!g_convs[k].seeded) continue;
+        if (seen == i) {
+            Conversation &a = g_convs[k];
+            if (id) *id = a.id;
+            if (label) *label = a.label;
+            if (reply) *reply = a.reply_addr;
+            if (reply_len) *reply_len = a.reply_len;
+            agents_unlock();
+            return true;
+        }
+        seen++;
+    }
+    agents_unlock();
+    return false;
+}
+
+/* Does a conversation with this exact id already exist? The literal-id join, for
+ * an AI door (its id is its own name). */
+bool agents_has_conversation(const char *id) {
+    agents_lock();
+    bool has = (agents_find(id) >= 0);
+    agents_unlock();
+    return has;
+}
+
+/* Does a mesh / LXMF peer at this return address already have a conversation?
+ * The join key is conv_peer_id — the first CONV_PEER_ID_BYTES of the address as
+ * hex — the same id conv_mint stores a peer under, so a match here means the
+ * Contacts row should point at the existing thread rather than create one. */
+bool agents_peer_has_conversation(const uint8_t *addr, uint8_t addr_len) {
+    char id[CONV_ID_LEN];
+    conv_peer_id(addr, addr_len, id, sizeof(id));
+    if (!id[0]) return false;
+    return agents_has_conversation(id);
+}
 
 static const char *agents_describe() {
     return

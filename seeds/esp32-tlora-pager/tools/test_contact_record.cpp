@@ -15,6 +15,7 @@
 #include <string.h>
 
 #include "../src/mesh/contact_record.h"
+#include "../src/mesh/contacts_enum.h"   /* pure mesh_contacts_filter selection */
 
 static MeshContactRec sample(void) {
     MeshContactRec c;
@@ -144,12 +145,54 @@ static void test_edges(void) {
     mesh_contact_unpack(b, NULL);
 }
 
+/* --- 6. the UI enumerator's pure selection over a flat run ----------------- */
+
+static void test_enum_filter(void) {
+    /* Five records on disk, two of them anonymous (type 0 — not contacts). The
+     * enumerator keeps only the worth-saving ones, in file order, so the mesh
+     * bucket shows peers this device actually met, not adverts it discarded. */
+    uint8_t file[MESH_CONTACT_REC_LEN * 5];
+    uint8_t types[5] = { 1, 0, 2, 0, 1 };
+    for (int k = 0; k < 5; k++) {
+        MeshContactRec c = sample();
+        c.type = types[k];
+        c.pub_key[0] = (uint8_t)(0x50 + k);
+        snprintf(c.name, sizeof(c.name), "rec-%d", k);
+        mesh_contact_pack(&c, file + k * MESH_CONTACT_REC_LEN);
+    }
+    MeshContactRec got[5];
+    int n = mesh_contacts_filter(file, sizeof(file), got, 5);
+    assert(n == 3);                                  /* records 0, 2, 4 */
+    assert(strcmp(got[0].name, "rec-0") == 0 && got[0].type == 1);
+    assert(strcmp(got[1].name, "rec-2") == 0 && got[1].type == 2);
+    assert(strcmp(got[2].name, "rec-4") == 0 && got[2].type == 1);
+
+    /* max bounds the copy: only the first two worth-saving records. */
+    assert(mesh_contacts_filter(file, sizeof(file), got, 2) == 2);
+    assert(strcmp(got[1].name, "rec-2") == 0);
+
+    /* A trailing partial record is ignored, exactly as the reader stops at the
+     * first short read: three whole records (types 1,0,2) plus 7 stray bytes
+     * yields the two worth-saving ones, and never touches the partial. */
+    assert(mesh_contacts_filter(file, MESH_CONTACT_REC_LEN * 3 + 7, got, 5) == 2);
+    assert(strcmp(got[1].name, "rec-2") == 0);
+
+    /* Fewer bytes than one record: nothing. */
+    assert(mesh_contacts_filter(file, MESH_CONTACT_REC_LEN - 1, got, 5) == 0);
+
+    /* NULL / zero-max are safe and select nothing. */
+    assert(mesh_contacts_filter(NULL, sizeof(file), got, 5) == 0);
+    assert(mesh_contacts_filter(file, sizeof(file), NULL, 5) == 0);
+    assert(mesh_contacts_filter(file, sizeof(file), got, 0) == 0);
+}
+
 int main(void) {
     test_record_size();
     test_field_offsets();
     test_roundtrip();
     test_stream();
     test_edges();
+    test_enum_filter();
     printf("contact record tests: OK\n");
     return 0;
 }
