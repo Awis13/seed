@@ -914,9 +914,12 @@ assert "lxmf_route_plan(&g_rns_lxmf_msg" in ingest, (
     "the clean-parse path must call the pure router lxmf_route_plan() — the "
     "card-vs-room / severity / key decision is factored out and host-tested"
 )
-assert "notify_ingest(" in ingest, (
-    "the DEFAULT (a plain client, no custom fields) must raise a card — without "
-    "this the phone writes and nothing lands on the screen"
+# The card is no longer the DEFAULT — a bare message from a person now opens
+# their conversation — but it is still the FLOOR under every other outcome, and
+# it is raised through the transport seam's card door rather than inline.
+assert "inbox_deliver_card(CONV_LXMF," in ingest, (
+    "an LXMF message that cannot become a chat must still raise a card — "
+    "without this the phone writes and nothing lands on the screen"
 )
 assert "g_rns_room_router(" in ingest, (
     "a message carrying a thread must route to a room INSTEAD of a card"
@@ -2597,6 +2600,35 @@ assert "ui_inbox_refresh(agents_sel);" in open_row, (
     "a row that no longer matches must rebuild AND repaint the list, not open "
     "anything — a rebuild alone draws nothing, because the renderer skips a "
     "repaint when the selection has not moved, and the stale name stays up"
+)
+
+# A REBUILT LIST MUST ACTUALLY REPAINT. The renderer skips drawing when the
+# selection has not moved, so a refresh that rebuilds the snapshot without
+# dropping the drawn-state memo draws NOTHING: the stale row stays on screen and
+# the next click opens the new occupant under the old name. Deleting the
+# invalidate call broke exactly that and left all 19 pin files green.
+_ri = main.index("static void ui_inbox_refresh(int selected) {")
+refresh = main[_ri : main.index("\n}", _ri) + 2]
+assert "ui_inbox_build();" in refresh, "a refresh must rebuild the snapshot"
+assert "hw_ui_inbox_invalidate();" in refresh, (
+    "a refresh must drop the renderer's drawn-state memo — without it the "
+    "rebuilt rows are never painted and the stale name stays up"
+)
+assert refresh.index("hw_ui_inbox_invalidate();") < refresh.index("hw_ui_show_inbox("), (
+    "the memo must be dropped BEFORE the draw, or the draw is the one that skips"
+)
+
+# THE INBOX MUST FOLLOW ARRIVALS WHILE IT IS OPEN. A chat message mints and
+# reorders without raising a card, so nothing else brings the list up to date:
+# without this block a new conversation or unread mark appears only after the
+# user leaves the screen and comes back.
+_ai = main.index("if (display_force && hw_ui_screen() == HW_UI_AGENTS) {")
+arrival = main[_ai : main.index("\n    }", _ai) + 6]
+assert "ui_inbox_refresh(agents_sel);" in arrival, (
+    "an arrival while the inbox is open must rebuild AND repaint the list"
+)
+assert "display_force = false;" in arrival, (
+    "the repaint flag must be consumed, or the block runs every tick"
 )
 
 # The fixed three-row constant is gone; it is what a later edit would grab.

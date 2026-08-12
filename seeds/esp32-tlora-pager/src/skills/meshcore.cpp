@@ -207,6 +207,17 @@ static MeshChatTx g_mesh_chat_tx = {};
  * keystroke, the drain is ~8 ms away, and a second submitted before the first
  * leaves is refused with a reason the room shows rather than queued behind an
  * unbounded backlog.
+ *
+ * WHAT THE SUBMIT ITSELF TOUCHES, stated plainly so "no stack call off the loop
+ * task" is not read as more absolute than it is: mesh_peer_tx_submit() runs
+ * mesh_client_ready() and mesh_client_knows_peer() on the CALLER's task. Both
+ * are read-only — a bounds-checked scan of a fixed contacts[] array — so they
+ * mutate nothing the loop task owns and cannot corrupt it; at worst a contact
+ * added in the same instant is missed, and the authoritative lookup runs again
+ * in the drain. They are here so the room can say "unknown peer" while the user
+ * is still looking at what they typed. The pin in tools/test_transport_pins.py
+ * bans the stack symbols BY FILE (skills/agents.cpp), which is a proxy for "not
+ * on an arbitrary task" and not a check of the task itself.
  */
 struct MeshPeerTx {
     volatile bool pending;

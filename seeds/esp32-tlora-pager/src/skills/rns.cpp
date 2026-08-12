@@ -3077,10 +3077,12 @@ static bool lxmf_ingest_wire(const uint8_t *wire, size_t len) {
         }
     }
 
-    /* THE DEFAULT: a card. Title and content are sanitised the seed.pager
-     * way — control bytes stripped, the body cut to the screen's character
-     * budget — into a title scratch and g_rns_card_body. An empty title still
-     * makes a card; notify_ingest() supplies its own placeholder. */
+    /* THE FLOOR: a card. Title and content are sanitised the seed.pager way —
+     * control bytes stripped, the body cut to the screen's character budget —
+     * into a title scratch and g_rns_card_body. The card door REFUSES an empty
+     * title (a card with none is invisible but still evicts a real one), so the
+     * "lxmf" fallback below is not decoration: it is what makes an untitled
+     * message showable. */
     char title[NOTIFY_TITLE_LEN];
     rns_text_sanitize((const uint8_t *)g_rns_lxmf_msg.title,
                       g_rns_lxmf_msg.title_len,

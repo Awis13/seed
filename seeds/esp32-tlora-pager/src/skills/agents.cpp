@@ -101,7 +101,7 @@
 
 struct AgentLine {
     bool from_me;
-    uint32_t ts;            // unix seconds (C1 JSONL "ts"); 0 = unknown
+    uint32_t ts;            // unix seconds (the JSONL "ts"); 0 = unknown
     char text[AGENT_TEXT_LEN];
 };
 
@@ -180,7 +180,7 @@ static ConvWindow g_win = { -1, 0, 0, 0, {} };
  * conversation without a timestamp (the clock is not trustworthy at boot). */
 static uint32_t g_conv_clock = 0;
 
-/* The two bridge/C1 agents, pre-created as CONV_AGENT conversations. Their
+/* The two bridge/gateway agents, pre-created as CONV_AGENT conversations. Their
  * return address is the agent id's own bytes, which is exactly what the bridge
  * and the MeshCore C1 DM have always used to answer them. Fields not named here
  * are value-initialised (empty room list, empty viewport). */
@@ -282,7 +282,7 @@ void gps_request_fix(void);
 static void agents_on_inbound(const char *agent_id, const char *text,
                               bool real_inbound);
 
-/* A genuine arrival (mesh C1 RX, HTTP /agents/inbound, a GPS answer landing)
+/* A genuine arrival (a mesh chat frame, HTTP /agents/inbound, a GPS answer)
  * pushed a line into a room. loop() consumes it together with display_force:
  * if the room is open on screen, the repaint wakes the panel once. Synthetic
  * error lines never set this. Set BEFORE display_force so the loop cannot
@@ -579,9 +579,8 @@ static void agents_sync_view(int idx) {
 /*
  * Find a conversation by id, or MINT one.
  *
- * This is what C1's fixed table could not do and what a transport needs the
- * moment a stranger's first message arrives: a peer has no slot until it
- * speaks. The id is the caller's (for a peer, the first hex of its address);
+ * A fixed table could not do this, and a transport needs it the moment a
+ * stranger's first message arrives: a peer has no slot until it speaks. The id is the caller's (for a peer, the first hex of its address);
  * label, transport and return address come from the wire that met it.
  *
  * WHEN THE TABLE IS FULL, the least-recently-used NON-SEEDED conversation is
@@ -670,9 +669,8 @@ static void agents_conv_apply(Conversation &a, const ConvManifestLine &ml) {
 }
 
 /* Fold one parsed manifest line into the live registry. A line naming an
- * unknown conversation is skipped rather than minting one: C1 has a fixed
- * seeded table, and a room invented from a stale id would be a room nothing can
- * ever answer.
+ * unknown conversation is skipped rather than minting one: a room invented
+ * from a stale id is a room nothing can ever answer.
  *
  * A ROOM-LESS LINE IS A REAL LINE, not a malformed one. A conversation that has
  * no rooms — the shape a peer gets, keyed on its address alone — still has to
@@ -694,12 +692,13 @@ static void agents_manifest_apply(const ConvManifestLine &ml) {
      * still name retired agent ids, and minting those would resurrect rooms
      * that post to the bridge.
      *
-     * A non-AGENT line is skipped for the same reason and one more: no peer
-     * conversation is created anywhere in this build, so a peer line on disk
-     * can only have been written by hand. conv_mint() and the room-less
-     * manifest line are built and tested for the receiver that will need them;
-     * loading a route from the card is a trust decision that belongs with the
-     * transport that can actually verify a peer. */
+     * A non-AGENT line is skipped for the same reason, and NOT because peers
+     * are hypothetical — they are minted at runtime by the mesh and LXMF
+     * receivers. That is exactly why: a peer's route must only ever come from a
+     * live, transport-authenticated arrival, never from a file. The writer
+     * therefore never puts a peer on the card and the loader would refuse one
+     * anyway, so the two halves agree. Loading a route from disk is a trust
+     * decision for a transport that can verify the peer, not for this parser. */
     if (ml.transport != CONV_AGENT) return;
     int idx = agents_find(ml.conv);
     if (idx < 0) return;
@@ -1823,7 +1822,12 @@ static bool agents_route_peer(const AgentRouteItem &item) {
          * there is nowhere to put the conversation and the alternative is
          * evicting the chat the user is reading. */
         agents_unlock();
-        Serial.printf("[agents] peer route: no slot for %s\n", id);
+        /* conv_mint refuses for two different reasons and they are not the same
+         * event: no free slot, or an id that collided with a conversation whose
+         * stored address or wire does not match. Reporting the second as the
+         * first would send someone looking at the table size. */
+        Serial.printf("[agents] peer route dropped: %s (no free slot, or id "
+                      "collided with a different address/transport)\n", id);
         return false;
     }
     Conversation &a = g_convs[idx];
@@ -2433,6 +2437,13 @@ static void skill_agents_init() {
                      g_convs[i].label);
             agents_push_line(i, false, intro);
         }
+        /* NOTHING FROM BOOT IS UNREAD. The greeting is a line the device wrote
+         * to itself, and no chat screen is up yet, so the arrival counter would
+         * otherwise start every seeded conversation at 1 and a fresh flash
+         * would come up showing *CLAUDE *HERMES with nothing behind the mark.
+         * The user was not there for any of this; unread means "arrived while
+         * you were away from it", and boot is not that. */
+        g_convs[i].unread = 0;
     }
 
     /* Off-loop chat-route drain: the transport (rns.cpp) enqueues incoming

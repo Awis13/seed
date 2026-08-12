@@ -13,10 +13,11 @@ WHAT IS PINNED
    chat path, or adding a transport means editing it again.
 2. transport_send() dispatches on the record's transport, through the pure
    planner, and hands each backend the address the planner resolved.
-3. The CONV_MESH branch refuses rather than falling back to the gateway. The
-   mesh layer has no arbitrary-peer send yet (mc_client.h exposes only
-   mesh_client_send_to_gateway), and routing a private reply through the gateway
-   would hand it to a third party.
+3. The CONV_MESH branch reaches the PEER and can never reach the gateway. It
+   submits to the loop task rather than driving the radio from whatever task
+   called it, and no MeshCore stack symbol may appear in skills/agents.cpp at
+   all — routing a private reply through the gateway would hand it to a third
+   party, and driving the stack off the loop task would corrupt it.
 4. A card becomes visible in exactly ONE place. The wake/ring/sound/log sequence
    was written out twice before; two copies is the shape where a transport
    quietly gets a card that does not ring.

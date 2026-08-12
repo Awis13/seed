@@ -334,4 +334,14 @@ assert re.search(r"#define CONV_PEER_ID_BYTES\s+5", agents), (
     "attacker can run offline against a known correspondent"
 )
 
+# --- 11. boot leaves nothing unread --------------------------------------
+# The greeting is a line the device writes to itself, and no chat screen is up
+# during init, so without this a fresh flash comes up showing every seeded
+# conversation marked unread with nothing behind the mark.
+init_fn = fn_body(agents, "static void skill_agents_init()")
+assert "g_convs[i].unread = 0;" in init_fn, (
+    "boot must leave nothing unread — the user was not there for it, and the "
+    "greeting is the device talking to itself"
+)
+
 print("conversation store firmware pins: OK")

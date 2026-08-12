@@ -296,7 +296,8 @@ static inline size_t conv_hex_decode(const char *in, uint8_t *out, size_t out_n)
  * conversation and flip its dead flag, transport or reply address. Today every
  * label is a compile-time literal, so neither is reachable — but the field
  * exists precisely so it can be set from an LXMF or mesh sender's name, i.e.
- * from the wire, and a barrier added after that is a barrier added too late. Control bytes become spaces rather than truncating the label: a
+ * from the wire, and a barrier added after that is a barrier added too late.
+ * Control bytes become spaces rather than truncating the label: a
  * hostile name still shows, it just cannot restructure the file. */
 static inline void conv_label_sanitize(const char *in, char *out, size_t out_n) {
     size_t j = 0;
