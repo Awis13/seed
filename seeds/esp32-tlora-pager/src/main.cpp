@@ -3298,16 +3298,23 @@ static void ui_contacts_render(const char *note) {
 //          (that is the future address-book ticket).
 static void ui_open_contacts() {
     // Candidate backing: contacts_build_rows COPIES label/id/reply into each
-    // row, so this only needs to outlive the build call below.
-    ContactCandidate ai[CONTACT_BUCKET_CAP];
-    ContactCandidate mesh[CONTACT_BUCKET_CAP];
-    ContactCandidate lxmf[CONTACT_BUCKET_CAP];
-    MeshContactRec   mrec[CONTACT_BUCKET_CAP];
+    // row, so this only needs to outlive the build call below. ALL of these are
+    // file-/function-scope static (not loop-task stack): mrec alone is
+    // sizeof(MeshContactRec)*16 ~= 2.5 KB and, with the three candidate arrays,
+    // overflowed the loop task's stack and tripped the canary. Same idiom as
+    // ui_open_msglist's static titles/handles above — rebuilt in full each call
+    // (the n_ai/n_mesh/n_lxmf loops overwrite every slot before build reads it),
+    // reached only from the loop task, so reuse across renders is safe. These are
+    // this screen's OWN statics; they are not shared with the msglist buffers.
+    static ContactCandidate ai[CONTACT_BUCKET_CAP];
+    static ContactCandidate mesh[CONTACT_BUCKET_CAP];
+    static ContactCandidate lxmf[CONTACT_BUCKET_CAP];
+    static MeshContactRec   mrec[CONTACT_BUCKET_CAP];
     static char mesh_ids[CONTACT_BUCKET_CAP][CONV_ID_LEN];
     static char lx_ids[CONTACT_BUCKET_CAP][CONV_ID_LEN];
     static char lx_labels[CONTACT_BUCKET_CAP][CONV_LABEL_LEN];
     static uint8_t lx_reply[CONTACT_BUCKET_CAP][CONV_REPLY_MAX];
-    uint8_t lx_reply_len[CONTACT_BUCKET_CAP];
+    static uint8_t lx_reply_len[CONTACT_BUCKET_CAP];
 
     // AI: the seeded doors. They always have a slot (has_conversation = true) and
     // their return address is the agent-id bytes the bridge answers to. The
