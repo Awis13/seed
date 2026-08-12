@@ -285,4 +285,19 @@ assert "if (g_convs[i].seeded && g_convs[i].lines == 0)" in boot_loop, (
     "into a peer conversation's history"
 )
 
+# --- 8. unread: counted only for a conversation nobody is reading ------------
+# A value rule a shape check cannot see: bumping unconditionally would mark the
+# chat the user is looking at, and counting our own lines would mark a
+# conversation the user just wrote in.
+append_fn = fn_body(agents, "static void agents_store_append(int idx, bool from_me, const char *text)")
+assert "if (!from_me && g_win.owner != idx && a.unread < 0xFFFF) a.unread++;" in append_fn, (
+    "unread must count only THEIR lines, and only when the conversation is not "
+    "the one on screen — reading it is the acknowledgement"
+)
+tail_fn = fn_body(agents, "void agents_thread_goto_tail(int idx)")
+assert "a.unread = 0;" in tail_fn, (
+    "opening a conversation must clear its unread count — goto_tail is the "
+    "focus point everything else in this file hangs off"
+)
+
 print("conversation store firmware pins: OK")

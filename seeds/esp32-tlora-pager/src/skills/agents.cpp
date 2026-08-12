@@ -135,6 +135,12 @@ struct Conversation {
     AgentLine last;
     /* Monotonic use stamp, for choosing an eviction victim (see conv_mint). */
     uint32_t last_use;
+    /* Arrivals the user has not looked at. Counted only for a conversation
+     * that is NOT the one on screen — reading it IS the acknowledgement, so a
+     * line landing in the open chat was never unread. Cleared when the
+     * conversation takes the window (agents_thread_goto_tail), which is the
+     * same focus point everything else in this file hangs off. */
+    uint16_t unread;
     /* Per-session liveness (live-room roster, README). 0 = alive/shown,
      * 1 = dead/hidden from the room picker. MARK-NOT-DELETE: a dead room's
      * JSONL history file is never removed — hiding is reversible (a later
@@ -333,6 +339,9 @@ static void agents_store_append(int idx, bool from_me, const char *text) {
     a.last.ts = ts;
     snprintf(a.last.text, sizeof(a.last.text), "%s", text ? text : "");
     a.last_use = ++g_conv_clock;
+    /* Their line, in a conversation nobody is reading. Our own lines and lines
+     * landing in the open chat are never unread. */
+    if (!from_me && g_win.owner != idx && a.unread < 0xFFFF) a.unread++;
     if (g_win.owner == idx) agents_view_append(g_win, from_me, ts, text);
     if (!agents_store_ready()) return;
     String path = agents_log_path(a.id, a.sessions[a.active_idx]);
@@ -975,6 +984,7 @@ void agents_thread_goto_tail(int idx) {
                    (((uint32_t)g_win.win_start + g_win.vn) >= a.lines);
     if (!at_tail) agents_window_take(idx);
     a.last_use = ++g_conv_clock;
+    a.unread = 0;                       /* opening it is reading it */
     agents_sync_view(idx);
     g_win.win_start = (a.lines > g_win.vn) ? (a.lines - g_win.vn) : 0;
     agents_unlock();
@@ -1128,6 +1138,23 @@ int agents_thread_view(int idx, char out[][AGENT_TEXT_LEN], bool *from_me,
     }
     agents_unlock();
     return n;
+}
+
+/* List-model accessors (main.cpp builds its inbox snapshot from these under
+ * agents_lock; see ../inbox_view.h for what it does with them). */
+uint8_t agents_transport(int idx) {
+    return (idx >= 0 && idx < g_conv_n) ? g_convs[idx].transport : (uint8_t)CONV_AGENT;
+}
+uint16_t agents_unread(int idx) {
+    return (idx >= 0 && idx < g_conv_n) ? g_convs[idx].unread : 0;
+}
+uint32_t agents_last_use(int idx) {
+    return (idx >= 0 && idx < g_conv_n) ? g_convs[idx].last_use : 0;
+}
+/* Rooms are an agent concept: a seeded conversation has them and its row opens
+ * the room picker, a minted peer has none and its row opens the chat. */
+bool agents_has_rooms(int idx) {
+    return (idx >= 0 && idx < g_conv_n) && g_convs[idx].n_sessions > 0;
 }
 
 static int agents_thread_count(int idx) {
@@ -2039,6 +2066,10 @@ static void agents_register_routes(AsyncWebServer &server) {
             o["id"] = a.id;
             o["name"] = a.label;
             o["messages"] = a.lines;
+            o["transport"] = a.transport;
+            o["unread"] = a.unread;
+            o["last_use"] = a.last_use;
+            o["seeded"] = a.seeded ? true : false;
             o["active"] = a.sessions[a.active_idx];
             JsonArray sess = o["sessions"].to<JsonArray>();
             JsonArray smsg = o["session_msgs"].to<JsonArray>();

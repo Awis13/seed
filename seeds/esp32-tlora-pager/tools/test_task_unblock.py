@@ -2563,4 +2563,44 @@ assert "not wired yet" not in agents, (
     "the placeholder that told the user claude had no transport must be gone"
 )
 
+# --- 12. the inbox list is a SNAPSHOT taken under the store lock -------------
+# The off-loop drain mints and evicts conversations while the panel paints, so
+# a list built from the live table could read a slot mid-rewrite. The lock is
+# the whole reason the snapshot is safe, and deleting it breaks nothing that
+# any other assertion can see.
+# Sliced inline (this file has no fn_body helper) and anchored on the DEFINITION
+# — the opening brace is part of the signature, so a forward declaration cannot
+# be matched instead.
+_bi = main.index("static void ui_inbox_build() {")
+build = main[_bi : main.index("\n}", _bi) + 2]
+assert build.index("agents_lock();") < build.index("agents_name("), (
+    "the inbox snapshot must be taken under the store lock — the off-loop "
+    "drain mints and evicts while the panel paints"
+)
+assert "agents_unlock();" in build, "the snapshot must release the lock"
+
+# A chosen row must be revalidated: minting on a full table recycles a slot,
+# so a row can still show the old name over a new occupant.
+open_row = main[main.index("case HW_UI_AGENTS:") :]
+open_row = open_row[: open_row.index("break;")]
+assert "strcmp(live, ag_inbox_ids[agents_sel]) == 0" in open_row, (
+    "opening a row must confirm the slot still holds the conversation the row "
+    "displayed — otherwise a recycled slot opens a stranger's thread under the "
+    "name the user picked"
+)
+assert "ui_inbox_build();" in open_row, (
+    "a row that no longer matches must rebuild the list, not open anything"
+)
+
+# The fixed three-row constant is gone; it is what a later edit would grab.
+main_code = re.sub(r"/\*.*?\*/", " ", main, flags=re.S)
+main_code = re.sub(r"//[^\n]*", " ", main_code)
+assert "AGENTS_LIST_COUNT" not in main_code, (
+    "the hardcoded inbox row count must not come back — the list is built from "
+    "the conversation table now"
+)
+assert "AGENTS_BACK" not in main_code, (
+    "BACK is the trailing row of a dynamic list, not a fixed index"
+)
+
 print("Task unblock policy tests: OK")

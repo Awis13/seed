@@ -9,6 +9,7 @@
 #include "hw_sound.h"   // tft_wake pumps the sound queue across its settle
 #include "micron/micron_layout.h"  // pure page layout -> grid (C3)
 #include "box_glyphs.h"            // box-drawing + block glyphs for micron pages
+#include "conv_store.h"             // CONV_LABEL_LEN: the inbox row label width
 #include "boot_logo.h"             // PURE b33pr boot-splash decrypt logic
 #include "psram_alloc.h"           // psram_calloc_pref: micron grids in PSRAM
 
@@ -1166,14 +1167,14 @@ static const char *const LAYOUT_ITEMS[LAYOUT_N] = {
     "ABC", "RU PHON", "RU", "BACK"
 };
 
-// Agents list (same geometry language as menu).
-static const int AGENTS_LIST_N = 3;
+// Inbox list (same geometry language as menu). The rows are built from the
+// conversation store now, so there is no fixed item table: what used to be
+// {"CLAUDE","HERMES","BACK"} is whatever has been talked to, newest first.
 static const int AGENTS_ROW0_Y = 42;
 static const int AGENTS_ROW_H = 30;
 static const int AGENTS_BAR_H = 25;
-static const char *const AGENTS_LIST_ITEMS[AGENTS_LIST_N] = {
-    "CLAUDE", "HERMES", "BACK"
-};
+// Rows the panel has height for below the title bar. A longer list scrolls.
+static const int INBOX_ROWS_VISIBLE = 6;
 
 // Card action sheet (after click/Enter on a notification).
 static const int CARD_ACT_N = 3;
@@ -1659,44 +1660,96 @@ void hw_ui_show_wifi_info(const char *const *lines, int n_lines) {
     tft_draw_text(MARGIN, PANEL_H - 16, "click = back", COL_DIM, COL_BG, 1);
 }
 
-static void agents_list_draw_row(int i, bool on) {
+/* One inbox row: "<glyph> <mark><label>".
+ *
+ * The glyph is drawn in its own column rather than glued to the label, so the
+ * eye can run down the transports without reading the names — which is the
+ * point of having it on a seven-row screen. The label is text scale 2 like the
+ * old fixed rows; the glyph shares that scale so it cannot be mistaken for
+ * part of the name. */
+static void inbox_draw_row(const char *label, char glyph, bool unread,
+                           int i, bool on) {
     uint16_t y = (uint16_t)(AGENTS_ROW0_Y + i * AGENTS_ROW_H);
     uint16_t bar_y = y - 4;
     uint16_t bar_w = PANEL_W - 2 * MARGIN;
-    if (on) {
-        tft_fill_rect(MARGIN, bar_y, bar_w, AGENTS_BAR_H, COL_ACCENT);
-        tft_draw_text(MARGIN + 12, y, AGENTS_LIST_ITEMS[i], COL_BG, COL_ACCENT, 2);
-    } else {
-        tft_fill_rect(MARGIN, bar_y, bar_w, AGENTS_BAR_H, COL_BG);
-        tft_draw_text(MARGIN + 12, y, AGENTS_LIST_ITEMS[i], COL_TIME, COL_BG, 2);
-    }
+    uint16_t fg = on ? COL_BG : COL_TIME;
+    uint16_t bg = on ? COL_ACCENT : COL_BG;
+    tft_fill_rect(MARGIN, bar_y, bar_w, AGENTS_BAR_H, bg);
+    char g[2] = { glyph ? glyph : ' ', '\0' };
+    tft_draw_text(MARGIN + 6, y, g, fg, bg, 2);
+    char row[CONV_LABEL_LEN + 2];
+    snprintf(row, sizeof(row), "%c%s", unread ? '*' : ' ', label ? label : "");
+    tft_draw_text(MARGIN + 28, y, row, fg, bg, 2);
 }
 
-void hw_ui_show_agents(int selected, bool bridge_ok) {
-    if (!panel_ok) return;
-    if (selected < 0) selected = 0;
-    if (selected >= AGENTS_LIST_N) selected = AGENTS_LIST_N - 1;
-    HwSpiBusGuard bus;
+/* The BACK row keeps the old look: no glyph column, no marker. */
+static void inbox_draw_back(int i, bool on) {
+    uint16_t y = (uint16_t)(AGENTS_ROW0_Y + i * AGENTS_ROW_H);
+    uint16_t bar_w = PANEL_W - 2 * MARGIN;
+    uint16_t fg = on ? COL_BG : COL_TIME;
+    uint16_t bg = on ? COL_ACCENT : COL_BG;
+    tft_fill_rect(MARGIN, y - 4, bar_w, AGENTS_BAR_H, bg);
+    tft_draw_text(MARGIN + 12, y, "BACK", fg, bg, 2);
+}
 
+void hw_ui_show_inbox(const char *const *labels, const char *glyphs,
+                      const int *unread, int count, int selected,
+                      bool bridge_ok) {
+    if (!panel_ok) return;
+    if (count < 0) count = 0;
+    int total = count + 1;                 /* conversations + BACK */
+    if (selected < 0) selected = 0;
+    if (selected >= total) selected = total - 1;
+
+    /* Scroll so the selection is always on screen: the list is as long as the
+     * user has correspondents, and a fixed window would make the newest
+     * conversations unreachable once there are more than fit. */
+    int first = 0;
+    if (total > INBOX_ROWS_VISIBLE) {
+        if (selected >= INBOX_ROWS_VISIBLE) first = selected - INBOX_ROWS_VISIBLE + 1;
+        if (first > total - INBOX_ROWS_VISIBLE) first = total - INBOX_ROWS_VISIBLE;
+        if (first < 0) first = 0;
+    }
+    int shown = total - first;
+    if (shown > INBOX_ROWS_VISIBLE) shown = INBOX_ROWS_VISIBLE;
+
+    HwSpiBusGuard bus;
+    /* Full repaint whenever the window moved; otherwise only the two rows that
+     * changed, which is what keeps knob scrolling from flickering. */
+    static int inbox_first_drawn = -1;
     if (screen == HW_UI_AGENTS && agents_sel_drawn >= 0 &&
-        agents_sel_drawn != selected) {
-        agents_list_draw_row(agents_sel_drawn, false);
-        agents_list_draw_row(selected, true);
+        agents_sel_drawn != selected && inbox_first_drawn == first) {
+        int a = agents_sel_drawn - first, b = selected - first;
+        for (int k = 0; k < shown; k++) {
+            if (k != a && k != b) continue;
+            int r = first + k;
+            if (r < count) inbox_draw_row(labels ? labels[r] : "",
+                                          glyphs ? glyphs[r] : ' ',
+                                          unread && unread[r] > 0, k, r == selected);
+            else           inbox_draw_back(k, r == selected);
+        }
         agents_sel_drawn = selected;
         return;
     }
-    if (screen == HW_UI_AGENTS && agents_sel_drawn == selected) return;
+    if (screen == HW_UI_AGENTS && agents_sel_drawn == selected &&
+        inbox_first_drawn == first)
+        return;
 
     screen = HW_UI_AGENTS;
     tft_fill(COL_BG);
     tft_fill_rect(0, 0, PANEL_W, 22, COL_ACCENT);
-    tft_draw_text(MARGIN, 4, "AGENTS", COL_BG, COL_ACCENT, 2);
-    tft_draw_text_r(PANEL_W - MARGIN, 6,
-                    bridge_ok ? "bridge" : "local",
+    tft_draw_text(MARGIN, 4, "INBOX", COL_BG, COL_ACCENT, 2);
+    tft_draw_text_r(PANEL_W - MARGIN, 6, bridge_ok ? "bridge" : "local",
                     COL_BG, COL_ACCENT, 1);
-    for (int i = 0; i < AGENTS_LIST_N; i++)
-        agents_list_draw_row(i, i == selected);
+    for (int k = 0; k < shown; k++) {
+        int r = first + k;
+        if (r < count) inbox_draw_row(labels ? labels[r] : "",
+                                      glyphs ? glyphs[r] : ' ',
+                                      unread && unread[r] > 0, k, r == selected);
+        else           inbox_draw_back(k, r == selected);
+    }
     agents_sel_drawn = selected;
+    inbox_first_drawn = first;
 }
 
 // Session list for one agent — like AGENTS but rows are smaller (up to

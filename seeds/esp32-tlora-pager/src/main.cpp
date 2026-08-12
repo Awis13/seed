@@ -1544,6 +1544,7 @@ static void handle_wifi_networks_post(AsyncWebServerRequest *request) {
 // ===== Skills =====
 // Included into this TU so they share auth, SPIFFS, event_add, display_force.
 // build_src_filter excludes skills/ from separate compilation (same as tembed).
+#include "inbox_view.h"   // the inbox list model: order, transport glyph, unread
 #include "skills/notify.cpp"
 // After notify: reuses notify_send_json / notify_send_error / notify_ingest_p1.
 #include "skills/progress.cpp"
@@ -1659,8 +1660,6 @@ enum {
 };
 // Card action sheet (click / Enter on a notification)
 enum { CARD_ACT_ACK = 0, CARD_ACT_REPLY, CARD_ACT_BACK, CARD_ACT_COUNT };
-// Agents list: 0..4 = agents, 5 = BACK
-enum { AGENTS_BACK = 2, AGENTS_LIST_COUNT = 3 };
 // In-chat menu (click while in agent chat room)
 enum { AGENT_ACT_CLEAR = 0, AGENT_ACT_BACK, AGENT_ACT_COUNT };
 // Layout picker: 0=ABC 1=PHON 2=RU 3=BACK
@@ -1734,6 +1733,57 @@ static uint32_t ag_chat_ts[AGENT_THREAD_MAX];
 static const char *ag_chat_ptrs[AGENT_THREAD_MAX];
 // Session-list screen rows: N sessions + "NEW SESSION" + "BACK".
 // ag_sess_msgs[i] < 0 ⇒ no message-count badge on that row.
+/* Inbox snapshot. Built under agents_lock() and drawn from — never a live
+ * pointer into the conversation table, which the off-loop drain mints into and
+ * evicts from while the panel is painting. */
+static char        ag_inbox_labels[CONV_MAX][CONV_LABEL_LEN];
+static const char *ag_inbox_ptrs[CONV_MAX];
+static char        ag_inbox_glyphs[CONV_MAX];
+static int         ag_inbox_unread[CONV_MAX];
+static char        ag_inbox_ids[CONV_MAX][CONV_ID_LEN];  /* what each row displayed */
+static uint8_t     ag_inbox_slot[CONV_MAX];     /* row -> conversation index */
+static bool        ag_inbox_rooms[CONV_MAX];    /* row opens rooms, not a chat */
+static int         ag_inbox_n = 0;              /* conversation rows (BACK extra) */
+
+/* Snapshot the conversation table into the row arrays, newest first. */
+static_assert(CONV_MAX <= INBOX_MAX_ROWS,
+              "the inbox model must be able to order every conversation slot");
+
+static void ui_inbox_build() {
+    InboxConvView v[CONV_MAX];
+    InboxRow rows[CONV_MAX];
+    int n = 0;
+    agents_lock();
+    int total = agents_count();
+    for (int i = 0; i < total && n < CONV_MAX; i++) {
+        v[n].slot = (uint8_t)i;
+        v[n].id = agents_id(i);
+        v[n].label = agents_name(i);
+        v[n].transport = agents_transport(i);
+        v[n].last_use = agents_last_use(i);
+        v[n].unread = agents_unread(i);
+        v[n].has_rooms = agents_has_rooms(i) ? 1 : 0;
+        n++;
+    }
+    int rn = inbox_build_rows(v, n, rows, CONV_MAX);
+    for (int i = 0; i < rn; i++) {
+        snprintf(ag_inbox_labels[i], sizeof(ag_inbox_labels[i]), "%s", rows[i].label);
+        ag_inbox_ptrs[i] = ag_inbox_labels[i];
+        ag_inbox_glyphs[i] = rows[i].glyph;
+        ag_inbox_unread[i] = (int)rows[i].unread;
+        ag_inbox_slot[i] = rows[i].slot;
+        ag_inbox_rooms[i] = rows[i].has_rooms != 0;
+        snprintf(ag_inbox_ids[i], sizeof(ag_inbox_ids[i]), "%s", rows[i].id);
+    }
+    agents_unlock();
+    ag_inbox_n = rn;
+}
+
+static void ui_inbox_render(int selected) {
+    hw_ui_show_inbox(ag_inbox_ptrs, ag_inbox_glyphs, ag_inbox_unread,
+                     ag_inbox_n, selected, agents_bridge_ok());
+}
+
 static char ag_sess_titles[AGENT_SESSIONS_MAX + 2][AGENT_SESSION_LEN + 2];
 static int  ag_sess_msgs[AGENT_SESSIONS_MAX + 2];
 static bool ag_sess_active[AGENT_SESSIONS_MAX + 2];
@@ -2817,7 +2867,8 @@ static void ui_open_menu() {
 
 static void ui_open_agents() {
     agents_sel = 0;
-    hw_ui_show_agents(agents_sel, agents_bridge_ok());
+    ui_inbox_build();
+    ui_inbox_render(agents_sel);
     ui_note_input();
 }
 
@@ -3183,10 +3234,30 @@ static void ui_on_click() {
         }
         break;
     case HW_UI_AGENTS:
-        if (agents_sel == AGENTS_BACK) {
+        if (agents_sel >= ag_inbox_n) {          /* the trailing BACK row */
             ui_open_menu();
         } else {
-            ui_open_agent_sessions(agents_sel);
+            /* THE SLOT MAY HAVE CHANGED HANDS since the list was drawn: the
+             * off-loop drain mints while the inbox sits open, and minting on a
+             * full table recycles a slot. Opening without checking would put
+             * the user in a stranger's thread under the name they picked. The
+             * check is one string compare against the id the row displayed;
+             * rebuilding the list on every scroll tick would cost a lock and a
+             * repaint per knob step instead. */
+            int slot = ag_inbox_slot[agents_sel];
+            agents_lock();
+            const char *live = agents_id(slot);
+            bool same = (live && ag_inbox_ids[agents_sel][0] &&
+                         strcmp(live, ag_inbox_ids[agents_sel]) == 0);
+            agents_unlock();
+            if (!same) {
+                /* Show what is actually there now rather than opening it. */
+                ui_inbox_build();
+                ui_inbox_render(agents_sel);
+                break;
+            }
+            if (ag_inbox_rooms[agents_sel]) ui_open_agent_sessions(slot);
+            else                            ui_open_agent_chat(slot);
         }
         break;
     case HW_UI_AGENT_SESSIONS: {
@@ -3315,10 +3386,12 @@ static void ui_on_steps(int steps) {
         break;
     }
     case HW_UI_AGENTS: {
+        int n = ag_inbox_n + 1;          /* conversations + BACK */
+        if (n < 1) n = 1;
         agents_sel += steps;
-        while (agents_sel < 0) agents_sel += AGENTS_LIST_COUNT;
-        while (agents_sel >= AGENTS_LIST_COUNT) agents_sel -= AGENTS_LIST_COUNT;
-        hw_ui_show_agents(agents_sel, agents_bridge_ok());
+        while (agents_sel < 0) agents_sel += n;
+        while (agents_sel >= n) agents_sel -= n;
+        ui_inbox_render(agents_sel);
         break;
     }
     case HW_UI_AGENT_SESSIONS: {
