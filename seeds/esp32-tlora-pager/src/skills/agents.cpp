@@ -58,6 +58,7 @@
 
 #include "../agents_chat_route.h"  // chat-route seam: claude_route_incoming + pure planner
 #include "../conv_store.h"         // the conversation record: keys, manifest, transports
+#include "../mesh/contact_record.h" // /contacts3 layout: which peers this device has met
 #include "../transport.h"          // the backend contract: transport_send + the inbox doors
 #include "../rns/outbox.h"         // the OTHER half of that seam: rns_send_envelope + rns_peer_addr
 
@@ -184,6 +185,9 @@ static uint32_t g_conv_clock = 0;
  * table, so those lines are dropped from disk in the same pass — this count is
  * the only trace they leave. */
 static uint16_t g_conv_load_skipped = 0;
+/* Mesh lines naming a peer no contact backs — a hand-written route, or a
+ * contact file that was cleared. Counted for the same reason as the above. */
+static uint16_t g_conv_load_unknown = 0;
 
 /* The two bridge/gateway agents, pre-created as CONV_AGENT conversations. Their
  * return address is the agent id's own bytes, which is exactly what the bridge
@@ -245,7 +249,18 @@ static bool agents_is_on_screen(int idx) {
 }
 void agents_set_on_screen_hook(bool (*fn)(int idx)) { g_agents_on_screen = fn; }
 
+/* The ONE filesystem the MeshCore contact table lives on (src/mesh/mc_client).
+ * DECLARED, NOT INCLUDED: this file is barred from seeing mc_client.h at all,
+ * because the MeshCore stack belongs to the loop task and this file also runs
+ * on the keyboard and AsyncTCP tasks. This accessor touches no stack state — it
+ * names a filesystem — so it is the one symbol pulled across, by hand, where
+ * the ban stays visible. */
+namespace fs { class FS; }
+fs::FS &mesh_contacts_fs();
+
 /* Forward decls (defined later in this TU; store section uses them early). */
+static void conv_peer_id(const uint8_t *pubkey, uint8_t len, char *out,
+                         size_t out_n);
 static void agents_view_append(ConvWindow &w, bool from_me, uint32_t ts,
                                const char *text);
 static int agents_find(const char *id);
@@ -673,6 +688,54 @@ static void agents_conv_apply(Conversation &a, const ConvManifestLine &ml) {
                        &a.transport, a.reply_addr, &a.reply_len);
 }
 
+/*
+ * IDS OF THE MESH PEERS THIS DEVICE HAS ACTUALLY MET, read straight from
+ * /contacts3 rather than from the radio's table.
+ *
+ * WHY NOT ASK THE MESH: the radio comes up ~5 s after boot (the deferred
+ * bring-up in skill_meshcore_poll), and conversations are restored during
+ * setup — so at the moment this question is asked the mesh has no table at all.
+ * The file is the same file the mesh will read, and reading it needs no radio.
+ *
+ * WHAT IT BUYS: a mesh conversation is only restored when its id matches a
+ * contact, so a line typed into /conversations.txt by hand cannot conjure a
+ * correspondent the device never heard advertise. It is a SECOND barrier —
+ * the send already refuses an unknown peer — and this one stops the forged
+ * conversation from appearing at all rather than only from being answerable.
+ */
+static char g_conv_known_ids[CONV_MAX * 2][CONV_ID_LEN];
+static uint8_t g_conv_known_n = 0;
+
+static void agents_known_peers_load() {
+    g_conv_known_n = 0;
+    /* THE MESH'S filesystem, not the conversation store's. g_store is the SD
+     * card whenever one mounts, and the contact table is written to SPIFFS —
+     * reading it from g_store on a card-equipped device finds nothing, refuses
+     * every mesh conversation, and the manifest rewrite straight after this
+     * then deletes the very records 1a exists to keep. */
+    fs::FS &cfs = mesh_contacts_fs();
+    if (!cfs.exists(MESH_CONTACTS_PATH)) return;
+    File f = cfs.open(MESH_CONTACTS_PATH, "r");
+    if (!f) return;
+    uint8_t buf[MESH_CONTACT_REC_LEN];
+    while (g_conv_known_n < (uint8_t)(CONV_MAX * 2) &&
+           f.read(buf, sizeof(buf)) == (int)sizeof(buf)) {
+        MeshContactRec r;
+        mesh_contact_unpack(buf, &r);
+        conv_peer_id(r.pub_key, MESH_CONTACT_PUBKEY_LEN,
+                     g_conv_known_ids[g_conv_known_n],
+                     sizeof(g_conv_known_ids[0]));
+        if (g_conv_known_ids[g_conv_known_n][0]) g_conv_known_n++;
+    }
+    f.close();
+}
+
+static bool agents_peer_is_known(const char *id) {
+    for (uint8_t i = 0; i < g_conv_known_n; i++)
+        if (strcmp(g_conv_known_ids[i], id) == 0) return true;
+    return false;
+}
+
 /* Fold one parsed manifest line into the live registry. A line naming an
  * unknown conversation is skipped rather than minting one: a room invented
  * from a stale id is a room nothing can ever answer.
@@ -700,6 +763,13 @@ static void agents_manifest_apply(const ConvManifestLine &ml) {
      *
      * Never evicts while loading: a manifest longer than the table fills it and
      * stops, rather than letting later lines throw out earlier ones. */
+    /* A MESH conversation must name a peer this device has met. LXMF has no
+     * contact notion — anyone holding the address can write — so the same test
+     * cannot be applied there and is not pretended at. */
+    if (ml.transport == CONV_MESH && !agents_peer_is_known(ml.conv)) {
+        g_conv_load_unknown++;
+        return;
+    }
     int idx = conv_mint(ml.conv, ml.label, ml.transport, ml.reply, ml.reply_len,
                         false);
     if (idx < 0) {
@@ -749,8 +819,10 @@ static void agents_manifest_read(const char *path) {
  * new one exists. */
 static void agents_manifest_load() {
     g_conv_load_skipped = 0;
+    g_conv_load_unknown = 0;
     {
         HwSpiBusGuard bus;
+        agents_known_peers_load();   /* who we have met, before who wrote */
         agents_manifest_read(CONV_MANIFEST_LEGACY);
         agents_manifest_read(CONV_MANIFEST);
     }
@@ -759,6 +831,8 @@ static void agents_manifest_load() {
      * with an answer. Outside the bus guard. */
     if (g_conv_load_skipped)
         event_add("conv load skipped %u (table full)", g_conv_load_skipped);
+    if (g_conv_load_unknown)
+        event_add("conv load refused %u (no mesh contact)", g_conv_load_unknown);
 }
 
 static void agents_manifest_persist() {

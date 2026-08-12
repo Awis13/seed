@@ -2,6 +2,7 @@
 #pragma once
 
 #include <Arduino.h>
+#include <FS.h>
 #include <stdbool.h>
 #include <stdint.h>
 
@@ -40,6 +41,23 @@ bool mesh_client_send_to_peer(const uint8_t *pubkey, const char *text,
 
 // Is this 32-byte public key a contact we already know (advert-attributed)?
 bool mesh_client_knows_peer(const uint8_t *pubkey);
+
+// Contact-table persistence, in the stock MeshCore /contacts3 layout (see
+// mesh/contact_record.h). The table used to be rebuilt from adverts on every
+// boot, so a stored conversation could not be answered until its peer spoke
+// again. load() runs inside mesh_client_begin(), before the client reports
+// ready; save() runs on every advert and path update.
+void mesh_contacts_save();
+int  mesh_contacts_load();
+
+// THE filesystem /contacts3 lives on. Exposed rather than assumed because the
+// conversation store reads this same file to decide which peers have been met,
+// and it keeps its own history on a DIFFERENT filesystem (SD when a card is
+// mounted, SPIFFS otherwise). Two components naming the same path on two
+// filesystems is two files: the reader finds nothing, every mesh conversation
+// is refused, and the manifest rewrite that follows deletes them. One accessor
+// means that cannot drift.
+fs::FS &mesh_contacts_fs();
 
 // Exactly one private send may await a MeshCore ACK at a time. Multi-part
 // callers use these to serialize frames and cancel a timed-out expectation

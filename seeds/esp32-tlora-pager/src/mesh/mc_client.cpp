@@ -1,6 +1,7 @@
 // Seed BaseChatMesh client: load SPIFFS identity, RX private DM, sparse TX.
 #include "mc_client.h"
 #include "mc_target.h"
+#include "contact_record.h"
 
 #include <Mesh.h>
 #include <SPIFFS.h>
@@ -102,13 +103,92 @@ class SeedMesh : public BaseChatMesh {
       gateway = lookupContactByPubKey(contact.id.pub_key, 32);
       mlog("gateway contact updated path_len=%d", (int)contact.out_path_len);
     }
+    /* ONLY WHEN THE CONTACT IS NEW. onDiscoveredContact fires for every advert,
+     * including repeats from peers already in the table (BaseChatMesh falls
+     * through to the callback after updating), so saving unconditionally
+     * rewrites the whole file every few minutes for as long as anything is in
+     * range — erase-and-write amplification on the internal flash, and a
+     * multi-millisecond blocking write on the loop task, both for data that did
+     * not change. A path change is a real change and is saved separately. */
+    if (is_new) saveContacts();
   }
 
   void onContactPathUpdated(const ContactInfo &contact) override {
     mlog("path %s len=%d", contact.name, (int)contact.out_path_len);
     if (gateway && memcmp(gateway->id.pub_key, contact.id.pub_key, 32) == 0)
       gateway = lookupContactByPubKey(contact.id.pub_key, 32);
+    saveContacts();   /* the route to a peer is worth as much as the peer */
   }
+
+ public:
+  /* Write the table to /contacts3 in the stock MeshCore layout — see
+   * contact_record.h for the transcribed field order. Anonymous/transient
+   * entries are skipped, matching upstream's save_filter. */
+  void saveContacts() {
+    File f = mesh_contacts_fs().open(MESH_CONTACTS_PATH, "w");
+    if (!f) { mlog("contacts save: open failed"); return; }
+    int written = 0;
+    for (int i = 0; i < num_contacts; i++) {
+      const ContactInfo &c = contacts[i];
+      if (!mesh_contact_worth_saving(c.type)) continue;
+      MeshContactRec r;
+      memset(&r, 0, sizeof(r));
+      memcpy(r.pub_key, c.id.pub_key, MESH_CONTACT_PUBKEY_LEN);
+      memcpy(r.name, c.name, MESH_CONTACT_NAME_LEN);
+      r.type = c.type;
+      r.flags = c.flags;
+      r.sync_since = c.sync_since;
+      r.out_path_len = c.out_path_len;
+      r.last_advert_timestamp = c.last_advert_timestamp;
+      memcpy(r.out_path, c.out_path, MESH_CONTACT_PATH_LEN);
+      r.lastmod = c.lastmod;
+      r.gps_lat = c.gps_lat;
+      r.gps_lon = c.gps_lon;
+      uint8_t buf[MESH_CONTACT_REC_LEN];
+      mesh_contact_pack(&r, buf);
+      if (f.write(buf, sizeof(buf)) != sizeof(buf)) break;  /* card full */
+      written++;
+    }
+    f.close();
+    mlog("contacts saved: %d", written);
+  }
+
+  /* Read the table back at boot. A short read is end-of-file, exactly as
+   * upstream treats it — there is no count and no terminator. */
+  int loadContacts() {
+    if (!mesh_contacts_fs().exists(MESH_CONTACTS_PATH)) return 0;
+    File f = mesh_contacts_fs().open(MESH_CONTACTS_PATH, "r");
+    if (!f) return 0;
+    int loaded = 0;
+    uint8_t buf[MESH_CONTACT_REC_LEN];
+    while (f.read(buf, sizeof(buf)) == (int)sizeof(buf)) {
+      MeshContactRec r;
+      mesh_contact_unpack(buf, &r);
+      ContactInfo c;
+      memset(&c, 0, sizeof(c));
+      c.id = mesh::Identity(r.pub_key);
+      memcpy(c.name, r.name, MESH_CONTACT_NAME_LEN);
+      c.name[MESH_CONTACT_NAME_LEN - 1] = '\0';
+      c.type = r.type;
+      c.flags = r.flags;
+      c.sync_since = r.sync_since;
+      c.out_path_len = r.out_path_len;
+      c.last_advert_timestamp = r.last_advert_timestamp;
+      memcpy(c.out_path, r.out_path, MESH_CONTACT_PATH_LEN);
+      c.lastmod = r.lastmod;
+      c.gps_lat = r.gps_lat;
+      c.gps_lon = r.gps_lon;
+      /* Derived, never stored: recomputed from the key pair on first use. */
+      c.shared_secret_valid = false;
+      if (!addContact(c)) break;    /* table full */
+      loaded++;
+    }
+    f.close();
+    mlog("contacts loaded: %d", loaded);
+    return loaded;
+  }
+
+ private:
 
   ContactInfo *processAck(const uint8_t *data) override {
     // BaseChatMesh only clears txt_send_timeout when processAck returns NON-NULL.
@@ -371,6 +451,13 @@ bool mesh_client_begin() {
   }
   mesh_radio_set_params(LORA_FREQ, LORA_BW, LORA_SF, LORA_CR);
   mesh_radio_set_tx_power(LORA_TX_POWER);
+  /* BEFORE g_ready, deliberately. Everything that sends checks
+   * mesh_client_ready() first, and POST /agents/send does it from the AsyncTCP
+   * task — so setting ready first would open a window where a reply could be
+   * accepted while the table was still empty and be refused as "unknown peer"
+   * for a peer the device knows perfectly well. Loading first makes "ready"
+   * mean "ready", rather than "nearly". */
+  g_client->loadContacts();
   g_ready = true;
   mlog("client up");
   return true;
@@ -386,6 +473,19 @@ bool mesh_client_send_to_gateway(const char *text, uint32_t *expected_ack,
                                  uint32_t *est_timeout_ms) {
   if (!g_client || !g_ready) return false;
   return g_client->sendToGateway(text, expected_ack, est_timeout_ms);
+}
+
+/* SPIFFS, not the conversation store's filesystem: the contact table is device
+ * identity, it is small, and it must be there before the SD card is even
+ * probed. The accessor exists so the one other reader cannot pick differently. */
+fs::FS &mesh_contacts_fs() { return SPIFFS; }
+
+void mesh_contacts_save() {
+  if (g_client && g_ready) g_client->saveContacts();
+}
+
+int mesh_contacts_load() {
+  return (g_client && g_ready) ? g_client->loadContacts() : 0;
 }
 
 bool mesh_client_send_to_peer(const uint8_t *pubkey, const char *text,
