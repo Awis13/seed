@@ -794,9 +794,23 @@ static void skill_meshcore_poll() {
     if (!g_mesh.has_identity || !g_mesh.radio_ready) return;
     if (!g_mesh.heltec_pk_hex[0]) return;
     if (g_mesh_chat_tx.active) return;
-    if (mesh_client_ack_pending()) return;
 
     unsigned long now = millis();
+    /* A keepalive whose ACK never returns must not wedge the TX path forever.
+     * The chat path cancels a stale probe after 12s (see mesh_chat_tx_poll);
+     * do the same for the standalone keepalive so it recovers on its own
+     * instead of blocking every future probe — and the menu PING's mesh
+     * column, which shares this ack-pending gate. */
+    if (mesh_client_ack_pending()) {
+        if (now - mesh_client_last_send_ms() < 12000UL) return;
+        mesh_client_cancel_pending_ack();
+        if (mesh_probe_awaiting_ack) {
+            mesh_probe_awaiting_ack = false;
+            g_mesh.fail_streak++;
+            g_mesh.probe_fail_count++;
+        }
+    }
+
     unsigned long interval_ms = (unsigned long)g_mesh.probe_interval_s * 1000UL;
     if (g_mesh.last_probe_ms != 0 &&
         (now - g_mesh.last_probe_ms) < interval_ms) {
