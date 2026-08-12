@@ -58,6 +58,7 @@
 
 #include "../agents_chat_route.h"  // chat-route seam: claude_route_incoming + pure planner
 #include "../conv_store.h"         // the conversation record: keys, manifest, transports
+#include "../transport.h"          // the backend contract: transport_send + the inbox doors
 #include "../rns/outbox.h"         // the OTHER half of that seam: rns_send_envelope + rns_peer_addr
 
 /* Conversation slots. Still 2 for now — every slot costs a full AGENT_VIEW_MAX
@@ -115,6 +116,11 @@ struct Conversation {
     uint8_t transport;                // CONV_AGENT / CONV_LXMF / CONV_MESH
     uint8_t reply_len;                // bytes used in reply_addr (0 = unknown)
     uint8_t reply_addr[CONV_REPLY_MAX];
+    /* Compiled in rather than discovered. A seeded conversation's ROUTE is
+     * re-derived at every load and never taken from the manifest — see
+     * conv_route_resolve() in ../transport.h for why that matters now that
+     * transport chooses the wire a reply leaves on. */
+    uint8_t seeded;
     char sessions[AGENT_SESSIONS_MAX][AGENT_SESSION_LEN];
     uint8_t n_sessions;
     uint8_t active_idx;         // into sessions[]
@@ -137,9 +143,9 @@ struct Conversation {
  * are value-initialised (empty room list, empty viewport). */
 static Conversation g_convs[CONV_MAX] = {
     { .id = "claude", .label = "CLAUDE", .transport = CONV_AGENT, .reply_len = 6,
-      .reply_addr = { 'c', 'l', 'a', 'u', 'd', 'e' } },
+      .reply_addr = { 'c', 'l', 'a', 'u', 'd', 'e' }, .seeded = 1 },
     { .id = "hermes", .label = "HERMES", .transport = CONV_AGENT, .reply_len = 6,
-      .reply_addr = { 'h', 'e', 'r', 'm', 'e', 's' } },
+      .reply_addr = { 'h', 'e', 'r', 'm', 'e', 's' }, .seeded = 1 },
 };
 /* Live conversations in g_convs[]. A constant today; the seam a later commit
  * uses to append a peer conversation without touching every loop below. */
@@ -492,11 +498,14 @@ static void agents_sync_view(int idx) {
  * conversation's rooms is intentional and idempotent. */
 static void agents_conv_apply(Conversation &a, const ConvManifestLine &ml) {
     if (ml.label[0]) snprintf(a.label, sizeof(a.label), "%s", ml.label);
-    a.transport = ml.transport;
-    if (ml.reply_len) {
-        a.reply_len = ml.reply_len;
-        memcpy(a.reply_addr, ml.reply, ml.reply_len);
-    }
+    /* The ROUTE is resolved, not assigned: a seeded conversation keeps the
+     * transport and return address the firmware compiled in, whatever the card
+     * says. /conversations.txt is user-editable and transport now chooses the
+     * wire a reply leaves on — see conv_route_resolve() in ../transport.h. */
+    conv_route_resolve(a.seeded != 0,
+                       a.transport, a.reply_addr, a.reply_len,
+                       ml.transport, ml.reply, ml.reply_len,
+                       &a.transport, a.reply_addr, &a.reply_len);
 }
 
 /* Fold one parsed manifest line into the live registry. A line naming an
@@ -1204,47 +1213,38 @@ static bool agents_rns_uplink(const char *agent_id, const char *session,
     return rns_send_envelope(peer, session, text, why);
 }
 
-/* Public: send a line as the user, into the agent's ACTIVE session.
- * Path: local thread/history → owned transport. `claude` goes over Reticulum
- * (see agents_rns_uplink) and falls back only when RNS cannot take it, saying
- * so in the room. Every other agent — `hermes` is the only one left — keeps the
- * plain ladder: the WiFi /v1/chat bridge when it is reachable, then the
- * MeshCore C1 DM when the bridge is down/absent.
- * Downlink reply uses the same transport (or WiFi /agents/inbound). One chat
- * loop. */
-static bool agents_send(const char *agent_id, const char *text) {
-    int idx = agents_find(agent_id);
-    if (idx < 0 || !text || !text[0]) return false;
+/* ---- transport backends --------------------------------------------------- *
+ *
+ * One backend per wire, each reached only through transport_send() below. The
+ * ladder that used to sit inline in agents_send() lives in the CONV_AGENT
+ * backend now, unchanged — which is the point: agents_send() no longer knows
+ * that `claude` has a Reticulum uplink and `hermes` does not. That is a
+ * property of the agent wire, and when the mesh messenger generalises it, only
+ * this backend changes. */
 
-    char cleaned[AGENT_TEXT_LEN];
-    agents_clean_text(text, cleaned, sizeof(cleaned));
-    if (!cleaned[0]) return false;
-
-    /* "where are you?" never leaves the device: answer with the GPS fix. */
-    if (agents_gps_intercept(idx, cleaned)) return true;
-
-    agents_push_line(idx, true, cleaned);   // persists + updates viewport
-    agents_lock();
-    const char *session = agents_active_session(idx);
-    event_add("agent %s<<%s %s", agent_id, session, cleaned);
-    agents_unlock();
-    display_force = true;
-
-    /* LXMF-ORIGIN ROOMS ANSWER AS LXMF (TLORA-LXMF C4), and BEFORE the seed.pager
-     * uplink below. If this room last received an LXMF message, its reply goes
-     * back to THAT sender over lxmf.delivery, not to the configured seed.pager
-     * peer — which is a different node. Only `claude` has an inbound RNS half, so
-     * only it can carry an LXMF origin; every other agent takes the check as a
-     * cheap miss. A build/enqueue failure does NOT fall through to seed.pager:
-     * that peer is not the LXMF sender and would misdeliver, so the fault is put
-     * in the room (one short line) and the reply stops here. A non-LXMF `claude`
-     * room drops straight through to the unchanged seed.pager path below. */
-    if (strcmp(agent_id, "claude") == 0) {
+/* CONV_AGENT: the existing ladder, byte for byte.
+ *
+ * The `claude` tests inside it are NOT dispatch — dispatch is done by the time
+ * we get here. They are this backend's internal routing, and both are load
+ * bearing: the LXMF origin table is keyed by ROOM NAME ALONE (lxmf_reply.h), so
+ * dropping the check would let a `hermes` room that merely shares a name with a
+ * `claude` room inherit its LXMF sender; and the Reticulum peer is a single
+ * configured address, so offering it to every agent would put `hermes` traffic
+ * on a link the user configured for something else. */
+static bool transport_send_agent(int idx, const char *conv_id, const char *session,
+                                 const char *text) {
+    /* LXMF-ORIGIN ROOMS ANSWER AS LXMF, and BEFORE the seed.pager uplink below.
+     * If this room last received an LXMF message, its reply goes back to THAT
+     * sender over lxmf.delivery, not to the configured seed.pager peer — which
+     * is a different node. A build/enqueue failure does NOT fall through to
+     * seed.pager: that peer is not the LXMF sender and would misdeliver, so the
+     * fault is put in the room (one short line) and the reply stops here. */
+    if (strcmp(conv_id, "claude") == 0) {
         uint8_t lxmf_dest[16];
         if (rns_lxmf_reply_target(session, lxmf_dest)) {
             const char *lx_why = nullptr;
-            if (rns_send_lxmf_reply(lxmf_dest, cleaned, &lx_why)) {
-                event_add("agent %s lxmf reply", agent_id);
+            if (rns_send_lxmf_reply(lxmf_dest, text, &lx_why)) {
+                event_add("agent %s lxmf reply", conv_id);
             } else {
                 char line[64];
                 snprintf(line, sizeof(line), "(lxmf: %s)",
@@ -1261,20 +1261,18 @@ static bool agents_send(const char *agent_id, const char *text) {
      * and did not take it", which is what makes the fallback visible instead of
      * a silent downgrade to a path the user did not choose. */
     const char *rns_why = nullptr;
-    if (agents_rns_uplink(agent_id, session, cleaned, &rns_why)) {
-        event_add("agent %s rns uplink", agent_id);
+    if (agents_rns_uplink(conv_id, session, text, &rns_why)) {
+        event_add("agent %s rns uplink", conv_id);
         return true;
     }
 
-    /* No mesh-owned agents left to skip the bridge for: codex and opencode were
-     * the two that owned a gateway inbox, and both are gone from the registry.
-     * Everything that reaches here tries the bridge first and the C1 DM after,
+    /* Everything that reaches here tries the bridge first and the C1 DM after,
      * which is the ladder the remaining pair has always wanted. */
-    bool wifi_ok = agents_bridge_post(agent_id, agents_active_session(idx), cleaned);
+    bool wifi_ok = agents_bridge_post(conv_id, session, text);
     bool mesh_ok = false;
     if (!wifi_ok && g_agents_mesh_uplink) {
-        mesh_ok = g_agents_mesh_uplink(agent_id, cleaned);
-        if (mesh_ok) event_add("agent %s mesh uplink", agent_id);
+        mesh_ok = g_agents_mesh_uplink(conv_id, text);
+        if (mesh_ok) event_add("agent %s mesh uplink", conv_id);
     }
     if (rns_why) {
         /* ONE SHORT LINE, ALWAYS, and it replaces the bridge's own complaint
@@ -1302,6 +1300,110 @@ static bool agents_send(const char *agent_id, const char *text) {
     return true;
 }
 
+/* CONV_LXMF: answer the sender this conversation was opened by. The address is
+ * the one the planner handed back — the conversation's own stored source hash,
+ * not a room-name lookup and not the configured Reticulum peer. */
+static bool transport_send_lxmf(const uint8_t *addr, const char *text,
+                                const char **why) {
+    return rns_send_lxmf_reply(addr, text, why);
+}
+
+/* CONV_MESH: a DM straight to the peer's public key.
+ *
+ * NOT WIRED YET, AND DELIBERATELY NOT FAKED. The mesh layer's only send is
+ * mesh_client_send_to_gateway(), which resolves one hardcoded gateway contact
+ * (mc_client.cpp sendToGateway -> lookupContactByPubKey(heltec_pk_hex)); there
+ * is no primitive for an arbitrary peer key, and routing a private reply
+ * through the gateway would hand it to a third party. So the branch exists, the
+ * planner already resolves the right address for it, and the send refuses with
+ * a reason instead of quietly going somewhere else. The peer-send primitive
+ * arrives with the mesh messenger. */
+static bool transport_send_mesh(const uint8_t *addr, uint8_t addr_len,
+                                const char *text, const char **why) {
+    (void)addr; (void)addr_len; (void)text;
+    if (why) *why = "no peer send yet";
+    return false;
+}
+
+/*
+ * THE one outbound seam. Chosen by conv->transport, never by a conversation's
+ * name: adding a wire means adding a backend above, not another branch in the
+ * chat path. The active room is read off the conversation so no caller has to
+ * pass — or pick — one.
+ */
+bool transport_send(const struct Conversation *conv, const char *text) {
+    if (!conv || !text || !text[0]) return false;
+    int idx = agents_find(conv->id);
+    if (idx < 0) return false;
+
+    TransportTarget tgt;
+    tgt.transport = conv->transport;
+    tgt.reply_addr = conv->reply_addr;
+    tgt.reply_len = conv->reply_len;
+
+    uint8_t backend = TRANSPORT_BACKEND_NONE;
+    const uint8_t *addr = nullptr;
+    uint8_t addr_len = 0;
+    int plan = transport_plan(&tgt, &backend, &addr, &addr_len);
+
+    const char *why = nullptr;
+    bool ok = false;
+    if (plan != TRANSPORT_OK) {
+        why = (plan == TRANSPORT_NO_ADDRESS) ? "no return address"
+                                             : "unknown transport";
+    } else if (backend == TRANSPORT_BACKEND_AGENT) {
+        /* Owns its own in-room reporting (the bridge/RNS ladder's error lines). */
+        return transport_send_agent(idx, conv->id,
+                                    conv->sessions[conv->active_idx], text);
+    } else if (backend == TRANSPORT_BACKEND_LXMF) {
+        ok = transport_send_lxmf(addr, text, &why);
+        if (ok) event_add("conv %s lxmf reply", conv->id);
+    } else if (backend == TRANSPORT_BACKEND_MESH_PEER) {
+        ok = transport_send_mesh(addr, addr_len, text, &why);
+    }
+
+    if (!ok) {
+        /* One short line in the room, same shape the agent ladder uses: a
+         * seven-row screen cannot afford two, and a silent failure is how a
+         * message the user believes they sent disappears. */
+        char line[64];
+        snprintf(line, sizeof(line), "(send: %s)", why ? why : "not sent");
+        agents_push_line(idx, false, line);
+        display_force = true;
+    }
+    return ok;
+}
+
+/* Public: send a line as the user, into the conversation's ACTIVE room.
+ * Path: local thread/history → transport_send(), which picks the wire from the
+ * conversation record. Downlink replies arrive on the same wire (or WiFi
+ * /agents/inbound). One chat loop. */
+static bool agents_send(const char *agent_id, const char *text) {
+    int idx = agents_find(agent_id);
+    if (idx < 0 || !text || !text[0]) return false;
+
+    char cleaned[AGENT_TEXT_LEN];
+    agents_clean_text(text, cleaned, sizeof(cleaned));
+    if (!cleaned[0]) return false;
+
+    /* "where are you?" never leaves the device: answer with the GPS fix. */
+    if (agents_gps_intercept(idx, cleaned)) return true;
+
+    agents_push_line(idx, true, cleaned);   // persists + updates viewport
+    agents_lock();
+    const char *session = agents_active_session(idx);
+    event_add("agent %s<<%s %s", agent_id, session, cleaned);
+    agents_unlock();
+    display_force = true;
+
+    transport_send(&g_convs[idx], cleaned);
+    /* The room already carries the outcome (the backend puts one line in it on
+     * failure), and the caller's contract has always been "accepted into the
+     * thread", not "delivered" — GET /agents and the transport status routes
+     * are where delivery is reported. */
+    return true;
+}
+
 /* Inject an agent reply into the active session of the agent (long texts split).
  * real_inbound: true only for genuine arrivals (HTTP /agents/inbound, GPS
  * answer) — they may wake the panel when the room is open on screen. Synthetic
@@ -1316,6 +1418,33 @@ static void agents_on_inbound(const char *agent_id, const char *text,
     agents_push_line(idx, false, cleaned);
     if (real_inbound) g_agents_real_inbound = true;
     display_force = true;
+}
+
+/*
+ * THE one inbound message door (declared in ../transport.h). A transport that
+ * has received a chat line hands it here instead of reaching into the store.
+ *
+ * `via` is CHECKED, not decoration: a conversation is only fed by the wire it
+ * lives on, so a sender on one transport cannot land a line in another's room
+ * by guessing its id. Creating a conversation for a peer nobody has met is the
+ * receive half and belongs with the receivers that need it, so an unknown
+ * peer_id is refused here rather than silently minted.
+ */
+bool inbox_deliver_msg(uint8_t via, const char *peer_id, const char *label,
+                       const char *text) {
+    if (!peer_id || !peer_id[0] || !text || !text[0]) return false;
+    int idx = agents_find(peer_id);
+    if (idx < 0) return false;
+    agents_lock();
+    Conversation &a = g_convs[idx];
+    bool wire_ok = (a.transport == via);
+    /* A sender's display name may change between messages; the id may not. */
+    if (wire_ok && label && label[0] && !a.seeded)
+        snprintf(a.label, sizeof(a.label), "%s", label);
+    agents_unlock();
+    if (!wire_ok) return false;
+    agents_on_inbound(a.id, text, true);
+    return true;
 }
 
 /* ---- chat-route seam: claude_route_incoming() ----------------------------- *

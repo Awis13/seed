@@ -1019,11 +1019,15 @@ assert '"data_lxmf_tx"' in json_builder, (
     "GET /rns/status must publish data_lxmf_tx, the OUT mirror of data_lxmf_rooms"
 )
 
-# skills/agents.cpp gates the LXMF reply on `claude` and takes it BEFORE the
+# The agent wire gates the LXMF reply on `claude` and takes it BEFORE the
 # seed.pager uplink; a non-LXMF room falls through to the unchanged old path.
+# This ladder now lives in the CONV_AGENT transport backend rather than inline
+# in agents_send() — the chat path dispatches by the conversation's transport
+# and no longer knows any agent's name — so the pin follows it there. The
+# invariant is unchanged: same two calls, same required order.
 agents = (ROOT / "src" / "skills" / "agents.cpp").read_text(encoding="utf-8")
-send_fn = agents[agents.index("static bool agents_send(") :]
-send_fn = send_fn[: send_fn.index("\n/* Inject an agent reply")]
+send_fn = agents[agents.index("static bool transport_send_agent(") :]
+send_fn = send_fn[: send_fn.index("\n/* CONV_LXMF:")]
 assert "rns_lxmf_reply_target(session, lxmf_dest)" in send_fn, (
     "agents_send must ask whether this room owes an LXMF reply"
 )
@@ -2444,10 +2448,12 @@ assert "(RNS_OUTBOX_ATTEMPTS_MAX - 1) * RNS_OUTBOX_RETRY_MS == 60000UL" in \
 # visible rather than silent.
 uplink = agents[agents.index("static bool agents_rns_uplink") :]
 uplink = uplink[: uplink.index("\n}\n")]
-# Sliced forward from the definition, not between two absolute indices: the
-# forward declaration of agents_on_inbound sits ABOVE agents_send.
-send = agents[agents.index("static bool agents_send") :]
-send = send[: send.index("static void agents_on_inbound")]
+# The uplink ladder moved into the CONV_AGENT transport backend when the chat
+# path started dispatching by the conversation's transport. The ordering
+# invariants below (RNS first, bridge as fallback, the room's own name as the
+# envelope's session field) are unchanged and are pinned in their new home.
+send = agents[agents.index("static bool transport_send_agent(") :]
+send = send[: send.index("\n/* CONV_LXMF:")]
 
 # 11a. It is the RNS entry point that is called, and it is the one declared in
 # the ring's own header — not a private copy, not an HTTP POST to ourselves.
@@ -2498,7 +2504,7 @@ assert 'if (strcmp(agent_id, "claude") != 0) return false;' in uplink, (
 )
 # 11c. THE ROOM'S OWN NAME IS THE SESSION FIELD. Without it the peer answers
 # into whichever room is newest, and a reply typed in one room lands in another.
-assert "agents_rns_uplink(agent_id, session, cleaned, &rns_why)" in send, (
+assert "agents_rns_uplink(conv_id, session, text, &rns_why)" in send, (
     "the active session name must be the envelope's session field, so the "
     "answer comes back to the room the message was typed in"
 )

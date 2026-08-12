@@ -105,6 +105,7 @@
  */
 
 #include "../micron/notify_record.h"
+#include "../transport.h"   /* the one card door: inbox_deliver_card + its plan */
 
 /* Forward decl: the off-loop archive enqueue is defined in skills/history.cpp,
  * which is #included AFTER this file in the unity build (main.cpp). Notify's
@@ -1079,6 +1080,83 @@ static void notify_poll() {
     }
 }
 
+/* The severity a transport names must be the severity the screen shows. */
+static_assert(INBOX_SEV_INFO == NOTIFY_INFO, "inbox/notify severity must agree");
+static_assert(INBOX_SEV_WARN == NOTIFY_WARN, "inbox/notify severity must agree");
+static_assert(INBOX_SEV_CRIT == NOTIFY_CRIT, "inbox/notify severity must agree");
+
+/*
+ * RAISE A CARD — the single place a notification becomes visible.
+ *
+ * Pushing a card into the ring is not the same as raising one: the panel has to
+ * be woken, the arrival staged for loop() to consume, the LED ring armed, the
+ * sound requested and the event logged, and every one of those has to happen
+ * for every card no matter which wire brought it. That sequence used to be
+ * written out twice — once in POST /notify and once in the mesh ingest — which
+ * is exactly the shape where a transport quietly gets a card that does not ring
+ * or does not wake the screen. Both callers now converge here, and
+ * inbox_deliver_card() below is the transport-facing door onto it.
+ *
+ * The timestamps are taken here rather than by the caller: time() must not be
+ * called inside notify_push's critical section, and one stamp for the whole
+ * card is what makes its age self-consistent.
+ *
+ * Returns the card id, or 0 when the queue refused it.
+ */
+static uint32_t notify_raise(Notification &e, const NotifyOptions *opts,
+                             uint32_t *replaced_out) {
+    time_t now = time(NULL);
+    e.created_epoch = (now > TIME_VALID_EPOCH) ? now : 0;
+    e.created_ms = millis();
+
+    uint32_t replaced = 0;
+    uint32_t id = notify_push(e, opts, &replaced);
+    if (replaced_out) *replaced_out = replaced;
+    if (id == 0) return 0;
+
+    /* Staged, not acted on: loop() owns every screen change, and the flash
+       write happens there too. A critical message is written on the next pass
+       rather than after the coalescing window, because the reboot it is
+       reporting may not wait. */
+    notify_arrived_id = id;
+    notify_arrived = true;
+    notify_ring_level = e.level;
+    notify_ring_arrived = true;
+    notify_request_sound(e.level, e.source);
+    /* Persistence already happened inside notify_push (archive write-through). */
+    display_force = true;
+    event_add("notify %s: %s%s%s", notify_level_name(e.level),
+              e.source[0] ? e.source : "", e.source[0] ? ": " : "", e.title);
+    return id;
+}
+
+/*
+ * THE card door (declared in ../transport.h): one entry every transport raises
+ * a notification card through, so a card carried by mesh or LXMF is admitted,
+ * labelled, ranked and shown exactly like one that arrived over HTTP.
+ * Admission (title required, severity clamped, source defaulted per transport)
+ * is the pure inbox_card_plan(); the raise is notify_raise() above.
+ */
+uint32_t inbox_deliver_card(uint8_t via, const char *key, uint8_t sev,
+                            const char *source, const char *title,
+                            const char *body) {
+    InboxCardPlan plan;
+    if (!inbox_card_plan(via, sev, source, title, &plan)) return 0;
+
+    Notification e;
+    memset(&e, 0, sizeof(e));
+    e.level = plan.sev;
+    e.unread = true;
+    e.chosen = -1;   /* memset made it 0, which would read as "picked the first" */
+    e.opt_count = 0;
+    e.ttl_s = 0;
+    notify_copy_text(e.source, sizeof(e.source), plan.source);
+    notify_copy_text(e.title, sizeof(e.title), title);
+    notify_copy_text(e.body, sizeof(e.body), body ? body : "");
+    if (key && key[0]) notify_copy_text(e.key, sizeof(e.key), key);
+    return notify_raise(e, NULL, NULL);
+}
+
 /* Ingest without HTTP — same card path as POST /notify.
  * Used by MeshCore private DM (P1|…) and any future transport. */
 static uint32_t notify_ingest(const char *level_s,
@@ -1101,25 +1179,7 @@ static uint32_t notify_ingest(const char *level_s,
     notify_copy_text(e.title, sizeof(e.title), title ? title : "notify");
     notify_copy_text(e.body, sizeof(e.body), body ? body : "");
     if (key && key[0]) notify_copy_text(e.key, sizeof(e.key), key);
-
-    time_t now = time(NULL);
-    e.created_epoch = (now > TIME_VALID_EPOCH) ? now : 0;
-    e.created_ms = millis();
-
-    uint32_t replaced = 0;
-    uint32_t id = notify_push(e, NULL, &replaced);
-    if (id == 0) return 0;
-
-    notify_arrived_id = id;
-    notify_arrived = true;
-    notify_ring_level = e.level;
-    notify_ring_arrived = true;
-    notify_request_sound(e.level, e.source);
-    /* Persistence already happened inside notify_push (archive write-through). */
-    display_force = true;
-    event_add("notify %s: %s%s%s", notify_level_name(e.level),
-              e.source[0] ? e.source : "", e.source[0] ? ": " : "", e.title);
-    return id;
+    return notify_raise(e, NULL, NULL);
 }
 
 /*
@@ -1469,34 +1529,16 @@ static void notify_register_routes(AsyncWebServer &server) {
             }
         }
 
-        /* Both clocks are read before the lock: time() must not be called
-           inside a critical section, and one timestamp for the whole entry is
-           what makes its age self-consistent. */
-        time_t now = time(NULL);
-        e.created_epoch = (now > TIME_VALID_EPOCH) ? now : 0;
-        e.created_ms = millis();
-
+        /* This route validates its JSON and nothing more: the card itself is
+           raised through the one shared entry, so the HTTP transport gets the
+           same wake/ring/sound/log every other transport gets, by construction
+           rather than by keeping two copies in step. */
         uint32_t replaced = 0;
-        uint32_t id = notify_push(e, e.opt_count ? &opts : NULL, &replaced);
+        uint32_t id = notify_raise(e, e.opt_count ? &opts : NULL, &replaced);
         if (id == 0) {
             notify_send_error(req, 500, "queue full");
             return;
         }
-
-        /* Staged, not acted on: loop() owns every screen change, and the flash
-           write happens there too. A critical message is written on the next
-           pass rather than after the coalescing window, because the reboot it
-           is reporting may not wait. */
-        notify_arrived_id = id;
-        notify_arrived = true;
-        notify_ring_level = e.level;
-        notify_ring_arrived = true;
-        notify_request_sound(e.level, e.source);
-        /* Persistence already happened inside notify_push (archive write-through). */
-        display_force = true;
-
-        event_add("notify %s: %s%s%s", notify_level_name(e.level),
-                  e.source[0] ? e.source : "", e.source[0] ? ": " : "", e.title);
 
         JsonDocument doc;
         doc["ok"] = true;
