@@ -385,36 +385,36 @@ static void test_slot_plan(void) {
     /* Two seeded conversations, six free slots: a new one appends. */
     uint8_t seeded[8] = {1, 1, 0, 0, 0, 0, 0, 0};
     uint32_t use[8]   = {50, 51, 0, 0, 0, 0, 0, 0};
-    assert(conv_slot_plan(2, 8, seeded, use, -1) == 2);
-    assert(conv_slot_plan(7, 8, seeded, use, -1) == 7);
+    assert(conv_slot_plan(2, 8, seeded, use, -1, true) == 2);
+    assert(conv_slot_plan(7, 8, seeded, use, -1, true) == 7);
 
     /* Full table: the least-recently-used NON-seeded slot goes. Slot 1 is the
      * globally oldest but seeded, so it must survive; slot 5 is the oldest peer. */
     uint32_t full_use[8] = {90, 1, 40, 70, 60, 20, 30, 80};
     uint8_t full_seed[8] = {1, 1, 0, 0, 0, 0, 0, 0};
-    int victim = conv_slot_plan(8, 8, full_seed, full_use, -1);
+    int victim = conv_slot_plan(8, 8, full_seed, full_use, -1, true);
     assert(victim == 5);
     assert(full_seed[victim] == 0);          /* never a seeded slot */
 
     /* Make that peer the most recent and the choice must move on — otherwise
      * the "least recently used" claim is just the lowest index in disguise. */
     full_use[5] = 99;
-    assert(conv_slot_plan(8, 8, full_seed, full_use, -1) == 6);
+    assert(conv_slot_plan(8, 8, full_seed, full_use, -1, true) == 6);
 
     /* Ties resolve to the lowest index, deterministically. */
     uint32_t tie_use[8] = {9, 9, 5, 5, 5, 5, 5, 5};
-    assert(conv_slot_plan(8, 8, full_seed, tie_use, -1) == 2);
-    assert(conv_slot_plan(8, 8, full_seed, tie_use, -1) == 2);
+    assert(conv_slot_plan(8, 8, full_seed, tie_use, -1, true) == 2);
+    assert(conv_slot_plan(8, 8, full_seed, tie_use, -1, true) == 2);
 
     /* A table of nothing but seeded conversations refuses rather than throwing
      * one of the device's own doors away. */
     uint8_t all_seeded[4] = {1, 1, 1, 1};
     uint32_t any_use[4] = {1, 2, 3, 4};
-    assert(conv_slot_plan(4, 4, all_seeded, any_use, -1) == -1);
+    assert(conv_slot_plan(4, 4, all_seeded, any_use, -1, true) == -1);
 
     /* Degenerate inputs are refused, not guessed at. */
-    assert(conv_slot_plan(0, 0, seeded, use, -1) == -1);
-    assert(conv_slot_plan(8, 8, NULL, NULL, -1) == -1);
+    assert(conv_slot_plan(0, 0, seeded, use, -1, true) == -1);
+    assert(conv_slot_plan(8, 8, NULL, NULL, -1, true) == -1);
 
     /* THE CONVERSATION ON SCREEN IS NOT A VICTIM. Recycling its slot does not
      * close that chat — it replaces it, leaving the reader in a stranger's
@@ -423,19 +423,19 @@ static void test_slot_plan(void) {
      * (The LRU case above made slot 5 the most recent; put it back, and assert
      * the unprotected answer first so the protected one is a real change.) */
     full_use[5] = 20;
-    assert(conv_slot_plan(8, 8, full_seed, full_use, -1) == 5);
-    assert(conv_slot_plan(8, 8, full_seed, full_use, 5) == 6);
+    assert(conv_slot_plan(8, 8, full_seed, full_use, -1, true) == 5);
+    assert(conv_slot_plan(8, 8, full_seed, full_use, 5, true) == 6);
     /* Protecting a slot that was never the victim changes nothing. */
-    assert(conv_slot_plan(8, 8, full_seed, full_use, 7) == 5);
+    assert(conv_slot_plan(8, 8, full_seed, full_use, 7, true) == 5);
     /* Protecting a seeded slot is harmless (it was already excluded). */
-    assert(conv_slot_plan(8, 8, full_seed, full_use, 0) == 5);
+    assert(conv_slot_plan(8, 8, full_seed, full_use, 0, true) == 5);
     /* Every non-seeded slot unavailable => refuse rather than evict the reader. */
     uint8_t one_peer[3] = {1, 1, 0};
     uint32_t one_use[3] = {5, 6, 7};
-    assert(conv_slot_plan(3, 3, one_peer, one_use, -1) == 2);
-    assert(conv_slot_plan(3, 3, one_peer, one_use, 2) == -1);
+    assert(conv_slot_plan(3, 3, one_peer, one_use, -1, true) == 2);
+    assert(conv_slot_plan(3, 3, one_peer, one_use, 2, true) == -1);
     /* An out-of-range protect index must not silently protect a real slot. */
-    assert(conv_slot_plan(8, 8, full_seed, full_use, 99) == 5);
+    assert(conv_slot_plan(8, 8, full_seed, full_use, 99, true) == 5);
 }
 
 /* --- 7d. a minted peer survives a reboot with its return address ------------ */

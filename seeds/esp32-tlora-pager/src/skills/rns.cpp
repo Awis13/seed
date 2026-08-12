@@ -926,6 +926,10 @@ static uint32_t g_rns_lxmf_bad = 0;
  * above. */
 static uint32_t g_rns_lxmf_cards = 0;
 static uint32_t g_rns_lxmf_rooms = 0;
+/* Chats are counted apart from rooms: a room is the legacy thread-named agent
+ * route, a chat is a sender's own conversation. Folding them together would
+ * report room routing that never happened. */
+static uint32_t g_rns_lxmf_chats = 0;
 /* LXMF replies built, signed and handed to the send ladder (C4). Disjoint from
  * every other counter: it is the OUT side, the mirror of data_lxmf_rooms on the
  * IN side. Loop-task- OR AsyncTCP-written (rns_send_lxmf_reply runs on whichever
@@ -2175,6 +2179,7 @@ static void rns_status_json(JsonDocument &doc) {
      * shortfall against it is a message that parsed but whose card was refused. */
     doc["data_lxmf_cards"] = (unsigned long)g_rns_lxmf_cards;
     doc["data_lxmf_rooms"] = (unsigned long)g_rns_lxmf_rooms;
+    doc["data_lxmf_chats"] = (unsigned long)g_rns_lxmf_chats;
     /* The OUT mirror of data_lxmf_rooms (C4): LXMF replies built, signed and
      * handed to the send ladder. Disjoint from every other counter. */
     doc["data_lxmf_tx"] = (unsigned long)g_rns_lxmf_tx;
@@ -3042,6 +3047,34 @@ static bool lxmf_ingest_wire(const uint8_t *wire, size_t len) {
             }
         }
         return true;
+    }
+
+    /* A PERSON WRITING TO US -> THEIR CONVERSATION. Loop-safety is the same
+     * constraint as the room path above: this runs on the loop task, so the
+     * producer is RAM-only and the mint/append happen on the off-loop drain.
+     * The conversation is keyed on the 16-byte source hash, not on any name the
+     * sender chose, so two senders can never land in one thread.
+     *
+     * A FAILURE FALLS THROUGH TO THE CARD BELOW rather than returning: the
+     * queue can be full and, for a sender we have never heard from, the table
+     * can be out of free slots (an address-based transport may not evict). The
+     * message must still be shown, so the card path is the floor under this
+     * one and nothing is silently dropped. */
+    if (route.kind == LXMF_ROUTE_CHAT) {
+        rns_text_sanitize((const uint8_t *)g_rns_lxmf_msg.content,
+                          g_rns_lxmf_msg.content_len,
+                          g_rns_room_text, sizeof(g_rns_room_text), 0);
+        /* NO NAME: on this branch route.source is provably the "lxmf" constant
+         * — a chat is reached only when our meta is absent, which is exactly
+         * when the planner falls back to that literal — so passing it would
+         * label every sender "lxmf" and hide the distinguishing hex id. LXMF
+         * carries no display name for a third-party sender, so the id is the
+         * honest label until something can resolve one. */
+        if (inbox_deliver_msg_lxmf(g_rns_lxmf_msg.source_hash, LXMF_HASH_LEN,
+                                   nullptr, g_rns_room_text)) {
+            g_rns_lxmf_chats++;
+            return true;
+        }
     }
 
     /* THE DEFAULT: a card. Title and content are sanitised the seed.pager

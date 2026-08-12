@@ -580,7 +580,7 @@ static void agents_sync_view(int idx) {
  * Caller holds agents_mux. Returns the slot index, or -1.
  */
 static int conv_mint(const char *id, const char *label, uint8_t transport,
-                     const uint8_t *addr, uint8_t addr_len) {
+                     const uint8_t *addr, uint8_t addr_len, bool may_evict) {
     if (!id || !id[0]) return -1;
     int idx = agents_find(id);
     if (idx >= 0) return idx;                    /* find, before mint */
@@ -597,7 +597,8 @@ static int conv_mint(const char *id, const char *label, uint8_t transport,
      * conversation the init loop synced last, which is harmless: nothing can
      * mint that early, and protecting the wrong slot only costs a different
      * victim.) */
-    idx = conv_slot_plan(g_conv_n, CONV_MAX, seeded_of, use_of, g_win.owner);
+    idx = conv_slot_plan(g_conv_n, CONV_MAX, seeded_of, use_of, g_win.owner,
+                         may_evict);
     if (idx < 0) return -1;                      /* nothing may be evicted */
     if (idx >= g_conv_n) {
         g_conv_n = (uint8_t)(idx + 1);           /* took a free slot */
@@ -1654,6 +1655,7 @@ struct AgentRouteItem {
      * shares memory with the radio callback that produced it. */
     uint8_t peer[CONV_REPLY_MAX];
     uint8_t peer_len;
+    uint8_t via;                        /* kind 2: CONV_MESH or CONV_LXMF */
 };
 
 #define AGENT_ROUTE_QUEUE_DEPTH  8      /* by-value queue: 8 x ~537 B ~= 4.3 KB */
@@ -1707,24 +1709,35 @@ static void conv_peer_id(const uint8_t *pubkey, uint8_t len, char *out,
     conv_hex_encode(pubkey, 4, out, out_n);
 }
 
-/* Off-loop half of a mesh peer message (kind 2): mint the conversation if this
- * peer is new, persist it, and append the line. All of it is SD work, which is
- * exactly why it happens here and not in the radio callback. */
-static void agents_route_mesh(const AgentRouteItem &item) {
+/* Off-loop half of a peer message (kind 2), for EITHER address-carrying wire:
+ * mint the conversation if this sender is new and append the line. All of it is
+ * SD work, which is exactly why it happens here and not in the receive
+ * callback. The wire is in item.via and the address width follows from it — a
+ * 32-byte mesh public key or a 16-byte LXMF source hash — but the identity
+ * rule is the same for both: the conversation is keyed on the address.
+ *
+ * ONLY AN ATTRIBUTED PEER MAY EVICT. A mesh contact exists because the mesh
+ * verified an advert against that key, so it has earned a slot. LXMF is
+ * address-based: anyone holding our announced address can write to us, so an
+ * LXMF sender may fill a FREE slot but never displace an existing conversation
+ * — otherwise a stranger could flood the table and push out the correspondents
+ * the user actually has. A full table sends it back as a card instead. */
+static bool agents_route_peer(const AgentRouteItem &item) {
     char id[CONV_ID_LEN];
     conv_peer_id(item.peer, item.peer_len, id, sizeof(id));
-    if (!id[0] || !item.text[0]) return;
+    if (!id[0] || !item.text[0]) return false;
 
     agents_lock();
     bool existed = (agents_find(id) >= 0);
-    int idx = conv_mint(id, item.session, CONV_MESH, item.peer, item.peer_len);
+    int idx = conv_mint(id, item.session, item.via, item.peer, item.peer_len,
+                        item.via == CONV_MESH);
     if (idx < 0) {
         /* Every slot is seeded or on screen. Dropping is the honest outcome:
          * there is nowhere to put the conversation and the alternative is
          * evicting the chat the user is reading. */
         agents_unlock();
-        Serial.printf("[agents] mesh route drop: no slot for %s\n", id);
-        return;
+        Serial.printf("[agents] peer route: no slot for %s\n", id);
+        return false;
     }
     Conversation &a = g_convs[idx];
     if (existed && item.session[0])
@@ -1739,12 +1752,13 @@ static void agents_route_mesh(const AgentRouteItem &item) {
          * /conv.<id>), so a peer that returns re-mints onto the same id and
          * reopens the same thread. Persisting peers is a deliberate decision
          * of its own, not an inherited side effect of minting one. */
-        event_add("conv new mesh %s", id);
+        event_add("conv new %s %s", item.via == CONV_MESH ? "mesh" : "lxmf", id);
     }
     agents_push_line(idx, false, item.text);
     g_agents_real_inbound = true;
     display_force = true;
     agents_unlock();
+    return true;
 }
 
 /* The off-loop drain: the ONLY SD I/O on the route path. Drains the queue
@@ -1761,8 +1775,8 @@ static void agents_route_task(void *arg) {
             agents_roster_apply(idx, item.text);
             continue;
         }
-        if (item.kind == 2) {              /* mesh peer message: mint + append */
-            agents_route_mesh(item);
+        if (item.kind == 2) {              /* peer message: mint + append */
+            agents_route_peer(item);
             continue;
         }
         if (!item.text[0]) continue;
@@ -1883,10 +1897,42 @@ bool inbox_deliver_msg_mesh(const uint8_t *pubkey, uint8_t pubkey_len,
     AgentRouteItem item;
     memset(&item, 0, sizeof(item));
     item.kind = 2;
+    item.via = CONV_MESH;
     item.peer_len = pubkey_len;
     memcpy(item.peer, pubkey, pubkey_len);
     /* The sender's name is untrusted display text like any other inbound
      * string — cleaned here, and bounded to the label field by the store. */
+    agents_clean_text(name, item.session, sizeof(item.session));
+    agents_clean_text(text, item.text, sizeof(item.text));
+    if (!item.text[0]) return false;
+    if (!g_route_q || xQueueSend(g_route_q, &item, 0) != pdTRUE) return false;
+    return true;
+}
+
+/*
+ * An LXMF sender's message (declared in ../transport.h). Same loop-safe shape
+ * as the mesh one — the LXMF receive also runs on the loop task, on both of its
+ * feeds — and the same off-loop drain lands it.
+ *
+ * The conversation is keyed on the 16-byte source hash, which is what makes
+ * this different from the room routing it replaces: that keyed the return
+ * address by THREAD NAME, so two senders who happened to use the same thread
+ * overwrote each other and a reply could go to the wrong one. A hash cannot
+ * collide by coincidence.
+ *
+ * Returns false when there is nothing to land or the queue is dead/full; the
+ * caller raises a card instead, so an LXMF message is never simply dropped.
+ */
+bool inbox_deliver_msg_lxmf(const uint8_t *source_hash, uint8_t hash_len,
+                            const char *name, const char *text) {
+    if (!source_hash || hash_len != TRANSPORT_LXMF_ADDR_LEN) return false;
+    if (!text || !text[0]) return false;
+    AgentRouteItem item;
+    memset(&item, 0, sizeof(item));
+    item.kind = 2;
+    item.via = CONV_LXMF;
+    item.peer_len = hash_len;
+    memcpy(item.peer, source_hash, hash_len);
     agents_clean_text(name, item.session, sizeof(item.session));
     agents_clean_text(text, item.text, sizeof(item.text));
     if (!item.text[0]) return false;

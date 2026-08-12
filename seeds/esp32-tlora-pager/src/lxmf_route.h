@@ -44,7 +44,8 @@
 /* Card-vs-room outcome. */
 typedef enum {
     LXMF_ROUTE_CARD = 0,   /* raise a notification card                          */
-    LXMF_ROUTE_ROOM = 1    /* route into a chat room (a thread was present)      */
+    LXMF_ROUTE_ROOM = 1,   /* route into a chat room (a thread was present)      */
+    LXMF_ROUTE_CHAT = 2    /* a person's message -> that sender's conversation   */
 } LxmfRouteKind;
 
 /* Fixed caps for the derived strings. These mirror the notify field sizes
@@ -152,8 +153,9 @@ static inline void lxmf_route_plan(const LxmfMsg *m, LxmfRoute *out) {
         return;
     }
 
-    /* CARD — the default, and the milestone path. */
-    out->kind = LXMF_ROUTE_CARD;
+    /* CARD OR CHAT. The card fields are computed for BOTH, because a chat that
+     * cannot be landed falls back to a card and must have one to fall back to.
+     * Only the kind differs, and it is decided at the end. */
 
     /* Source label: meta.src if present, else the "lxmf" constant. */
     if (m->has_meta && m->meta_src_len > 0)
@@ -168,4 +170,20 @@ static inline void lxmf_route_plan(const LxmfMsg *m, LxmfRoute *out) {
                               m->meta_key, m->meta_key_len);
     else
         lxmf_route_derive_key(m, out->key, sizeof(out->key));
+
+    /* OUR NOTIFICATION SHAPE -> CARD; ANYTHING ELSE IS A PERSON -> CHAT.
+     *
+     * FIELD_CUSTOM_META is this project's own field: the gateway sets it to say
+     * "this is a notification". No third-party client emits it, so its PRESENCE
+     * is the whole test — not the presence of any particular key inside it. An
+     * earlier version listed sev/key/src, which silently missed `ttl` (a fourth
+     * key the codec parses) and an empty map, sending both to a chat; the field
+     * is the statement of intent, and its contents are just detail. A message
+     * carrying neither a thread (handled above) nor that meta is someone
+     * writing to us, and it belongs in their conversation.
+     *
+     * The test comes AFTER the thread test on purpose: a message with both a
+     * thread and meta is a room today, and reordering these would silently turn
+     * those into cards. */
+    out->kind = m->has_meta ? LXMF_ROUTE_CARD : LXMF_ROUTE_CHAT;
 }

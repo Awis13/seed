@@ -249,3 +249,17 @@ bool inbox_deliver_msg(uint8_t via, const char *peer_id, const char *label,
  */
 bool inbox_deliver_msg_mesh(const uint8_t *pubkey, uint8_t pubkey_len,
                             const char *name, const char *text);
+
+/*
+ * Land an LXMF sender's message, creating that sender's conversation if this is
+ * the first time they have written (skills/agents.cpp). Keyed and answered by
+ * the 16-byte source hash, so two senders cannot be confused for one another
+ * the way a shared thread name allowed.
+ *
+ * Loop-safe on the same terms as the mesh entry. `hash_len` must be
+ * TRANSPORT_LXMF_ADDR_LEN. Returns false when the message could not be queued
+ * or there was no free slot for a new sender — the caller raises a card, so
+ * nothing is dropped.
+ */
+bool inbox_deliver_msg_lxmf(const uint8_t *source_hash, uint8_t hash_len,
+                            const char *name, const char *text);

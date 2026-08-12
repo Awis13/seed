@@ -130,15 +130,26 @@ enum ConvTransport {
  *   seeded      per-slot flag, non-zero = never evict
  *   last_use    per-slot monotonic use stamp (higher = more recent)
  *   protect_idx slot currently on screen, or -1
+ *   may_evict   false = take a free slot or refuse; never displace anyone
+ *
+ * SOME CALLERS MAY NOT EVICT AT ALL. An address-based transport accepts
+ * messages from anyone who knows our address, so letting those mint by
+ * displacement would hand an unauthenticated sender the power to churn the
+ * table — flooding out conversations the user actually has. Such a caller
+ * passes may_evict=false: it may occupy a free slot, and when there is none the
+ * message becomes a card instead. Transports that only accept cryptographically
+ * attributed peers may evict normally.
  *
  * Returns the slot index to use, or -1 when nothing may be evicted.
  */
 static inline int conv_slot_plan(int n_live, int cap, const uint8_t *seeded,
-                                 const uint32_t *last_use, int protect_idx) {
+                                 const uint32_t *last_use, int protect_idx,
+                                 bool may_evict) {
     if (cap <= 0) return -1;
     if (n_live < 0) n_live = 0;
     if (n_live > cap) n_live = cap;
     if (n_live < cap) return n_live;          /* a free slot at the end */
+    if (!may_evict) return -1;                /* full: refuse, never displace */
     if (!seeded || !last_use) return -1;
     int victim = -1;
     uint32_t oldest = 0;

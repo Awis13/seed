@@ -293,6 +293,14 @@ assert 'notify_ingest("info", "mesh", "MESH", text, NULL)' in tail, (
 )
 
 # 7d. the policy gate: known contacts only.
+# Same conditional-delivery rule on the mesh side, and for the same reason:
+# inbox_deliver_msg_mesh returns false on a full/dead queue or when no slot is
+# free, and the card is the floor under it. Pinned as the delivery gating the
+# branch, so calling it and ignoring the result cannot pass.
+assert "mesh_client_knows_peer(from_pubkey) &&\n            inbox_deliver_msg_mesh(" in tail, (
+    "the mesh chat branch must be taken only when delivery SUCCEEDED — calling "
+    "it and ignoring the result skips the card fallback and drops the message"
+)
 assert "mesh_client_knows_peer(from_pubkey)" in tail, (
     "only an advert-attributed contact may open or feed a conversation; the "
     "inbox is not open to anyone in radio range"
@@ -318,9 +326,10 @@ for banned in ("agents_store_append", "agents_push_line", "conv_mint",
 assert re.search(r"xQueueSend\(g_route_q,\s*&item,\s*0\)", producer), (
     "the mesh inbound must hand off to the off-loop drain with a 0-tick send"
 )
-drain_mesh = fn_body(agents, "static void agents_route_mesh(const AgentRouteItem &item)")
-assert "conv_mint(id, item.session, CONV_MESH, item.peer, item.peer_len)" in drain_mesh, (
-    "the mint happens off-loop, in the drain"
+drain_mesh = fn_body(agents, "static bool agents_route_peer(const AgentRouteItem &item)")
+assert "conv_mint(id, item.session, item.via, item.peer, item.peer_len,\n                        item.via == CONV_MESH)" in drain_mesh, (
+    "the mint happens off-loop, in the drain, on the wire the message came "
+    "in on — and only an advert-attributed mesh peer may evict"
 )
 assert "agents_push_line(idx, false, item.text);" in drain_mesh, (
     "the append happens off-loop, in the drain"
@@ -350,6 +359,96 @@ assert "pubkey_len != TRANSPORT_MESH_ADDR_LEN" in producer, (
 )
 assert "memcpy(item.peer, pubkey, pubkey_len);" in producer, (
     "the copy must use the checked length, not a hardcoded width"
+)
+
+# --- 8. the LXMF wire: a person's message is a chat, a stranger cannot churn --
+rns = (ROOT / "src" / "skills" / "rns.cpp").read_text(encoding="utf-8")
+
+ingest = fn_body(rns, "static bool lxmf_ingest_wire(const uint8_t *wire, size_t len)")
+assert "if (route.kind == LXMF_ROUTE_CHAT) {" in ingest, (
+    "a person's LXMF must route to their conversation"
+)
+assert "inbox_deliver_msg_lxmf(g_rns_lxmf_msg.source_hash, LXMF_HASH_LEN," in ingest, (
+    "the conversation is keyed on the sender's SOURCE HASH, not on a thread "
+    "name — that is what stops two senders sharing one return address"
+)
+# NEVER A SILENT DROP. The chat branch must fall through to the card, not
+# return: the queue can be full, and a stranger can find no free slot.
+_chat = ingest.index("if (route.kind == LXMF_ROUTE_CHAT) {")
+_card = ingest.index("notify_ingest(route.level, route.source")
+assert _chat < _card, "the chat attempt must precede the card fallback"
+chat_branch = ingest[_chat:_card]
+# THE LABEL IS A VALUE BUG A STRUCTURAL PIN CANNOT SEE. route.source is
+# provably the "lxmf" literal on this branch (a chat is reached only when our
+# meta is absent, which is exactly when the planner falls back to it), so
+# passing it would name every sender alike and the hex id would never show.
+chat_code = re.sub(r"/\*.*?\*/", " ", chat_branch, flags=re.S)
+assert "route.source" not in chat_code, (
+    "the chat path must not pass route.source as the conversation label — it "
+    "identifies nobody there, and it masks the distinguishing hex id"
+)
+assert "nullptr, g_rns_room_text)" in chat_code, (
+    "the chat path passes no name: LXMF carries none for a third-party sender"
+)
+# Chats and rooms are different things and must not share a counter.
+assert "g_rns_lxmf_chats++" in chat_code, (
+    "a chat must count as a chat, not as a room — /rns/status would otherwise "
+    "report room routing that never happened"
+)
+assert "g_rns_lxmf_rooms++" not in chat_code, (
+    "the room counter belongs to the thread-named route, not to chats"
+)
+assert chat_branch.count("return true;") == 1, (
+    "only the SUCCESS path may return — a failed chat has to fall through to "
+    "the card below, or an LXMF message vanishes"
+)
+assert "return false;" not in chat_branch, (
+    "a failed chat must fall through to the card, not abandon the message"
+)
+# THE RETURN MUST BE CONDITIONAL ON DELIVERY, and the two shape checks above do
+# not establish that: calling the deliver, ignoring its bool and returning true
+# unconditionally satisfies both (one return true, no return false) while the
+# card fallback never runs and the message is silently dropped. That failure is
+# not hypothetical — inbox_deliver_msg_lxmf returns false exactly when the queue
+# is full or a stranger finds no free slot, which is the designed outcome of the
+# no-evict rule. So the call itself must BE the condition.
+assert "if (inbox_deliver_msg_lxmf(" in chat_branch, (
+    "the chat's return must be conditional on delivery — an unconditional "
+    "return true skips the card fallback and drops the message"
+)
+
+# The producer is loop-safe: the LXMF receive runs on the loop task, both feeds.
+lproducer = fn_body(agents,
+                    "bool inbox_deliver_msg_lxmf(const uint8_t *source_hash, uint8_t hash_len,\n"
+                    "                            const char *name, const char *text) {")
+for banned in ("agents_store_append", "agents_push_line", "conv_mint",
+               "agents_manifest_persist", "agents_sync_view"):
+    assert banned not in lproducer, (
+        f"inbox_deliver_msg_lxmf must not call {banned} — it runs on the loop "
+        "task, where an SD append seizes the shared bus"
+    )
+assert re.search(r"xQueueSend\(g_route_q,\s*&item,\s*0\)", lproducer), (
+    "the LXMF inbound must hand off to the off-loop drain with a 0-tick send"
+)
+assert "hash_len != TRANSPORT_LXMF_ADDR_LEN" in lproducer, (
+    "the source-hash length must be checked, not assumed"
+)
+assert "item.via = CONV_LXMF;" in lproducer, (
+    "the item must record which wire it came in on — the drain decides whether "
+    "it may evict from that"
+)
+
+# AN ADDRESS-BASED SENDER MAY NOT EVICT. Anyone holding our announced address
+# can write to us, so minting by displacement would let a stranger flood out
+# the conversations the user actually has.
+assert "item.via == CONV_MESH)" in drain_mesh, (
+    "only the advert-attributed mesh wire may evict; an LXMF sender takes a "
+    "free slot or the message becomes a card"
+)
+conv_store_h = (ROOT / "src" / "conv_store.h").read_text(encoding="utf-8")
+assert "if (!may_evict) return -1;" in conv_store_h, (
+    "the planner must refuse outright rather than displace when eviction is "
+    "not permitted"
 )
 
 print("transport seam pins: OK")
