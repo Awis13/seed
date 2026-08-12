@@ -1,5 +1,16 @@
 /*
- * skills/agents.cpp — pocket chat with remote agents (Claude / Hermes)
+ * skills/agents.cpp — pocket chat, on top of the CONVERSATION store
+ *
+ * WHAT CHANGED AND WHY. This used to be a table of exactly two AGENTS
+ * (`claude`, `hermes`), each addressable only by a room name and answerable only
+ * by handing its own id back to the bridge. Notification cards are the device's
+ * main feature and must be deliverable over EVERY transport, so a thread has to
+ * be able to arrive from an LXMF sender or a mesh peer too — and such a thread
+ * must remember WHERE to answer, which an agent id cannot express. The record is
+ * therefore a Conversation (see ../conv_store.h): it carries a `transport`, an
+ * opaque `reply_addr`, and a display `label` that no longer has to be the id.
+ * The two agents are now SEEDED conversations of transport CONV_AGENT, so this
+ * commit is a pure refactor — same screens, same API, same wire behaviour.
  *
  * Pager is the thin terminal. A bridge on the LAN does the real work:
  *   POST {bridge}/v1/chat  { "agent","session","text" }
@@ -11,12 +22,13 @@
  *   /agent_bridge.txt  — base URL, e.g. http://192.168.1.138:8090  (one line)
  *
  * History:
- *   Non-transient per-(agent, session) history lives on removable SD as an
- *   append-only JSONL file, one message per line:  {ts, from_me, text}.
+ *   Non-transient per-(conversation, session) history lives on removable SD as
+ *   an append-only JSONL file, one message per line:  {ts, from_me, text}.
  *   Only a small viewport window (the last AGENT_VIEW_MAX messages of the
  *   current session) is kept in RAM as an index; the rest stays on disk, so a
  *   "very long history" costs no extra static RAM. Multiple sessions exist per
- *   agent under the key (agent, session); one is active and selectable.
+ *   conversation under the key (conversation, session); one is active and
+ *   selectable.
  *   The chat screen scrolls the whole history page-by-page (older pages are
  *   loaded from disk on demand) and shows the message timestamp with the
  *   sender marker.
@@ -27,9 +39,11 @@
  *   Either way persistence is append-only JSONL, so behaviour is identical and
  *   there is no hardlock when the SD is missing.
  *
- *   Session registry is a tiny manifest  /agents_sessions.txt  (one
- *   "agent\tsession" line each) in the same store, so the session list
- *   survives reboots without needing SD directory iteration.
+ *   Thread registry is a tiny manifest  /conversations.txt  (one
+ *   "key\tlabel\ttransport\treply_hex\tdead" line each) in the same store, so
+ *   the room list survives reboots without needing SD directory iteration. The
+ *   legacy /agents_sessions.txt is still READ (2- and 3-field lines) so an
+ *   existing card keeps its rooms; only the new file is ever written.
  *
  * HTTP API on the seed:
  *   GET  /agents             — list + bridge status + per-agent sessions/history
@@ -43,11 +57,20 @@
 #include <SPI.h>
 
 #include "../agents_chat_route.h"  // chat-route seam: claude_route_incoming + pure planner
+#include "../conv_store.h"         // the conversation record: keys, manifest, transports
 #include "../rns/outbox.h"         // the OTHER half of that seam: rns_send_envelope + rns_peer_addr
 
-#define AGENTS_N            2
-#define AGENT_ID_LEN        12
-#define AGENT_NAME_LEN      16
+/* Conversation slots. Still 2 for now — every slot costs a full AGENT_VIEW_MAX
+ * viewport (~12.6 KB of static RAM), so growing the table is a memory decision
+ * of its own and not part of laying the record down. g_conv_n is the LIVE count
+ * so a later commit can register a peer conversation at runtime without another
+ * pass over every loop in this file. */
+#define CONV_MAX            2
+#define CONV_SEEDED_N       2       /* claude + hermes, pre-created below */
+/* Kept as the capacity spelling the rest of the tree already uses (main.cpp
+ * sizes its UI copies with it; meshcore.cpp sizes its per-agent TX flags). */
+#define AGENTS_N            CONV_MAX
+#define AGENT_ID_LEN        CONV_ID_LEN
 /* One chat line / viewport cell. 512 stays: bridge + mesh multi-part chunks. */
 #define AGENT_TEXT_LEN      512
 /* RAM viewport window: the last N messages of the ACTIVE session per agent.
@@ -59,10 +82,8 @@
 #define AGENT_BRIDGE_LEN    96
 #define AGENT_BRIDGE_FILE   "/agent_bridge.txt"
 #define AGENT_BRIDGE_TMP    "/agent_bridge.tmp"
-#define AGENT_SESSION_LEN   24
-#define AGENT_SESSIONS_MAX  8       /* max sessions per agent (registry cap) */
-#define AGENT_MANIFEST      "/agents_sessions.txt"
-#define AGENT_LOG_PREFIX    "agent" /* flat store files /agent.<id>.<s>.jsonl */
+#define AGENT_SESSION_LEN   CONV_SESSION_LEN
+#define AGENT_SESSIONS_MAX  CONV_SESSIONS_MAX  /* rooms per conversation (cap) */
 /* JSONL line worst case: 2x escaped text + wrapper + newline. */
 #define AGENT_JSONL_MAX     (AGENT_TEXT_LEN * 2 + 64)
 /* Bus-hold budget for a whole-file session scan. A months-old session JSONL
@@ -83,9 +104,17 @@ struct AgentLine {
     char text[AGENT_TEXT_LEN];
 };
 
-struct AgentSlot {
-    const char *id;     // "claude" / "hermes"
-    const char *name;   // UI label
+/* One conversation: a thread source with its own rooms, wire and return
+ * address. `id` is the storage id (no '.', it separates id from room in the
+ * on-disk key); `label` is what the screen shows; `reply_addr` is OPAQUE — its
+ * meaning is the transport's (agent-id bytes / LXMF source hash / mesh pubkey)
+ * and nothing in this file interprets it. */
+struct Conversation {
+    char id[CONV_ID_LEN];             // "claude" / "hermes"; later 8 hex of a peer
+    char label[CONV_LABEL_LEN];       // UI display name
+    uint8_t transport;                // CONV_AGENT / CONV_LXMF / CONV_MESH
+    uint8_t reply_len;                // bytes used in reply_addr (0 = unknown)
+    uint8_t reply_addr[CONV_REPLY_MAX];
     char sessions[AGENT_SESSIONS_MAX][AGENT_SESSION_LEN];
     uint8_t n_sessions;
     uint8_t active_idx;         // into sessions[]
@@ -102,10 +131,19 @@ struct AgentSlot {
     uint8_t session_dead[AGENT_SESSIONS_MAX];
 };
 
-static AgentSlot g_agents[AGENTS_N] = {
-    { "claude",   "CLAUDE",   {}, 0, 0, {}, 0, 0, 0, 0, {} },
-    { "hermes",   "HERMES",   {}, 0, 0, {}, 0, 0, 0, 0, {} },
+/* The two bridge/C1 agents, pre-created as CONV_AGENT conversations. Their
+ * return address is the agent id's own bytes, which is exactly what the bridge
+ * and the MeshCore C1 DM have always used to answer them. Fields not named here
+ * are value-initialised (empty room list, empty viewport). */
+static Conversation g_convs[CONV_MAX] = {
+    { .id = "claude", .label = "CLAUDE", .transport = CONV_AGENT, .reply_len = 6,
+      .reply_addr = { 'c', 'l', 'a', 'u', 'd', 'e' } },
+    { .id = "hermes", .label = "HERMES", .transport = CONV_AGENT, .reply_len = 6,
+      .reply_addr = { 'h', 'e', 'r', 'm', 'e', 's' } },
 };
+/* Live conversations in g_convs[]. A constant today; the seam a later commit
+ * uses to append a peer conversation without touching every loop below. */
+static uint8_t g_conv_n = CONV_SEEDED_N;
 
 static char g_bridge[AGENT_BRIDGE_LEN] = "";
 static char g_session[AGENT_SESSION_LEN] = "pager";
@@ -116,7 +154,7 @@ static bool g_store_is_sd = false;
  * a lock) while send/inbound/view also take the same lock (nested). File IO
  * happens under the mutex, never under portENTER_CRITICAL — SD writes block.
  *
- * TWO locks, two concerns: agents_mux guards store STATE (g_agents, view
+ * TWO locks, two concerns: agents_mux guards store STATE (g_convs, view
  * windows, session registry); the shared SPI bus lock (HwSpiBusGuard /
  * hw_spi_bus_lock, hw_ui.h) guards the BUS the SD card shares with the
  * ST7796 and SX1262. These routes run on the AsyncTCP task while the loop
@@ -145,7 +183,7 @@ static unsigned long agents_now_s() {
 }
 
 /* Forward decls (defined later in this TU; store section uses them early). */
-static void agents_view_append(AgentSlot &a, bool from_me, uint32_t ts,
+static void agents_view_append(Conversation &a, bool from_me, uint32_t ts,
                                const char *text);
 static int agents_find(const char *id);
 static int agents_session_add(int idx, const char *name);
@@ -199,13 +237,25 @@ static const char *agents_store_name() { return g_store_is_sd ? "sd" : "spiffs";
 
 static bool agents_store_ready() { return g_store != nullptr; }
 
-/* Flat key path (no directory on SPIFFS; FAT root on SD). Session is already
- * sanitised to [A-Za-z0-9._-]. */
-static String agents_log_path(const char *agent_id, const char *session) {
-    /* SPIFFS object-name limit is 32 bytes (31 usable incl. NUL). A suffix of
-     * ".jsonl" can push a long agent-id path past it — file never created,
-     * empty thread, black chat screen. Drop the extension; content stays JSONL. */
-    return String("/") + AGENT_LOG_PREFIX + "." + agent_id + "." + session;
+/* Flat key path (no directory on SPIFFS; FAT root on SD) for one thread of one
+ * conversation: /conv.<conv_id>[.<session>]. The old form was
+ * /agent.<id>.<session>, which had no guard on the SPIFFS object-name limit —
+ * a long room name produced a path the store silently refused to create, i.e.
+ * an empty thread and a black chat screen (the same trap that already cost the
+ * ".jsonl" extension). conv_log_path() now HOLDS that budget, folding an
+ * over-long key onto a fingerprinted name instead of overflowing it, and
+ * returns "" if it cannot — an empty path opens no file, so every caller
+ * degrades the way a missing store already does. Content stays JSONL. */
+static String agents_log_path(const char *conv_id, const char *session) {
+    char path[CONV_PATH_LEN];
+    if (!conv_log_path(path, sizeof(path), conv_id, session)) return String("");
+    return String(path);
+}
+
+/* Legacy key of the same thread, read once at boot so an existing card's
+ * history follows it into the new namespace (see agents_migrate_logs). */
+static String agents_legacy_log_path(const char *conv_id, const char *session) {
+    return String("/agent.") + conv_id + "." + session;
 }
 
 static void agents_session_sanitize(const char *in, char *out, size_t out_n) {
@@ -230,7 +280,7 @@ static void agents_session_sanitize(const char *in, char *out, size_t out_n) {
  * loop task from the keyboard path, and the old esc[1088]+line[1088] buffers
  * overran it (Stack canary / loopTask panic on Enter). */
 static void agents_store_append(int idx, bool from_me, const char *text) {
-    AgentSlot &a = g_agents[idx];
+    Conversation &a = g_convs[idx];
     uint32_t ts = agents_now_s();
     agents_view_append(a, from_me, ts, text);
     if (!agents_store_ready()) return;
@@ -276,7 +326,7 @@ static void agents_store_append(int idx, bool from_me, const char *text) {
     }
 }
 
-static void agents_view_append(AgentSlot &a, bool from_me, uint32_t ts,
+static void agents_view_append(Conversation &a, bool from_me, uint32_t ts,
                                const char *text) {
     if (a.vn >= AGENT_VIEW_MAX) {
         memmove(&a.view[0], &a.view[1], (AGENT_VIEW_MAX - 1) * sizeof(AgentLine));
@@ -396,7 +446,7 @@ static void agents_scan_chunked(AgentJScanner &sc, char *lbuf, size_t lbuf_n,
  * file_sync (delta), append them to the window. On external truncation/resync
  * the window is rebuilt from zero. Caller holds the lock. */
 static void agents_sync_view(int idx) {
-    AgentSlot &a = g_agents[idx];
+    Conversation &a = g_convs[idx];
     if (!agents_store_ready()) return;
     String path = agents_log_path(a.id, a.sessions[a.active_idx]);
     /* Open + size/seek under one short bus burst; the line scan below bounds
@@ -437,48 +487,99 @@ static void agents_sync_view(int idx) {
     { HwSpiBusGuard bus; f.close(); }
 }
 
-/* Load the session registry from the store manifest. Line format is
- * "agent\tsession" with an OPTIONAL third tab-field "\t<0|1>" carrying the
- * live-room-roster dead flag. A two-field line (old manifest) loads as alive
- * (0), so an older on-disk manifest still loads unchanged. */
-static void agents_manifest_load() {
-    HwSpiBusGuard bus;
-    if (!g_store || !g_store->exists(AGENT_MANIFEST)) return;
-    File f = g_store->open(AGENT_MANIFEST, "r");
+/* Apply the conversation-level half of a manifest line: the fields that belong
+ * to the conversation rather than to one of its rooms. Repeating across a
+ * conversation's rooms is intentional and idempotent. */
+static void agents_conv_apply(Conversation &a, const ConvManifestLine &ml) {
+    if (ml.label[0]) snprintf(a.label, sizeof(a.label), "%s", ml.label);
+    a.transport = ml.transport;
+    if (ml.reply_len) {
+        a.reply_len = ml.reply_len;
+        memcpy(a.reply_addr, ml.reply, ml.reply_len);
+    }
+}
+
+/* Fold one parsed manifest line into the live registry. A line naming an
+ * unknown conversation is skipped rather than minting one: C1 has a fixed
+ * seeded table, and a room invented from a stale id would be a room nothing can
+ * ever answer.
+ *
+ * A ROOM-LESS LINE IS A REAL LINE, not a malformed one. A conversation that has
+ * no rooms — the shape a peer gets, keyed on its address alone — still has to
+ * survive a reboot, so its line carries an empty session field and restores the
+ * conversation's own fields without adding a room. Dropping such a line (which
+ * this used to do) meant the store could describe a peer conversation on disk
+ * and then silently forget it on the next boot. */
+static void agents_manifest_apply(const ConvManifestLine &ml) {
+    int idx = agents_find(ml.conv);
+    if (idx < 0) return;
+    Conversation &a = g_convs[idx];
+    agents_conv_apply(a, ml);
+    if (!ml.session[0]) return;         /* conversation-level line: no room */
+    int si = agents_session_add(idx, ml.session);
+    if (si < 0) return;
+    a.session_dead[si] = ml.dead;
+}
+
+/* Read one manifest file through the shared parser. Both the new 5-field lines
+ * and the legacy 2/3-field ones are handled there, so this is format-blind. */
+static void agents_manifest_read(const char *path) {
+    if (!g_store || !g_store->exists(path)) return;
+    File f = g_store->open(path, "r");
     if (!f) return;
-    char ln[AGENT_ID_LEN + 1 + AGENT_SESSION_LEN + 4];  // +\tD room for dead flag
+    char ln[CONV_MANIFEST_LINE_LEN];
+    ConvManifestLine ml;
     AgentJScanner sc(f);
     while (sc.next(ln, sizeof(ln))) {
-        if (!ln[0]) continue;
-        char *tab = strchr(ln, '\t');
-        if (!tab || !tab[1]) continue;
-        *tab = '\0';
-        char *sess = tab + 1;
-        uint8_t dead = 0;                       // absent 3rd field => alive
-        char *tab2 = strchr(sess, '\t');
-        if (tab2) { *tab2 = '\0'; dead = (tab2[1] == '1') ? 1 : 0; }
-        int idx = agents_find(ln);
-        if (idx >= 0) {
-            int si = agents_session_add(idx, sess);
-            if (si >= 0) g_agents[idx].session_dead[si] = dead;
-        }
+        if (conv_manifest_parse(ln, &ml)) agents_manifest_apply(ml);
     }
     f.close();
+}
+
+/* Load the room registry.
+ *
+ * MIGRATION: READ BOTH, WRITE ONE. The legacy manifest is read first and the
+ * new one on top, so a card that has both ends up with the new file's flags
+ * winning; every persist after that writes only /conversations.txt. This beats
+ * a rewrite-in-place migration because there is no half-migrated state to
+ * recover from — the legacy file is never edited or removed (deleting a user's
+ * data is not this code's call), it simply stops being authoritative once the
+ * new one exists. */
+static void agents_manifest_load() {
+    HwSpiBusGuard bus;
+    agents_manifest_read(CONV_MANIFEST_LEGACY);
+    agents_manifest_read(CONV_MANIFEST);
 }
 
 static void agents_manifest_persist() {
     if (!agents_store_ready()) return;
     String out;
-    for (int i = 0; i < AGENTS_N; i++) {
-        AgentSlot &a = g_agents[i];
+    char line[CONV_MANIFEST_LINE_LEN];
+    for (int i = 0; i < g_conv_n; i++) {
+        Conversation &a = g_convs[i];
+        if (a.n_sessions == 0) {
+            /* A conversation with no rooms still needs a line, or it vanishes
+             * on the next boot — see agents_manifest_apply. The session field
+             * is empty and the dead flag is 0: liveness is a property of a
+             * room, and this conversation has none to mark. */
+            if (conv_manifest_format(line, sizeof(line), a.id, "", a.label,
+                                     a.transport, a.reply_addr, a.reply_len, 0)) {
+                out += line;
+                out += '\n';
+            }
+            continue;
+        }
         for (int j = 0; j < a.n_sessions; j++) {
-            out += a.id; out += '\t'; out += a.sessions[j];
-            out += '\t'; out += (a.session_dead[j] ? '1' : '0');  // roster flag
+            if (!conv_manifest_format(line, sizeof(line), a.id, a.sessions[j],
+                                      a.label, a.transport, a.reply_addr,
+                                      a.reply_len, a.session_dead[j]))
+                continue;
+            out += line;
             out += '\n';
         }
     }
     HwSpiBusGuard bus;  /* write burst only — manifest text built above */
-    File f = g_store->open(AGENT_MANIFEST, "w");
+    File f = g_store->open(CONV_MANIFEST, "w");
     if (!f) return;
     f.print(out);
     f.close();
@@ -488,21 +589,21 @@ static void agents_manifest_persist() {
 
 static int agents_find(const char *id) {
     if (!id || !id[0]) return -1;
-    for (int i = 0; i < AGENTS_N; i++) {
-        if (strcmp(g_agents[i].id, id) == 0) return i;
+    for (int i = 0; i < g_conv_n; i++) {
+        if (strcmp(g_convs[i].id, id) == 0) return i;
     }
     return -1;
 }
 
 static int agents_session_exists(int idx, const char *name) {
-    AgentSlot &a = g_agents[idx];
+    Conversation &a = g_convs[idx];
     for (int i = 0; i < a.n_sessions; i++)
         if (strcmp(a.sessions[i], name) == 0) return i;
     return -1;
 }
 
 static int agents_session_add(int idx, const char *name) {
-    AgentSlot &a = g_agents[idx];
+    Conversation &a = g_convs[idx];
     if (!name || !name[0]) return -1;
     int ex = agents_session_exists(idx, name);
     if (ex >= 0) return ex;
@@ -513,44 +614,44 @@ static int agents_session_add(int idx, const char *name) {
 }
 
 const char *agents_active_session(int idx) {
-    if (idx < 0 || idx >= AGENTS_N) return "";
-    return g_agents[idx].sessions[g_agents[idx].active_idx];
+    if (idx < 0 || idx >= g_conv_n) return "";
+    return g_convs[idx].sessions[g_convs[idx].active_idx];
 }
 
 int agents_session_count(int idx) {
-    if (idx < 0 || idx >= AGENTS_N) return 0;
-    return g_agents[idx].n_sessions;
+    if (idx < 0 || idx >= g_conv_n) return 0;
+    return g_convs[idx].n_sessions;
 }
 
 const char *agents_session_name(int idx, int i) {
-    if (idx < 0 || idx >= AGENTS_N || i < 0 || i >= g_agents[idx].n_sessions)
+    if (idx < 0 || idx >= g_conv_n || i < 0 || i >= g_convs[idx].n_sessions)
         return "";
-    return g_agents[idx].sessions[i];
+    return g_convs[idx].sessions[i];
 }
 
 bool agents_session_is_active(int idx, int i) {
-    if (idx < 0 || idx >= AGENTS_N || i < 0 || i >= g_agents[idx].n_sessions)
+    if (idx < 0 || idx >= g_conv_n || i < 0 || i >= g_convs[idx].n_sessions)
         return false;
-    return (i == g_agents[idx].active_idx);
+    return (i == g_convs[idx].active_idx);
 }
 
 int agents_session_msg_count(int idx, int i) {
-    if (idx < 0 || idx >= AGENTS_N || i < 0 || i >= g_agents[idx].n_sessions)
+    if (idx < 0 || idx >= g_conv_n || i < 0 || i >= g_convs[idx].n_sessions)
         return 0;
-    return (int)g_agents[idx].session_lines[i];
+    return (int)g_convs[idx].session_lines[i];
 }
 
 /* Liveness of session i (live-room roster). true => dead/hidden from picker. */
 bool agents_session_is_dead(int idx, int i) {
-    if (idx < 0 || idx >= AGENTS_N || i < 0 || i >= g_agents[idx].n_sessions)
+    if (idx < 0 || idx >= g_conv_n || i < 0 || i >= g_convs[idx].n_sessions)
         return false;
-    return g_agents[idx].session_dead[i] != 0;
+    return g_convs[idx].session_dead[i] != 0;
 }
 
 /* Count of live (non-dead) sessions — the number of rows the picker shows. */
 int agents_session_visible_count(int idx) {
-    if (idx < 0 || idx >= AGENTS_N) return 0;
-    AgentSlot &a = g_agents[idx];
+    if (idx < 0 || idx >= g_conv_n) return 0;
+    Conversation &a = g_convs[idx];
     int c = 0;
     for (int i = 0; i < a.n_sessions; i++) if (!a.session_dead[i]) c++;
     return c;
@@ -563,9 +664,9 @@ int agents_session_visible_count(int idx) {
  * away from the RAM index, re-sync (delta or full) so win_start/lines stay
  * consistent with view[]. */
 bool agents_session_refresh_counts(int idx) {
-    if (idx < 0 || idx >= AGENTS_N || !agents_store_ready()) return false;
+    if (idx < 0 || idx >= g_conv_n || !agents_store_ready()) return false;
     agents_lock();
-    AgentSlot &a = g_agents[idx];
+    Conversation &a = g_convs[idx];
     for (int j = 0; j < a.n_sessions; j++) {
         String path = agents_log_path(a.id, a.sessions[j]);
         uint32_t cnt = 0;
@@ -607,18 +708,18 @@ bool agents_session_refresh_counts(int idx) {
 
 /* Select an existing session: rewind + reload the viewport from SD. */
 bool agents_session_select(int idx, const char *name) {
-    if (idx < 0 || idx >= AGENTS_N || !name || !name[0]) return false;
+    if (idx < 0 || idx >= g_conv_n || !name || !name[0]) return false;
     agents_lock();
     int in_list = agents_session_exists(idx, name);
     if (in_list < 0) { agents_unlock(); return false; }
-    g_agents[idx].active_idx = (uint8_t)in_list;
-    g_agents[idx].file_sync = 0;
-    g_agents[idx].lines = 0;
-    g_agents[idx].vn = 0;
-    g_agents[idx].win_start = 0;
+    g_convs[idx].active_idx = (uint8_t)in_list;
+    g_convs[idx].file_sync = 0;
+    g_convs[idx].lines = 0;
+    g_convs[idx].vn = 0;
+    g_convs[idx].win_start = 0;
     agents_sync_view(idx);
-    g_agents[idx].win_start = (g_agents[idx].lines > g_agents[idx].vn)
-        ? (g_agents[idx].lines - g_agents[idx].vn) : 0;
+    g_convs[idx].win_start = (g_convs[idx].lines > g_convs[idx].vn)
+        ? (g_convs[idx].lines - g_convs[idx].vn) : 0;
     agents_unlock();
     return true;
 }
@@ -626,9 +727,9 @@ bool agents_session_select(int idx, const char *name) {
 /* Create a fresh session (or reuse an existing name) and make it active.
  * Returns the index in the session list, or -1 on full/empty. */
 int agents_session_create(int idx, const char *wanted, bool &created) {
-    if (idx < 0 || idx >= AGENTS_N) return -1;
+    if (idx < 0 || idx >= g_conv_n) return -1;
     agents_lock();
-    AgentSlot &a = g_agents[idx];
+    Conversation &a = g_convs[idx];
     char name[AGENT_SESSION_LEN];
     if (wanted && wanted[0]) {
         agents_session_sanitize(wanted, name, sizeof(name));
@@ -662,7 +763,7 @@ int agents_session_create(int idx, const char *wanted, bool &created) {
  * end_line (exclusive), by one forward scan (keeps a sliding window). Used for
  * scrolling back through very long history. Caller holds no lock (internal). */
 static void agents_load_page(int idx, uint32_t end_line) {
-    AgentSlot &a = g_agents[idx];
+    Conversation &a = g_convs[idx];
     if (!agents_store_ready()) return;
     if (end_line > a.lines) end_line = a.lines;
     uint32_t keep_from = (end_line > AGENT_VIEW_MAX) ? (end_line - AGENT_VIEW_MAX) : 0;
@@ -693,9 +794,9 @@ static void agents_load_page(int idx, uint32_t end_line) {
  * was browsing an old page the window is stale, so force a full rebuild; if it
  * is already the tail, a cheap delta-sync folds any new arrivals. */
 void agents_thread_goto_tail(int idx) {
-    if (idx < 0 || idx >= AGENTS_N) return;
+    if (idx < 0 || idx >= g_conv_n) return;
     agents_lock();
-    AgentSlot &a = g_agents[idx];
+    Conversation &a = g_convs[idx];
     bool at_tail = ((uint32_t)a.win_start + a.vn) >= a.lines;
     if (!at_tail) {
         a.file_sync = 0; a.lines = 0; a.vn = 0;
@@ -711,9 +812,9 @@ void agents_thread_goto_tail(int idx) {
  * Page-load rescans the file from byte 0 (O(up-to-end)); realistic session
  * sizes are fast, and the newest page is always O(delta). */
 void agents_thread_goto_page(int idx, uint32_t end_line) {
-    if (idx < 0 || idx >= AGENTS_N) return;
+    if (idx < 0 || idx >= g_conv_n) return;
     agents_lock();
-    AgentSlot &a = g_agents[idx];
+    Conversation &a = g_convs[idx];
     if (end_line >= a.lines) {
         a.vn = 0; a.win_start = a.lines;
     } else {
@@ -723,22 +824,22 @@ void agents_thread_goto_page(int idx, uint32_t end_line) {
 }
 
 uint32_t agents_thread_total(int idx) {
-    return (idx >= 0 && idx < AGENTS_N) ? g_agents[idx].lines : 0;
+    return (idx >= 0 && idx < g_conv_n) ? g_convs[idx].lines : 0;
 }
 
 uint32_t agents_thread_start(int idx) {
-    return (idx >= 0 && idx < AGENTS_N) ? g_agents[idx].win_start : 0;
+    return (idx >= 0 && idx < g_conv_n) ? g_convs[idx].win_start : 0;
 }
 
 bool agents_thread_is_tail(int idx) {
-    if (idx < 0 || idx >= AGENTS_N) return true;
-    const AgentSlot &a = g_agents[idx];
+    if (idx < 0 || idx >= g_conv_n) return true;
+    const Conversation &a = g_convs[idx];
     return ((uint32_t)a.win_start + a.vn) >= a.lines;
 }
 
 uint32_t agents_thread_line_ts(int idx, int i) {
-    if (idx < 0 || idx >= AGENTS_N) return 0;
-    const AgentSlot &a = g_agents[idx];
+    if (idx < 0 || idx >= g_conv_n) return 0;
+    const Conversation &a = g_convs[idx];
     return (i >= 0 && i < a.vn) ? a.view[i].ts : 0;
 }
 
@@ -746,7 +847,7 @@ uint32_t agents_thread_line_ts(int idx, int i) {
  * (used by GET /agents when the RAM window is a rewound page, not the tail). */
 static bool agents_file_last(int idx, char *text, size_t text_n,
                              bool *from_me, uint32_t *ts) {
-    AgentSlot &a = g_agents[idx];
+    Conversation &a = g_convs[idx];
     if (!agents_store_ready()) return false;
     String path = agents_log_path(a.id, a.sessions[a.active_idx]);
     /* GET /agents runs on the AsyncTCP task; scan the whole file for its last
@@ -787,7 +888,7 @@ static int agents_utf8_len(const char *s) {
  * (locks itself; callers that already hold the recursive lock are fine). */
 static void agents_push_line(int idx, bool from_me, const char *text) {
     agents_lock();
-    if (idx < 0 || idx >= AGENTS_N || !text || !text[0]) {
+    if (idx < 0 || idx >= g_conv_n || !text || !text[0]) {
         agents_unlock();
         return;
     }
@@ -832,10 +933,10 @@ static void agents_push_line(int idx, bool from_me, const char *text) {
  * unix ts (0 = unknown). Returns count. Caller may hold the recursive lock. */
 int agents_thread_view(int idx, char out[][AGENT_TEXT_LEN], bool *from_me,
                        uint32_t *ts_out, int max_lines) {
-    if (idx < 0 || idx >= AGENTS_N || max_lines <= 0) return 0;
+    if (idx < 0 || idx >= g_conv_n || max_lines <= 0) return 0;
     int n = 0;
     agents_lock();
-    AgentSlot &a = g_agents[idx];
+    Conversation &a = g_convs[idx];
     n = a.vn < max_lines ? a.vn : max_lines;
     for (int i = 0; i < n; i++) {
         snprintf(out[i], AGENT_TEXT_LEN, "%s", a.view[i].text);
@@ -847,8 +948,8 @@ int agents_thread_view(int idx, char out[][AGENT_TEXT_LEN], bool *from_me,
 }
 
 static int agents_thread_count(int idx) {
-    if (idx < 0 || idx >= AGENTS_N) return 0;
-    return g_agents[idx].lines;
+    if (idx < 0 || idx >= g_conv_n) return 0;
+    return g_convs[idx].lines;
 }
 
 static void agents_bridge_load() {
@@ -968,7 +1069,7 @@ static void agents_set_mesh_uplink(AgentsMeshUplinkFn fn) {
 
 #define AGENT_GPS_FRESH_S 60    /* mirror gps.cpp GPS_FRESH_S */
 
-static bool g_agents_gps_pending[AGENTS_N];
+static bool g_agents_gps_pending[CONV_MAX];
 
 /* Case-insensitive substring (lowercase only ASCII; needles are ASCII/Cyrillic). */
 static bool agents_ci_has(const char *hay, const char *needle) {
@@ -1016,8 +1117,8 @@ static bool agents_loc_card(int idx) {
     }
     /* real_inbound: the fix can land minutes after the question — from the
      * user's side this is an answer arriving in the room, not an error line. */
-    agents_on_inbound(g_agents[idx].id, line, true);
-    event_add("agent %s gps %s", g_agents[idx].id, fresh ? "located" : "pending");
+    agents_on_inbound(g_convs[idx].id, line, true);
+    event_add("agent %s gps %s", g_convs[idx].id, fresh ? "located" : "pending");
     return fresh;
 }
 
@@ -1034,7 +1135,7 @@ static bool agents_gps_intercept(int idx, const char *text) {
 /* gps.cpp on-fix hook: resolve every pending "where are you?" agent. Cheap
  * no-op when nothing is pending (runs once per RMC 'A', ~1/s). */
 static void agents_gps_on_fix(void) {
-    for (int i = 0; i < AGENTS_N; i++) {
+    for (int i = 0; i < g_conv_n; i++) {
         if (g_agents_gps_pending[i]) {
             g_agents_gps_pending[i] = false;
             agents_loc_card(i);
@@ -1265,7 +1366,7 @@ static void agents_roster_apply(int idx, const char *payload) {
     if (idx < 0) return;
     int nlive = 0, ndead = 0, incomplete = 0;
     agents_lock();
-    AgentSlot &a = g_agents[idx];
+    Conversation &a = g_convs[idx];
     const char *names[AGENT_SESSIONS_MAX];
     int n = a.n_sessions;
     if (n > AGENT_SESSIONS_MAX) n = AGENT_SESSIONS_MAX;
@@ -1303,7 +1404,7 @@ static void agents_route_task(void *arg) {
         }
         if (!item.text[0]) continue;
         agents_lock();
-        AgentSlot &a = g_agents[idx];
+        Conversation &a = g_convs[idx];
         bool created = false;
         if (item.newest) {
             /* newest-active room. active_idx already points at the most-recently
@@ -1371,7 +1472,7 @@ bool claude_route_incoming(const char *session, const char *text, int *reason) {
     int r;
     agents_lock();
     {
-        AgentSlot &a = g_agents[idx];
+        Conversation &a = g_convs[idx];
         const char *names[AGENT_SESSIONS_MAX];
         int n = a.n_sessions;
         if (n > AGENT_SESSIONS_MAX) n = AGENT_SESSIONS_MAX;
@@ -1407,7 +1508,7 @@ static bool agents_clear(const char *agent_id) {
     bool any = false;
     bool all = (!agent_id || !agent_id[0] || strcmp(agent_id, "*") == 0);
     auto clear_agent = [&](int i) -> void {
-        AgentSlot &a = g_agents[i];
+        Conversation &a = g_convs[i];
         if (all) {
             for (int j = 0; j < a.n_sessions; j++) {
                 if (agents_store_ready()) {
@@ -1433,7 +1534,7 @@ static bool agents_clear(const char *agent_id) {
         any = true;
     };
     if (all) {
-        for (int i = 0; i < AGENTS_N; i++) clear_agent(i);
+        for (int i = 0; i < g_conv_n; i++) clear_agent(i);
     } else {
         int idx = agents_find(agent_id);
         if (idx >= 0) clear_agent(idx);
@@ -1443,13 +1544,13 @@ static bool agents_clear(const char *agent_id) {
     return any;
 }
 
-static int agents_count() { return AGENTS_N; }
+static int agents_count() { return g_conv_n; }
 
 static const char *agents_id(int i) {
-    return (i >= 0 && i < AGENTS_N) ? g_agents[i].id : "";
+    return (i >= 0 && i < g_conv_n) ? g_convs[i].id : "";
 }
 static const char *agents_name(int i) {
-    return (i >= 0 && i < AGENTS_N) ? g_agents[i].name : "";
+    return (i >= 0 && i < g_conv_n) ? g_convs[i].label : "";
 }
 static bool agents_bridge_ok() { return g_bridge[0] != '\0'; }
 static const char *agents_bridge_url() { return g_bridge; }
@@ -1463,8 +1564,9 @@ static const char *agents_describe() {
         "Downlink: same C1 side=a (or WiFi /agents/inbound) — one loop.\n"
         "A \"where are you?\" / \"где ты\" message is answered locally with the\n"
         "GNSS fix (POST /gps/fix semantics) and never hits the bridge.\n\n"
-        "History: append-only JSONL on SD (fallback SPIFFS), keyed by\n"
-        "(agent, session); only a 24-message viewport is kept in RAM.\n\n"
+        "History: append-only JSONL on SD (fallback SPIFFS) at\n"
+        "`/conv.<conversation>[.<session>]`; only a 24-message viewport is kept\n"
+        "in RAM. Room registry: `/conversations.txt`.\n\n"
         "SPIFFS `/agent_bridge.txt` = base URL (http://host:port).\n";
 }
 
@@ -1488,11 +1590,11 @@ static void agents_register_routes(AsyncWebServer &server) {
         doc["store"] = agents_store_ready() ? agents_store_name() : "none";
         JsonArray arr = doc["agents"].to<JsonArray>();
         agents_lock();
-        for (int i = 0; i < AGENTS_N; i++) {
-            AgentSlot &a = g_agents[i];
+        for (int i = 0; i < g_conv_n; i++) {
+            Conversation &a = g_convs[i];
             JsonObject o = arr.add<JsonObject>();
             o["id"] = a.id;
-            o["name"] = a.name;
+            o["name"] = a.label;
             o["messages"] = a.lines;
             o["active"] = a.sessions[a.active_idx];
             JsonArray sess = o["sessions"].to<JsonArray>();
@@ -1711,6 +1813,42 @@ static void agents_store_init() {
     event_add("agents store %s", agents_store_name());
 }
 
+/* One-shot rename of every known thread's log from the retired
+ * /agent.<id>.<session> key into /conv.<...>. Runs once at boot, AFTER the
+ * registry is loaded (that is what makes the set of threads known) and BEFORE
+ * the first view sync, so a card that was written by an older build shows its
+ * history in the new namespace instead of appearing empty. A thread that has
+ * already moved, or never had a legacy file, costs one exists() and nothing
+ * else. Nothing is deleted: a rename that fails leaves the legacy file exactly
+ * where it was. */
+static void agents_migrate_logs() {
+    if (!agents_store_ready()) return;
+    int moved = 0, skipped = 0, failed = 0;
+    {
+        HwSpiBusGuard bus;   /* one boot burst; released before event_add */
+        for (int i = 0; i < g_conv_n; i++) {
+            Conversation &a = g_convs[i];
+            for (int j = 0; j < a.n_sessions; j++) {
+                String from = agents_legacy_log_path(a.id, a.sessions[j]);
+                if (!g_store->exists(from.c_str())) continue;
+                String to = agents_log_path(a.id, a.sessions[j]);
+                /* BOTH files present. Reachable on the reflash workflow (a card
+                 * used by a new build, then an old one, then new again): each
+                 * half holds real messages and picking one silently discards
+                 * the other, so neither is touched and the split is REPORTED
+                 * instead — a count that appears in the event log is what turns
+                 * "my history looks short" into a diagnosable state. */
+                if (!to.length() || g_store->exists(to.c_str())) { skipped++; continue; }
+                if (g_store->rename(from.c_str(), to.c_str())) moved++;
+                else failed++;
+            }
+        }
+    }
+    if (moved || skipped || failed)
+        event_add("agents store logs moved=%d split=%d failed=%d",
+                  moved, skipped, failed);
+}
+
 static void skill_agents_init() {
     // Session default tag includes last 4 of chip for multi-pager later.
     uint64_t mac = ESP.getEfuseMac();
@@ -1723,8 +1861,8 @@ static void skill_agents_init() {
     /* Answer pending "where are you?" cards the moment a GPS fix lands. */
     gps_set_on_fix(agents_gps_on_fix);
 
-    for (int i = 0; i < AGENTS_N; i++) {
-        AgentSlot &a = g_agents[i];
+    for (int i = 0; i < g_conv_n; i++) {
+        Conversation &a = g_convs[i];
         a.active_idx = 0; a.file_sync = 0; a.lines = 0; a.vn = 0; a.win_start = 0;
         for (int j = 0; j < AGENT_SESSIONS_MAX; j++) {
             a.session_lines[j] = 0;
@@ -1732,15 +1870,16 @@ static void skill_agents_init() {
         }
         agents_session_add(i, g_session);               // default always present
     }
-    agents_manifest_load();                             // existing sessions
-    // Guarantee at least the default survives a reboot.
+    agents_manifest_load();                             // existing rooms
+    agents_migrate_logs();      // retired /agent.* keys -> /conv.* (once)
+    // Guarantee at least the default survives a reboot, in the new format.
     agents_manifest_persist();
 
-    for (int i = 0; i < AGENTS_N; i++) {
+    for (int i = 0; i < g_conv_n; i++) {
         agents_sync_view(i);
         char intro[AGENT_TEXT_LEN];
-        snprintf(intro, sizeof(intro), "hi - type to talk to %s", g_agents[i].name);
-        if (g_agents[i].lines == 0)
+        snprintf(intro, sizeof(intro), "hi - type to talk to %s", g_convs[i].label);
+        if (g_convs[i].lines == 0)
             agents_push_line(i, false, intro);
         agents_thread_goto_tail(i);
     }

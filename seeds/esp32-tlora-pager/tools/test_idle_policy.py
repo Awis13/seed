@@ -86,7 +86,7 @@ assert "static volatile bool g_agents_real_inbound = false;" in agents
 assert 'agents_on_inbound(agent, text, true);' in agents, (
     "HTTP /agents/inbound is a genuine arrival: real_inbound = true"
 )
-assert "agents_on_inbound(g_agents[idx].id, line, true);" in agents, (
+assert "agents_on_inbound(g_convs[idx].id, line, true);" in agents, (
     "a GPS answer landing (possibly minutes later) is an arrival for the user"
 )
 assert 'agents_on_inbound(agent, "(mesh delivery failed - resend)", false);' in mesh, (
