@@ -60,7 +60,6 @@
 #include "../conv_store.h"         // the conversation record: keys, manifest, transports
 #include "../transport.h"          // the backend contract: transport_send + the inbox doors
 #include "../rns/outbox.h"         // the OTHER half of that seam: rns_send_envelope + rns_peer_addr
-#include "../mesh/mc_client.h"    // the mesh backend: peer send + known-contact test
 
 /* Conversation slots. A slot used to carry its own AGENT_VIEW_MAX viewport, so
  * the table cost 12.6 KB per conversation and could not grow without spending
@@ -232,6 +231,15 @@ static unsigned long agents_now_s() {
     return millis() / 1000;
 }
 
+/* Is this conversation the one the chat screen is showing right now? Supplied
+ * by the UI (main.cpp) because only it knows which screen is up; the store must
+ * not guess from window ownership, which outlives the screen. */
+static bool (*g_agents_on_screen)(int idx) = nullptr;
+static bool agents_is_on_screen(int idx) {
+    return g_agents_on_screen && g_agents_on_screen(idx);
+}
+void agents_set_on_screen_hook(bool (*fn)(int idx)) { g_agents_on_screen = fn; }
+
 /* Forward decls (defined later in this TU; store section uses them early). */
 static void agents_view_append(ConvWindow &w, bool from_me, uint32_t ts,
                                const char *text);
@@ -339,9 +347,11 @@ static void agents_store_append(int idx, bool from_me, const char *text) {
     a.last.ts = ts;
     snprintf(a.last.text, sizeof(a.last.text), "%s", text ? text : "");
     a.last_use = ++g_conv_clock;
-    /* Their line, in a conversation nobody is reading. Our own lines and lines
-     * landing in the open chat are never unread. */
-    if (!from_me && g_win.owner != idx && a.unread < 0xFFFF) a.unread++;
+    /* Their line, in a conversation nobody is READING. "Reading" is the chat
+     * screen being open on it — not window ownership: the window stays owned
+     * after the user walks back to the clock, so keying on it left every
+     * conversation they had ever opened permanently unable to go unread. */
+    if (!from_me && !agents_is_on_screen(idx) && a.unread < 0xFFFF) a.unread++;
     if (g_win.owner == idx) agents_view_append(g_win, from_me, ts, text);
     if (!agents_store_ready()) return;
     String path = agents_log_path(a.id, a.sessions[a.active_idx]);
@@ -592,7 +602,21 @@ static int conv_mint(const char *id, const char *label, uint8_t transport,
                      const uint8_t *addr, uint8_t addr_len, bool may_evict) {
     if (!id || !id[0]) return -1;
     int idx = agents_find(id);
-    if (idx >= 0) return idx;                    /* find, before mint */
+    if (idx >= 0) {
+        /* THE ID IS A HANDLE, NOT A CREDENTIAL. It is a prefix of the address,
+         * so a hit means "probably the same peer" — the full stored address and
+         * the wire are what make it certain. A mismatch is a different party
+         * arriving under a colliding prefix, and continuing would drop their
+         * message into someone else's thread and point that thread's replies at
+         * them. Refuse instead; the caller falls back to a card. */
+        Conversation &e = g_convs[idx];
+        if (e.transport != transport) return -1;
+        if (addr && addr_len) {
+            if (e.reply_len != addr_len) return -1;
+            if (memcmp(e.reply_addr, addr, addr_len) != 0) return -1;
+        }
+        return idx;                              /* find, before mint */
+    }
 
     uint8_t seeded_of[CONV_MAX];
     uint32_t use_of[CONV_MAX];
@@ -723,6 +747,13 @@ static void agents_manifest_persist() {
     char line[CONV_MANIFEST_LINE_LEN];
     for (int i = 0; i < g_conv_n; i++) {
         Conversation &a = g_convs[i];
+        /* PEERS ARE NEVER WRITTEN, from any caller. Their route is live-only,
+         * nothing reads a peer line back, and a peer-authored label sitting in
+         * /conversations.txt is the record a later reader might decide to
+         * trust. The mint path already skipped this; the room-create and
+         * roster-change paths did not, so the rule lives in the writer where
+         * every caller gets it. */
+        if (a.transport != CONV_AGENT) continue;
         if (a.n_sessions == 0) {
             /* A conversation with no rooms still needs a line, or it vanishes
              * on the next boot — see agents_manifest_apply. The session field
@@ -1183,7 +1214,7 @@ static bool agents_bridge_save(const char *url) {
     }
     if (strncmp(url, "http://", 7) != 0) return false;
     if (strlen(url) >= AGENT_BRIDGE_LEN) return false;
-    /* Atomic (C8): a power cut mid-write must never leave an empty bridge
+    /* Atomic: a power cut mid-write must never leave an empty bridge
      * file — agents_bridge_load treats it as "no bridge configured". */
     if (!write_spiffs_file_atomic(AGENT_BRIDGE_FILE, AGENT_BRIDGE_TMP,
                                   String(url)))
@@ -1260,12 +1291,26 @@ static void agents_clean_text(const char *in, char *out, size_t out_n) {
     out[j] = '\0';
 }
 
-/* Optional mesh uplink (registered by meshcore skill). Same C1 framing as downlink. */
+/* Optional mesh uplink (registered by meshcore skill). Same framing as downlink. */
 typedef bool (*AgentsMeshUplinkFn)(const char *agent_id, const char *text);
 static AgentsMeshUplinkFn g_agents_mesh_uplink = nullptr;
 
 static void agents_set_mesh_uplink(AgentsMeshUplinkFn fn) {
     g_agents_mesh_uplink = fn;
+}
+
+/* Peer reply submit, registered the same way and for the same reason: THIS FILE
+ * MUST NOT TOUCH THE MESHCORE STACK. sendMessage allocates from the packet
+ * pool, runs the ECDH and arms the ACK — state the loop task drives with no
+ * lock — and a reply can originate on the AsyncTCP task (POST /agents/send
+ * resolves any conversation). So the mesh skill hands in a submit that only
+ * fills a slot, and the send happens on the loop task where the stack lives. */
+typedef bool (*AgentsMeshPeerSendFn)(const uint8_t *pubkey, const char *text,
+                                     const char **why);
+static AgentsMeshPeerSendFn g_agents_mesh_peer_send = nullptr;
+
+static void agents_set_mesh_peer_send(AgentsMeshPeerSendFn fn) {
+    g_agents_mesh_peer_send = fn;
 }
 
 /* ---- GPS location door-card ("where are you?" interception) ---------------
@@ -1524,7 +1569,15 @@ static bool transport_send_mesh(const uint8_t *addr, uint8_t addr_len,
         if (why) *why = "bad peer key";
         return false;
     }
-    return mesh_client_send_to_peer(addr, text, why);
+    if (!g_agents_mesh_peer_send) {
+        if (why) *why = "no mesh";
+        return false;
+    }
+    /* SUBMIT, not send: the radio belongs to the loop task and this can be
+     * running on AsyncTCP. Returns true when the reply is accepted for the
+     * next tick, which is the same "queued, not delivered" contract the
+     * Reticulum uplink has. */
+    return g_agents_mesh_peer_send(addr, text, why);
 }
 
 /*
@@ -1645,7 +1698,7 @@ bool inbox_deliver_msg(uint8_t via, const char *peer_id, const char *label,
         snprintf(a.label, sizeof(a.label), "%s", label);
     agents_unlock();
     if (!wire_ok) return false;
-    agents_on_inbound(a.id, text, true);
+    agents_on_inbound(a.id, text, true);   /* sets the arrival flag + repaint */
     return true;
 }
 
@@ -1728,12 +1781,19 @@ static void agents_roster_apply(int idx, const char *payload) {
 /* Short, filename-safe id for a peer: the first 8 hex of its public key. Long
  * enough that two peers colliding is not a practical concern, short enough that
  * /conv.<id> is 14 bytes — well inside the object-name budget. */
+/* CONV_PEER_ID_BYTES of the address, hex. Five, not four: the id is what a
+ * find-before-mint hits on, and four bytes is a 2^32 prefix grind an attacker
+ * can run offline against a known correspondent. Five costs two characters —
+ * /conv.<10hex> is 16 bytes against a 32-byte budget — and the full address is
+ * compared anyway (see conv_mint), so this is depth, not the only barrier. */
+#define CONV_PEER_ID_BYTES 5
+
 static void conv_peer_id(const uint8_t *pubkey, uint8_t len, char *out,
                          size_t out_n) {
     if (!out || out_n == 0) return;
     out[0] = '\0';
-    if (!pubkey || len < 4) return;
-    conv_hex_encode(pubkey, 4, out, out_n);
+    if (!pubkey || len < CONV_PEER_ID_BYTES) return;
+    conv_hex_encode(pubkey, CONV_PEER_ID_BYTES, out, out_n);
 }
 
 /* Off-loop half of a peer message (kind 2), for EITHER address-carrying wire:
@@ -1781,11 +1841,13 @@ static bool agents_route_peer(const AgentRouteItem &item) {
          * of its own, not an inherited side effect of minting one. */
         event_add("conv new %s %s", item.via == CONV_MESH ? "mesh" : "lxmf", id);
     }
-    agents_push_line(idx, false, item.text);
-    g_agents_real_inbound = true;
-    display_force = true;
     agents_unlock();
-    return true;
+    /* Delivered through the door rather than appended here, so its wire check
+     * actually runs on this path: the door refuses a conversation whose
+     * transport is not the one the message came in on. conv_mint has already
+     * compared the full address; this is the second half of the same rule and
+     * the reason the door exists at all. */
+    return inbox_deliver_msg(item.via, id, item.session, item.text);
 }
 
 /* The off-loop drain: the ONLY SD I/O on the route path. Drains the queue
@@ -2117,7 +2179,7 @@ static void agents_register_routes(AsyncWebServer &server) {
         const char *text   = input["text"]   | "";
         const char *sess   = input["session"] | "";
         int idx = agents_find(agent);
-        if (idx < 0) { notify_send_error(req, 400, "agent must be claude or hermes"); return; }
+        if (idx < 0) { notify_send_error(req, 400, "unknown conversation"); return; }
         if (!text[0]) { notify_send_error(req, 400, "text required"); return; }
         if (sess[0]) {
             agents_lock();
@@ -2171,7 +2233,7 @@ static void agents_register_routes(AsyncWebServer &server) {
         free(body);
         const char *agent = input["agent"] | "";
         const char *text  = input["text"]  | "";
-        if (agents_find(agent) < 0) { notify_send_error(req, 400, "agent must be claude or hermes"); return; }
+        if (agents_find(agent) < 0) { notify_send_error(req, 400, "unknown conversation"); return; }
         if (!text[0]) { notify_send_error(req, 400, "text required"); return; }
         agents_on_inbound(agent, text, true);
         event_add("agent %s >> %s", agent, text);
@@ -2216,7 +2278,7 @@ static void agents_register_routes(AsyncWebServer &server) {
         const char *agent = input["agent"] | "";
         const char *sess  = input["session"] | "";
         int idx = agents_find(agent);
-        if (idx < 0) { notify_send_error(req, 400, "agent must be claude or hermes"); return; }
+        if (idx < 0) { notify_send_error(req, 400, "unknown conversation"); return; }
         if (!sess[0]) { notify_send_error(req, 400, "session required"); return; }
         agents_lock();
         bool ok = agents_session_select(idx, sess);
@@ -2244,7 +2306,7 @@ static void agents_register_routes(AsyncWebServer &server) {
         const char *agent = input["agent"] | "";
         const char *sess  = input["session"] | "";
         int idx = agents_find(agent);
-        if (idx < 0) { notify_send_error(req, 400, "agent must be claude or hermes"); return; }
+        if (idx < 0) { notify_send_error(req, 400, "unknown conversation"); return; }
         agents_lock();
         bool created = false;
         int r = agents_session_create(idx, sess[0] ? sess : nullptr, created);

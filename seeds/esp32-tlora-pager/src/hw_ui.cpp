@@ -1692,6 +1692,11 @@ static void inbox_draw_back(int i, bool on) {
     tft_draw_text(MARGIN + 12, y, "BACK", fg, bg, 2);
 }
 
+/* Drop the drawn-state memo so the next hw_ui_show_inbox() repaints in full
+ * even when the selection has not moved — the row CONTENT changed. Without it
+ * a rebuilt list silently redraws nothing and keeps showing stale names. */
+void hw_ui_inbox_invalidate(void) { agents_sel_drawn = -1; }
+
 void hw_ui_show_inbox(const char *const *labels, const char *glyphs,
                       const int *unread, int count, int selected,
                       bool bridge_ok) {

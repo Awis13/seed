@@ -290,14 +290,48 @@ assert "if (g_convs[i].seeded && g_convs[i].lines == 0)" in boot_loop, (
 # chat the user is looking at, and counting our own lines would mark a
 # conversation the user just wrote in.
 append_fn = fn_body(agents, "static void agents_store_append(int idx, bool from_me, const char *text)")
-assert "if (!from_me && g_win.owner != idx && a.unread < 0xFFFF) a.unread++;" in append_fn, (
+assert "if (!from_me && !agents_is_on_screen(idx) && a.unread < 0xFFFF) a.unread++;" in append_fn, (
     "unread must count only THEIR lines, and only when the conversation is not "
-    "the one on screen — reading it is the acknowledgement"
+    "the one on screen — reading it is the acknowledgement. It must ask the UI "
+    "which conversation is being read: window ownership outlives the screen, so "
+    "keying on it leaves every conversation ever opened unable to go unread"
+)
+assert "g_win.owner != idx" not in append_fn, (
+    "window ownership is not readership — it survives leaving the chat"
 )
 tail_fn = fn_body(agents, "void agents_thread_goto_tail(int idx)")
 assert "a.unread = 0;" in tail_fn, (
     "opening a conversation must clear its unread count — goto_tail is the "
     "focus point everything else in this file hangs off"
+)
+
+# --- 9. no peer line is EVER written to the manifest, from any caller --------
+# The rule lives in the writer, not in one caller: the mint path already skipped
+# it, but room-create and roster-change call the same function and did not.
+assert "if (a.transport != CONV_AGENT) continue;" in persist, (
+    "agents_manifest_persist must skip non-agent conversations — a peer's route "
+    "is live-only, and a peer-authored label sitting in /conversations.txt is "
+    "the record a later reader might decide to trust"
+)
+
+# --- 10. a prefix id is a handle, not a credential ---------------------------
+# The conversation id is a prefix of the address, so a find-hit means "probably
+# the same peer". The full stored address and the wire are what make it certain;
+# without them a colliding prefix drops a stranger into someone else's thread
+# and points that thread's replies at them.
+assert "if (e.transport != transport) return -1;" in mint, (
+    "a find-hit must confirm the wire, not just the id prefix"
+)
+assert "if (memcmp(e.reply_addr, addr, addr_len) != 0) return -1;" in mint, (
+    "a find-hit must confirm the FULL stored address — the id is only a prefix "
+    "of it, and an offline grind can produce a colliding one"
+)
+assert "if (e.reply_len != addr_len) return -1;" in mint, (
+    "an address of a different width is a different party"
+)
+assert re.search(r"#define CONV_PEER_ID_BYTES\s+5", agents), (
+    "the peer id must be wider than four bytes — that is a prefix grind an "
+    "attacker can run offline against a known correspondent"
 )
 
 print("conversation store firmware pins: OK")

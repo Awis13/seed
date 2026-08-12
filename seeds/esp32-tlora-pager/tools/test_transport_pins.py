@@ -242,11 +242,30 @@ assert "expected_ack_crc != 0" in peer_send, (
 
 # 7b. transport_send_mesh is wired to it and to nothing else.
 tmesh = fn_body(agents, "static bool transport_send_mesh(")
-assert "mesh_client_send_to_peer(addr, text, why)" in tmesh, (
-    "the mesh backend must send to the planner-resolved peer address"
+assert "g_agents_mesh_peer_send(addr, text, why)" in tmesh, (
+    "the mesh backend must SUBMIT the planner-resolved peer address to the "
+    "loop task, not drive the radio from whatever task it was called on"
 )
 assert "mesh_client_send_to_gateway" not in tmesh, (
     "the mesh backend must never fall back to the gateway"
+)
+# NO MESHCORE STACK CALL MAY LIVE IN THIS FILE AT ALL. sendMessage allocates
+# from the packet pool, runs the ECDH and arms the ACK, all state the loop task
+# drives without a lock — and a reply can originate on AsyncTCP, since
+# POST /agents/send resolves any conversation. The whole file is checked, not
+# just the backend, because the next inline call would be somewhere else.
+agents_code = re.sub(r"/\*.*?\*/", " ", agents, flags=re.S)
+agents_code = re.sub(r"//[^\n]*", " ", agents_code)
+for stack_call in ("mesh_client_send_to_peer", "mesh_client_send_to_gateway",
+                   "mesh_client_loop", "mesh_client_knows_peer"):
+    assert stack_call not in agents_code, (
+        f"{stack_call} is a MeshCore stack call and must not be reachable from "
+        "this file — the radio belongs to the loop task, and this file runs on "
+        "the keyboard task and the AsyncTCP task too"
+    )
+assert "#include \"../mesh/mc_client.h\"" not in agents, (
+    "the store must not even see the mesh client header — the peer send is "
+    "handed in as a submit callback the mesh skill registers"
 )
 assert "no peer send yet" not in agents, (
     "the placeholder refusal must be gone now that the peer send exists"
@@ -275,11 +294,12 @@ assert "inbox_deliver_msg_mesh(from_pubkey, MESH_PUB_LEN, from_name, text)" in t
 # be true is that it is no longer reached unconditionally: the peer test and the
 # conversation attempt both come FIRST. (If either were deleted outright the
 # .index below raises and this file fails, which is the same signal.)
-assert 'notify_ingest("info", "mesh", "MESH", text, NULL)' in tail, (
+assert 'inbox_deliver_card(CONV_MESH,' in tail, (
     "the unknown-peer card fallback must still exist — without it a "
-    "stranger's DM is silently dropped"
+    "stranger's DM is silently dropped — and it must go through the card door "
+    "like every other transport rather than around it"
 )
-_card = tail.index('notify_ingest("info", "mesh", "MESH", text, NULL)')
+_card = tail.index('inbox_deliver_card(CONV_MESH,')
 assert tail.index("mesh_client_knows_peer") < _card, (
     "the card must no longer be the unconditional plain-DM default — the peer "
     "test comes first"
@@ -288,7 +308,7 @@ assert tail.index("inbox_deliver_msg_mesh") < _card, (
     "a known peer's DM must be tried as a conversation before falling back"
 )
 # ... and the fallback must still be there, or a stranger's DM vanishes.
-assert 'notify_ingest("info", "mesh", "MESH", text, NULL)' in tail, (
+assert 'inbox_deliver_card(CONV_MESH,' in tail, (
     "an unknown peer's DM must still become a card — nothing may be dropped"
 )
 
@@ -331,8 +351,20 @@ assert "conv_mint(id, item.session, item.via, item.peer, item.peer_len,\n       
     "the mint happens off-loop, in the drain, on the wire the message came "
     "in on — and only an advert-attributed mesh peer may evict"
 )
-assert "agents_push_line(idx, false, item.text);" in drain_mesh, (
-    "the append happens off-loop, in the drain"
+# The drain delivers through the door rather than appending directly, so the
+# door's wire check runs on the mint path too. The append still happens
+# off-loop — inside inbox_deliver_msg, which the drain calls.
+assert "inbox_deliver_msg(item.via, id, item.session, item.text)" in drain_mesh, (
+    "the drain must deliver through the message door, so its transport check "
+    "runs on the path that mints — appending directly skips it"
+)
+door = fn_body(agents, "bool inbox_deliver_msg(uint8_t via, const char *peer_id, const char *label,\n"
+                       "                       const char *text) {")
+assert "a.transport == via" in door, (
+    "the door is only worth routing through if it still checks the wire"
+)
+assert "agents_on_inbound(a.id, text, true);" in door, (
+    "the door is where the append happens, off-loop, via the drain"
 )
 assert "conv_peer_id(item.peer, item.peer_len, id, sizeof(id))" in drain_mesh, (
     "the conversation is keyed on the peer's public key, not on its name"
@@ -375,7 +407,10 @@ assert "inbox_deliver_msg_lxmf(g_rns_lxmf_msg.source_hash, LXMF_HASH_LEN," in in
 # NEVER A SILENT DROP. The chat branch must fall through to the card, not
 # return: the queue can be full, and a stranger can find no free slot.
 _chat = ingest.index("if (route.kind == LXMF_ROUTE_CHAT) {")
-_card = ingest.index("notify_ingest(route.level, route.source")
+assert "inbox_deliver_card(CONV_LXMF," in ingest, (
+    "the LXMF card fallback must exist and go through the card door"
+)
+_card = ingest.index("inbox_deliver_card(CONV_LXMF,")
 assert _chat < _card, "the chat attempt must precede the card fallback"
 chat_branch = ingest[_chat:_card]
 # THE LABEL IS A VALUE BUG A STRUCTURAL PIN CANNOT SEE. route.source is
@@ -449,6 +484,16 @@ conv_store_h = (ROOT / "src" / "conv_store.h").read_text(encoding="utf-8")
 assert "if (!may_evict) return -1;" in conv_store_h, (
     "the planner must refuse outright rather than displace when eviction is "
     "not permitted"
+)
+
+# --- 9. the agent chat frame may only land in an AGENT conversation ----------
+# The frame names its target by id and carries a side marker, so `side=u` lands
+# a line attributed to the USER. That was safe while ids were two compiled-in
+# names; peer ids are observable by anyone in radio range, so without this gate
+# a stranger could forge words into a peer's thread as if the user typed them.
+assert "if (idx >= 0 && agents_transport(idx) != CONV_AGENT) idx = -1;" in meshcore, (
+    "the C1-style agent frame must be refused for a non-agent conversation — "
+    "otherwise it can forge a user-attributed line into a peer's thread"
 )
 
 print("transport seam pins: OK")

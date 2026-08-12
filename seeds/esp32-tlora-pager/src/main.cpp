@@ -1556,10 +1556,17 @@ static void handle_wifi_networks_post(AsyncWebServerRequest *request) {
 #include "skills/gps.cpp"    // after notify: reuses notify_send_json; uses hw_ui_expand_ok
 #include "skills/rns.cpp"    // Reticulum bring-up; uses write_spiffs_file_atomic
 
+/* Defined with the other UI helpers below; the store needs it as soon as it
+ * starts counting unread, which is from the first message it stores. */
+static bool ui_conv_on_screen(int idx);
+
 static void skills_init() {
     skill_notify_init();
     skill_progress_init();
     skill_agents_init();
+    /* Only the UI knows which conversation is being read; the store must not
+     * infer it from window ownership, which outlives the screen. */
+    agents_set_on_screen_hook(ui_conv_on_screen);
     skill_meshcore_init();
     skill_backlight_init();
     skill_wg_init();
@@ -1749,6 +1756,12 @@ static int         ag_inbox_n = 0;              /* conversation rows (BACK extra
 static_assert(CONV_MAX <= INBOX_MAX_ROWS,
               "the inbox model must be able to order every conversation slot");
 
+/* The store's "is the user reading this?" test. The chat screen being up on
+ * this conversation is the only thing that counts as reading it. */
+static bool ui_conv_on_screen(int idx) {
+    return hw_ui_screen() == HW_UI_AGENT_CHAT && agent_focus == idx;
+}
+
 static void ui_inbox_build() {
     InboxConvView v[CONV_MAX];
     InboxRow rows[CONV_MAX];
@@ -1777,6 +1790,15 @@ static void ui_inbox_build() {
     }
     agents_unlock();
     ag_inbox_n = rn;
+}
+
+/* Repaint from a REBUILT snapshot: the rows changed, so the renderer's
+ * selection memo has to be dropped or it decides nothing needs drawing. */
+static void ui_inbox_refresh(int selected) {
+    ui_inbox_build();
+    hw_ui_inbox_invalidate();
+    hw_ui_show_inbox(ag_inbox_ptrs, ag_inbox_glyphs, ag_inbox_unread,
+                     ag_inbox_n, selected, agents_bridge_ok());
 }
 
 static void ui_inbox_render(int selected) {
@@ -2867,8 +2889,7 @@ static void ui_open_menu() {
 
 static void ui_open_agents() {
     agents_sel = 0;
-    ui_inbox_build();
-    ui_inbox_render(agents_sel);
+    ui_inbox_refresh(agents_sel);
     ui_note_input();
 }
 
@@ -3245,15 +3266,17 @@ static void ui_on_click() {
              * rebuilding the list on every scroll tick would cost a lock and a
              * repaint per knob step instead. */
             int slot = ag_inbox_slot[agents_sel];
+            InboxRow probe;
+            memset(&probe, 0, sizeof(probe));
+            snprintf(probe.id, sizeof(probe.id), "%s", ag_inbox_ids[agents_sel]);
             agents_lock();
-            const char *live = agents_id(slot);
-            bool same = (live && ag_inbox_ids[agents_sel][0] &&
-                         strcmp(live, ag_inbox_ids[agents_sel]) == 0);
+            bool same = inbox_row_matches(&probe, agents_id(slot));
             agents_unlock();
             if (!same) {
-                /* Show what is actually there now rather than opening it. */
-                ui_inbox_build();
-                ui_inbox_render(agents_sel);
+                /* Show what is actually there now rather than opening it —
+                 * and force the repaint, or the stale name stays on screen and
+                 * the next click opens the stranger under it. */
+                ui_inbox_refresh(agents_sel);
                 break;
             }
             if (ag_inbox_rooms[agents_sel]) ui_open_agent_sessions(slot);
@@ -3852,6 +3875,19 @@ void loop() {
             hw_haptic_notify(lvl);
             hw_sound_poll();        // prime DMA immediately
         }
+    }
+
+    // Inbox open when something arrives: the rows themselves changed — a new
+    // conversation may have been minted, an unread mark raised, the order
+    // moved — so the list is rebuilt and repainted. Without this the inbox
+    // shows the state it had when it was opened until the user leaves and
+    // comes back.
+    if (display_force && hw_ui_screen() == HW_UI_AGENTS) {
+        display_force = false;
+        bool real_in = g_agents_real_inbound;
+        g_agents_real_inbound = false;
+        ui_inbox_refresh(agents_sel);
+        if (real_in) ui_note_wake();
     }
 
     // Agent thread inbound (display_force) — refresh open chat room live.

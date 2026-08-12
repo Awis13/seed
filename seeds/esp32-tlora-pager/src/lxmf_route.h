@@ -17,22 +17,37 @@
  * the same card/room buffers the seed.pager path uses, so the two receive paths
  * strip control bytes and bound length identically.
  *
- * ROUTING RULES (see TLORA-LXMF C3)
- * ---------------------------------
- *   - THREAD (FIELD 0x08) present  -> ROOM. The message belongs to a running
- *     conversation; it is routed into that room INSTEAD of raising a card. The
- *     room name is the thread bytes, NUL-terminated and bounded; the chat router
- *     (claude_route_incoming) sanitises the name itself.
- *   - otherwise                    -> CARD. The DEFAULT, and the milestone path:
- *     a plain client (Retichat) sends only title+content and no custom fields,
- *     and it MUST land as a card.
+ * ROUTING RULES, IN THIS ORDER
+ * ----------------------------
+ *   1. THREAD (FIELD 0x08) present -> ROOM. The message belongs to a running,
+ *      thread-named conversation and is routed into that room. The room name is
+ *      the thread bytes, NUL-terminated and bounded; the chat router
+ *      (claude_route_incoming) sanitises the name itself.
+ *   2. else CUSTOM_META (FIELD 0xFD) present -> CARD. That field is this
+ *      project's own: the gateway sets it to say "this is a notification". No
+ *      third-party client emits it, so its PRESENCE is the test — not the
+ *      presence of any particular key inside it, and not its contents.
+ *   3. else -> CHAT. A message with neither is a person writing to us, and it
+ *      opens (or continues) that sender's own conversation, keyed on their
+ *      16-byte source hash rather than on any name they chose.
+ *
+ * THE ORDER IS PART OF THE CONTRACT. A message carrying both a thread and the
+ * meta is a room, and testing the meta first would turn every one of those into
+ * a card. tools/test_lxmf_route.cpp pins that case.
+ *
+ * A CHAT THAT CANNOT BE LANDED FALLS BACK TO A CARD, so the card fields below
+ * are computed for kinds 2 and 3 alike — the queue can be full, and an
+ * address-based sender may find no free conversation slot.
+ *
  *   - SEVERITY: meta.sev (0xFD) -> 0=info, 1=warn, >=2=crit; absent -> info.
- *   - SOURCE:   meta.src (0xFD) if present, else the constant "lxmf".
+ *   - SOURCE:   meta.src (0xFD) if present, else the constant "lxmf". On a CHAT
+ *     that constant is all there is, so it names nobody and must not be used as
+ *     a conversation label.
  *   - KEY (card replace-in-place): meta.key (0xFD) if present, else a DERIVED
  *     stable-but-unique default (see lxmf_route_derive_key below).
- *   - RENDERER (0x0F) does NOT affect routing. v1 renders every card as plain;
- *     RENDERER_MICRON is treated as plain here — a micron-page body is a
- *     separate later ticket, not built in this commit.
+ *   - RENDERER (0x0F) does NOT affect routing. Every card renders as plain;
+ *     RENDERER_MICRON is treated as plain here — a micron-page body is separate
+ *     work.
  */
 
 #include <string.h>

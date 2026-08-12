@@ -295,9 +295,8 @@ static inline size_t conv_hex_decode(const char *in, uint8_t *out, size_t out_n)
  * well-formed-looking one, letting a label forge a line for a DIFFERENT
  * conversation and flip its dead flag, transport or reply address. Today every
  * label is a compile-time literal, so neither is reachable — but the field
- * exists precisely so a later commit can set it from an LXMF or mesh sender's
- * name, i.e. from the wire, and a barrier added after that is a barrier added
- * too late. Control bytes become spaces rather than truncating the label: a
+ * exists precisely so it can be set from an LXMF or mesh sender's name, i.e.
+ * from the wire, and a barrier added after that is a barrier added too late. Control bytes become spaces rather than truncating the label: a
  * hostile name still shows, it just cannot restructure the file. */
 static inline void conv_label_sanitize(const char *in, char *out, size_t out_n) {
     size_t j = 0;
@@ -346,7 +345,7 @@ static inline bool conv_manifest_format(char *out, size_t out_n,
  *
  * A legacy line has no transport and no return address, so it loads as
  * CONV_AGENT with the agent id itself as the reply address — exactly what the
- * bridge/C1 path has always used to answer such a room.
+ * bridge and gateway-DM path has always used to answer such a room.
  *
  * Returns false on a malformed line (too few fields, unparseable key); the
  * caller skips it rather than inventing a room. */

@@ -60,6 +60,8 @@ static bool lxmf_ingest_wire(const uint8_t *wire, size_t len);
  * L1 branch uses the same sentinel. */
 #define MESH_RX_HANDLED        1u
 /* Wire keepalive: daemon silent bot; optional app pong MC|a for alive counter. */
+/* One pending peer reply; a chat line is bounded by AGENT_TEXT_LEN. */
+#define MESH_PEER_TX_TEXT_CAP  512
 #define MESH_KEEPALIVE_TEXT    "MC|k"
 #define MESH_ALIVE_PONG_TEXT   "MC|a"
 
@@ -187,6 +189,83 @@ struct MeshChatTx {
     char frames[MESH_CHAT_TX_MAX_PARTS][160];
 };
 static MeshChatTx g_mesh_chat_tx = {};
+
+/*
+ * PEER REPLY HAND-OFF — the MeshCore stack is the LOOP TASK'S, and only its.
+ *
+ * BaseChatMesh::sendMessage allocates from the packet pool, runs the ECDH,
+ * touches the duplicate table and the dispatcher's TX queue, and arms
+ * expected_ack_crc — all state mesh_client_loop() drives on the loop task with
+ * no lock of its own. Calling it from anywhere else corrupts that state, and
+ * the corruption surfaces later as a panic with nothing pointing back at the
+ * caller. Every other producer already respects this: the agent uplink only
+ * fills g_mesh_chat_tx and returns, and the frames go out from the poll below.
+ *
+ * A peer reply is submitted the same way. POST /agents/send resolves any
+ * conversation and runs on the AsyncTCP task, so without this it would drive
+ * the radio underneath the loop task. One slot is enough: a reply is a
+ * keystroke, the drain is ~8 ms away, and a second submitted before the first
+ * leaves is refused with a reason the room shows rather than queued behind an
+ * unbounded backlog.
+ */
+struct MeshPeerTx {
+    volatile bool pending;
+    uint8_t peer[32];
+    char text[MESH_PEER_TX_TEXT_CAP];
+};
+static MeshPeerTx g_mesh_peer_tx = {};
+static portMUX_TYPE g_mesh_peer_mux = portMUX_INITIALIZER_UNLOCKED;
+
+/* Submitted from ANY task (keyboard on the loop task, HTTP on AsyncTCP). Does
+ * no radio work: it fills the slot and returns. */
+static bool mesh_peer_tx_submit(const uint8_t *pubkey, const char *text,
+                                const char **why) {
+    if (!pubkey || !text || !text[0]) {
+        if (why) *why = "nothing to send";
+        return false;
+    }
+    if (!g_mesh.radio_ready || !mesh_client_ready()) {
+        if (why) *why = "radio down";
+        return false;
+    }
+    /* Refused here rather than in the drain, so the room can say so while the
+     * user is still looking at what they typed. */
+    if (!mesh_client_knows_peer(pubkey)) {
+        if (why) *why = "unknown peer";
+        return false;
+    }
+    bool taken = false;
+    portENTER_CRITICAL(&g_mesh_peer_mux);
+    if (!g_mesh_peer_tx.pending) {
+        memcpy(g_mesh_peer_tx.peer, pubkey, sizeof(g_mesh_peer_tx.peer));
+        snprintf(g_mesh_peer_tx.text, sizeof(g_mesh_peer_tx.text), "%s", text);
+        g_mesh_peer_tx.pending = true;
+        taken = true;
+    }
+    portEXIT_CRITICAL(&g_mesh_peer_mux);
+    if (!taken && why) *why = "radio busy";
+    return taken;
+}
+
+/* Drained on the LOOP TASK from the mesh tick — the only place the peer send
+ * touches the stack. */
+static void mesh_peer_tx_poll() {
+    if (!g_mesh_peer_tx.pending) return;
+    if (!g_mesh.radio_ready || !mesh_client_ready()) return;
+    if (mesh_client_ack_pending()) return;   /* let the outstanding one finish */
+
+    uint8_t peer[32];
+    char text[MESH_PEER_TX_TEXT_CAP];
+    portENTER_CRITICAL(&g_mesh_peer_mux);
+    memcpy(peer, g_mesh_peer_tx.peer, sizeof(peer));
+    memcpy(text, g_mesh_peer_tx.text, sizeof(text));
+    g_mesh_peer_tx.pending = false;
+    portEXIT_CRITICAL(&g_mesh_peer_mux);
+
+    const char *why = nullptr;
+    if (!mesh_client_send_to_peer(peer, text, &why))
+        event_add("mesh peer send failed: %s", why ? why : "unknown");
+}
 
 static void mesh_chat_tx_fail(const char *reason) {
     char agent[13];
@@ -626,7 +705,15 @@ static uint32_t mesh_on_private_text(const uint8_t *from_pubkey,
         }
         mesh_reasm_append(r, (uint8_t)part_i, (uint8_t)n_parts, chunk);
         if (r->got_count >= r->n_parts && r->n_parts > 0) {
+            /* AGENT CONVERSATIONS ONLY. This frame names its target by id and
+             * carries a side marker, so `side=u` lands a line attributed to the
+             * USER. That was safe while ids were two compiled-in names; peers
+             * are minted with ids anyone in radio range can observe, and
+             * without this check a stranger could forge words into a peer's
+             * thread as if the user had typed them. The agent wire is the only
+             * one this frame belongs to. */
             int idx = agents_find(r->agent);
+            if (idx >= 0 && agents_transport(idx) != CONV_AGENT) idx = -1;
             if (idx >= 0) {
                 bool from_me = (r->side == 'u');
                 agents_push_line(idx, from_me, r->buf);
@@ -687,7 +774,10 @@ static uint32_t mesh_on_private_text(const uint8_t *from_pubkey,
             inbox_deliver_msg_mesh(from_pubkey, MESH_PUB_LEN, from_name, text)) {
             id = MESH_RX_HANDLED;
         } else {
-            id = notify_ingest("info", "mesh", "MESH", text, NULL);
+            /* Through the seam, not around it: this is the card door every
+             * transport is supposed to raise a card by. */
+            id = inbox_deliver_card(CONV_MESH, NULL, INBOX_SEV_INFO, "mesh",
+                                    "MESH", text);
         }
     }
 
@@ -824,6 +914,7 @@ static void skill_meshcore_poll() {
     /* MeshCore stack — same loop task as display (shared SPI). */
     if (g_mesh.radio_ready) mesh_client_loop();
     mesh_chat_tx_poll();
+    mesh_peer_tx_poll();
 
     /* Sparse private keepalive — only when radio stack can TX. */
     if (!g_mesh.has_identity || !g_mesh.radio_ready) return;
@@ -1020,6 +1111,7 @@ static void skill_meshcore_init() {
 
     mesh_client_set_callbacks(mesh_cb_dm, mesh_cb_ack, mesh_cb_log);
     agents_set_mesh_uplink(mesh_chat_uplink);
+    agents_set_mesh_peer_send(mesh_peer_tx_submit);
 
     if (g_mesh.has_identity) {
         /* Defer radio bring-up to poll() so WiFi/HTTP always come up first.

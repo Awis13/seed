@@ -3089,9 +3089,14 @@ static bool lxmf_ingest_wire(const uint8_t *wire, size_t len) {
                       g_rns_lxmf_msg.content_len,
                       g_rns_card_body, sizeof(g_rns_card_body),
                       RNS_CARD_VISIBLE_CHARS);
-    if (notify_ingest(route.level, route.source,
-                      title[0] ? title : "lxmf",
-                      g_rns_card_body, route.key) != 0)
+    /* Through the card door, like every other transport. The severity is
+     * mapped from the route's level string here because the door takes a
+     * severity rather than a name — the same three values either way. */
+    uint8_t sev = INBOX_SEV_INFO;
+    if (strcmp(route.level, "warn") == 0)      sev = INBOX_SEV_WARN;
+    else if (strcmp(route.level, "crit") == 0) sev = INBOX_SEV_CRIT;
+    if (inbox_deliver_card(CONV_LXMF, route.key, sev, route.source,
+                           title[0] ? title : "lxmf", g_rns_card_body) != 0)
         g_rns_lxmf_cards++;
     return true;
 }

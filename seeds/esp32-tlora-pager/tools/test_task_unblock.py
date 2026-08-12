@@ -1139,11 +1139,16 @@ pickup = re.sub(r"//[^\n]*", " ", pickup)
 assert "rns_inbox_take(" in pickup and "notify_ingest(" in pickup, (
     "the pickup is what takes the messages and what raises the cards"
 )
-assert rns_code.count("notify_ingest(") == 2, (
+# BOTH card doors are counted. The LXMF site now raises through
+# inbox_deliver_card() (the transport seam) while the seed.pager pickup still
+# uses notify_ingest(); counting only the latter would let a third card site
+# appear under the newer name without tripping this.
+_card_sites = rns_code.count("notify_ingest(") + rns_code.count("inbox_deliver_card(")
+assert _card_sites == 2, (
     "there are exactly two card sites — the seed.pager pickup and the LXMF poll "
-    "(TLORA-LXMF C3) — and BOTH are on the loop task outside the drain: a "
-    "notify_ingest() reachable from either callback would take the notify_mux "
-    "critical section inside Transport::inbound()"
+    "— and BOTH are on the loop task outside the drain: a card raised from "
+    "either callback would take the notify_mux critical section inside "
+    "Transport::inbound(); found %d" % _card_sites
 )
 for banned in ("new ", "malloc", "String "):
     assert banned not in pickup, (
@@ -2583,13 +2588,15 @@ assert "agents_unlock();" in build, "the snapshot must release the lock"
 # so a row can still show the old name over a new occupant.
 open_row = main[main.index("case HW_UI_AGENTS:") :]
 open_row = open_row[: open_row.index("break;")]
-assert "strcmp(live, ag_inbox_ids[agents_sel]) == 0" in open_row, (
+assert "inbox_row_matches(&probe, agents_id(slot))" in open_row, (
     "opening a row must confirm the slot still holds the conversation the row "
     "displayed — otherwise a recycled slot opens a stranger's thread under the "
     "name the user picked"
 )
-assert "ui_inbox_build();" in open_row, (
-    "a row that no longer matches must rebuild the list, not open anything"
+assert "ui_inbox_refresh(agents_sel);" in open_row, (
+    "a row that no longer matches must rebuild AND repaint the list, not open "
+    "anything — a rebuild alone draws nothing, because the renderer skips a "
+    "repaint when the selection has not moved, and the stale name stays up"
 )
 
 # The fixed three-row constant is gone; it is what a later edit would grab.

@@ -11,7 +11,7 @@
  * hardwired `strcmp(agent_id, "claude")` ladder, and nothing could answer a
  * thread that arrived over a wire the ladder had never heard of.
  *
- * C1 made the record able to hold a thread from any transport (conv_store.h:
+ * The conversation record can hold a thread from any transport (conv_store.h:
  * `transport` + an opaque `reply_addr`). This header is the other half — the
  * seam those records are ACTED on through:
  *
@@ -222,10 +222,11 @@ uint32_t inbox_deliver_card(uint8_t via, const char *key, uint8_t sev,
 
 /*
  * Land a message into the conversation `peer_id` names (skills/agents.cpp).
- * Thin on purpose this commit: it resolves an existing conversation and appends
- * the line. Creating a conversation for an unknown peer is the receive half and
- * belongs with the receivers that will need it. Returns false when no
- * conversation matches.
+ * Resolves an EXISTING conversation and appends the line, refusing one whose
+ * transport is not the wire the message arrived on. Creating a conversation for
+ * an unknown peer belongs to the receivers that can attribute one; this door is
+ * what they deliver through once they have. Returns false when no conversation
+ * matches, or the wire does not.
  */
 bool inbox_deliver_msg(uint8_t via, const char *peer_id, const char *label,
                        const char *text);

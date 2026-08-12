@@ -200,6 +200,10 @@ void hw_ui_show_wifi_info(const char *const *lines, int n_lines);
 // ('A' agent / 'M' mesh / 'L' lxmf) and unread[i] the arrival count (0 = none,
 // drawn as a * marker). `count` counts the CONVERSATION rows only; the renderer
 // adds BACK after them, so the caller's selected index runs 0..count inclusive.
+// Forget what was drawn, so the next show_inbox repaints even if `selected` is
+// unchanged. Needed whenever the ROWS changed rather than the selection.
+void hw_ui_inbox_invalidate(void);
+
 void hw_ui_show_inbox(const char *const *labels,
                       const char *glyphs,
                       const int *unread,
