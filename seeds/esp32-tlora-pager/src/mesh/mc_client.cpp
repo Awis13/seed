@@ -42,7 +42,7 @@
 #define DIRECT_SEND_PERHOP_FACTOR 6.0f
 #define DIRECT_SEND_PERHOP_EXTRA_MILLIS 250
 
-static void (*cb_dm)(const char *, const char *) = nullptr;
+static void (*cb_dm)(const uint8_t *, const char *, const char *) = nullptr;
 static void (*cb_ack)(uint32_t) = nullptr;
 static void (*cb_log)(const char *) = nullptr;
 
@@ -134,7 +134,10 @@ class SeedMesh : public BaseChatMesh {
     (void)pkt;
     (void)sender_timestamp;
     mlog("DM from %s: %.40s", from.name, text ? text : "");
-    if (cb_dm) cb_dm(from.name, text ? text : "");
+    /* The public key is the sender's identity — the mesh attributes it —
+     * while the name is only what it calls itself. Both go up; the caller
+     * decides with the key and displays with the name. */
+    if (cb_dm) cb_dm(from.id.pub_key, from.name, text ? text : "");
   }
 
   void onCommandDataRecv(const ContactInfo &, mesh::Packet *, uint32_t,
@@ -276,6 +279,52 @@ public:
     return true;
   }
 
+  /* Is this key already an advert-attributed contact? */
+  bool knowsPeer(const uint8_t *pk) {
+    return pk && lookupContactByPubKey((uint8_t *)pk, 32) != nullptr;
+  }
+
+  /* Private DM to a PEER, addressed by its own public key.
+   *
+   * Deliberately not sendToGateway with a different argument: that function
+   * resolves the one paired gateway and would silently deliver a private reply
+   * to a third party if handed a peer's key. This resolves the PEER's contact
+   * and sends to that, or refuses. There is no create-on-miss — a contact is
+   * how the mesh says it has cryptographically attributed this key, and
+   * inventing one from an unverified key is precisely the hole. */
+  bool sendToPeer(const uint8_t *pk, const char *text, const char **why) {
+    if (why) *why = nullptr;
+    if (!pk || !text || !text[0]) {
+      if (why) *why = "nothing to send";
+      return false;
+    }
+    ContactInfo *peer = lookupContactByPubKey((uint8_t *)pk, 32);
+    if (!peer) {
+      if (why) *why = "unknown peer";
+      return false;
+    }
+    /* ONE private send may await an ACK at a time, and the gateway's
+     * multi-part chat holds that slot while it runs. Waiting is right here:
+     * stomping it would abandon a half-delivered message the user already
+     * believes they sent. The room shows the reason and the user can retry. */
+    if (expected_ack_crc != 0) {
+      if (why) *why = "radio busy";
+      return false;
+    }
+    uint32_t ack = 0, timeout = 0;
+    int result = sendMessage(*peer, fallback_clock.getCurrentTime(), 0, text,
+                             ack, timeout);
+    if (result == MSG_SEND_FAILED) {
+      if (why) *why = "send failed";
+      return false;
+    }
+    expected_ack_crc = ack;
+    last_msg_sent_ms = mesh_ms_clock.getMillis();
+    mlog("sent peer %s (%s)", result == MSG_SEND_SENT_FLOOD ? "FLOOD" : "DIRECT",
+         peer->name);
+    return true;
+  }
+
   uint32_t lastSendMs() const { return last_msg_sent_ms; }
   bool ackPending() const { return expected_ack_crc != 0; }
   void cancelPendingAck() { expected_ack_crc = 0; }
@@ -300,7 +349,8 @@ static StaticPoolPacketManager packet_mgr(16);
 static SeedMesh *g_client = nullptr;
 static bool g_ready = false;
 
-void mesh_client_set_callbacks(void (*on_dm)(const char *, const char *),
+void mesh_client_set_callbacks(void (*on_dm)(const uint8_t *, const char *,
+                                             const char *),
                                void (*on_ack)(uint32_t),
                                void (*on_log)(const char *)) {
   cb_dm = on_dm;
@@ -336,6 +386,19 @@ bool mesh_client_send_to_gateway(const char *text, uint32_t *expected_ack,
                                  uint32_t *est_timeout_ms) {
   if (!g_client || !g_ready) return false;
   return g_client->sendToGateway(text, expected_ack, est_timeout_ms);
+}
+
+bool mesh_client_send_to_peer(const uint8_t *pubkey, const char *text,
+                              const char **why) {
+  if (!g_client || !g_ready) {
+    if (why) *why = "radio down";
+    return false;
+  }
+  return g_client->sendToPeer(pubkey, text, why);
+}
+
+bool mesh_client_knows_peer(const uint8_t *pubkey) {
+  return g_client && g_ready && g_client->knowsPeer(pubkey);
 }
 
 bool mesh_client_ack_pending() {

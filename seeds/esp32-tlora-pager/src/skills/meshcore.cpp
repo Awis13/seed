@@ -54,6 +54,11 @@ static bool lxmf_ingest_wire(const uint8_t *wire, size_t len);
 #define MESH_PROBE_MAX_S       7200u  /* 2 h cap */
 /* After this many failed probes (or silence), icon → DOWN. */
 #define MESH_FAIL_DOWN         2
+/* "This DM was handled" where there is no card id to return. The caller only
+ * tests the result for zero (to bump dm_rx and mark the link alive), so any
+ * non-zero value does; naming it keeps it from reading as a real card id. The
+ * L1 branch uses the same sentinel. */
+#define MESH_RX_HANDLED        1u
 /* Wire keepalive: daemon silent bot; optional app pong MC|a for alive counter. */
 #define MESH_KEEPALIVE_TEXT    "MC|k"
 #define MESH_ALIVE_PONG_TEXT   "MC|a"
@@ -162,7 +167,9 @@ static int mesh_ui_state() {
 
 /* Pending probe: send returns true; ACK callback sets last_ok. */
 static bool mesh_probe_awaiting_ack = false;
-static uint32_t mesh_on_private_text(const char *text);  /* fwd */
+static uint32_t mesh_on_private_text(const uint8_t *from_pubkey,
+                                    const char *from_name,
+                                    const char *text);  /* fwd */
 
 #define MESH_CHAT_TX_MAX_PARTS 32
 #define MESH_CHAT_TX_RETRIES   3
@@ -288,8 +295,8 @@ static bool mesh_probe_gateway(uint32_t *rtt_ms_out) {
     return true;
 }
 
-static void mesh_cb_dm(const char *from_name, const char *text) {
-    (void)from_name;
+static void mesh_cb_dm(const uint8_t *from_pubkey, const char *from_name,
+                       const char *text) {
     if (!text) return;
     /* App-level alive pong from gateway (or echo) — refresh M counter, no card. */
     if (strcmp(text, "K") == 0 || strcmp(text, MESH_KEEPALIVE_TEXT) == 0 ||
@@ -299,7 +306,7 @@ static void mesh_cb_dm(const char *from_name, const char *text) {
         event_add("mesh alive pong");
         return;
     }
-    mesh_on_private_text(text);
+    mesh_on_private_text(from_pubkey, from_name, text);
 }
 
 static void mesh_cb_ack(uint32_t rtt_ms) {
@@ -523,7 +530,9 @@ static L1Slot *l1_slot_get(const char *mid) {
 
 /* Called when MeshCore stack delivers a private text.
  * Also used by POST /mesh/inject for dry-run of the notify path. */
-static uint32_t mesh_on_private_text(const char *text) {
+static uint32_t mesh_on_private_text(const uint8_t *from_pubkey,
+                                    const char *from_name,
+                                    const char *text) {
     if (!text || !text[0]) return 0;
     uint32_t id = 0;
 
@@ -653,7 +662,33 @@ static uint32_t mesh_on_private_text(const char *text) {
         }
         /* rc == 0: awaiting more parts (or a duplicate) — id stays 0, no dm_rx. */
     } else {
-        id = notify_ingest("info", "mesh", "MESH", text, NULL);
+        /* A PLAIN PRIVATE DM IS A MESSAGE FROM A PERSON, so it lands in a
+         * conversation rather than as a one-off card. Everything above this is
+         * a machine format (P1/M1 cards, C1 agent chat, L1 LXMF) and is
+         * untouched.
+         *
+         * KNOWN CONTACTS ONLY, and this is the whole policy. A contact exists
+         * because the mesh cryptographically attributed an advert to that
+         * public key, so "known" is a real check and not a name the sender
+         * chose. A stranger's DM keeps the OLD behaviour — a card — because the
+         * inbox is the user's own list of correspondents and this path runs on
+         * the loop task with no rate limit: opening it to anyone in radio range
+         * is a separate decision with its own throttling to design. Either way
+         * the message is shown: a known peer's lands in a conversation, a
+         * stranger's becomes a card. The ONE exception is the off-loop drain
+         * finding no free slot (every slot seeded or on screen) — the message is
+         * dropped with a log line, because by then this branch has already been
+         * taken and there is no card to fall back to. Unreachable as the table
+         * stands, with six evictable slots against two seeded ones.
+         *
+         * The HTTP inject route passes no key (there is no peer behind it), so
+         * it takes the card path too — it cannot conjure a conversation. */
+        if (from_pubkey && mesh_client_knows_peer(from_pubkey) &&
+            inbox_deliver_msg_mesh(from_pubkey, MESH_PUB_LEN, from_name, text)) {
+            id = MESH_RX_HANDLED;
+        } else {
+            id = notify_ingest("info", "mesh", "MESH", text, NULL);
+        }
     }
 
     if (id) {
@@ -897,7 +932,9 @@ static void meshcore_register_routes(AsyncWebServer &server) {
             snprintf(wire_buf, sizeof(wire_buf), "%s", body);
             free(body);
         }
-        uint32_t id = mesh_on_private_text(wire_buf);
+        /* No peer behind an HTTP inject: there is no key to attribute it to,
+         * so it cannot open or feed a conversation and takes the card path. */
+        uint32_t id = mesh_on_private_text(nullptr, nullptr, wire_buf);
         JsonDocument out;
         out["ok"] = id != 0;
         out["id"] = id;

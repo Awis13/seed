@@ -229,3 +229,23 @@ uint32_t inbox_deliver_card(uint8_t via, const char *key, uint8_t sev,
  */
 bool inbox_deliver_msg(uint8_t via, const char *peer_id, const char *label,
                        const char *text);
+
+/*
+ * Land a MeshCore peer's message, creating that peer's conversation if this is
+ * the first time it has spoken (skills/agents.cpp). The 32-byte public key is
+ * the identity — the conversation is keyed on it and answers to it — while
+ * `name` is only what the peer calls itself and is used for display.
+ *
+ * LOOP-SAFE, and it has to be: the mesh receive callback runs on the loop task,
+ * where a synchronous SD append would seize the shared SPI bus the panel and
+ * the radio also use. This does RAM work only and hands the message to the same
+ * off-loop drain the chat route uses. Returns true when the message was queued,
+ * false on a full/dead queue or nothing worth landing — the caller falls back
+ * to a card rather than losing it.
+ *
+ * `pubkey_len` must be TRANSPORT_MESH_ADDR_LEN — the length is a parameter
+ * rather than an assumption so a caller with a shorter buffer is refused
+ * here instead of having 32 bytes read out of it.
+ */
+bool inbox_deliver_msg_mesh(const uint8_t *pubkey, uint8_t pubkey_len,
+                            const char *name, const char *text);

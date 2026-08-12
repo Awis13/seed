@@ -256,8 +256,10 @@ assert "int idx = agents_find(id);" in mint and "return idx;" in mint, (
     "mint must FIND first — a peer that speaks twice gets one conversation, "
     "not two"
 )
-assert "conv_slot_plan(g_conv_n, CONV_MAX, seeded_of, use_of)" in mint, (
-    "slot choice must go through the pure planner, not a private loop"
+assert "conv_slot_plan(g_conv_n, CONV_MAX, seeded_of, use_of, g_win.owner)" in mint, (
+    "slot choice must go through the pure planner AND protect the slot on "
+    "screen — g_win.owner is the conversation being read, and recycling it "
+    "would swap the reader into a stranger's chat rather than close it"
 )
 assert "g_win.owner == idx) agents_window_take(-1)" in mint, (
     "evicting the conversation that holds the window must release it"

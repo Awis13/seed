@@ -118,15 +118,23 @@ enum ConvTransport {
  * touches. A peer that comes back is re-minted onto the same id and reopens the
  * same log. That is what makes reusing the slot safe rather than lossy.
  *
- *   n_live   conversations currently in the table
- *   cap      table capacity
- *   seeded   per-slot flag, non-zero = never evict
- *   last_use per-slot monotonic use stamp (higher = more recent)
+ * THE CONVERSATION BEING READ IS ALSO PROTECTED. The screen holds an index into
+ * this table, so recycling the slot it points at does not close that chat — it
+ * silently REPLACES it, leaving the reader looking at a stranger's messages
+ * under a stranger's name, mid-scroll, with no event to notice. Losing an
+ * incoming conversation is recoverable; being quietly moved into someone else's
+ * is not. protect_idx is that slot (-1 for none).
  *
- * Returns the slot index to use, or -1 when the table is full of seeded slots.
+ *   n_live      conversations currently in the table
+ *   cap         table capacity
+ *   seeded      per-slot flag, non-zero = never evict
+ *   last_use    per-slot monotonic use stamp (higher = more recent)
+ *   protect_idx slot currently on screen, or -1
+ *
+ * Returns the slot index to use, or -1 when nothing may be evicted.
  */
 static inline int conv_slot_plan(int n_live, int cap, const uint8_t *seeded,
-                                 const uint32_t *last_use) {
+                                 const uint32_t *last_use, int protect_idx) {
     if (cap <= 0) return -1;
     if (n_live < 0) n_live = 0;
     if (n_live > cap) n_live = cap;
@@ -135,7 +143,7 @@ static inline int conv_slot_plan(int n_live, int cap, const uint8_t *seeded,
     int victim = -1;
     uint32_t oldest = 0;
     for (int i = 0; i < n_live; i++) {
-        if (seeded[i]) continue;
+        if (seeded[i] || i == protect_idx) continue;
         if (victim < 0 || last_use[i] < oldest) {
             victim = i;
             oldest = last_use[i];

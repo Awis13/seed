@@ -208,4 +208,148 @@ assert "wire_ok && label && label[0] && !a.seeded" in msg, (
     "itself off as it"
 )
 
+# --- 7. the mesh wire: peer in, peer out ------------------------------------
+meshcore = (ROOT / "src" / "skills" / "meshcore.cpp").read_text(encoding="utf-8")
+mc_h = (ROOT / "src" / "mesh" / "mc_client.h").read_text(encoding="utf-8")
+mc_c = (ROOT / "src" / "mesh" / "mc_client.cpp").read_text(encoding="utf-8")
+
+# 7a. the peer send exists, addresses the PEER, and cannot become the gateway.
+assert "bool mesh_client_send_to_peer(const uint8_t *pubkey" in mc_h, (
+    "the peer send must be its own primitive, not a gateway call with a "
+    "different argument"
+)
+peer_send = fn_body(mc_c, "  bool sendToPeer(const uint8_t *pk, const char *text, const char **why) {",
+                    "\n  }")
+assert "lookupContactByPubKey((uint8_t *)pk, 32)" in peer_send, (
+    "the peer send must resolve the PEER's contact from its own key"
+)
+# Absence assertions run on the CODE: the function's own comment explains why it
+# is not the gateway send, and a check that reads comments would fire on that.
+peer_code = re.sub(r"/\*.*?\*/", " ", peer_send, flags=re.S)
+peer_code = re.sub(r"//[^\n]*", " ", peer_code)
+assert "heltec_pk_hex" not in peer_code and "ateway" not in peer_code, (
+    "a peer reply must never resolve or fall back to the gateway — that "
+    "delivers a private message to a third party"
+)
+assert "addContact" not in peer_code, (
+    "there must be no create-on-miss: inventing a contact from an unverified "
+    "key is exactly how a stranger would get one"
+)
+assert "expected_ack_crc != 0" in peer_send, (
+    "only one private send may await an ACK; a peer send must wait rather than "
+    "stomp the gateway's multi-part chat mid-delivery"
+)
+
+# 7b. transport_send_mesh is wired to it and to nothing else.
+tmesh = fn_body(agents, "static bool transport_send_mesh(")
+assert "mesh_client_send_to_peer(addr, text, why)" in tmesh, (
+    "the mesh backend must send to the planner-resolved peer address"
+)
+assert "mesh_client_send_to_gateway" not in tmesh, (
+    "the mesh backend must never fall back to the gateway"
+)
+assert "no peer send yet" not in agents, (
+    "the placeholder refusal must be gone now that the peer send exists"
+)
+
+# 7c. the plain-DM default is a CONVERSATION, and the old card default is gone.
+priv = fn_body(
+    meshcore,
+    "static uint32_t mesh_on_private_text(const uint8_t *from_pubkey,\n"
+    "                                    const char *from_name,\n"
+    "                                    const char *text) {",
+)
+# The plain-DM branch is the one containing the conversation call — anchored on
+# that rather than on "the last else", which is the fallback nested inside it.
+assert "inbox_deliver_msg_mesh" in priv, (
+    "the plain-DM path must reach a conversation at all — without it there "
+    "is no branch to check and every assertion below is meaningless"
+)
+_mark = priv.index("inbox_deliver_msg_mesh")
+tail = priv[priv.rindex("} else {", 0, _mark) :]
+assert "inbox_deliver_msg_mesh(from_pubkey, MESH_PUB_LEN, from_name, text)" in tail, (
+    "a plain private DM must land in a conversation"
+)
+# THE OLD DEFAULT IS GONE AS A DEFAULT. The card call still exists — it is the
+# fallback for an unknown peer — so its mere presence proves nothing. What must
+# be true is that it is no longer reached unconditionally: the peer test and the
+# conversation attempt both come FIRST. (If either were deleted outright the
+# .index below raises and this file fails, which is the same signal.)
+assert 'notify_ingest("info", "mesh", "MESH", text, NULL)' in tail, (
+    "the unknown-peer card fallback must still exist — without it a "
+    "stranger's DM is silently dropped"
+)
+_card = tail.index('notify_ingest("info", "mesh", "MESH", text, NULL)')
+assert tail.index("mesh_client_knows_peer") < _card, (
+    "the card must no longer be the unconditional plain-DM default — the peer "
+    "test comes first"
+)
+assert tail.index("inbox_deliver_msg_mesh") < _card, (
+    "a known peer's DM must be tried as a conversation before falling back"
+)
+# ... and the fallback must still be there, or a stranger's DM vanishes.
+assert 'notify_ingest("info", "mesh", "MESH", text, NULL)' in tail, (
+    "an unknown peer's DM must still become a card — nothing may be dropped"
+)
+
+# 7d. the policy gate: known contacts only.
+assert "mesh_client_knows_peer(from_pubkey)" in tail, (
+    "only an advert-attributed contact may open or feed a conversation; the "
+    "inbox is not open to anyone in radio range"
+)
+assert "from_pubkey &&" in tail, (
+    "a message with no key at all (the HTTP inject) cannot reach a conversation"
+)
+inject = meshcore[meshcore.index("uint32_t id = mesh_on_private_text(nullptr") :][:120]
+assert "nullptr, nullptr, wire_buf" in inject, (
+    "the HTTP inject has no peer behind it and must stay on the card path"
+)
+
+# 7e. the mesh inbound is LOOP-SAFE: the radio callback does no SD work.
+producer = fn_body(agents,
+                   "bool inbox_deliver_msg_mesh(const uint8_t *pubkey, uint8_t pubkey_len,\n"
+                   "                            const char *name, const char *text) {")
+for banned in ("agents_store_append", "agents_push_line", "conv_mint",
+               "agents_manifest_persist", "agents_sync_view"):
+    assert banned not in producer, (
+        f"inbox_deliver_msg_mesh must not call {banned} — it runs on the loop "
+        "task from the radio callback, where an SD append seizes the shared bus"
+    )
+assert re.search(r"xQueueSend\(g_route_q,\s*&item,\s*0\)", producer), (
+    "the mesh inbound must hand off to the off-loop drain with a 0-tick send"
+)
+drain_mesh = fn_body(agents, "static void agents_route_mesh(const AgentRouteItem &item)")
+assert "conv_mint(id, item.session, CONV_MESH, item.peer, item.peer_len)" in drain_mesh, (
+    "the mint happens off-loop, in the drain"
+)
+assert "agents_push_line(idx, false, item.text);" in drain_mesh, (
+    "the append happens off-loop, in the drain"
+)
+assert "conv_peer_id(item.peer, item.peer_len, id, sizeof(id))" in drain_mesh, (
+    "the conversation is keyed on the peer's public key, not on its name"
+)
+
+# 7f. A PEER IS LIVE-ONLY: history persists, routing never does.
+# The append writes /conv.<id> (checked above). The manifest must NOT be
+# written: nothing reads a peer line back, so it is state no consumer wants —
+# and it would leave /conversations.txt carrying CONV_MESH records with
+# peer-chosen labels that this build authored and no later reader has decided
+# to trust, which is how the "the loader creates nothing from the card" rule
+# gets quietly re-armed with real data underneath it.
+drain_code = re.sub(r"/\*.*?\*/", " ", drain_mesh, flags=re.S)
+drain_code = re.sub(r"//[^\n]*", " ", drain_code)
+assert "agents_manifest_persist" not in drain_code, (
+    "minting a peer must not write /conversations.txt — a peer's route is "
+    "live-only, and persisting it is a decision of its own rather than a "
+    "side effect of meeting the peer"
+)
+# The length contract is a parameter, not an assumption.
+assert "pubkey_len != TRANSPORT_MESH_ADDR_LEN" in producer, (
+    "the public key length must be checked, so a caller with a shorter buffer "
+    "is refused rather than having 32 bytes read out of it"
+)
+assert "memcpy(item.peer, pubkey, pubkey_len);" in producer, (
+    "the copy must use the checked length, not a hardcoded width"
+)
+
 print("transport seam pins: OK")

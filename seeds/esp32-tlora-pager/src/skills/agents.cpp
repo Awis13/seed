@@ -60,6 +60,7 @@
 #include "../conv_store.h"         // the conversation record: keys, manifest, transports
 #include "../transport.h"          // the backend contract: transport_send + the inbox doors
 #include "../rns/outbox.h"         // the OTHER half of that seam: rns_send_envelope + rns_peer_addr
+#include "../mesh/mc_client.h"    // the mesh backend: peer send + known-contact test
 
 /* Conversation slots. A slot used to carry its own AGENT_VIEW_MAX viewport, so
  * the table cost 12.6 KB per conversation and could not grow without spending
@@ -590,8 +591,14 @@ static int conv_mint(const char *id, const char *label, uint8_t transport,
         seeded_of[i] = g_convs[i].seeded;
         use_of[i] = g_convs[i].last_use;
     }
-    idx = conv_slot_plan(g_conv_n, CONV_MAX, seeded_of, use_of);
-    if (idx < 0) return -1;                      /* table is all seeded */
+    /* g_win.owner IS the conversation on screen — window ownership changes only
+     * on an explicit focus — so it is the slot the reader would be swapped out
+     * of, and it is protected. (Between boot and the first draw it is whichever
+     * conversation the init loop synced last, which is harmless: nothing can
+     * mint that early, and protecting the wrong slot only costs a different
+     * victim.) */
+    idx = conv_slot_plan(g_conv_n, CONV_MAX, seeded_of, use_of, g_win.owner);
+    if (idx < 0) return -1;                      /* nothing may be evicted */
     if (idx >= g_conv_n) {
         g_conv_n = (uint8_t)(idx + 1);           /* took a free slot */
     } else {
@@ -1476,19 +1483,20 @@ static bool transport_send_lxmf(const uint8_t *addr, const char *text,
 
 /* CONV_MESH: a DM straight to the peer's public key.
  *
- * NOT WIRED YET, AND DELIBERATELY NOT FAKED. The mesh layer's only send is
- * mesh_client_send_to_gateway(), which resolves one hardcoded gateway contact
- * (mc_client.cpp sendToGateway -> lookupContactByPubKey(heltec_pk_hex)); there
- * is no primitive for an arbitrary peer key, and routing a private reply
- * through the gateway would hand it to a third party. So the branch exists, the
- * planner already resolves the right address for it, and the send refuses with
- * a reason instead of quietly going somewhere else. The peer-send primitive
- * arrives with the mesh messenger. */
+ * The address is the planner's output — this conversation's own stored key —
+ * and mesh_client_send_to_peer() resolves THAT peer's contact. It is not built
+ * on the gateway send and must never fall back to it: the gateway is a
+ * different node, so a fallback would deliver a private reply to a third party
+ * rather than fail. A refusal (radio down, peer not a known contact, or a
+ * private send already awaiting its ACK) comes back with a reason that the
+ * room shows, and the user can retry. */
 static bool transport_send_mesh(const uint8_t *addr, uint8_t addr_len,
                                 const char *text, const char **why) {
-    (void)addr; (void)addr_len; (void)text;
-    if (why) *why = "no peer send yet";
-    return false;
+    if (addr_len != TRANSPORT_MESH_ADDR_LEN) {
+        if (why) *why = "bad peer key";
+        return false;
+    }
+    return mesh_client_send_to_peer(addr, text, why);
 }
 
 /*
@@ -1637,10 +1645,15 @@ bool inbox_deliver_msg(uint8_t via, const char *peer_id, const char *label,
  * bounded (agents_clean_text) — the third untrusted-input barrier after the mac
  * and the transport receiver. */
 struct AgentRouteItem {
-    uint8_t kind;                       /* 0 = chat message, 1 = live-room roster */
+    uint8_t kind;                       /* 0 = chat message, 1 = roster, 2 = mesh peer message */
     bool newest;                        /* empty name => newest-active room */
-    char session[AGENT_SESSION_LEN];    /* resolved sanitised room (when !newest) */
-    char text[AGENT_TEXT_LEN];          /* kind 0: cleaned reply; kind 1: raw roster payload (<=346 B) */
+    char session[AGENT_SESSION_LEN];    /* kind 0/1: room; kind 2: sender display name */
+    char text[AGENT_TEXT_LEN];          /* kind 0/2: cleaned message; kind 1: roster payload */
+    /* kind 2 only: the peer's public key — its identity and its return address.
+     * Carried by value like everything else here, so the drain task never
+     * shares memory with the radio callback that produced it. */
+    uint8_t peer[CONV_REPLY_MAX];
+    uint8_t peer_len;
 };
 
 #define AGENT_ROUTE_QUEUE_DEPTH  8      /* by-value queue: 8 x ~537 B ~= 4.3 KB */
@@ -1683,6 +1696,57 @@ static void agents_roster_apply(int idx, const char *payload) {
     display_force = true;                        /* repaint the room picker */
 }
 
+/* Short, filename-safe id for a peer: the first 8 hex of its public key. Long
+ * enough that two peers colliding is not a practical concern, short enough that
+ * /conv.<id> is 14 bytes — well inside the object-name budget. */
+static void conv_peer_id(const uint8_t *pubkey, uint8_t len, char *out,
+                         size_t out_n) {
+    if (!out || out_n == 0) return;
+    out[0] = '\0';
+    if (!pubkey || len < 4) return;
+    conv_hex_encode(pubkey, 4, out, out_n);
+}
+
+/* Off-loop half of a mesh peer message (kind 2): mint the conversation if this
+ * peer is new, persist it, and append the line. All of it is SD work, which is
+ * exactly why it happens here and not in the radio callback. */
+static void agents_route_mesh(const AgentRouteItem &item) {
+    char id[CONV_ID_LEN];
+    conv_peer_id(item.peer, item.peer_len, id, sizeof(id));
+    if (!id[0] || !item.text[0]) return;
+
+    agents_lock();
+    bool existed = (agents_find(id) >= 0);
+    int idx = conv_mint(id, item.session, CONV_MESH, item.peer, item.peer_len);
+    if (idx < 0) {
+        /* Every slot is seeded or on screen. Dropping is the honest outcome:
+         * there is nowhere to put the conversation and the alternative is
+         * evicting the chat the user is reading. */
+        agents_unlock();
+        Serial.printf("[agents] mesh route drop: no slot for %s\n", id);
+        return;
+    }
+    Conversation &a = g_convs[idx];
+    if (existed && item.session[0])
+        snprintf(a.label, sizeof(a.label), "%s", item.session);  /* name may change */
+    if (!existed) {
+        /* NO MANIFEST WRITE. A peer conversation is live-only by design: its
+         * ROUTE is never read back from the card, so writing it there would be
+         * state nothing consumes — and worse, it would leave /conversations.txt
+         * carrying CONV_MESH lines, with peer-chosen display names, that this
+         * build authored and no later reader ever decided to trust. The
+         * history is the part that persists (the JSONL append below, keyed
+         * /conv.<id>), so a peer that returns re-mints onto the same id and
+         * reopens the same thread. Persisting peers is a deliberate decision
+         * of its own, not an inherited side effect of minting one. */
+        event_add("conv new mesh %s", id);
+    }
+    agents_push_line(idx, false, item.text);
+    g_agents_real_inbound = true;
+    display_force = true;
+    agents_unlock();
+}
+
 /* The off-loop drain: the ONLY SD I/O on the route path. Drains the queue
  * forever, resolves the target room, reloads its view from SD and appends the
  * reply — everything the caller must NOT do on the loop task. */
@@ -1695,6 +1759,10 @@ static void agents_route_task(void *arg) {
         if (idx < 0) continue;
         if (item.kind == 1) {              /* live-room roster: reconcile + persist */
             agents_roster_apply(idx, item.text);
+            continue;
+        }
+        if (item.kind == 2) {              /* mesh peer message: mint + append */
+            agents_route_mesh(item);
             continue;
         }
         if (!item.text[0]) continue;
@@ -1796,6 +1864,32 @@ bool claude_route_incoming(const char *session, const char *text, int *reason) {
     /* Hand off to the drain task; 0-tick send never blocks the loop. A dead or
      * full queue drops (false) rather than falling back to a synchronous SD
      * write on the caller's task. */
+    if (!g_route_q || xQueueSend(g_route_q, &item, 0) != pdTRUE) return false;
+    return true;
+}
+
+/*
+ * A MeshCore peer's message (declared in ../transport.h). RAM ONLY: the radio
+ * callback that calls this runs on the loop task, so the message is cleaned,
+ * copied by value and handed to the off-loop drain — the mint, the manifest
+ * write and the JSONL append all happen there (agents_route_mesh). Returns
+ * false when there is nothing to land or the queue is dead/full, and the caller
+ * falls back to a card so the message is never simply lost.
+ */
+bool inbox_deliver_msg_mesh(const uint8_t *pubkey, uint8_t pubkey_len,
+                            const char *name, const char *text) {
+    if (!pubkey || pubkey_len != TRANSPORT_MESH_ADDR_LEN) return false;
+    if (!text || !text[0]) return false;
+    AgentRouteItem item;
+    memset(&item, 0, sizeof(item));
+    item.kind = 2;
+    item.peer_len = pubkey_len;
+    memcpy(item.peer, pubkey, pubkey_len);
+    /* The sender's name is untrusted display text like any other inbound
+     * string — cleaned here, and bounded to the label field by the store. */
+    agents_clean_text(name, item.session, sizeof(item.session));
+    agents_clean_text(text, item.text, sizeof(item.text));
+    if (!item.text[0]) return false;
     if (!g_route_q || xQueueSend(g_route_q, &item, 0) != pdTRUE) return false;
     return true;
 }
