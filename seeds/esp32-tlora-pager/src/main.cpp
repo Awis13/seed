@@ -61,7 +61,7 @@
 #include "psram_alloc.h"          // psram_calloc_pref: park big buffers in PSRAM
 
 // ===== Configuration =====
-#define SEED_VERSION        "0.9.77"
+#define SEED_VERSION        "0.9.79"
 // Core clock: datasheet puts 240 vs 80 ~11.5mA apart on WAITI. Periph bus holds
 // at 80 for every PLL-fed core clock; go lower and RMT/I2S retimes. Same floor
 // as tembed idle policy (no light sleep — notify latency is the job).
@@ -837,6 +837,12 @@ static void wifi_setup() {
      * set before the first WiFi.mode() call to reach wifiLowLevelInit(). */
     WiFi.persistent(false);
     WiFi.mode(WIFI_STA);
+    /* Disable modem-sleep power save. The S3 default (WIFI_PS_MIN_MODEM) parks
+     * the radio between DTIM beacons; under the RNS/mesh/display load on core 1
+     * the association is not serviced in time and the AP drops us on a ~20 s
+     * cadence. WIFI_PS_NONE keeps the receiver awake — the standard fix for
+     * exactly this "WiFi keeps falling off" symptom on ESP32. */
+    WiFi.setSleep(false);
     /* Arduino-ESP32 defaults this to true and otherwise retries underneath our
      * scheduler, causing the same UI stalls the 20-minute cadence avoids. */
     WiFi.setAutoReconnect(false);
