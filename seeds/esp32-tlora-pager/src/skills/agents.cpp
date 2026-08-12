@@ -2176,6 +2176,60 @@ static bool agents_clear(const char *agent_id) {
     return any;
 }
 
+/* DELETE a whole conversation — DISTINCT from agents_clear.
+ *
+ * agents_clear empties the active room and re-seeds a "chat cleared" line: the
+ * conversation stays in the table and in /conversations.txt. DELETE removes it:
+ * every room's JSONL history file, the RAM slot (the live table is compacted so
+ * indices stay contiguous), and its line in the manifest (rewritten without it).
+ * After a reboot the conversation is therefore NOT restored — the whole point,
+ * on a device rebooted this often.
+ *
+ * SEEDED conversations (claude / hermes, the device's own doors) are REFUSED:
+ * they are re-created from firmware at every boot, so a delete could never stick,
+ * and the user must always be able to reach them. conv_mint already treats them
+ * as never-evictable for the same reason.
+ *
+ * Matched BY ID (agents_find), which is the recycle-safe key: if the slot changed
+ * hands under the open chat (the off-loop drain mints while a sheet is up), the
+ * id simply is not found and nothing is deleted, rather than the wrong thread
+ * being removed. Returns true when a conversation was removed. */
+static bool agents_delete(const char *conv_id) {
+    agents_lock();
+    int idx = agents_find(conv_id);
+    if (idx < 0 || g_convs[idx].seeded) { agents_unlock(); return false; }
+    Conversation &a = g_convs[idx];
+
+    /* Remove the history files. A peer with no rooms logs to the no-room path
+     * /conv.<id> (empty session); a conversation with rooms has one file each.
+     * Both are attempted, so no orphan JSONL is left behind. Explicit user
+     * delete, not the reversible MARK-NOT-DELETE the dead-room roster uses. */
+    if (agents_store_ready()) {
+        String p0 = agents_log_path(a.id, "");
+        if (p0.length()) { HwSpiBusGuard bus; g_store->remove(p0.c_str()); }
+        for (int j = 0; j < a.n_sessions; j++) {
+            String path = agents_log_path(a.id, a.sessions[j]);
+            if (path.length()) { HwSpiBusGuard bus; g_store->remove(path.c_str()); }
+        }
+    }
+
+    /* Drop the scrollback window if it was loaded for the deleted slot; a window
+     * owned by a HIGHER slot follows the compaction down by one. */
+    if (g_win.owner == idx) agents_window_take(-1);
+
+    /* Compact the live table: shift [idx+1 .. g_conv_n) down one so slot indices
+     * (which the manifest walk and every UI handle use) stay contiguous. */
+    for (int i = idx; i + 1 < g_conv_n; i++) g_convs[i] = g_convs[i + 1];
+    g_conv_n--;
+    memset(&g_convs[g_conv_n], 0, sizeof(g_convs[g_conv_n]));
+    if (g_win.owner > idx) g_win.owner--;
+
+    agents_manifest_persist();   /* rewrite /conversations.txt without the line */
+    agents_unlock();
+    display_force = true;
+    return true;
+}
+
 static int agents_count() { return g_conv_n; }
 
 static const char *agents_id(int i) {
@@ -2183,6 +2237,12 @@ static const char *agents_id(int i) {
 }
 static const char *agents_name(int i) {
     return (i >= 0 && i < g_conv_n) ? g_convs[i].label : "";
+}
+/* Is conversation i a seeded door (claude / hermes)? The UI drops the DELETE
+ * action for these — they are re-created from firmware every boot, so a delete
+ * could never survive one. */
+static bool agents_is_seeded(int i) {
+    return (i >= 0 && i < g_conv_n) ? (g_convs[i].seeded != 0) : false;
 }
 static bool agents_bridge_ok() { return g_bridge[0] != '\0'; }
 static const char *agents_bridge_url() { return g_bridge; }

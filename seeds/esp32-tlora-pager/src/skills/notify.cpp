@@ -564,6 +564,53 @@ static void notify_archive_by_id(uint32_t id) {
     if (found) notify_archive_put(e);
 }
 
+/* --- Delete a card from the feed, and keep it deleted (ticket) ---
+ *
+ * DELETE is distinct from ACK: ack marks a card read (it stays in the ring and
+ * in the archive as a read card), delete removes it from the RAM ring AND writes
+ * an archive TOMBSTONE so the boot restore does not resurrect it. The tombstone
+ * lands on the card's OWN archive identity — the same (MICRON_NS_NOTIFY, key)
+ * notify_archive_put() used, derived here by notify_rec_archive_key() from the
+ * card's dedup key and id — so it is newest-wins over the card's data record and
+ * notify_restore_from_archive() skips the key on the next boot (see
+ * notify_record.h). The enqueue is the same 0-tick off-loop hand-off every other
+ * persist here uses, done OUTSIDE the spinlock with a stack copy of (key,id). */
+static void notify_archive_tombstone(const char *key, uint32_t id) {
+    char idkey[NOTIFY_ARCHIVE_IDKEY_CAP];
+    const char *akey = notify_rec_archive_key(key, id, idkey, sizeof(idkey));
+    uint8_t buf[NOTIFY_REC_MAX];
+    size_t n = notify_rec_tombstone_encode(buf, sizeof(buf));
+    if (n) history_enqueue(MICRON_NS_NOTIFY, akey, buf, n);
+}
+
+/* Remove the card carrying `id` from the RAM ring and tombstone it in the
+ * archive. Returns false when there is no such entry (so the UI can stay put).
+ * The card's dedup key is captured under the lock BEFORE the slot is freed,
+ * because the tombstone's archive identity is derived from that key + the id. */
+static bool notify_delete_id(uint32_t id) {
+    char key[NOTIFY_KEY_LEN];
+    key[0] = '\0';
+    bool found = false;
+
+    portENTER_CRITICAL(&notify_mux);
+    for (int i = 0; i < notify_len; i++) {
+        if (notify_slot[notify_order[i]].id != id) continue;
+        memcpy(key, notify_slot[notify_order[i]].key, sizeof(key));
+        notify_drop_at(i);
+        found = true;
+        break;
+    }
+    portEXIT_CRITICAL(&notify_mux);
+    if (!found) return false;
+
+    /* Write-through the tombstone off-loop, outside the lock — the archive's own
+       write task does the SD append. A deleted card must not come back on the
+       reboot this pager does so often. */
+    notify_archive_tombstone(key, id);
+    display_force = true;
+    return true;
+}
+
 /* --- Store operations (each takes the lock itself) --- */
 
 /*

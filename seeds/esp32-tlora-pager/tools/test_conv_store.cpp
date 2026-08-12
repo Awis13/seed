@@ -537,6 +537,149 @@ static void test_manifest_names(void) {
     assert(strcmp(CONV_MANIFEST, CONV_MANIFEST_LEGACY) != 0);
 }
 
+/* --- conversation DELETE: distinct from clear, and it stays deleted ----------
+ *
+ * agents.cpp owns the live FS/mutex, so the delete itself is not host-callable;
+ * what IS pure and pinned here is the on-disk fallout the delete produces and how
+ * it differs from clear, driven through the same conv_store functions the device
+ * uses (conv_manifest_format for the persisted line, conv_log_path for the file
+ * the device removes). The model mirrors agents.cpp exactly:
+ *   - agents_manifest_persist writes one line per live conversation (a room-less
+ *     conversation still gets a line with an empty session), so a conversation
+ *     that has been removed from the live table produces NO line — its manifest
+ *     record is gone after a rewrite;
+ *   - agents_delete compacts the live table (shift the tail down), refuses a
+ *     seeded door, and removes /conv.<id>;
+ *   - agents_clear does NONE of that: the slot and its manifest line stay.
+ */
+struct ConvModel {
+    char    id[CONV_ID_LEN];
+    char    label[CONV_LABEL_LEN];
+    uint8_t transport;
+    uint8_t reply[CONV_REPLY_MAX];
+    uint8_t reply_len;
+    uint8_t seeded;
+    char    session[CONV_SESSION_LEN];   /* "" = a room-less peer */
+    uint8_t dead;
+};
+
+/* Mirror agents_manifest_persist: one formatted line per live conversation. */
+static int model_persist(const ConvModel *cv, int n,
+                         char out[][CONV_MANIFEST_LINE_LEN], int max) {
+    int m = 0;
+    for (int i = 0; i < n && m < max; i++) {
+        char line[CONV_MANIFEST_LINE_LEN];
+        if (conv_manifest_format(line, sizeof(line), cv[i].id, cv[i].session,
+                                 cv[i].label, cv[i].transport, cv[i].reply,
+                                 cv[i].reply_len, cv[i].dead)) {
+            snprintf(out[m], CONV_MANIFEST_LINE_LEN, "%s", line);
+            m++;
+        }
+    }
+    return m;
+}
+
+/* Is conversation `id` present in a persisted manifest? Parse each line back and
+ * compare the conversation component, so a substring match cannot fool it. */
+static bool model_manifest_has(char lines[][CONV_MANIFEST_LINE_LEN], int m,
+                               const char *id) {
+    for (int i = 0; i < m; i++) {
+        ConvManifestLine ml;
+        if (conv_manifest_parse(lines[i], &ml) && strcmp(ml.conv, id) == 0)
+            return true;
+    }
+    return false;
+}
+
+/* Mirror agents_delete's table bookkeeping: refuse a seeded door, else remove
+ * the slot and compact the tail down one. Returns the new live count. */
+static int model_delete(ConvModel *cv, int n, const char *id) {
+    int idx = -1;
+    for (int i = 0; i < n; i++)
+        if (strcmp(cv[i].id, id) == 0) { idx = i; break; }
+    if (idx < 0 || cv[idx].seeded) return n;   /* not found / seeded: refused */
+    for (int i = idx; i + 1 < n; i++) cv[i] = cv[i + 1];
+    return n - 1;
+}
+
+static void model_seed(ConvModel *cv) {
+    memset(cv, 0, sizeof(ConvModel) * 4);
+    /* claude / hermes: seeded doors with one room each */
+    snprintf(cv[0].id, sizeof(cv[0].id), "%s", SEED_A);
+    snprintf(cv[0].label, sizeof(cv[0].label), "CLAUDE");
+    cv[0].transport = CONV_AGENT; cv[0].reply_len = 6;
+    memcpy(cv[0].reply, "claude", 6); cv[0].seeded = 1;
+    snprintf(cv[0].session, sizeof(cv[0].session), "%s", SEED_ROOM);
+    snprintf(cv[1].id, sizeof(cv[1].id), "%s", SEED_B);
+    snprintf(cv[1].label, sizeof(cv[1].label), "HERMES");
+    cv[1].transport = CONV_AGENT; cv[1].reply_len = 6;
+    memcpy(cv[1].reply, "hermes", 6); cv[1].seeded = 1;
+    snprintf(cv[1].session, sizeof(cv[1].session), "%s", SEED_ROOM);
+    /* two room-less LXMF peers */
+    snprintf(cv[2].id, sizeof(cv[2].id), "%s", PEER_ID);   /* a1b2c3d4 */
+    snprintf(cv[2].label, sizeof(cv[2].label), "peer-a");
+    cv[2].transport = CONV_LXMF; cv[2].reply_len = 16;
+    memset(cv[2].reply, 0xAB, 16); cv[2].seeded = 0;
+    snprintf(cv[3].id, sizeof(cv[3].id), "b2c3d4e5");
+    snprintf(cv[3].label, sizeof(cv[3].label), "peer-b");
+    cv[3].transport = CONV_LXMF; cv[3].reply_len = 16;
+    memset(cv[3].reply, 0xCD, 16); cv[3].seeded = 0;
+}
+
+static void test_conv_delete_distinct_from_clear(void) {
+    ConvModel cv[4];
+    char lines[8][CONV_MANIFEST_LINE_LEN];
+
+    /* Baseline: four conversations, all four appear in the manifest. */
+    model_seed(cv);
+    int n = 4;
+    int m = model_persist(cv, n, lines, 8);
+    assert(m == 4);
+    assert(model_manifest_has(lines, m, SEED_A));
+    assert(model_manifest_has(lines, m, SEED_B));
+    assert(model_manifest_has(lines, m, PEER_ID));
+    assert(model_manifest_has(lines, m, "b2c3d4e5"));
+
+    /* The exact JSONL file the device removes for the room-less peer. */
+    char path[CONV_PATH_LEN];
+    path_of(PEER_ID, "", path, sizeof(path));
+    assert(strcmp(path, "/conv.a1b2c3d4") == 0);
+    assert_path_sane(path);
+
+    /* DELETE the first peer (a middle slot). The live table shrinks by one AND
+     * the tail compacts: peer-b moves down into the freed slot, order preserved. */
+    n = model_delete(cv, n, PEER_ID);
+    assert(n == 3);
+    assert(strcmp(cv[2].id, "b2c3d4e5") == 0);   /* compaction shifted it down */
+
+    /* Rewriting the manifest now omits the deleted conversation entirely — the
+     * line is gone, which is what makes the delete survive the reboot. */
+    m = model_persist(cv, n, lines, 8);
+    assert(m == 3);
+    assert(!model_manifest_has(lines, m, PEER_ID));   /* manifest line is GONE */
+    assert(model_manifest_has(lines, m, SEED_A));      /* the doors stay */
+    assert(model_manifest_has(lines, m, SEED_B));
+    assert(model_manifest_has(lines, m, "b2c3d4e5"));  /* the other peer stays */
+
+    /* CLEAR is NOT delete: the conversation stays in the live table, so its
+     * manifest line is still written. (agents_clear only empties the room's
+     * history and re-seeds a "chat cleared" line — the slot is untouched.) */
+    model_seed(cv);
+    n = 4;
+    /* clear touches no table state, so persist still lists every conversation */
+    m = model_persist(cv, n, lines, 8);
+    assert(m == 4);
+    assert(model_manifest_has(lines, m, PEER_ID));     /* clear KEEPS the line */
+
+    /* A seeded door refuses deletion (it would re-seed on the next boot anyway):
+     * the table and its manifest line are unchanged. */
+    int n2 = model_delete(cv, n, SEED_A);
+    assert(n2 == 4);                                   /* refused: nothing removed */
+    m = model_persist(cv, n2, lines, 8);
+    assert(model_manifest_has(lines, m, SEED_A));
+    printf("  conversation delete: line + slot gone, distinct from clear: OK\n");
+}
+
 int main(void) {
     test_path_form();
     test_path_budget();
@@ -551,6 +694,7 @@ int main(void) {
     test_peer_roundtrip();
     test_peer_survives_reboot();
     test_manifest_names();
+    test_conv_delete_distinct_from_clear();
     printf("conversation store tests: OK\n");
     return 0;
 }

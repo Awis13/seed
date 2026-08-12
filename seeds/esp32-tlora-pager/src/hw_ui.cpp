@@ -1178,12 +1178,12 @@ static const int AGENTS_BAR_H = 25;
 static const int INBOX_ROWS_VISIBLE = 6;
 
 // Card action sheet (after click/Enter on a notification).
-static const int CARD_ACT_N = 3;
+static const int CARD_ACT_N = 4;
 static const int CARD_ACT_ROW0_Y = 72;
 static const int CARD_ACT_ROW_H = 36;
 static const int CARD_ACT_BAR_H = 28;
 static const char *const CARD_ACT_ITEMS[CARD_ACT_N] = {
-    "ACKNOWLEDGE", "REPLY", "BACK"
+    "ACKNOWLEDGE", "REPLY", "DELETE", "BACK"
 };
 
 static void menu_draw_row(int i, bool on) {
@@ -2031,15 +2031,20 @@ int hw_ui_show_agent_chat(const char *agent_name,
     return scroll;
 }
 
-static const int AGENT_ACT_N = 2;
-static const char *const AGENT_ACT_ITEMS[AGENT_ACT_N] = {
-    "CLEAR CHAT", "BACK"
-};
+// The in-chat sheet. A peer conversation shows CLEAR CHAT / DELETE / BACK; a
+// seeded door (claude / hermes) drops DELETE — the caller passes allow_delete,
+// which never changes while one sheet is open, so the selection-diff repaint
+// below stays valid against the same row list.
+static const char *const AGENT_ACT_ITEMS_DEL[3]   = { "CLEAR CHAT", "DELETE", "BACK" };
+static const char *const AGENT_ACT_ITEMS_NODEL[2] = { "CLEAR CHAT", "BACK" };
 
-void hw_ui_show_agent_act(int selected, const char *agent_name) {
+void hw_ui_show_agent_act(int selected, const char *agent_name, bool allow_delete) {
     if (!panel_ok) return;
+    const char *const *items = allow_delete ? AGENT_ACT_ITEMS_DEL
+                                            : AGENT_ACT_ITEMS_NODEL;
+    const int n = allow_delete ? 3 : 2;
     if (selected < 0) selected = 0;
-    if (selected >= AGENT_ACT_N) selected = AGENT_ACT_N - 1;
+    if (selected >= n) selected = n - 1;
     HwSpiBusGuard bus;
 
     if (screen == HW_UI_AGENT_ACT && agent_act_sel_drawn >= 0 &&
@@ -2049,10 +2054,10 @@ void hw_ui_show_agent_act(int selected, const char *agent_name) {
         uint16_t y1 = (uint16_t)(CARD_ACT_ROW0_Y + selected * CARD_ACT_ROW_H);
         uint16_t bar_w = PANEL_W - 2 * MARGIN;
         tft_fill_rect(MARGIN, y0 - 4, bar_w, CARD_ACT_BAR_H, COL_BG);
-        tft_draw_text(MARGIN + 12, y0, AGENT_ACT_ITEMS[agent_act_sel_drawn],
+        tft_draw_text(MARGIN + 12, y0, items[agent_act_sel_drawn],
                       COL_TIME, COL_BG, 2);
         tft_fill_rect(MARGIN, y1 - 4, bar_w, CARD_ACT_BAR_H, COL_ACCENT);
-        tft_draw_text(MARGIN + 12, y1, AGENT_ACT_ITEMS[selected],
+        tft_draw_text(MARGIN + 12, y1, items[selected],
                       COL_BG, COL_ACCENT, 2);
         agent_act_sel_drawn = selected;
         return;
@@ -2066,16 +2071,16 @@ void hw_ui_show_agent_act(int selected, const char *agent_name) {
     tft_draw_text(MARGIN, 36,
                   agent_name && agent_name[0] ? agent_name : "AGENT",
                   COL_DIM, COL_BG, 1);
-    for (int i = 0; i < AGENT_ACT_N; i++) {
+    for (int i = 0; i < n; i++) {
         uint16_t y = (uint16_t)(CARD_ACT_ROW0_Y + i * CARD_ACT_ROW_H);
         bool on = (i == selected);
         uint16_t bar_w = PANEL_W - 2 * MARGIN;
         if (on) {
             tft_fill_rect(MARGIN, y - 4, bar_w, CARD_ACT_BAR_H, COL_ACCENT);
-            tft_draw_text(MARGIN + 12, y, AGENT_ACT_ITEMS[i], COL_BG, COL_ACCENT, 2);
+            tft_draw_text(MARGIN + 12, y, items[i], COL_BG, COL_ACCENT, 2);
         } else {
             tft_fill_rect(MARGIN, y - 4, bar_w, CARD_ACT_BAR_H, COL_BG);
-            tft_draw_text(MARGIN + 12, y, AGENT_ACT_ITEMS[i], COL_TIME, COL_BG, 2);
+            tft_draw_text(MARGIN + 12, y, items[i], COL_TIME, COL_BG, 2);
         }
     }
     agent_act_sel_drawn = selected;

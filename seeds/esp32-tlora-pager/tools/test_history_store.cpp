@@ -20,6 +20,7 @@
 #include <vector>
 
 #include "../src/micron/history_store.h"
+#include "../src/micron/notify_record.h"   /* the delete-marker (tombstone) codec */
 
 /* --- a buffer sink for encode ---------------------------------------------- */
 
@@ -613,8 +614,80 @@ static void test_index_mru_window_boundary(void) {
            HISTORY_INDEX_MAX);
 }
 
+/* --- delete-marker (tombstone) record: codec + newest-wins ------------------
+ *
+ * A card is deleted by appending a TOMBSTONE record on the card's own (ns,key)
+ * identity. At the archive layer a tombstone is just a record whose payload is
+ * the reserved delete marker (notify_record.h). This pins two properties the
+ * delete-survives-reboot behaviour rests on:
+ *   1. codec: a tombstone-payload record round-trips through history_encode /
+ *      history_decode byte-for-byte, and the decoded payload is recognisable as
+ *      a tombstone (and NOT as a card);
+ *   2. newest-wins: appended AFTER the card's data record, the tombstone has the
+ *      higher seq, so the index resolves the identity to it — and a later re-add
+ *      (higher seq still) supersedes the tombstone in turn.
+ */
+static void test_tombstone_delete_marker(void) {
+    uint8_t marker[NOTIFY_REC_MAX];
+    size_t mlen = notify_rec_tombstone_encode(marker, sizeof(marker));
+    assert(mlen == 1);
+
+    /* (1) codec round-trip of a tombstone-payload record. */
+    std::vector<uint8_t> enc =
+        encode_one(MICRON_NS_NOTIFY, "raid-tank", 20, 0x55, marker, (uint16_t)mlen);
+    history_record got;
+    size_t consumed = 0;
+    assert(history_decode(enc.data(), enc.size(), &got, &consumed) == HISTORY_DECODE_OK);
+    assert(consumed == enc.size());
+    assert(got.len == 1);
+    assert(notify_rec_is_tombstone(got.payload, got.len));   /* it IS a delete marker */
+    notify_rec dummy;
+    assert(notify_rec_decode(got.payload, got.len, &dummy) == 0);  /* NOT a card */
+
+    /* (2) newest-wins: data record (seq 10) then a tombstone (seq 20) on the same
+     * (ns,key). The index resolves the identity to the tombstone. */
+    history_index ix;
+    history_index_init(&ix);
+    const uint8_t card_body[] = { NOTIFY_REC_VER, 1, 2, 3 };   /* stand-in card bytes */
+    history_record data_rec;
+    memset(&data_rec, 0, sizeof(data_rec));
+    data_rec.ns = MICRON_NS_NOTIFY;
+    data_rec.seq = 10;
+    snprintf(data_rec.key, sizeof(data_rec.key), "raid-tank");
+    data_rec.len = sizeof(card_body);
+    memcpy(data_rec.payload, card_body, sizeof(card_body));
+    assert(history_index_observe(&ix, &data_rec, 100) == 1);
+    assert(history_index_get(&ix, MICRON_NS_NOTIFY, "raid-tank")->offset == 100);
+
+    history_record tomb_rec;
+    memset(&tomb_rec, 0, sizeof(tomb_rec));
+    tomb_rec.ns = MICRON_NS_NOTIFY;
+    tomb_rec.seq = 20;
+    snprintf(tomb_rec.key, sizeof(tomb_rec.key), "raid-tank");
+    tomb_rec.len = (uint16_t)mlen;
+    memcpy(tomb_rec.payload, marker, mlen);
+    assert(history_index_observe(&ix, &tomb_rec, 200) == 1);
+    const history_index_entry *e = history_index_get(&ix, MICRON_NS_NOTIFY, "raid-tank");
+    assert(e && e->seq == 20 && e->offset == 200);           /* tombstone wins */
+    assert(history_index_ns_count(&ix, MICRON_NS_NOTIFY) == 1);  /* one identity, not two */
+
+    /* A later re-add of the same key supersedes the tombstone (newest-wins). */
+    history_record readd;
+    memset(&readd, 0, sizeof(readd));
+    readd.ns = MICRON_NS_NOTIFY;
+    readd.seq = 30;
+    snprintf(readd.key, sizeof(readd.key), "raid-tank");
+    readd.len = sizeof(card_body);
+    memcpy(readd.payload, card_body, sizeof(card_body));
+    assert(history_index_observe(&ix, &readd, 300) == 1);
+    e = history_index_get(&ix, MICRON_NS_NOTIFY, "raid-tank");
+    assert(e && e->seq == 30 && e->offset == 300);           /* re-add wins */
+    printf("  delete-marker (tombstone): codec + newest-wins: OK\n");
+}
+
 int main(void) {
     test_codec_roundtrip();
+    test_tombstone_delete_marker();
     test_codec_bounds();
     test_codec_rejects_bad_keys();
     test_newest_wins();

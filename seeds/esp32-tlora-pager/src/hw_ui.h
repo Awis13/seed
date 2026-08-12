@@ -234,8 +234,9 @@ int hw_ui_show_agent_chat(const char *agent_name,
                           int *total_rows_out,
                           const char *footer);
 
-// In-chat sheet: CLEAR CHAT / BACK. selected is 0..1.
-void hw_ui_show_agent_act(int selected, const char *agent_name);
+// In-chat sheet. allow_delete true → CLEAR CHAT / DELETE / BACK (selected 0..2);
+// false (a seeded door) → CLEAR CHAT / BACK (selected 0..1).
+void hw_ui_show_agent_act(int selected, const char *agent_name, bool allow_delete);
 
 // Unified Messages feed: one list of notification cards AND chat conversations,
 // merged by time (src/feed_view.h). Per row: title, a single glyph letter, an

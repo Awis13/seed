@@ -1668,10 +1668,13 @@ enum {
     MENU_BACK,
     MENU_COUNT
 };
-// Card action sheet (click / Enter on a notification)
-enum { CARD_ACT_ACK = 0, CARD_ACT_REPLY, CARD_ACT_BACK, CARD_ACT_COUNT };
-// In-chat menu (click while in agent chat room)
-enum { AGENT_ACT_CLEAR = 0, AGENT_ACT_BACK, AGENT_ACT_COUNT };
+// Card action sheet (click / Enter on a notification). DELETE removes the card
+// from the feed for good (RAM ring + an archive tombstone); it survives reboot.
+enum { CARD_ACT_ACK = 0, CARD_ACT_REPLY, CARD_ACT_DELETE, CARD_ACT_BACK, CARD_ACT_COUNT };
+// In-chat menu (click while in agent chat room). DELETE removes the whole
+// conversation (history + manifest + slot); CLEAR only empties the active room.
+// DELETE is offered only for non-seeded conversations (see agent_act_del_ok).
+enum { AGENT_ACT_CLEAR = 0, AGENT_ACT_DELETE, AGENT_ACT_BACK, AGENT_ACT_COUNT };
 // Layout picker: 0=ABC 1=PHON 2=RU 3=BACK
 enum { LAYOUT_BACK = 3, LAYOUT_LIST_COUNT = 4 };
 // SETTINGS: 0=LAYOUT 1=BACKLIGHT 2=AUTO-DIM 3=BACK
@@ -1699,6 +1702,10 @@ static int menu_sel = 0;
 static int card_act_sel = 0;
 static int agents_sel = 0;
 static int agent_act_sel = 0;
+// The in-chat sheet drops the DELETE row for a seeded conversation (claude /
+// hermes): those doors are re-created from firmware every boot, so a delete
+// could never stick. Set when the sheet opens; drives its row count + mapping.
+static bool agent_act_del_ok = false;
 static int layout_sel = 0;
 static int settings_sel = 0;
 static int mesh_sel = 0;
@@ -1953,6 +1960,9 @@ static void notify_restore_from_archive() {
     for (int rank = 0; rank < NOTIFY_MAX; rank++) {
         history_record rec;
         if (!history_restore_at(MICRON_NS_NOTIFY, rank, &rec)) break;  // past the last
+        // A deleted card's newest archived record is a tombstone (newest-wins over
+        // its data record): skip the identity so a delete survives the reboot.
+        if (notify_rec_is_tombstone(rec.payload, rec.len)) continue;
         notify_rec nr;
         if (!notify_rec_decode(rec.payload, rec.len, &nr)) continue;   // skip a bad body
         if (notify_restore_one(&nr, now, now_ms)) restored++;
@@ -3047,17 +3057,35 @@ static void ui_open_agent_sessions(int idx) {
     ui_agent_sessions_refresh();
 }
 
+// The in-chat sheet has a variable row count: CLEAR / DELETE / BACK for a peer
+// conversation, CLEAR / BACK for a seeded door (DELETE dropped). These two map a
+// visible row index onto the stable AGENT_ACT_* action for the current layout.
+static int agent_act_row_count() { return agent_act_del_ok ? 3 : 2; }
+static int agent_act_row_action(int sel) {
+    if (agent_act_del_ok) return sel;                 // 0=CLEAR 1=DELETE 2=BACK
+    return (sel == 0) ? AGENT_ACT_CLEAR : AGENT_ACT_BACK;  // 0=CLEAR 1=BACK
+}
+
 static void ui_open_agent_act() {
-    agent_act_sel = AGENT_ACT_CLEAR;
-    hw_ui_show_agent_act(agent_act_sel, agents_name(agent_focus));
+    agent_act_sel = 0;
+    agent_act_del_ok = !agents_is_seeded(agent_focus);
+    hw_ui_show_agent_act(agent_act_sel, agents_name(agent_focus), agent_act_del_ok);
     ui_note_input();
 }
 
 static void ui_agent_act_confirm() {
-    if (agent_act_sel == AGENT_ACT_CLEAR) {
+    int act = agent_act_row_action(agent_act_sel);
+    if (act == AGENT_ACT_CLEAR) {
         agents_clear(agents_id(agent_focus));
         hw_haptic_notify(0);
         ui_open_agent_chat(agent_focus);
+    } else if (act == AGENT_ACT_DELETE) {
+        // Whole conversation gone — history, manifest line and RAM slot — matched
+        // by id (recycle-safe), so it does not come back on the next boot. Then
+        // the unified feed, which recomputes without it.
+        agents_delete(agents_id(agent_focus));
+        hw_haptic_notify(0);
+        ui_open_msglist();
     } else {
         ui_open_msglist();   // BACK from the in-chat sheet → the unified feed
     }
@@ -3222,6 +3250,12 @@ static void ui_card_act_confirm() {
     } else if (card_act_sel == CARD_ACT_REPLY) {
         ui_open_reply(notify_card_id,
                       reply_title[0] ? reply_title : NULL, NULL);
+    } else if (card_act_sel == CARD_ACT_DELETE) {
+        // Gone for good: out of the RAM ring and tombstoned in the archive, so
+        // it does not come back on the next boot. Rebuild the feed around it.
+        notify_delete_id(notify_card_id);
+        notify_card_id = 0;
+        ui_open_msglist();
     } else {
         // BACK → re-show the card
         ui_open_notify_id(notify_card_id);
@@ -3525,10 +3559,11 @@ static void ui_on_steps(int steps) {
         break;
     }
     case HW_UI_AGENT_ACT: {
+        int n = agent_act_row_count();
         agent_act_sel += steps;
-        while (agent_act_sel < 0) agent_act_sel += AGENT_ACT_COUNT;
-        while (agent_act_sel >= AGENT_ACT_COUNT) agent_act_sel -= AGENT_ACT_COUNT;
-        hw_ui_show_agent_act(agent_act_sel, agents_name(agent_focus));
+        while (agent_act_sel < 0) agent_act_sel += n;
+        while (agent_act_sel >= n) agent_act_sel -= n;
+        hw_ui_show_agent_act(agent_act_sel, agents_name(agent_focus), agent_act_del_ok);
         break;
     }
     case HW_UI_LAYOUT: {
