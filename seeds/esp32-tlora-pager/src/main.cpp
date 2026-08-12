@@ -1545,6 +1545,7 @@ static void handle_wifi_networks_post(AsyncWebServerRequest *request) {
 // Included into this TU so they share auth, SPIFFS, event_add, display_force.
 // build_src_filter excludes skills/ from separate compilation (same as tembed).
 #include "inbox_view.h"   // the inbox list model: order, transport glyph, unread
+#include "feed_view.h"    // the unified Messages feed: cards + chats merged by time
 #include "skills/notify.cpp"
 // After notify: reuses notify_send_json / notify_send_error / notify_ingest_p1.
 #include "skills/progress.cpp"
@@ -1656,8 +1657,10 @@ static void ui_blank_wake_repaint() {
 // --- Front-panel state (encoder) --------------------------------------------
 // MENU items
 enum {
+    /* MESSAGES is now the single unified feed: notification cards and chat
+     * conversations merged by time. The old separate AGENTS entry is retired —
+     * chats are reachable straight from here (src/feed_view.h). */
     MENU_MESSAGES = 0,
-    MENU_AGENTS,
     MENU_MESHCORE,
     MENU_WIFI,
     MENU_SETTINGS,
@@ -1816,8 +1819,19 @@ static const char *ag_sess_ptrs[AGENT_SESSIONS_MAX + 2];
 static int ag_sess_row2idx[AGENT_SESSIONS_MAX];
 static int ag_sess_vis_n = 0;
 static int msglist_sel = 0;
-// Cached ids for the visible msglist rows (map row → notify id).
-static uint32_t msglist_ids[HW_UI_MSGLIST_MAX];
+// Tagged handle for one unified-feed row: the Messages feed mixes notification
+// cards and chat conversations, so a row opens by one of two handles. A card
+// row carries its notify id; a conversation row carries its table slot and the
+// id it displayed (revalidated before opening, so a recycled slot cannot drop
+// the user into a stranger's thread — see the HW_UI_MSGLIST click handler).
+struct MsgHandle {
+    bool     is_conv;                 // false = notify card, true = conversation
+    uint32_t card_id;                 // card handle (is_conv == false)
+    uint8_t  slot;                    // conversation slot (is_conv == true)
+    bool     rooms;                   // conv opens a room picker vs a chat
+    char     conv_id[CONV_ID_LEN];    // what the conv row displayed
+};
+static MsgHandle msglist_h[HW_UI_MSGLIST_MAX];
 static int msglist_count = 0;
 // Notify card currently shown (for ack-on-click / reply).
 static uint32_t notify_card_id = 0;
@@ -2685,7 +2699,6 @@ static void ui_open_msglist();  // defined below
 static void ui_open_notify_id(uint32_t id);
 static void ui_open_card_act();
 static void ui_card_act_confirm();
-static void ui_open_agents();
 static void ui_open_agent_sessions(int idx);
 static void ui_agent_sessions_refresh();
 static void ui_open_agent_chat(int idx);
@@ -2887,12 +2900,6 @@ static void ui_open_menu() {
     ui_note_input();
 }
 
-static void ui_open_agents() {
-    agents_sel = 0;
-    ui_inbox_refresh(agents_sel);
-    ui_note_input();
-}
-
 static int agents_index_from_source(const char *src) {
     if (!src || !src[0]) return -1;
     // notify source is short: "claude", "hermes"
@@ -3052,7 +3059,7 @@ static void ui_agent_act_confirm() {
         hw_haptic_notify(0);
         ui_open_agent_chat(agent_focus);
     } else {
-        ui_open_agents();
+        ui_open_msglist();   // BACK from the in-chat sheet → the unified feed
     }
 }
 
@@ -3067,31 +3074,92 @@ static void ui_open_info() {
     ui_note_input();
 }
 
-// Build msglist from newest-first notify views (up to HW_UI_MSGLIST_MAX).
-// Unread flags drive the Nokia-style * NEW markers on the list face.
+// One notify level → one severity letter, the glyph a card row shows in the
+// unified feed (conversation rows show a transport glyph instead).
+static char msglist_sev_letter(uint8_t level) {
+    const char *n = notify_level_name(level);
+    if (n[0] == 'c' || n[0] == 'C') return 'C';
+    if (n[0] == 'w' || n[0] == 'W') return 'W';
+    return 'I';
+}
+
+// Build the unified Messages feed: notification cards AND chat conversations,
+// merged into one list ordered by unix time, newest first (src/feed_view.h).
+// Cards sort on created_epoch, conversations on last.ts; the row's tagged
+// handle (card id vs conv slot+id) is cached so a click opens the right thing.
 static void ui_open_msglist() {
-    static char titles[HW_UI_MSGLIST_MAX][41];
-    static char levels[HW_UI_MSGLIST_MAX][8];
+    static char titles[HW_UI_MSGLIST_MAX][FEED_LABEL_LEN];
+    static char glyphs[HW_UI_MSGLIST_MAX];
+    static bool is_conv[HW_UI_MSGLIST_MAX];
     static bool unread[HW_UI_MSGLIST_MAX];
     static const char *title_ptrs[HW_UI_MSGLIST_MAX];
-    static const char *level_ptrs[HW_UI_MSGLIST_MAX];
 
-    msglist_count = 0;
-    for (int i = 0; i < NOTIFY_MAX && msglist_count < HW_UI_MSGLIST_MAX; i++) {
+    // Cards out of the notify queue (newest first). Titles are copied into a
+    // scratch that outlives the merge, so the view can point at them.
+    FeedCardView cards[FEED_MAX_CARDS];
+    static char card_titles[FEED_MAX_CARDS][NOTIFY_TITLE_LEN];
+    int nc = 0;
+    for (int i = 0; i < NOTIFY_MAX && nc < FEED_MAX_CARDS; i++) {
         NotifyView v;
         if (!notify_view(i, v)) break;
-        msglist_ids[msglist_count] = v.id;
-        snprintf(titles[msglist_count], sizeof(titles[0]), "%s", v.title);
-        snprintf(levels[msglist_count], sizeof(levels[0]), "%s",
-                 notify_level_name(v.level));
-        unread[msglist_count] = v.unread;
+        snprintf(card_titles[nc], sizeof(card_titles[0]), "%s", v.title);
+        cards[nc].id = v.id;
+        cards[nc].epoch = v.created_epoch;
+        cards[nc].title = card_titles[nc];
+        cards[nc].sev = msglist_sev_letter(v.level);
+        cards[nc].unread = v.unread ? 1 : 0;
+        nc++;
+    }
+
+    // Conversations out of the live table, then merge — both under the lock,
+    // because the view points into the table until feed_build_rows copies each
+    // label and id out. After it returns the rows are self-contained.
+    FeedConvView convs[CONV_MAX];
+    FeedRow rows[HW_UI_MSGLIST_MAX];
+    int rn = 0;
+    agents_lock();
+    int total = agents_count();
+    int nv = 0;
+    for (int i = 0; i < total && nv < CONV_MAX; i++) {
+        convs[nv].slot = (uint8_t)i;
+        convs[nv].id = agents_id(i);
+        convs[nv].label = agents_name(i);
+        convs[nv].epoch = agents_last_ts(i);
+        convs[nv].transport = agents_transport(i);
+        convs[nv].unread = agents_unread(i);
+        convs[nv].has_rooms = agents_has_rooms(i) ? 1 : 0;
+        nv++;
+    }
+    rn = feed_build_rows(cards, nc, convs, nv, rows, HW_UI_MSGLIST_MAX);
+    agents_unlock();
+
+    msglist_count = 0;
+    for (int i = 0; i < rn && msglist_count < HW_UI_MSGLIST_MAX; i++) {
+        const FeedRow &r = rows[i];
+        snprintf(titles[msglist_count], sizeof(titles[0]), "%s", r.label);
         title_ptrs[msglist_count] = titles[msglist_count];
-        level_ptrs[msglist_count] = levels[msglist_count];
+        glyphs[msglist_count] = r.glyph;
+        is_conv[msglist_count] = (r.origin == FEED_CONV);
+        unread[msglist_count] = (r.mark != ' ');
+        MsgHandle &h = msglist_h[msglist_count];
+        if (r.origin == FEED_CONV) {
+            h.is_conv = true;
+            h.slot = r.slot;
+            h.rooms = r.has_rooms != 0;
+            h.card_id = 0;
+            snprintf(h.conv_id, sizeof(h.conv_id), "%s", r.id);
+        } else {
+            h.is_conv = false;
+            h.card_id = r.card_id;
+            h.slot = 0;
+            h.rooms = false;
+            h.conv_id[0] = '\0';
+        }
         msglist_count++;
     }
     if (msglist_sel >= msglist_count) msglist_sel = msglist_count > 0 ? msglist_count - 1 : 0;
     if (msglist_sel < 0) msglist_sel = 0;
-    hw_ui_show_msglist(title_ptrs, level_ptrs, unread, msglist_count, msglist_sel);
+    hw_ui_show_msglist(title_ptrs, glyphs, is_conv, unread, msglist_count, msglist_sel);
     ui_note_input();
 }
 
@@ -3176,8 +3244,6 @@ static void ui_on_click() {
         if (menu_sel == MENU_MESSAGES) {
             msglist_sel = 0;
             ui_open_msglist();
-        } else if (menu_sel == MENU_AGENTS) {
-            ui_open_agents();
         } else if (menu_sel == MENU_MESHCORE) {
             ui_open_meshcore();
         } else if (menu_sel == MENU_WIFI) {
@@ -3306,7 +3372,7 @@ static void ui_on_click() {
                 event_add("agent new session refused (full)");
             }
         } else {  // BACK
-            ui_open_agents();
+            ui_open_msglist();   // → the unified feed, not the retired list
         }
         break;
     }
@@ -3321,7 +3387,31 @@ static void ui_on_click() {
         if (msglist_count == 0) {
             ui_open_menu();
         } else {
-            ui_open_notify_id(msglist_ids[msglist_sel]);
+            const MsgHandle &h = msglist_h[msglist_sel];
+            if (!h.is_conv) {
+                ui_open_notify_id(h.card_id);
+            } else {
+                /* A conversation row. THE SLOT MAY HAVE CHANGED HANDS since the
+                 * feed was drawn: the off-loop drain mints while the list sits
+                 * open, and minting on a full table recycles a slot. Opening
+                 * without checking would put the user in a stranger's thread
+                 * under the name they picked — one string compare closes it,
+                 * the same guard the old Agents screen used. */
+                int slot = h.slot;
+                InboxRow probe;
+                memset(&probe, 0, sizeof(probe));
+                snprintf(probe.id, sizeof(probe.id), "%s", h.conv_id);
+                agents_lock();
+                bool same = inbox_row_matches(&probe, agents_id(slot));
+                agents_unlock();
+                if (!same) {
+                    /* Show what is actually there now rather than opening it. */
+                    ui_open_msglist();
+                    break;
+                }
+                if (h.rooms) ui_open_agent_sessions(slot);
+                else         ui_open_agent_chat(slot);
+            }
         }
         break;
     case HW_UI_NOTIFY: {

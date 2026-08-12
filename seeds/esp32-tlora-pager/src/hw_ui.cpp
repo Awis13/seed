@@ -1132,12 +1132,13 @@ void hw_ui_show_agent_invite(const char *agent_name,
 }
 
 // Menu row geometry — fixed so selection can repaint one bar without a wipe.
-static const int MENU_N = 7;
+// MESSAGES is the single unified feed (cards + chats); the AGENTS entry retired.
+static const int MENU_N = 6;
 static const int MENU_ROW0_Y = 32;
 static const int MENU_ROW_H = 26;
 static const int MENU_BAR_H = 22;
 static const char *const MENU_ITEMS[MENU_N] = {
-    "MESSAGES", "AGENTS", "MESHCORE", "WIFI", "SETTINGS", "INFO", "BACK"
+    "MESSAGES", "MESHCORE", "WIFI", "SETTINGS", "INFO", "BACK"
 };
 
 // WiFi submenu
@@ -2097,17 +2098,13 @@ static int msglist_top_for(int selected, int count) {
     return top;
 }
 
-static char msglist_level_letter(const char *level) {
-    if (!level || !level[0]) return 'I';
-    if (level[0] == 'c' || level[0] == 'C') return 'C';
-    if (level[0] == 'w' || level[0] == 'W') return 'W';
-    return 'I';
-}
-
-static uint16_t msglist_level_color(const char *level) {
-    if (!level || !level[0]) return COL_INFO;
-    if (level[0] == 'c' || level[0] == 'C') return COL_CRIT;
-    if (level[0] == 'w' || level[0] == 'W') return COL_WARN;
+// Colour for a row's glyph and left tick. A card's severity keeps its meaning
+// (red crit, orange warn, teal info); a chat's transport glyph (A/M/L) is not a
+// severity, so it takes the neutral warm white the clock uses for a live value.
+static uint16_t msglist_glyph_color(char g, bool is_conv) {
+    if (is_conv) return COL_TIME;
+    if (g == 'c' || g == 'C') return COL_CRIT;
+    if (g == 'w' || g == 'W') return COL_WARN;
     return COL_INFO;
 }
 
@@ -2121,14 +2118,16 @@ static uint8_t msglist_mask_of(const bool *unread, int count) {
 
 // Row:  [*| ][W]  Title…     — * only when NEW; title bright vs dim.
 static void msglist_draw_row(const char *const *titles,
-                             const char *const *levels,
+                             const char *glyphs,
+                             const bool *is_conv,
                              const bool *unread,
                              int i, uint16_t y, bool on) {
     uint16_t bar_w = PANEL_W - 2 * MARGIN;
     bool is_new = unread && unread[i];
-    const char *lvl = (levels && levels[i]) ? levels[i] : "info";
-    uint16_t sev = msglist_level_color(lvl);
-    char letter[2] = { msglist_level_letter(lvl), '\0' };
+    bool conv = is_conv && is_conv[i];
+    char g = (glyphs && glyphs[i]) ? glyphs[i] : 'I';
+    uint16_t sev = msglist_glyph_color(g, conv);
+    char letter[2] = { g, '\0' };
 
     uint16_t bg = on ? COL_ACCENT : COL_BG;
     // Unread title = warm white; read = slate (Nokia bold vs plain).
@@ -2164,7 +2163,8 @@ static void msglist_draw_row(const char *const *titles,
 }
 
 void hw_ui_show_msglist(const char *const *titles,
-                        const char *const *levels,
+                        const char *glyphs,
+                        const bool *is_conv,
                         const bool *unread,
                         int count,
                         int selected) {
@@ -2190,10 +2190,10 @@ void hw_ui_show_msglist(const char *const *titles,
         int old_row = msglist_sel_drawn - top;
         int new_row = selected - top;
         if (old_row >= 0 && old_row < MSGLIST_VIS)
-            msglist_draw_row(titles, levels, unread, msglist_sel_drawn,
+            msglist_draw_row(titles, glyphs, is_conv, unread, msglist_sel_drawn,
                              (uint16_t)(MSGLIST_ROW0_Y + old_row * MSGLIST_ROW_H), false);
         if (new_row >= 0 && new_row < MSGLIST_VIS)
-            msglist_draw_row(titles, levels, unread, selected,
+            msglist_draw_row(titles, glyphs, is_conv, unread, selected,
                              (uint16_t)(MSGLIST_ROW0_Y + new_row * MSGLIST_ROW_H), true);
         msglist_sel_drawn = selected;
         return;
@@ -2242,7 +2242,7 @@ void hw_ui_show_msglist(const char *const *titles,
     for (int row = 0; row < MSGLIST_VIS; row++) {
         int i = top + row;
         if (i >= count) break;
-        msglist_draw_row(titles, levels, unread, i,
+        msglist_draw_row(titles, glyphs, is_conv, unread, i,
                          (uint16_t)(MSGLIST_ROW0_Y + row * MSGLIST_ROW_H),
                          i == selected);
         // Subtle separator between rows (Symbian-era lists had rules)
@@ -2254,7 +2254,7 @@ void hw_ui_show_msglist(const char *const *titles,
 
     // Footer legend — teaches the * glyph once, classic phone chrome.
     tft_hline(0, PANEL_H - 18, PANEL_W, COL_RULE);
-    tft_draw_text(MARGIN, PANEL_H - 14, "* NEW   . read   I/W/C level",
+    tft_draw_text(MARGIN, PANEL_H - 14, "* NEW  I/W/C card  A/M/L chat",
                   COL_DIM, COL_BG, 1);
     tft_draw_text_r(PANEL_W - MARGIN, PANEL_H - 14, "click open",
                     COL_DIM, COL_BG, 1);

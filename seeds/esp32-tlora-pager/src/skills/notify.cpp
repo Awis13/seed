@@ -204,6 +204,10 @@ struct NotifyView {
     int8_t   chosen;
     uint8_t  opt_count;
     unsigned long age_s;
+    /* Arrival wall-clock second, 0 when the clock was unset. The unified
+     * Messages feed (src/feed_view.h) orders cards against conversations by
+     * this, the only stamp comparable across the two stores. */
+    uint32_t created_epoch;
     char source[NOTIFY_SOURCE_LEN];
     char title[NOTIFY_TITLE_LEN];
     char body[NOTIFY_BODY_LEN];
@@ -684,6 +688,7 @@ static void notify_fill_view(const Notification &e, const NotifyOptions &op,
     out.chosen = e.chosen;
     out.opt_count = e.opt_count;
     out.age_s = notify_age_of(e, now, now_ms);
+    out.created_epoch = (uint32_t)(e.created_epoch > 0 ? e.created_epoch : 0);
     memcpy(out.source, e.source, sizeof(out.source));
     memcpy(out.title, e.title, sizeof(out.title));
     memcpy(out.body, e.body, sizeof(out.body));

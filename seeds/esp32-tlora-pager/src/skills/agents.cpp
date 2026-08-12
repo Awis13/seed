@@ -1275,6 +1275,13 @@ uint16_t agents_unread(int idx) {
 uint32_t agents_last_use(int idx) {
     return (idx >= 0 && idx < g_conv_n) ? g_convs[idx].last_use : 0;
 }
+/* Unix second of the newest message — the merge key the unified Messages feed
+ * (src/feed_view.h) orders a conversation on, against a card's created_epoch.
+ * NOT last_use, which is a boot-relative eviction counter and not comparable
+ * across the two stores. 0 when the thread has no dated message yet. */
+uint32_t agents_last_ts(int idx) {
+    return (idx >= 0 && idx < g_conv_n) ? g_convs[idx].last.ts : 0;
+}
 /* Rooms are an agent concept: a seeded conversation has them and its row opens
  * the room picker, a minted peer has none and its row opens the chat. */
 bool agents_has_rooms(int idx) {

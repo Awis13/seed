@@ -237,12 +237,16 @@ int hw_ui_show_agent_chat(const char *agent_name,
 // In-chat sheet: CLEAR CHAT / BACK. selected is 0..1.
 void hw_ui_show_agent_act(int selected, const char *agent_name);
 
-// Message list: title + level + unread flag per row (Nokia/pager inbox).
-// Unread rows get a * marker and bright title; read rows are dim.
-// levels are "info"/"warn"/"crit"; unread[i] true = NEW.
+// Unified Messages feed: one list of notification cards AND chat conversations,
+// merged by time (src/feed_view.h). Per row: title, a single glyph letter, an
+// origin flag and an unread flag. glyphs[i] is the row's tag character — a
+// severity letter (I/W/C) for a card, a transport letter (A/M/L) for a chat;
+// is_conv[i] true = chat row, false = card row; unread[i] true = NEW (gets a *
+// marker and a bright title, read rows are dim).
 #define HW_UI_MSGLIST_MAX 8
 void hw_ui_show_msglist(const char *const *titles,
-                        const char *const *levels,
+                        const char *glyphs,
+                        const bool *is_conv,
                         const bool *unread,
                         int count,
                         int selected);
