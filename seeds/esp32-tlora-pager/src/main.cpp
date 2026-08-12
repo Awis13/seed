@@ -59,6 +59,28 @@
 #include "hw_sound.h"
 #include "hw_kb.h"
 #include "psram_alloc.h"          // psram_calloc_pref: park big buffers in PSRAM
+#include "ui_nav.h"               // pure, host-tested back-navigation policy
+
+// Bind the host-testable UiNavScreen ids to HwUiScreen so the two never drift.
+static_assert((int)UINAV_CLOCK          == (int)HW_UI_CLOCK,          "ui_nav enum drift");
+static_assert((int)UINAV_NOTIFY         == (int)HW_UI_NOTIFY,         "ui_nav enum drift");
+static_assert((int)UINAV_CARD_ACT       == (int)HW_UI_CARD_ACT,      "ui_nav enum drift");
+static_assert((int)UINAV_MENU           == (int)HW_UI_MENU,           "ui_nav enum drift");
+static_assert((int)UINAV_AGENTS         == (int)HW_UI_AGENTS,         "ui_nav enum drift");
+static_assert((int)UINAV_AGENT_CHAT     == (int)HW_UI_AGENT_CHAT,     "ui_nav enum drift");
+static_assert((int)UINAV_AGENT_ACT      == (int)HW_UI_AGENT_ACT,      "ui_nav enum drift");
+static_assert((int)UINAV_AGENT_SESSIONS == (int)HW_UI_AGENT_SESSIONS, "ui_nav enum drift");
+static_assert((int)UINAV_MSGLIST        == (int)HW_UI_MSGLIST,        "ui_nav enum drift");
+static_assert((int)UINAV_INFO           == (int)HW_UI_INFO,           "ui_nav enum drift");
+static_assert((int)UINAV_REPLY          == (int)HW_UI_REPLY,          "ui_nav enum drift");
+static_assert((int)UINAV_LAYOUT         == (int)HW_UI_LAYOUT,         "ui_nav enum drift");
+static_assert((int)UINAV_SETTINGS       == (int)HW_UI_SETTINGS,       "ui_nav enum drift");
+static_assert((int)UINAV_MESHCORE       == (int)HW_UI_MESHCORE,       "ui_nav enum drift");
+static_assert((int)UINAV_MESH_PING      == (int)HW_UI_MESH_PING,      "ui_nav enum drift");
+static_assert((int)UINAV_WIFI           == (int)HW_UI_WIFI,           "ui_nav enum drift");
+static_assert((int)UINAV_WIFI_LIST      == (int)HW_UI_WIFI_LIST,      "ui_nav enum drift");
+static_assert((int)UINAV_WIFI_INFO      == (int)HW_UI_WIFI_INFO,      "ui_nav enum drift");
+static_assert((int)UINAV_PAGE           == (int)HW_UI_PAGE,           "ui_nav enum drift");
 
 // ===== Configuration =====
 #define SEED_VERSION        "0.9.80"
@@ -2719,6 +2741,37 @@ static bool notify_is_chat_door(const NotifyView &v);
 static int agents_index_from_door(const NotifyView &v);
 static void ui_show_agent_invite_from_view(const NotifyView &v, uint32_t id);
 static void ui_enter_agent_from_notify(uint32_t id, const NotifyView &v);
+static void ui_open_menu();
+static void ui_open_info();
+
+// Navigate to `target` (a UiNavScreen id) by rebuilding its content — the same
+// open helpers the per-screen BACK rows call. Used only for the small set of
+// screens ui_nav_back_target() can hand back.
+static void ui_go_to_screen(uint8_t target) {
+    switch (target) {
+    case UINAV_CLOCK:          ui_go_clock(NULL);                 break;
+    case UINAV_MENU:           ui_open_menu();                    break;
+    case UINAV_MSGLIST:        ui_open_msglist();                 break;
+    case UINAV_NOTIFY:         ui_open_notify_id(notify_card_id); break;
+    case UINAV_AGENT_CHAT:     ui_open_agent_chat(agent_focus);   break;
+    case UINAV_AGENT_SESSIONS: ui_open_agent_sessions(agent_focus); break;
+    case UINAV_SETTINGS:       ui_open_settings();                break;
+    case UINAV_MESHCORE:       ui_open_meshcore();                break;
+    case UINAV_WIFI:           ui_open_wifi();                    break;
+    default:                   ui_go_clock(NULL);                 break;
+    }
+}
+
+// One "go back" step from the current face — the BACKSPACE key's navigation
+// action and the shared spec for the BACK rows. No-op on CLOCK (root) and on the
+// text-entry editor (REPLY handles BACKSPACE as delete-a-char before this runs).
+static void ui_go_back() {
+    HwUiScreen scr = hw_ui_screen();
+    if (!ui_nav_backspace_goes_back((uint8_t)scr)) return;
+    bool has_rooms = (scr == HW_UI_AGENT_CHAT) && agents_has_rooms(agent_focus);
+    ui_go_to_screen(ui_nav_back_target((uint8_t)scr, has_rooms));
+    hw_haptic_notify(0);
+}
 
 // first_utf8: optional first character (UTF-8); NULL/empty = empty draft.
 static void ui_open_reply(uint32_t id, const char *title, const char *first_utf8) {
@@ -2823,10 +2876,17 @@ static void ui_on_key(const char *u) {
         return;
     }
 
+    // Backspace = go back one screen on every navigation face. On the text-entry
+    // editor (REPLY) it still deletes a character — handled by that screen's
+    // block below, so it is excluded here.
+    if (c0 == '\b' && !ui_nav_is_text_entry((uint8_t)scr)) {
+        ui_go_back();
+        return;
+    }
+
     // From a card: typing jumps straight into reply.
     // Enter: agent door → open chat; else Ack·Reply sheet.
     if (scr == HW_UI_NOTIFY && notify_card_id) {
-        if (c0 == '\b') return;
         if (c0 == '\n') {
             NotifyView v;
             if (notify_view_by_id(notify_card_id, v, NULL, NULL) &&
@@ -3379,8 +3439,10 @@ static void ui_on_click() {
                 ui_inbox_refresh(agents_sel);
                 break;
             }
-            if (ag_inbox_rooms[agents_sel]) ui_open_agent_sessions(slot);
-            else                            ui_open_agent_chat(slot);
+            // Land straight in the conversation's active (last-used) room, even
+            // when it has several — one tap to read/type. The room list stays
+            // reachable with BACKSPACE from inside the chat (see ui_go_back).
+            ui_open_agent_chat(slot);
         }
         break;
     case HW_UI_AGENT_SESSIONS: {
@@ -3443,8 +3505,9 @@ static void ui_on_click() {
                     ui_open_msglist();
                     break;
                 }
-                if (h.rooms) ui_open_agent_sessions(slot);
-                else         ui_open_agent_chat(slot);
+                // Straight into the active (last-used) room's chat; the room
+                // list stays reachable with BACKSPACE from the chat.
+                ui_open_agent_chat(slot);
             }
         }
         break;
