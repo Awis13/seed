@@ -180,6 +180,11 @@ static ConvWindow g_win = { -1, 0, 0, 0, {} };
  * conversation without a timestamp (the clock is not trustworthy at boot). */
 static uint32_t g_conv_clock = 0;
 
+/* Manifest lines the table had no room for. Boot rewrites the file from the
+ * table, so those lines are dropped from disk in the same pass — this count is
+ * the only trace they leave. */
+static uint16_t g_conv_load_skipped = 0;
+
 /* The two bridge/gateway agents, pre-created as CONV_AGENT conversations. Their
  * return address is the agent id's own bytes, which is exactly what the bridge
  * and the MeshCore C1 DM have always used to answer them. Fields not named here
@@ -679,29 +684,37 @@ static void agents_conv_apply(Conversation &a, const ConvManifestLine &ml) {
  * this used to do) meant the store could describe a peer conversation on disk
  * and then silently forget it on the next boot. */
 static void agents_manifest_apply(const ConvManifestLine &ml) {
-    /* THE LOADER CREATES NOTHING. It resolves against the conversations this
-     * build already has, and a line naming any other is skipped.
+    /* THE LOADER RESTORES WHAT WAS THERE, peers included. A line for a
+     * conversation this build does not hold is a peer coming back after a
+     * reboot, which is the entire reason its record was written.
      *
-     * WHY, given the store can now mint: /conversations.txt lives on a card a
-     * user can pull and edit, and a minted conversation is not seeded — so
-     * conv_route_resolve() would take its transport and return address from
-     * that file verbatim. Minting here would therefore let a hand-written line
-     * conjure a conversation whose replies go wherever the line says, which is
-     * exactly the re-pointing the seeded-route rule was written to stop, just
-     * through a different door. The legacy manifest makes it concrete: it can
-     * still name retired agent ids, and minting those would resurrect rooms
-     * that post to the bridge.
+     * WHAT THIS COSTS, stated rather than hidden: /conversations.txt is a file
+     * on a card a user can pull and edit, and a restored peer is not seeded, so
+     * conv_route_resolve() takes its transport and return address from that
+     * file. Someone holding the card can therefore author a conversation whose
+     * replies go where they choose. That is a physical-access threat and it is
+     * accepted deliberately: the alternative, refusing to restore anything,
+     * made every chat vanish on every reboot — a certainty rather than a
+     * threat. Once the MeshCore contact table persists, a restored peer can be
+     * required to match a known contact, and this narrows.
      *
-     * A non-AGENT line is skipped for the same reason, and NOT because peers
-     * are hypothetical — they are minted at runtime by the mesh and LXMF
-     * receivers. That is exactly why: a peer's route must only ever come from a
-     * live, transport-authenticated arrival, never from a file. The writer
-     * therefore never puts a peer on the card and the loader would refuse one
-     * anyway, so the two halves agree. Loading a route from disk is a trust
-     * decision for a transport that can verify the peer, not for this parser. */
-    if (ml.transport != CONV_AGENT) return;
-    int idx = agents_find(ml.conv);
-    if (idx < 0) return;
+     * Never evicts while loading: a manifest longer than the table fills it and
+     * stops, rather than letting later lines throw out earlier ones. */
+    int idx = conv_mint(ml.conv, ml.label, ml.transport, ml.reply, ml.reply_len,
+                        false);
+    if (idx < 0) {
+        /* COUNTED, BECAUSE THE NEXT THING BOOT DOES IS REWRITE THIS FILE.
+         * skill_agents_init runs load, then migrate, then persist — and persist
+         * rebuilds /conversations.txt from the table, so a line that could not
+         * be restored is gone from disk the same boot. The /conv.<id> history
+         * survives; the route that named it does not, and silently. Only
+         * reachable when the table is smaller than the card expects (a build
+         * with a lower cap, or a card moved between builds), and refusing is
+         * still right — keeping what came first beats evicting it. But it must
+         * not happen without saying so. */
+        g_conv_load_skipped++;
+        return;
+    }
     Conversation &a = g_convs[idx];
     agents_conv_apply(a, ml);
     if (!ml.session[0]) return;         /* conversation-level line: no room */
@@ -735,9 +748,17 @@ static void agents_manifest_read(const char *path) {
  * data is not this code's call), it simply stops being authoritative once the
  * new one exists. */
 static void agents_manifest_load() {
-    HwSpiBusGuard bus;
-    agents_manifest_read(CONV_MANIFEST_LEGACY);
-    agents_manifest_read(CONV_MANIFEST);
+    g_conv_load_skipped = 0;
+    {
+        HwSpiBusGuard bus;
+        agents_manifest_read(CONV_MANIFEST_LEGACY);
+        agents_manifest_read(CONV_MANIFEST);
+    }
+    /* The same breadcrumb shape the log migration leaves: silence means nothing
+     * was lost, and a number turns "where did that chat go" into a question
+     * with an answer. Outside the bus guard. */
+    if (g_conv_load_skipped)
+        event_add("conv load skipped %u (table full)", g_conv_load_skipped);
 }
 
 static void agents_manifest_persist() {
@@ -746,13 +767,12 @@ static void agents_manifest_persist() {
     char line[CONV_MANIFEST_LINE_LEN];
     for (int i = 0; i < g_conv_n; i++) {
         Conversation &a = g_convs[i];
-        /* PEERS ARE NEVER WRITTEN, from any caller. Their route is live-only,
-         * nothing reads a peer line back, and a peer-authored label sitting in
-         * /conversations.txt is the record a later reader might decide to
-         * trust. The mint path already skipped this; the room-create and
-         * roster-change paths did not, so the rule lives in the writer where
-         * every caller gets it. */
-        if (a.transport != CONV_AGENT) continue;
+        /* EVERY CONVERSATION IS WRITTEN, peers included. Keeping a peer's route
+         * in RAM only meant it lived exactly as long as the power did, and this
+         * device is rebooted constantly — so a chat you were having disappeared
+         * along with any way to answer it. A conversation that cannot survive a
+         * battery change is not a conversation. The route is device state now,
+         * and that is what makes replying after a reboot possible at all. */
         if (a.n_sessions == 0) {
             /* A conversation with no rooms still needs a line, or it vanishes
              * on the next boot — see agents_manifest_apply. The session field
@@ -1834,15 +1854,10 @@ static bool agents_route_peer(const AgentRouteItem &item) {
     if (existed && item.session[0])
         snprintf(a.label, sizeof(a.label), "%s", item.session);  /* name may change */
     if (!existed) {
-        /* NO MANIFEST WRITE. A peer conversation is live-only by design: its
-         * ROUTE is never read back from the card, so writing it there would be
-         * state nothing consumes — and worse, it would leave /conversations.txt
-         * carrying CONV_MESH lines, with peer-chosen display names, that this
-         * build authored and no later reader ever decided to trust. The
-         * history is the part that persists (the JSONL append below, keyed
-         * /conv.<id>), so a peer that returns re-mints onto the same id and
-         * reopens the same thread. Persisting peers is a deliberate decision
-         * of its own, not an inherited side effect of minting one. */
+        /* WRITTEN THE MOMENT THE PEER IS MET, not at the next unrelated save:
+         * a reboot between meeting someone and the next room-create would
+         * otherwise lose them, which is the whole failure this undoes. */
+        agents_manifest_persist();
         event_add("conv new %s %s", item.via == CONV_MESH ? "mesh" : "lxmf", id);
     }
     agents_unlock();

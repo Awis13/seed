@@ -371,19 +371,14 @@ assert "conv_peer_id(item.peer, item.peer_len, id, sizeof(id))" in drain_mesh, (
     "the conversation is keyed on the peer's public key, not on its name"
 )
 
-# 7f. A PEER IS LIVE-ONLY: history persists, routing never does.
-# The append writes /conv.<id> (checked above). The manifest must NOT be
-# written: nothing reads a peer line back, so it is state no consumer wants —
-# and it would leave /conversations.txt carrying CONV_MESH records with
-# peer-chosen labels that this build authored and no later reader has decided
-# to trust, which is how the "the loader creates nothing from the card" rule
-# gets quietly re-armed with real data underneath it.
+# 7f. A PEER IS PERSISTED THE MOMENT IT IS MET. Both halves: its history goes
+# to /conv.<id> (the append, checked above) and its record to the manifest, so a
+# reboot between meeting someone and the next unrelated save cannot lose them.
 drain_code = re.sub(r"/\*.*?\*/", " ", drain_mesh, flags=re.S)
 drain_code = re.sub(r"//[^\n]*", " ", drain_code)
-assert "agents_manifest_persist" not in drain_code, (
-    "minting a peer must not write /conversations.txt — a peer's route is "
-    "live-only, and persisting it is a decision of its own rather than a "
-    "side effect of meeting the peer"
+assert "agents_manifest_persist();" in drain_code, (
+    "meeting a new peer must write the manifest right away — deferring it to "
+    "the next save loses the peer across a reboot in between"
 )
 # The length contract is a parameter, not an assumption.
 assert "pubkey_len != TRANSPORT_MESH_ADDR_LEN" in producer, (

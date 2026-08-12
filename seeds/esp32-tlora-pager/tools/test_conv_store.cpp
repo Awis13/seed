@@ -28,6 +28,7 @@
 #include <string.h>
 
 #include "../src/conv_store.h"
+#include "../src/transport.h"
 
 /* The two seeded agent conversations and the room the firmware mints at boot. */
 #define SEED_A     "claude"
@@ -469,6 +470,65 @@ static void test_peer_roundtrip(void) {
     assert_path_sane(p2);
 }
 
+/* --- 7e. a peer survives a reboot with its route intact --------------------- */
+
+/* The whole point of persisting a peer: the device is rebooted constantly, and
+ * a conversation that cannot survive a battery change is not a conversation.
+ * This walks the real round trip — write the record, lose everything, read it
+ * back — and checks the bytes that decide where a reply goes. */
+static void test_peer_survives_reboot(void) {
+    struct Peer { const char *id; const char *label; uint8_t transport; uint8_t len; };
+    const Peer peers[2] = {
+        { "a1b2c3d4d5", "night walk", (uint8_t)CONV_MESH, 32 },
+        { "f0e1d2c3b4", "",           (uint8_t)CONV_LXMF, 16 },
+    };
+    for (int k = 0; k < 2; k++) {
+        uint8_t addr[CONV_REPLY_MAX];
+        for (size_t i = 0; i < peers[k].len; i++) addr[i] = (uint8_t)(k * 91 + i * 7 + 3);
+
+        /* --- before the reboot: the record as the writer emits it --- */
+        char line[CONV_MANIFEST_LINE_LEN];
+        assert(conv_manifest_format(line, sizeof(line), peers[k].id, "",
+                                    peers[k].label, peers[k].transport,
+                                    addr, peers[k].len, 0));
+        char before[CONV_PATH_LEN];
+        path_of(peers[k].id, "", before, sizeof(before));
+
+        /* --- the reboot: nothing survives but that line --- */
+        ConvManifestLine got;
+        assert(conv_manifest_parse(line, &got));
+
+        /* --- after: the conversation is the same one, and answerable --- */
+        assert(strcmp(got.conv, peers[k].id) == 0);
+        assert(got.session[0] == '\0');            /* still room-less */
+        assert(got.transport == peers[k].transport); /* same wire */
+        assert(got.reply_len == peers[k].len);       /* same address width */
+        assert(memcmp(got.reply, addr, peers[k].len) == 0);  /* SAME ADDRESS */
+        assert(strcmp(got.label, peers[k].label) == 0);
+        /* ... and it reopens the history it already had, rather than a new file */
+        char after[CONV_PATH_LEN];
+        path_of(got.conv, got.session, after, sizeof(after));
+        assert(strcmp(before, after) == 0);
+        assert_path_sane(after);
+
+        /* The restored record must route to the backend it came in on — a
+         * reply that went out on the wrong wire would reach nobody. */
+        uint8_t backend = 0xFF;
+        const uint8_t *out = NULL;
+        uint8_t out_len = 0;
+        TransportTarget tgt;
+        tgt.transport = got.transport;
+        tgt.reply_addr = got.reply;
+        tgt.reply_len = got.reply_len;
+        assert(transport_plan(&tgt, &backend, &out, &out_len) == TRANSPORT_OK);
+        assert(backend == (peers[k].transport == CONV_MESH
+                               ? TRANSPORT_BACKEND_MESH_PEER
+                               : TRANSPORT_BACKEND_LXMF));
+        assert(out_len == peers[k].len);
+        assert(memcmp(out, addr, peers[k].len) == 0);
+    }
+}
+
 /* --- 8. the manifest file names moved, and the old one is only a reader ------ */
 
 static void test_manifest_names(void) {
@@ -489,6 +549,7 @@ int main(void) {
     test_label_cannot_forge_a_record();
     test_slot_plan();
     test_peer_roundtrip();
+    test_peer_survives_reboot();
     test_manifest_names();
     printf("conversation store tests: OK\n");
     return 0;

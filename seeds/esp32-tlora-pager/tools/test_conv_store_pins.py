@@ -71,30 +71,29 @@ assert re.search(r'conv_manifest_format\([^;]*?a\.id,\s*""', roomless, re.S), (
 
 # --- 2. the loader keeps a room-less line ------------------------------------
 apply_fn = fn_body(agents, "static void agents_manifest_apply(const ConvManifestLine &ml)")
-assert "if (idx < 0) return;" in apply_fn, (
-    "an unknown conversation is still skipped — the loader creates nothing"
+assert "if (idx < 0) {" in apply_fn, (
+    "a line the table had no room for must still be refused rather than "
+    "evicting something to make space"
 )
-# THE LOADER MUST NOT MINT. /conversations.txt is on a card a user can edit and
-# a minted conversation is not seeded, so conv_route_resolve would take its
-# transport and reply address from that file verbatim — a hand-written line
-# could conjure a conversation whose replies go wherever it says, which is the
-# seeded-route re-pointing rule defeated through a different door. The legacy
-# manifest makes it concrete: it can still name retired agent ids.
-# Checked against the CODE, comments stripped: an absence assertion that reads
-# comments too would fire on a comment merely naming the function (and, worse,
-# a presence assertion would be satisfied by a commented-out call).
+# THE LOADER MUST RESTORE PEERS. This reverses an earlier rule: peer routes
+# were kept in RAM only, so a peer conversation lived exactly as long as the
+# power did and every chat vanished on a reboot the device takes constantly.
+# Restoring from the card is what makes a reply after a reboot possible, and the
+# physical-access risk it carries is accepted deliberately.
+# Checked against the CODE, comments stripped: a presence assertion would
+# otherwise be satisfied by a commented-out call.
 apply_code = re.sub(r"/\*.*?\*/", " ", apply_fn, flags=re.S)
 apply_code = re.sub(r"//[^\n]*", " ", apply_code)
-assert "conv_mint(" not in apply_code, (
-    "the manifest loader must not mint conversations — a line on a removable "
-    "card would then choose where replies are sent"
+assert "conv_mint(ml.conv, ml.label, ml.transport, ml.reply, ml.reply_len," in apply_code, (
+    "the loader must recreate a conversation the table does not hold — that is "
+    "a peer coming back after a reboot, and the reason its record was written"
 )
-assert "if (ml.transport != CONV_AGENT) return;" in apply_fn, (
-    "a non-AGENT manifest line must create nothing: no peer conversation is "
-    "created anywhere in this build, so such a line can only be hand-written"
+assert "ml.transport != CONV_AGENT" not in apply_code, (
+    "a peer line must no longer be refused; peers persist now"
 )
-assert "agents_find(ml.conv)" in apply_fn, (
-    "the loader resolves against the conversations the build already has"
+assert "false);" in apply_code, (
+    "loading must never evict — a manifest longer than the table fills it and "
+    "stops, rather than letting later lines throw out earlier ones"
 )
 # The conversation's own fields must be applied BEFORE the room branch: that
 # ordering is the whole fix. A room-less line carries label/transport/reply and
@@ -308,10 +307,9 @@ assert "a.unread = 0;" in tail_fn, (
 # --- 9. no peer line is EVER written to the manifest, from any caller --------
 # The rule lives in the writer, not in one caller: the mint path already skipped
 # it, but room-create and roster-change call the same function and did not.
-assert "if (a.transport != CONV_AGENT) continue;" in persist, (
-    "agents_manifest_persist must skip non-agent conversations — a peer's route "
-    "is live-only, and a peer-authored label sitting in /conversations.txt is "
-    "the record a later reader might decide to trust"
+assert "a.transport != CONV_AGENT" not in persist, (
+    "agents_manifest_persist must write peers too — skipping them is what made "
+    "every peer conversation vanish on reboot"
 )
 
 # --- 10. a prefix id is a handle, not a credential ---------------------------
@@ -342,6 +340,28 @@ init_fn = fn_body(agents, "static void skill_agents_init()")
 assert "g_convs[i].unread = 0;" in init_fn, (
     "boot must leave nothing unread — the user was not there for it, and the "
     "greeting is the device talking to itself"
+)
+
+# --- 12. a line the table had no room for is COUNTED, not silently erased ----
+# Boot rewrites /conversations.txt from the table, so a line that could not be
+# restored is dropped from disk on the same pass. The history file survives, the
+# route does not, and without this the only symptom is a chat that quietly stops
+# existing.
+assert "g_conv_load_skipped++;" in apply_fn, (
+    "a manifest line the table had no room for must be counted — boot rewrites "
+    "the file from the table, so the line is erased that same boot"
+)
+load_fn = fn_body(agents, "static void agents_manifest_load()")
+assert "g_conv_load_skipped = 0;" in load_fn, (
+    "the counter must be reset per load, or it reports the previous boot too"
+)
+assert "if (g_conv_load_skipped)" in load_fn, (
+    "the report must be conditional — a silent boot must stay silent"
+)
+assert "event_add(" in load_fn, (
+    "the skip count must reach the event log — the same breadcrumb the log "
+    "migration already leaves, so a lost route has an answer instead of a "
+    "chat that quietly stopped existing"
 )
 
 print("conversation store firmware pins: OK")
