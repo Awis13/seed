@@ -81,6 +81,7 @@ static_assert((int)UINAV_WIFI           == (int)HW_UI_WIFI,           "ui_nav en
 static_assert((int)UINAV_WIFI_LIST      == (int)HW_UI_WIFI_LIST,      "ui_nav enum drift");
 static_assert((int)UINAV_WIFI_INFO      == (int)HW_UI_WIFI_INFO,      "ui_nav enum drift");
 static_assert((int)UINAV_PAGE           == (int)HW_UI_PAGE,           "ui_nav enum drift");
+static_assert((int)UINAV_CONTACTS       == (int)HW_UI_CONTACTS,       "ui_nav enum drift");
 
 // ===== Configuration =====
 #define SEED_VERSION        "0.9.80"
@@ -1568,6 +1569,8 @@ static void handle_wifi_networks_post(AsyncWebServerRequest *request) {
 // build_src_filter excludes skills/ from separate compilation (same as tembed).
 #include "inbox_view.h"   // the inbox list model: order, transport glyph, unread
 #include "feed_view.h"    // the unified Messages feed: cards + chats merged by time
+#include "contacts_view.h"      // the grouped Contacts model: AI / LXMF / mesh rows
+#include "mesh/contacts_enum.h" // /contacts3 enumeration for the mesh bucket
 #include "skills/notify.cpp"
 // After notify: reuses notify_send_json / notify_send_error / notify_ingest_p1.
 #include "skills/progress.cpp"
@@ -1687,6 +1690,7 @@ enum {
     MENU_WIFI,
     MENU_SETTINGS,
     MENU_INFO,
+    MENU_CONTACTS,
     MENU_BACK,
     MENU_COUNT
 };
@@ -3251,6 +3255,151 @@ static void ui_open_msglist() {
     ui_note_input();
 }
 
+// ===== Contacts screen =====
+// The grouped "who can I write to" list. The rows contacts_build_rows produces
+// ARE the tagged handle array: a clicked contact row carries its own
+// {transport, id, reply} so open-or-create can act on it after the input arrays
+// are gone (src/contacts_view.h). Selection only ever lands on a contact row;
+// header rows are non-selectable dividers.
+static ContactRow contacts_rows[CONTACT_ROWS_MAX];
+static int contacts_count = 0;
+static int contacts_sel = 0;
+// Flattened view arrays for the renderer (labels point into contacts_rows, which
+// is static, so the pointers stay valid until the next rebuild).
+static const char *contacts_labels[CONTACT_ROWS_MAX];
+static bool contacts_is_header[CONTACT_ROWS_MAX];
+static bool contacts_has_conv[CONTACT_ROWS_MAX];
+
+// First contact (non-header) row at or after `from`, stepping by dir (+1/-1);
+// -1 if there is none in that direction. This is how selection skips headers.
+static int contacts_next_contact(int from, int dir) {
+    for (int i = from; i >= 0 && i < contacts_count; i += dir)
+        if (contacts_rows[i].kind == CONTACT_ROW_CONTACT) return i;
+    return -1;
+}
+
+// Flatten contacts_rows into the primitive view arrays and paint. `note` is an
+// optional short status line (e.g. the table-full refusal), else NULL.
+static void ui_contacts_render(const char *note) {
+    for (int i = 0; i < contacts_count; i++) {
+        contacts_labels[i] = contacts_rows[i].label;
+        contacts_is_header[i] = (contacts_rows[i].kind == CONTACT_ROW_HEADER);
+        contacts_has_conv[i] = (contacts_rows[i].has_conversation != 0);
+    }
+    hw_ui_show_contacts(contacts_labels, contacts_is_header, contacts_has_conv,
+                        contacts_count, contacts_sel, note);
+    ui_note_input();
+}
+
+// Build the three bucket candidate arrays and run contacts_build_rows.
+//   AI   = seeded doors (always have a slot).
+//   mesh = /contacts3 peers (id + has_conversation derived from the public key).
+//   LXMF = EXISTING LXMF conversations only — no manual address-add this commit
+//          (that is the future address-book ticket).
+static void ui_open_contacts() {
+    // Candidate backing: contacts_build_rows COPIES label/id/reply into each
+    // row, so this only needs to outlive the build call below.
+    ContactCandidate ai[CONTACT_BUCKET_CAP];
+    ContactCandidate mesh[CONTACT_BUCKET_CAP];
+    ContactCandidate lxmf[CONTACT_BUCKET_CAP];
+    MeshContactRec   mrec[CONTACT_BUCKET_CAP];
+    static char mesh_ids[CONTACT_BUCKET_CAP][CONV_ID_LEN];
+    static char lx_ids[CONTACT_BUCKET_CAP][CONV_ID_LEN];
+    static char lx_labels[CONTACT_BUCKET_CAP][CONV_LABEL_LEN];
+    static uint8_t lx_reply[CONTACT_BUCKET_CAP][CONV_REPLY_MAX];
+    uint8_t lx_reply_len[CONTACT_BUCKET_CAP];
+
+    // AI: the seeded doors. They always have a slot (has_conversation = true) and
+    // their return address is the agent-id bytes the bridge answers to. The
+    // pointers agents_seeded_at hands back stay valid after its lock drops — a
+    // seeded slot never moves or is evicted (see agents.cpp).
+    int n_ai = 0;
+    int seeded = agents_seeded_count();
+    for (int i = 0; i < seeded && n_ai < CONTACT_BUCKET_CAP; i++) {
+        const char *id = NULL, *label = NULL;
+        const uint8_t *reply = NULL;
+        uint8_t rlen = 0;
+        if (!agents_seeded_at(i, &id, &label, &reply, &rlen)) break;
+        ai[n_ai].label = label;
+        ai[n_ai].id = id;
+        ai[n_ai].transport = CONV_AGENT;
+        ai[n_ai].has_conversation = 1;
+        ai[n_ai].reply = reply;
+        ai[n_ai].reply_len = rlen;
+        n_ai++;
+    }
+
+    // Mesh: peers this device has met (/contacts3, loop-safe file read). The id
+    // and the has_conversation flag both derive from the 32-byte public key the
+    // same way conv_mint keys a peer, so a row that maps to an existing thread is
+    // marked and opens it rather than making a duplicate.
+    int nmesh = mesh_contacts_list(mrec, CONTACT_BUCKET_CAP);
+    int n_mesh = 0;
+    for (int i = 0; i < nmesh && n_mesh < CONTACT_BUCKET_CAP; i++) {
+        conv_peer_id(mrec[i].pub_key, MESH_CONTACT_PUBKEY_LEN,
+                     mesh_ids[n_mesh], sizeof(mesh_ids[0]));
+        if (!mesh_ids[n_mesh][0]) continue;   // key too short to key on: skip
+        mesh[n_mesh].label = mrec[i].name;
+        mesh[n_mesh].id = mesh_ids[n_mesh];
+        mesh[n_mesh].transport = CONV_MESH;
+        mesh[n_mesh].has_conversation =
+            agents_peer_has_conversation(mrec[i].pub_key,
+                                         MESH_CONTACT_PUBKEY_LEN) ? 1 : 0;
+        mesh[n_mesh].reply = mrec[i].pub_key;
+        mesh[n_mesh].reply_len = MESH_CONTACT_PUBKEY_LEN;
+        n_mesh++;
+    }
+
+    // LXMF: existing LXMF conversations only. Snapshot the table under the lock,
+    // then build the rows — contacts_build_rows copies each id/label/reply out,
+    // so the rows are self-contained once it returns and the lock can drop.
+    int n_lxmf = 0;
+    agents_lock();
+    int total = agents_count();
+    for (int i = 0; i < total && n_lxmf < CONTACT_BUCKET_CAP; i++) {
+        if (agents_transport(i) != CONV_LXMF) continue;
+        snprintf(lx_ids[n_lxmf], sizeof(lx_ids[0]), "%s", agents_id(i));
+        snprintf(lx_labels[n_lxmf], sizeof(lx_labels[0]), "%s", agents_name(i));
+        lx_reply_len[n_lxmf] = agents_reply_addr(i, lx_reply[n_lxmf],
+                                                 CONV_REPLY_MAX);
+        lxmf[n_lxmf].label = lx_labels[n_lxmf];
+        lxmf[n_lxmf].id = lx_ids[n_lxmf];
+        lxmf[n_lxmf].transport = CONV_LXMF;
+        lxmf[n_lxmf].has_conversation = 1;   // it exists: that IS the thread
+        lxmf[n_lxmf].reply = lx_reply[n_lxmf];
+        lxmf[n_lxmf].reply_len = lx_reply_len[n_lxmf];
+        n_lxmf++;
+    }
+    contacts_count = contacts_build_rows(ai, n_ai, lxmf, n_lxmf, mesh, n_mesh,
+                                         contacts_rows, CONTACT_ROWS_MAX);
+    agents_unlock();
+
+    // Land the selection on the first contact row (headers are not selectable).
+    contacts_sel = contacts_next_contact(0, +1);
+    if (contacts_sel < 0) contacts_sel = 0;
+    ui_contacts_render(NULL);
+}
+
+// A picked contact opens its chat or creates one, then lands there. On a full
+// table that refuses (only a brand-new mesh peer can hit this), surface it and
+// stay on the list rather than crash.
+static void ui_contacts_open_selected() {
+    if (contacts_count == 0) { ui_open_menu(); return; }
+    if (contacts_sel < 0 || contacts_sel >= contacts_count) return;
+    const ContactRow &r = contacts_rows[contacts_sel];
+    if (r.kind != CONTACT_ROW_CONTACT) return;   // never open a header
+    int slot = agents_open_or_create(r.transport, r.id, r.label,
+                                     r.reply_len ? r.reply : NULL, r.reply_len);
+    if (slot < 0) {
+        event_add("contacts open refused (table full): %s", r.id);
+        hw_haptic_notify(0);
+        ui_contacts_render("CONTACTS FULL - CLEAR A CHAT");
+        return;
+    }
+    hw_haptic_notify(0);
+    ui_open_agent_chat(slot);
+}
+
 // Show the agent "door" card (pretty invite). Does not enter the room yet.
 static void ui_show_agent_invite_from_view(const NotifyView &v, uint32_t id) {
     notify_card_id = id;
@@ -3347,6 +3496,8 @@ static void ui_on_click() {
             ui_open_settings();
         } else if (menu_sel == MENU_INFO) {
             ui_open_info();
+        } else if (menu_sel == MENU_CONTACTS) {
+            ui_open_contacts();
         } else {
             ui_go_clock(NULL);
         }
@@ -3528,6 +3679,9 @@ static void ui_on_click() {
     case HW_UI_INFO:
         ui_open_menu();
         break;
+    case HW_UI_CONTACTS:
+        ui_contacts_open_selected();
+        break;
     case HW_UI_PAGE:
         // Click toggles the two input modes: OPEN the page for in-page scrolling,
         // or (when already open) CLOSE back to paging between pages.
@@ -3665,6 +3819,23 @@ static void ui_on_steps(int steps) {
         if (msglist_sel >= msglist_count) msglist_sel = msglist_count - 1;
         ui_open_msglist();
         break;
+    case HW_UI_CONTACTS: {
+        // Move the selection by |steps| CONTACT rows, skipping section headers.
+        // Stops at the first/last contact rather than wrapping (headers make a
+        // wrap ambiguous, and clamping matches the other lists here).
+        if (contacts_count <= 0) break;
+        int dir = (steps > 0) ? 1 : -1;
+        int nsteps = (steps > 0) ? steps : -steps;
+        int cur = contacts_sel;
+        for (int s = 0; s < nsteps; s++) {
+            int nx = contacts_next_contact(cur + dir, dir);
+            if (nx < 0) break;   // no further contact this way: stay put
+            cur = nx;
+        }
+        contacts_sel = cur;
+        ui_contacts_render(NULL);
+        break;
+    }
     case HW_UI_NOTIFY: {
         // Scroll the queue: next/prev message by position in newest-first list.
         if (!notify_card_id) break;

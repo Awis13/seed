@@ -88,6 +88,7 @@ PAINT_ENTRIES = [
     "int hw_ui_show_agent_chat(",
     "void hw_ui_show_agent_act(",
     "void hw_ui_show_msglist(",
+    "void hw_ui_show_contacts(",
     "void hw_ui_show_reply(",
     "void hw_ui_show_info(",
     # Micron page renderer: second paint consumer (cell grid + diff). Guards the

@@ -29,6 +29,7 @@
 
 #include "../src/conv_store.h"
 #include "../src/transport.h"
+#include "../src/mesh/contact_record.h"   /* MESH_CONTACT_PUBKEY_LEN, for widths */
 
 /* The two seeded agent conversations and the room the firmware mints at boot. */
 #define SEED_A     "claude"
@@ -680,6 +681,74 @@ static void test_conv_delete_distinct_from_clear(void) {
     printf("  conversation delete: line + slot gone, distinct from clear: OK\n");
 }
 
+/* --- peer id derivation: the Contacts open-or-create MAPPING ---------------
+ *
+ * A mesh / LXMF contact row keys its conversation on conv_peer_id(address) — the
+ * SAME id conv_mint stores a peer under — so a picked row that already has a
+ * thread finds it instead of duplicating it. This proves the derivation BY VALUE
+ * (the id is the first CONV_PEER_ID_BYTES of the address as hex), that it is
+ * deterministic and a prefix (so the store's full-address compare, not the id,
+ * is what separates two peers sharing a prefix), and that a too-short address is
+ * unkeyable rather than half-keyed. */
+static void test_peer_id_derivation(void) {
+    uint8_t pub[MESH_CONTACT_PUBKEY_LEN];
+    for (int i = 0; i < MESH_CONTACT_PUBKEY_LEN; i++) pub[i] = (uint8_t)(0x11 * (i + 1));
+    /* 0x11,0x22,0x33,0x44,0x55 -> "1122334455" (CONV_PEER_ID_BYTES = 5). */
+    char id[CONV_ID_LEN];
+    conv_peer_id(pub, MESH_CONTACT_PUBKEY_LEN, id, sizeof(id));
+    assert(strcmp(id, "1122334455") == 0);
+    assert(strlen(id) == (size_t)(CONV_PEER_ID_BYTES * 2));
+
+    /* Deterministic: the same address gives the same id every call. */
+    char id2[CONV_ID_LEN];
+    conv_peer_id(pub, MESH_CONTACT_PUBKEY_LEN, id2, sizeof(id2));
+    assert(strcmp(id, id2) == 0);
+
+    /* A prefix: two addresses that agree on the first CONV_PEER_ID_BYTES map to
+     * the SAME id even though the rest differs — the id is a handle, the full
+     * address (compared in the store) is the credential. */
+    uint8_t other[MESH_CONTACT_PUBKEY_LEN];
+    memcpy(other, pub, sizeof(other));
+    other[MESH_CONTACT_PUBKEY_LEN - 1] ^= 0xFF;   /* differ past the prefix */
+    char id3[CONV_ID_LEN];
+    conv_peer_id(other, MESH_CONTACT_PUBKEY_LEN, id3, sizeof(id3));
+    assert(strcmp(id, id3) == 0);
+    /* ...but a byte INSIDE the prefix changes the id. */
+    uint8_t near[MESH_CONTACT_PUBKEY_LEN];
+    memcpy(near, pub, sizeof(near));
+    near[0] ^= 0x01;
+    char id4[CONV_ID_LEN];
+    conv_peer_id(near, MESH_CONTACT_PUBKEY_LEN, id4, sizeof(id4));
+    assert(strcmp(id, id4) != 0);
+
+    /* Too-short address (and NULL): "" — an unkeyable peer, never a partial id. */
+    char emp[CONV_ID_LEN] = "x";
+    conv_peer_id(pub, CONV_PEER_ID_BYTES - 1, emp, sizeof(emp));
+    assert(emp[0] == '\0');
+    emp[0] = 'x';
+    conv_peer_id(NULL, MESH_CONTACT_PUBKEY_LEN, emp, sizeof(emp));
+    assert(emp[0] == '\0');
+
+    /* An LXMF source hash (16 bytes) is keyed the same way and by the same
+     * prefix — id derivation does not depend on the address WIDTH, only that it
+     * is at least CONV_PEER_ID_BYTES long. */
+    uint8_t lx[16];
+    for (int i = 0; i < 16; i++) lx[i] = pub[i];
+    char lxid[CONV_ID_LEN];
+    conv_peer_id(lx, 16, lxid, sizeof(lxid));
+    assert(strcmp(lxid, "1122334455") == 0);
+
+    /* The reply-address WIDTHS the Contacts buckets carry all fit CONV_REPLY_MAX:
+     * mesh = 32-byte public key (== the max), LXMF = 16-byte hash, AI = the short
+     * agent-id bytes. This is the "reply_addr width" half of the mapping. */
+    assert(MESH_CONTACT_PUBKEY_LEN == CONV_REPLY_MAX);   /* mesh: the widest */
+    assert((size_t)16 <= (size_t)CONV_REPLY_MAX);        /* LXMF hash fits    */
+    assert((size_t)6 <= (size_t)CONV_REPLY_MAX);         /* agent-id fits     */
+    /* Buckets map one-to-one onto the wire transports the store persists. */
+    assert((int)CONV_AGENT == 0 && (int)CONV_LXMF == 1 && (int)CONV_MESH == 2);
+    printf("  peer id derivation + reply widths (open-or-create mapping): OK\n");
+}
+
 int main(void) {
     test_path_form();
     test_path_budget();
@@ -695,6 +764,7 @@ int main(void) {
     test_peer_survives_reboot();
     test_manifest_names();
     test_conv_delete_distinct_from_clear();
+    test_peer_id_derivation();
     printf("conversation store tests: OK\n");
     return 0;
 }

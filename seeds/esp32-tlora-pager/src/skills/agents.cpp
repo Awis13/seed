@@ -258,9 +258,9 @@ void agents_set_on_screen_hook(bool (*fn)(int idx)) { g_agents_on_screen = fn; }
 namespace fs { class FS; }
 fs::FS &mesh_contacts_fs();
 
-/* Forward decls (defined later in this TU; store section uses them early). */
-static void conv_peer_id(const uint8_t *pubkey, uint8_t len, char *out,
-                         size_t out_n);
+/* Forward decls (defined later in this TU; store section uses them early).
+ * conv_peer_id (a peer's address -> its conversation id) is pure and lives in
+ * ../conv_store.h now, so no forward decl of it is needed here. */
 static void agents_view_append(ConvWindow &w, bool from_me, uint32_t ts,
                                const char *text);
 static int agents_find(const char *id);
@@ -296,6 +296,12 @@ bool   agents_seeded_at(int i, const char **id, const char **label,
                         const uint8_t **reply, uint8_t *reply_len);
 bool   agents_has_conversation(const char *id);  // literal-id join (AI door)
 bool   agents_peer_has_conversation(const uint8_t *addr, uint8_t addr_len);
+// idx's opaque return address, into out[0..out_max); returns the byte count.
+uint8_t agents_reply_addr(int idx, uint8_t *out, uint8_t out_max);
+// Open the conversation this contact points at, or create it, and return its
+// slot (-1 if the table is full and refuses). See the definition for the rules.
+int    agents_open_or_create(uint8_t transport, const char *id, const char *label,
+                             const uint8_t *reply_addr, uint8_t addr_len);
 
 /* GPS location collaboration. gps.cpp is #include'd AFTER this file in the
  * same TU, so these are prototypes resolved to the gps.cpp section below.
@@ -1888,23 +1894,9 @@ static void agents_roster_apply(int idx, const char *payload) {
     display_force = true;                        /* repaint the room picker */
 }
 
-/* Short, filename-safe id for a peer: the first 8 hex of its public key. Long
- * enough that two peers colliding is not a practical concern, short enough that
- * /conv.<id> is 14 bytes — well inside the object-name budget. */
-/* CONV_PEER_ID_BYTES of the address, hex. Five, not four: the id is what a
- * find-before-mint hits on, and four bytes is a 2^32 prefix grind an attacker
- * can run offline against a known correspondent. Five costs two characters —
- * /conv.<10hex> is 16 bytes against a 32-byte budget — and the full address is
- * compared anyway (see conv_mint), so this is depth, not the only barrier. */
-#define CONV_PEER_ID_BYTES 5
-
-static void conv_peer_id(const uint8_t *pubkey, uint8_t len, char *out,
-                         size_t out_n) {
-    if (!out || out_n == 0) return;
-    out[0] = '\0';
-    if (!pubkey || len < CONV_PEER_ID_BYTES) return;
-    conv_hex_encode(pubkey, CONV_PEER_ID_BYTES, out, out_n);
-}
+/* The peer id derivation (conv_peer_id, first CONV_PEER_ID_BYTES of the address
+ * as hex) is pure and now lives in ../conv_store.h, so both this store and the
+ * Contacts screen key a peer the one way. */
 
 /* Off-loop half of a peer message (kind 2), for EITHER address-carrying wire:
  * mint the conversation if this sender is new and append the line. All of it is
@@ -2315,6 +2307,54 @@ bool agents_peer_has_conversation(const uint8_t *addr, uint8_t addr_len) {
     conv_peer_id(addr, addr_len, id, sizeof(id));
     if (!id[0]) return false;
     return agents_has_conversation(id);
+}
+
+/* Copy conversation idx's opaque return address into out[0..out_max), returning
+ * the byte count. The Contacts screen carries an existing LXMF conversation's
+ * address into its row so open-or-create can mint on the same address the thread
+ * already answers to. Caller holds agents_lock (matches agents_transport et al.,
+ * which also read the table without taking it themselves). */
+uint8_t agents_reply_addr(int idx, uint8_t *out, uint8_t out_max) {
+    if (idx < 0 || idx >= g_conv_n || !out) return 0;
+    uint8_t n = g_convs[idx].reply_len;
+    if (n > out_max) n = out_max;
+    memcpy(out, g_convs[idx].reply_addr, n);
+    return n;
+}
+
+/*
+ * Open the conversation keyed on `id`, or create it, and return its slot.
+ *
+ * This is the Contacts screen's "start a chat with…": a picked contact row hands
+ * its {transport, id, reply} triple here and the caller lands in the returned
+ * slot's chat. find-before-mint means an AI door (its id is its literal name) or
+ * an existing peer (its id is conv_peer_id of the address) returns its LIVE slot
+ * rather than a duplicate; a peer with no slot yet is minted onto the same id
+ * and address a message from it would use.
+ *
+ * WHO MAY EVICT follows the receive path exactly (see agents_route_peer): only a
+ * mesh peer is cryptographically attributed and so may displace the LRU
+ * non-seeded slot when the table is full; AI doors already exist, and LXMF is
+ * address-based (anyone holding the address can write), so neither evicts — an
+ * LXMF row shown here is an EXISTING conversation and so always finds its slot.
+ * When nothing may be evicted the table is full and this returns -1; the caller
+ * surfaces that rather than dropping the user into a stranger's thread.
+ *
+ * A newly minted peer is persisted at once, so a chat started from Contacts
+ * survives a reboot the same as one met over the air.
+ */
+int agents_open_or_create(uint8_t transport, const char *id, const char *label,
+                          const uint8_t *reply_addr, uint8_t addr_len) {
+    if (!id || !id[0]) return -1;
+    agents_lock();
+    int idx = agents_find(id);
+    if (idx < 0) {
+        bool may_evict = (transport == CONV_MESH);
+        idx = conv_mint(id, label, transport, reply_addr, addr_len, may_evict);
+        if (idx >= 0) agents_manifest_persist();
+    }
+    agents_unlock();
+    return idx;
 }
 
 static const char *agents_describe() {

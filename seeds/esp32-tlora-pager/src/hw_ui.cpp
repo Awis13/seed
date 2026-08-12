@@ -1133,12 +1133,12 @@ void hw_ui_show_agent_invite(const char *agent_name,
 
 // Menu row geometry — fixed so selection can repaint one bar without a wipe.
 // MESSAGES is the single unified feed (cards + chats); the AGENTS entry retired.
-static const int MENU_N = 6;
+static const int MENU_N = 7;
 static const int MENU_ROW0_Y = 32;
 static const int MENU_ROW_H = 26;
 static const int MENU_BAR_H = 22;
 static const char *const MENU_ITEMS[MENU_N] = {
-    "MESSAGES", "MESHCORE", "WIFI", "SETTINGS", "INFO", "BACK"
+    "MESSAGES", "MESHCORE", "WIFI", "SETTINGS", "INFO", "CONTACTS", "BACK"
 };
 
 // WiFi submenu
@@ -2268,6 +2268,95 @@ void hw_ui_show_msglist(const char *const *titles,
     msglist_top_drawn = top;
     msglist_count_drawn = count;
     msglist_unread_mask = mask;
+}
+
+// ---- Contacts screen -------------------------------------------------------
+// Grouped list: AI / LXMF / mesh section dividers (non-selectable) and contact
+// rows (selectable). A full redraw each call — the list is short and rebuilt on
+// open and on every wheel step, so the msglist-style partial-bar optimisation is
+// not worth the extra state here.
+static const int CONTACTS_ROW0_Y = 30;
+static const int CONTACTS_ROW_H   = 24;
+static const int CONTACTS_VIS     = 7;    // rows visible in the window
+
+// Scroll so `selected` sits inside the visible window, centred where possible so
+// its section header above it is usually pulled in with it.
+static int contacts_top_for(int selected, int count) {
+    if (count <= CONTACTS_VIS) return 0;
+    int top = selected - CONTACTS_VIS / 2;
+    if (top < 0) top = 0;
+    if (top > count - CONTACTS_VIS) top = count - CONTACTS_VIS;
+    if (top < 0) top = 0;
+    return top;
+}
+
+void hw_ui_show_contacts(const char *const *labels,
+                         const bool *is_header,
+                         const bool *has_conv,
+                         int count,
+                         int selected,
+                         const char *note) {
+    if (!panel_ok) return;
+    if (count < 0) count = 0;
+    if (count > HW_UI_CONTACTS_MAX) count = HW_UI_CONTACTS_MAX;
+    if (selected < 0) selected = 0;
+    if (count > 0 && selected >= count) selected = count - 1;
+
+    screen = HW_UI_CONTACTS;
+    HwSpiBusGuard bus;
+    tft_fill(COL_BG);
+
+    tft_fill_rect(0, 0, PANEL_W, 22, COL_ACCENT);
+    tft_draw_text(MARGIN, 4, "CONTACTS", COL_BG, COL_ACCENT, 2);
+    tft_hline(0, 22, PANEL_W, COL_RULE);
+
+    if (count == 0) {
+        tft_draw_text(MARGIN, 80, "NO CONTACTS", COL_DIM, COL_BG, 2);
+        tft_draw_text(MARGIN, 120, "click = back", COL_DIM, COL_BG, 1);
+        return;
+    }
+
+    int top = contacts_top_for(selected, count);
+    for (int row = 0; row < CONTACTS_VIS; row++) {
+        int i = top + row;
+        if (i >= count) break;
+        uint16_t y = (uint16_t)(CONTACTS_ROW0_Y + row * CONTACTS_ROW_H);
+        const char *lab = (labels && labels[i]) ? labels[i] : "";
+        if (is_header && is_header[i]) {
+            // Section divider: an amber title with a hairline under it. Never
+            // selectable, so it never takes the highlight bar.
+            char t[16];
+            snprintf(t, sizeof(t), "%s", lab[0] ? lab : "?");
+            tft_draw_text(MARGIN, y + 2, t, COL_ACCENT, COL_BG, 1);
+            tft_hline(MARGIN, (uint16_t)(y + 16), PANEL_W - 2 * MARGIN, COL_RULE);
+            continue;
+        }
+        bool on = (i == selected);
+        bool hasc = has_conv && has_conv[i];
+        uint16_t bar_w = PANEL_W - 2 * MARGIN;
+        uint16_t bg = on ? COL_ACCENT : COL_BG;
+        uint16_t fg = on ? COL_BG : COL_TIME;
+        tft_fill_rect(MARGIN, (uint16_t)(y - 2), bar_w,
+                      (uint16_t)(CONTACTS_ROW_H - 2), bg);
+        // Marker for a contact that already has a thread (">" = has chat).
+        tft_draw_text(MARGIN + 14, y + 2, hasc ? ">" : " ",
+                      on ? COL_BG : COL_DIM, bg, 2);
+        // Indented name so contacts read as children of their section header.
+        char t[34];
+        snprintf(t, sizeof(t), "%s", lab[0] ? lab : "(no name)");
+        if (strlen(t) > 26) { t[25] = t[24] = t[23] = '.'; t[26] = '\0'; }
+        tft_draw_text(MARGIN + 34, y + 2, t, fg, bg, 2);
+    }
+
+    tft_hline(0, PANEL_H - 18, PANEL_W, COL_RULE);
+    if (note && note[0]) {
+        tft_draw_text(MARGIN, PANEL_H - 14, note, COL_WARN, COL_BG, 1);
+    } else {
+        tft_draw_text(MARGIN, PANEL_H - 14, "> has chat   click open",
+                      COL_DIM, COL_BG, 1);
+        tft_draw_text_r(PANEL_W - MARGIN, PANEL_H - 14, "back = menu",
+                        COL_DIM, COL_BG, 1);
+    }
 }
 
 void hw_ui_show_reply(const char *title,

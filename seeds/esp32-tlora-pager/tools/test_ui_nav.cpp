@@ -51,6 +51,11 @@ int main(void) {
     assert(ui_nav_back_target(UINAV_WIFI_LIST, false)     == UINAV_WIFI);
     assert(ui_nav_back_target(UINAV_WIFI_INFO, false)     == UINAV_WIFI);
     assert(ui_nav_back_target(UINAV_PAGE, false)          == UINAV_CLOCK);
+    // Contacts backs out to the menu it was opened from, and BACKSPACE navigates
+    // (it is a list, not a text-entry field).
+    assert(ui_nav_back_target(UINAV_CONTACTS, false)      == UINAV_MENU);
+    assert(ui_nav_backspace_goes_back(UINAV_CONTACTS));
+    assert(!ui_nav_is_text_entry(UINAV_CONTACTS));
 
     // Root and editor: no navigation (return self).
     assert(ui_nav_back_target(UINAV_CLOCK, false) == UINAV_CLOCK);

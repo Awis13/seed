@@ -77,6 +77,7 @@ enum HwUiScreen : uint8_t {
     HW_UI_WIFI_LIST,   // scan results or saved profiles list
     HW_UI_WIFI_INFO,   // multi-line WiFi/WG status
     HW_UI_PAGE,        // micron page view (system-layer store, wheel-paged)
+    HW_UI_CONTACTS,    // grouped Contacts: AI / LXMF / mesh, pick to open a chat
 };
 
 HwUiScreen hw_ui_screen();
@@ -251,6 +252,21 @@ void hw_ui_show_msglist(const char *const *titles,
                         const bool *unread,
                         int count,
                         int selected);
+
+// Grouped Contacts screen: the rows contacts_build_rows produced, flattened to
+// primitive arrays so this header stays free of the model struct. Per row:
+//   labels[i]    — section title (header row) or contact name (contact row)
+//   is_header[i] — true = a non-selectable section divider (AI / LXMF / mesh)
+//   has_conv[i]  — contact row only: already has a thread (gets a small marker)
+// `selected` indexes a CONTACT row (the caller keeps selection off headers);
+// `note`, when non-NULL, is a short status line (e.g. the table-full refusal).
+#define HW_UI_CONTACTS_MAX 51   /* CONTACT_ROWS_MAX in src/contacts_view.h */
+void hw_ui_show_contacts(const char *const *labels,
+                         const bool *is_header,
+                         const bool *has_conv,
+                         int count,
+                         int selected,
+                         const char *note);
 
 // Device info (version, IP, host, token, free heap).
 void hw_ui_show_info(const char *version,

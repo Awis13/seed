@@ -285,6 +285,24 @@ static inline size_t conv_hex_decode(const char *in, uint8_t *out, size_t out_n)
     return len / 2;
 }
 
+/* CONV_PEER_ID_BYTES of a peer's address, hex, as the conversation id it is
+ * keyed under. Five, not four: the id is what find-before-mint hits on, and four
+ * bytes is a 2^32 prefix grind an attacker can run offline against a known
+ * correspondent. Five costs two characters — /conv.<10hex> is 16 bytes against a
+ * 32-byte budget — and the full address is compared anyway (see conv_mint in
+ * skills/agents.cpp), so this is depth, not the only barrier. A shorter-than-id
+ * address yields "" (an unkeyable peer), never a partial id. Lives here rather
+ * than in agents.cpp so both the live store and the Contacts screen derive a
+ * peer id the one way, and the derivation is proved by value on the host. */
+#define CONV_PEER_ID_BYTES 5
+static inline void conv_peer_id(const uint8_t *pubkey, uint8_t len, char *out,
+                                size_t out_n) {
+    if (!out || out_n == 0) return;
+    out[0] = '\0';
+    if (!pubkey || len < CONV_PEER_ID_BYTES) return;
+    conv_hex_encode(pubkey, CONV_PEER_ID_BYTES, out, out_n);
+}
+
 /* Copy a display label into a field-safe form, bounded to CONV_LABEL_LEN.
  *
  * THE LABEL IS THE ONE FREE-TEXT FIELD IN A TAB-SEPARATED, NEWLINE-JOINED

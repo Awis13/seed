@@ -29,6 +29,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).parents[1]
 agents = (ROOT / "src" / "skills" / "agents.cpp").read_text(encoding="utf-8")
+conv_store = (ROOT / "src" / "conv_store.h").read_text(encoding="utf-8")
 
 
 def fn_body(text, sig, terminator="\n}"):
@@ -327,7 +328,10 @@ assert "if (memcmp(e.reply_addr, addr, addr_len) != 0) return -1;" in mint, (
 assert "if (e.reply_len != addr_len) return -1;" in mint, (
     "an address of a different width is a different party"
 )
-assert re.search(r"#define CONV_PEER_ID_BYTES\s+5", agents), (
+# conv_peer_id (and its CONV_PEER_ID_BYTES) is pure and lives in conv_store.h now,
+# so both the live store and the Contacts screen key a peer the one way. The
+# five-byte floor is the invariant, wherever the define sits.
+assert re.search(r"#define CONV_PEER_ID_BYTES\s+5", conv_store), (
     "the peer id must be wider than four bytes — that is a prefix grind an "
     "attacker can run offline against a known correspondent"
 )
