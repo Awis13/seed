@@ -20,8 +20,9 @@ assert "if (wifi_load_legacy_config()) wifi_persist_profiles();" in load
 assert "read_spiffs_file(WIFI_CONFIG_FILE)" in legacy
 assert 'WIFI_PROFILE_NVS_NS "wifi_profiles"' in store
 assert 'WIFI_PROFILE_KEY_A  "blob0"' in store and 'WIFI_PROFILE_KEY_B  "blob1"' in store
-assert "putBytes(key, raw, len) == len" in store
-assert "memcmp(raw, verify, len) == 0" in store
-assert "wifi_profile_equal(&current, set)" in store
+assert "static uint8_t wifi_profile_raw_write[WIFI_PROFILE_BLOB_MAX]" in store
+assert "putBytes(key, wifi_profile_raw_write, len) == len" in store
+assert "memcmp(wifi_profile_raw_write, wifi_profile_raw_verify, len) == 0" in store
+assert "wifi_profile_equal(&wifi_profile_current, set)" in store
 
 print("Wi-Fi NVS integration tests: OK")
