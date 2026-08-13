@@ -13,9 +13,16 @@
  * make it explicit — the trailing '|' always ends the arbitrary body/chunk and
  * begins the key. See notify_wire_parse_p / notify_wire_parse_m.
  *
- * The pager answers on the same link with one frame:
- *   R1|key|reply
- * built in main.cpp (reply_upstream_mesh) when WiFi cannot reach the gateway.
+ * The pager answers on the same link with two device->gateway frames:
+ *   R1|key|reply    a user reply typed on the card (main.cpp reply_upstream_mesh)
+ *   A1|key          a per-card DELIVERY ACK: "card `key` was admitted here, you
+ *                   may dequeue it from the store-and-forward queue" (ticket
+ *                   CARD-DELIVERY / C2, staged in mesh_card_ack_stage and emitted
+ *                   from mesh_card_ack_poll; full spec in src/card_ack.h). Only a
+ *                   card that arrived over an ASYNC lane (mesh/LXMF) is A1'd — the
+ *                   WiFi lane's synchronous 200 already confirmed delivery — and
+ *                   only a KEYED card, since a keyless one cannot be dequeued by
+ *                   key. R1/A1/C1/keepalive all share the ONE MeshCore ACK slot.
  *
  * Pair identity (Ed25519) lives on SPIFFS:
  *   /mesh_identity.id  — pub(32)+prv(64) MeshCore LocalIdentity blob
@@ -38,6 +45,7 @@
 #include "mesh/utf8_chunk.h"
 #include "../l1_frame.h"    /* pure L1 frame parse + byte reassembler (host-tested) */
 #include "../notify_wire.h" /* pure P/M notify-wire parse — the cross-transport key */
+#include "../card_ack.h"    /* pure A1|key delivery-ack: decision + wire + dedup ring */
 
 /* THE SHARED LXMF ROUTER lives in skills/rns.cpp, which main.cpp #includes AFTER
  * this file into the same translation unit. Forward-declare it so the MeshCore
@@ -282,6 +290,75 @@ static void mesh_peer_tx_poll() {
     const char *why = nullptr;
     if (!mesh_client_send_to_peer(peer, text, &why))
         event_add("mesh peer send failed: %s", why ? why : "unknown");
+}
+
+/*
+ * PER-CARD DELIVERY ACK over the mesh lane (ticket CARD-DELIVERY / C2).
+ *
+ * When a KEYED notification card is admitted off a MeshCore DM (P/M wire), the
+ * gateway that pushed it store-and-forward gets no confirmation the way the WiFi
+ * lane does. mesh_card_ack_stage() records the card's key; mesh_card_ack_poll()
+ * emits "A1|key" as a private DM to the gateway from the LOOP TASK, sharing the
+ * SINGLE MeshCore ACK slot with R1/C1/probe (mesh_client_ack_pending gate) so it
+ * never stomps a send already in flight.
+ *
+ * A tiny FIFO, not one slot: a store-and-forward gateway flushing a backlog on
+ * reconnect delivers several cards in a burst, and each owes an ack; a single
+ * slot would drop all but the last. It is drained one per pass (the ack slot only
+ * carries one frame at a time anyway). g_mesh_ack_seen stops an ACK storm — a key
+ * acked recently is not re-staged — and is marked on EMIT SUCCESS, so an ack that
+ * failed to leave is retried when the gateway re-delivers the card. All bounded,
+ * all static (loop-task stack rule). The stage runs on the loop task (the mesh DM
+ * callback's task) but is spinlock-guarded so a future off-loop caller is safe. */
+#define MESH_ACK_Q_MAX 6
+static char       g_mesh_ack_q[MESH_ACK_Q_MAX][NW_KEY_CAP];
+static uint8_t    g_mesh_ack_qn = 0;
+static CardAckSeen g_mesh_ack_seen = {};
+static portMUX_TYPE g_mesh_ack_mux = portMUX_INITIALIZER_UNLOCKED;
+
+static void mesh_card_ack_stage(const char *key) {
+    if (card_ack_decide(CONV_MESH, key) != CARD_ACK_MESH) return;
+    portENTER_CRITICAL(&g_mesh_ack_mux);
+    bool skip = card_ack_seen_has(&g_mesh_ack_seen, key);  /* already acked */
+    for (int i = 0; !skip && i < g_mesh_ack_qn; i++)
+        if (strcmp(g_mesh_ack_q[i], key) == 0) skip = true;  /* already queued */
+    if (!skip && g_mesh_ack_qn < MESH_ACK_Q_MAX) {
+        snprintf(g_mesh_ack_q[g_mesh_ack_qn], NW_KEY_CAP, "%s", key);
+        g_mesh_ack_qn++;
+    }
+    portEXIT_CRITICAL(&g_mesh_ack_mux);
+}
+
+/* Drained on the LOOP TASK from the mesh tick — the only place the ack touches
+ * the stack. One A1 per pass, and only when the shared ACK slot is free. */
+static void mesh_card_ack_poll() {
+    if (g_mesh_ack_qn == 0) return;
+    if (!g_mesh.radio_ready || !mesh_client_ready()) return;
+    if (!g_mesh.heltec_pk_hex[0]) return;
+    if (mesh_client_ack_pending()) return;   /* R1/C1/probe/A1 share one slot */
+
+    char key[NW_KEY_CAP];
+    portENTER_CRITICAL(&g_mesh_ack_mux);
+    snprintf(key, sizeof(key), "%s", g_mesh_ack_q[0]);
+    for (int i = 1; i < g_mesh_ack_qn; i++)
+        memcpy(g_mesh_ack_q[i - 1], g_mesh_ack_q[i], NW_KEY_CAP);
+    g_mesh_ack_qn--;
+    portEXIT_CRITICAL(&g_mesh_ack_mux);
+    if (!key[0]) return;
+
+    char frame[CARD_ACK_FRAME_CAP];
+    if (!card_ack_encode(key, frame, sizeof(frame))) return;
+
+    uint32_t ack = 0, est = 0;
+    if (mesh_client_send_to_gateway(frame, &ack, &est)) {
+        portENTER_CRITICAL(&g_mesh_ack_mux);
+        card_ack_seen_add(&g_mesh_ack_seen, key);  /* delivered: suppress dups */
+        portEXIT_CRITICAL(&g_mesh_ack_mux);
+        event_add("card ack mesh A1: %s", key);
+    } else {
+        /* Not marked seen: the gateway will re-deliver, which re-stages it. */
+        event_add("card ack mesh A1 TX failed: %s", key);
+    }
 }
 
 static void mesh_chat_tx_fail(const char *reason) {
@@ -646,6 +723,14 @@ static uint32_t mesh_on_private_text(const uint8_t *from_pubkey,
     if (strncmp(text, "P1|", 3) == 0 || strncmp(text, "P2|", 3) == 0) {
         /* P1 legacy (key by heuristic) / P2 explicit trailing key — one parser. */
         id = notify_ingest_p1(text);
+        /* Admitted and keyed: stage a delivery ACK back to the gateway (C2). The
+         * pure parse is re-run only to recover the key — cheap, no alloc — so the
+         * card admission path in notify.cpp is left untouched. */
+        if (id) {
+            NotifyPFrame pf;
+            if (notify_wire_parse_p(text, &pf) && pf.key[0])
+                mesh_card_ack_stage(pf.key);
+        }
     } else if (strncmp(text, "M1|", 3) == 0 || strncmp(text, "M2|", 3) == 0) {
         /* M1|mid|i|n|level|source|title|chunk         (legacy, keyless)
          * M2|mid|i|n|level|source|title|chunk|key      (explicit stable card key)
@@ -675,6 +760,9 @@ static uint32_t mesh_on_private_text(const uint8_t *from_pubkey,
         if (r->got_count >= r->n_parts && r->n_parts > 0) {
             id = notify_ingest(r->level, r->source, r->title, r->buf,
                                r->key[0] ? r->key : NULL);
+            /* Admitted and keyed (M2): stage the delivery ACK (C2). M1 is keyless
+             * and card_ack_decide returns NONE for it anyway. */
+            if (id && r->key[0]) mesh_card_ack_stage(r->key);
             r->used = false;
         }
     } else if (strncmp(text, "C1|", 3) == 0) {
@@ -932,6 +1020,7 @@ static void skill_meshcore_poll() {
     if (g_mesh.radio_ready) mesh_client_loop();
     mesh_chat_tx_poll();
     mesh_peer_tx_poll();
+    mesh_card_ack_poll();   /* emit any staged A1|key delivery acks (C2) */
 
     /* Sparse private keepalive — only when radio stack can TX. */
     if (!g_mesh.has_identity || !g_mesh.radio_ready) return;
