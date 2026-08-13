@@ -90,12 +90,12 @@
  * which is the whole point — the old loop-task snapshot write was a LOOPHEALTH
  * loop-blocker. See notify_record.h for the card <-> record codec.
  *
- * A record carries the fields that must survive a reboot — id, level, unread,
- * ttl_s, created_epoch, source, title, body, key. The reply OPTIONS and chosen
- * index are ephemeral UI and are NOT archived: a historical card needs no
- * buttons, so it comes back as a plain notification. The archive is append-only
- * and newest-wins, so an update of the same card (same identity key) supersedes
- * the older record rather than duplicating it.
+ * A record carries the fields that must survive a reboot — id, persistent event
+ * identity, level, unread, ttl_s, created_epoch, source, title, body, key. The
+ * reply OPTIONS and chosen index are ephemeral UI and are NOT archived: a
+ * historical card needs no buttons, so it comes back as a plain notification.
+ * The archive is append-only and newest-wins, so an update of the same card
+ * (same archive key) supersedes the older record rather than duplicating it.
  *
  * Ages survive the reboot through the stored epoch: millis() restarts at zero,
  * so an entry whose creation time was known is aged against the wall clock and
@@ -175,6 +175,8 @@ struct NotifyOptions {
 
 struct Notification {
     uint32_t id;              /* 0 marks a free slot */
+    NotifyEventId event_id;   /* persistent identity, independent of ring id */
+    bool event_distinct;      /* this card is one chat event, never a key update */
     uint32_t ttl_s;           /* 0 = never expires */
     unsigned long created_ms;
     time_t   created_epoch;   /* 0 when the clock was unset at arrival */
@@ -200,6 +202,8 @@ struct Notification {
 
 struct NotifyView {
     uint32_t id;
+    NotifyEventId event_id;
+    bool event_distinct;
     uint8_t  level;
     bool     unread;
     int8_t   chosen;
@@ -226,7 +230,7 @@ struct NotifyView {
 /* 0.9.22: title 61 + body 241 (was 41+97) → larger fixed slot; pin so host
  * tests and future field adds stay honest. */
 /* 0.9.22: title 61 + body 241 (was 41+97). */
-static_assert(sizeof(Notification) == 376,
+static_assert(sizeof(Notification) == 408,
               "Notification changed size: the queue costs NOTIFY_MAX times this");
 
 /* The archive codec (notify_record.h) mirrors the persisted field widths; pin
@@ -258,6 +262,88 @@ static uint8_t notify_len = 0;
 static uint32_t notify_next_id = 1;
 /* host-test:end */
 
+#define NOTIFY_EVENT_NVS_NS "notify-event"
+#define NOTIFY_EVENT_BLOCK UINT64_C(65536)
+#define NOTIFY_EVENT_STATE_INITIALIZING 1
+#define NOTIFY_EVENT_STATE_READY 2
+static portMUX_TYPE notify_event_spin = portMUX_INITIALIZER_UNLOCKED;
+static NotifyEventId notify_event_next = {};
+static uint64_t notify_event_limit = 0;
+
+/* Reserve counter blocks in NVS before use. A reboot only wastes the unused
+ * tail; it never reissues an identity. Losing NVS creates a fresh 128-bit
+ * random epoch, independent of archived numeric ids and client keys. */
+static bool notify_event_reserve_locked() {
+    Preferences prefs;
+    if (!prefs.begin(NOTIFY_EVENT_NVS_NS, false)) return false;
+    bool any_key = prefs.isKey("state") || prefs.isKey("epoch_hi") ||
+                   prefs.isKey("epoch_lo") || prefs.isKey("counter_hi");
+    bool ready_u8 = prefs.isKey("state") && prefs.getType("state") == PT_U8;
+    uint8_t state = ready_u8 ? prefs.getUChar("state", 0) : 0;
+    bool epoch_hi_u64 = prefs.isKey("epoch_hi") &&
+                        prefs.getType("epoch_hi") == PT_U64;
+    bool epoch_lo_u64 = prefs.isKey("epoch_lo") &&
+                        prefs.getType("epoch_lo") == PT_U64;
+    bool counter_hi_u64 = prefs.isKey("counter_hi") &&
+                          prefs.getType("counter_hi") == PT_U64;
+    uint64_t epoch_hi = epoch_hi_u64 ? prefs.getULong64("epoch_hi", 0) : 0;
+    uint64_t epoch_lo = epoch_lo_u64 ? prefs.getULong64("epoch_lo", 0) : 0;
+    uint64_t old_limit = counter_hi_u64 ? prefs.getULong64("counter_hi", 0) : 0;
+    if (notify_event_epoch_must_rotate(any_key, ready_u8, state,
+                                       epoch_hi_u64, epoch_lo_u64,
+                                       counter_hi_u64, epoch_hi, epoch_lo,
+                                       old_limit)) {
+        do { epoch_hi = ((uint64_t)esp_random() << 32) | esp_random(); }
+        while (epoch_hi == 0);
+        do { epoch_lo = ((uint64_t)esp_random() << 32) | esp_random(); }
+        while (epoch_lo == 0);
+        old_limit = 0;
+        /* A wrong NVS type cannot be overwritten with putULong64. Remove the
+         * whole partially valid tuple first; any interrupted rewrite is again
+         * recognized as incomplete and rotated on the next attempt. */
+        prefs.remove("epoch_hi");
+        prefs.remove("epoch_lo");
+        prefs.remove("counter_hi");
+        prefs.remove("state");
+        if (prefs.putUChar("state", NOTIFY_EVENT_STATE_INITIALIZING) != 1 ||
+            prefs.putULong64("epoch_hi", epoch_hi) != sizeof(epoch_hi) ||
+            prefs.putULong64("epoch_lo", epoch_lo) != sizeof(epoch_lo) ||
+            prefs.putULong64("counter_hi", 0) != sizeof(uint64_t) ||
+            prefs.getULong64("epoch_hi", 0) != epoch_hi ||
+            prefs.getULong64("epoch_lo", 0) != epoch_lo ||
+            prefs.getULong64("counter_hi", UINT64_MAX) != 0 ||
+            prefs.putUChar("state", NOTIFY_EVENT_STATE_READY) != 1 ||
+            prefs.getUChar("state", 0) != NOTIFY_EVENT_STATE_READY) {
+            prefs.end(); return false;
+        }
+    }
+    NotifyEventReservation reservation;
+    if (!notify_event_reservation_plan(old_limit, NOTIFY_EVENT_BLOCK,
+                                       &reservation)) {
+        prefs.end(); return false;
+    }
+    uint64_t new_limit = reservation.limit;
+    bool ok = prefs.putULong64("counter_hi", new_limit) == sizeof(new_limit) &&
+              prefs.getULong64("epoch_hi", 0) == epoch_hi &&
+              prefs.getULong64("epoch_lo", 0) == epoch_lo &&
+              prefs.getULong64("counter_hi", 0) == new_limit;
+    prefs.end();
+    if (!ok) return false;
+    notify_event_next.epoch_hi = epoch_hi;
+    notify_event_next.epoch_lo = epoch_lo;
+    notify_event_next.counter = reservation.first;
+    notify_event_limit = new_limit;
+    return true;
+}
+
+static bool notify_event_take(NotifyEventId &out) {
+    portENTER_CRITICAL(&notify_event_spin);
+    bool ok = notify_event_ram_take(&notify_event_next,
+                                    notify_event_limit, &out);
+    portEXIT_CRITICAL(&notify_event_spin);
+    return ok;
+}
+
 static portMUX_TYPE notify_mux = portMUX_INITIALIZER_UNLOCKED;
 
 /* Raised by the endpoint, consumed by loop(). The endpoints never draw. */
@@ -287,6 +373,11 @@ static volatile bool notify_ring_acked = false;
 static volatile bool notify_snd_arrived = false;
 static uint8_t notify_snd_level = NOTIFY_INFO;
 static char notify_snd_source[NOTIFY_SOURCE_LEN];
+typedef bool (*NotifyEventDistinctFn)(const char *source, const char *key);
+static NotifyEventDistinctFn notify_event_distinct_fn = nullptr;
+static void notify_set_event_distinct_fn(NotifyEventDistinctFn fn) {
+    notify_event_distinct_fn = fn;
+}
 
 /* --- Levels --- */
 
@@ -516,12 +607,11 @@ static int notify_victim() {
  * The archive identity is (MICRON_NS_NOTIFY, key). The namespace is a DISTINCT,
  * trusted qualifier — never derived from the card's `source` (client-supplied
  * body) — so a notify record can never surface under a SYSTEM/FOREIGN page walk.
- * The key is derived by notify_rec_archive_key(): the card's dedup key when it is
- * a valid archive key, else the synthetic "#<id>". The '#' sentinel keeps client
- * keys and synthetic id-keys in DISJOINT subspaces so a client key "5" and a
- * keyless card whose id is 5 can never collide onto one identity (see the header).
- * A stable key makes an update of the same card an upsert (newest-wins) rather
- * than a duplicate.
+ * Ordinary cards use their dedup key (or synthetic "#<id>"). Chat doors use a
+ * compact hash of the persistent event identity instead: two messages through
+ * the same logical `*-chat` door must remain two restorable records. ACK and
+ * delete derive the identical event key, so each update still upserts only its
+ * own event.
  *
  * Options and the chosen index are NOT persisted (ephemeral UI, see
  * notify_record.h). The card's own dedup key travels IN the payload too, so the
@@ -530,6 +620,8 @@ static void notify_archive_put(const Notification &e) {
     notify_rec r;
     memset(&r, 0, sizeof(r));
     r.id = e.id;
+    r.event_id = e.event_id;
+    r.event_distinct = e.event_distinct ? 1 : 0;
     r.ttl_s = e.ttl_s;
     r.created_epoch = (uint32_t)(e.created_epoch > 0 ? e.created_epoch : 0);
     r.level = e.level;
@@ -543,12 +635,11 @@ static void notify_archive_put(const Notification &e) {
     r.body[sizeof(r.body) - 1]     = '\0';
     r.key[sizeof(r.key) - 1]       = '\0';
 
-    /* Client dedup keys and synthetic id-keys occupy DISJOINT archive subspaces:
-       a valid client key is used raw, otherwise the '#'-prefixed "#<id>". This
-       prevents a client key "5" and a keyless card with id 5 from colliding onto
-       one (NS_NOTIFY,"5") identity and silently upserting each other. */
-    char idkey[NOTIFY_ARCHIVE_IDKEY_CAP];
-    const char *key = notify_rec_archive_key(e.key, e.id, idkey, sizeof(idkey));
+    /* Door events are archived independently; ordinary keyed cards retain the
+       established newest-wins update behavior. */
+    char idkey[NOTIFY_ARCHIVE_EVENTKEY_CAP];
+    const char *key = notify_rec_archive_event_key(
+        e.key, e.id, &e.event_id, e.event_distinct, idkey, sizeof(idkey));
 
     uint8_t buf[NOTIFY_REC_MAX];
     size_t n = notify_rec_encode(&r, buf, sizeof(buf));
@@ -578,14 +669,17 @@ static void notify_archive_by_id(uint32_t id) {
  * in the archive as a read card), delete removes it from the RAM ring AND writes
  * an archive TOMBSTONE so the boot restore does not resurrect it. The tombstone
  * lands on the card's OWN archive identity — the same (MICRON_NS_NOTIFY, key)
- * notify_archive_put() used, derived here by notify_rec_archive_key() from the
- * card's dedup key and id — so it is newest-wins over the card's data record and
+ * notify_archive_put() used, including a door's event identity — so it is
+ * newest-wins over exactly that card's data record and
  * notify_restore_from_archive() skips the key on the next boot (see
  * notify_record.h). The enqueue is the same 0-tick off-loop hand-off every other
- * persist here uses, done OUTSIDE the spinlock with a stack copy of (key,id). */
-static void notify_archive_tombstone(const char *key, uint32_t id) {
-    char idkey[NOTIFY_ARCHIVE_IDKEY_CAP];
-    const char *akey = notify_rec_archive_key(key, id, idkey, sizeof(idkey));
+ * persist here uses, done OUTSIDE the spinlock with a stack copy of the identity. */
+static void notify_archive_tombstone(const char *key, uint32_t id,
+                                     const NotifyEventId *event,
+                                     bool event_distinct) {
+    char idkey[NOTIFY_ARCHIVE_EVENTKEY_CAP];
+    const char *akey = notify_rec_archive_event_key(
+        key, id, event, event_distinct, idkey, sizeof(idkey));
     uint8_t buf[NOTIFY_REC_MAX];
     size_t n = notify_rec_tombstone_encode(buf, sizeof(buf));
     if (n) history_enqueue(MICRON_NS_NOTIFY, akey, buf, n);
@@ -593,10 +687,11 @@ static void notify_archive_tombstone(const char *key, uint32_t id) {
 
 /* Remove the card carrying `id` from the RAM ring and tombstone it in the
  * archive. Returns false when there is no such entry (so the UI can stay put).
- * The card's dedup key is captured under the lock BEFORE the slot is freed,
- * because the tombstone's archive identity is derived from that key + the id. */
+ * The card identity is captured under the lock BEFORE the slot is freed. */
 static bool notify_delete_id(uint32_t id) {
     char key[NOTIFY_KEY_LEN];
+    NotifyEventId event = {};
+    bool event_distinct = false;
     key[0] = '\0';
     bool found = false;
 
@@ -604,6 +699,8 @@ static bool notify_delete_id(uint32_t id) {
     for (int i = 0; i < notify_len; i++) {
         if (notify_slot[notify_order[i]].id != id) continue;
         memcpy(key, notify_slot[notify_order[i]].key, sizeof(key));
+        event = notify_slot[notify_order[i]].event_id;
+        event_distinct = notify_slot[notify_order[i]].event_distinct;
         notify_drop_at(i);
         found = true;
         break;
@@ -614,7 +711,7 @@ static bool notify_delete_id(uint32_t id) {
     /* Write-through the tombstone off-loop, outside the lock — the archive's own
        write task does the SD append. A deleted card must not come back on the
        reboot this pager does so often. */
-    notify_archive_tombstone(key, id);
+    notify_archive_tombstone(key, id, &event, event_distinct);
     display_force = true;
     return true;
 }
@@ -643,7 +740,7 @@ static uint32_t notify_push(Notification &e, const NotifyOptions *opts,
 
     portENTER_CRITICAL(&notify_mux);
 
-    if (e.key[0]) {
+    if (notify_rec_key_replaces(e.key) && !e.event_distinct) {
         for (int i = notify_len - 1; i >= 0; i--) {
             if (strcmp(notify_slot[notify_order[i]].key, e.key) == 0) {
                 replaced = notify_slot[notify_order[i]].id;
@@ -738,6 +835,8 @@ static void notify_fill_view(const Notification &e, const NotifyOptions &op,
                              const char *reply, NotifyView &out,
                              time_t now, unsigned long now_ms) {
     out.id = e.id;
+    out.event_id = e.event_id;
+    out.event_distinct = e.event_distinct;
     out.level = e.level;
     out.unread = e.unread;
     out.chosen = e.chosen;
@@ -838,6 +937,26 @@ static bool notify_ack_id(uint32_t id) {
     portEXIT_CRITICAL(&notify_mux);
     if (changed) {
         notify_archive_by_id(id);   /* unread badge changed: persist the new state */
+        display_force = true;
+        notify_ring_acked = true;
+    }
+    return found;
+}
+
+static bool notify_ack_identity(uint32_t id, const NotifyEventId *event) {
+    bool found = false, changed = false;
+    portENTER_CRITICAL(&notify_mux);
+    for (int i = 0; i < notify_len; i++) {
+        Notification &e = notify_slot[notify_order[i]];
+        if (e.id != id || !notify_event_id_equal(&e.event_id, event)) continue;
+        found = true;
+        changed = e.unread;
+        e.unread = false;
+        break;
+    }
+    portEXIT_CRITICAL(&notify_mux);
+    if (changed) {
+        notify_archive_by_id(id);
         display_force = true;
         notify_ring_acked = true;
     }
@@ -1092,6 +1211,8 @@ static bool notify_restore_one(const notify_rec *r, time_t now, unsigned long no
     e.chosen = -1;
     e.opt_count = 0;
     e.id = r->id;
+    e.event_id = r->event_id;
+    e.event_distinct = r->event_distinct != 0;
     e.level = (r->level > NOTIFY_CRIT) ? (uint8_t)NOTIFY_INFO : r->level;
     e.unread = r->unread ? true : false;
     e.ttl_s = (r->ttl_s > NOTIFY_TTL_MAX) ? (uint32_t)NOTIFY_TTL_MAX : r->ttl_s;
@@ -1165,6 +1286,9 @@ static_assert(INBOX_SEV_CRIT == NOTIFY_CRIT, "inbox/notify severity must agree")
  */
 static uint32_t notify_raise(Notification &e, const NotifyOptions *opts,
                              uint32_t *replaced_out) {
+    if (!notify_event_take(e.event_id)) memset(&e.event_id, 0, sizeof(e.event_id));
+    e.event_distinct = notify_rec_is_chat_door_key(e.key) ||
+        (notify_event_distinct_fn && notify_event_distinct_fn(e.source, e.key));
     time_t now = time(NULL);
     e.created_epoch = (now > TIME_VALID_EPOCH) ? now : 0;
     e.created_ms = millis();
@@ -1685,5 +1809,9 @@ static void skill_notify_init() {
     memset(notify_slot, 0, sizeof(notify_slot));
     memset(notify_opt, 0, sizeof(notify_opt));
     memset(notify_reply, 0, sizeof(notify_reply));
+    /* The only NVS reservation happens during boot. Live producers consume the
+     * pre-reserved RAM block under a tiny critical section and fail closed at
+     * exhaustion; notify_raise never waits or touches Preferences. */
+    notify_event_reserve_locked();
     skill_register(&notify_skill);
 }

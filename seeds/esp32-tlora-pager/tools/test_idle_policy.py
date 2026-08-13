@@ -27,15 +27,15 @@ assert "repaints and synthetic errors must not call this" in wake_decl, (
 # user-input stamps, and nothing stamped after the branches either.
 arrival = main[main.index("uint32_t arrived_id = 0;") :]
 arrival = arrival[: arrival.index("hw_sound_poll();")]
-assert arrival.count("ui_note_wake();") == 2, (
-    "the arrival block must wake exactly twice: chat open-room + severity card"
+drain = main[main.index("static bool notify_reconcile_pending_chats(") :]
+drain = drain[: drain.index("static void agents_head_time(")]
+assert arrival.count("ui_note_wake();") == 1 and drain.count("ui_note_wake();") == 1, (
+    "arrival handling must wake once for an open chat and once for severity"
 )
 assert "ui_note_input" not in arrival, (
     "an arriving card is a system event, not user input"
 )
-door = arrival[arrival.index("notify_is_chat(v)") :]
-door = door[: door.index("// Real message from any service")]
-assert "ui_note_wake();" in door, (
+assert "ui_note_wake();" in drain, (
     "a chat message landing in the open room must wake the panel"
 )
 sev = arrival[arrival.index("// Real message from any service") :]
@@ -46,10 +46,9 @@ assert "ui_note_wake();" in sev, "an arriving severity card must light the scree
 # The loop() arrival chat branch mirrors the mesh/LXMF model: it delivers the
 # text with agents_on_inbound() and badges; it must NOT pop the agent invite or
 # a severity card, and must not stamp user input.
-chat_arr = arrival[arrival.index("notify_is_chat(v)") :]
-chat_arr = chat_arr[: chat_arr.index("// Real message from any service")]
-assert "agents_on_inbound(agents_id(ax), v.body, true)" in chat_arr, (
-    "an arriving chat must land in its conversation thread like a mesh/LXMF peer"
+chat_arr = drain
+assert "agents_chat_door_enqueue(" in chat_arr, (
+    "an arriving chat must enqueue off-loop delivery into its conversation"
 )
 assert (
     "hw_ui_show_agent_invite" not in chat_arr
@@ -101,9 +100,9 @@ assert "agents_on_inbound(g_convs[idx].id, line, true);" in agents, (
 assert 'agents_on_inbound(agent, "(mesh delivery failed - resend)", false);' in mesh, (
     "the synthetic failure line must never claim to be a genuine arrival"
 )
-onin = agents[agents.index("static void agents_on_inbound(const char *agent_id,"
+onin = agents[agents.index("static bool agents_on_inbound(const char *agent_id,"
                            " const char *text,\n                              "
-                           "bool real_inbound) {") :]
+                           "bool real_inbound, uint32_t origin_id,") :]
 onin = onin[: onin.index("static bool agents_clear")]
 assert "if (real_inbound) g_agents_real_inbound = true;" in onin
 assert onin.index("if (real_inbound) g_agents_real_inbound = true;") < onin.index(

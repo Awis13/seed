@@ -185,7 +185,7 @@ assert not re.search(r"ConvWindow\s+\w+\[", agents), (
 # --- 5. an arriving message must not steal the window ------------------------
 # The chat that is OPEN must keep its scrollback when a line lands for some
 # other conversation; otherwise the screen blanks on every inbound message.
-append = fn_body(agents, "static void agents_store_append(int idx, bool from_me, const char *text)")
+append = fn_body(agents, "static bool agents_store_append(int idx, bool from_me, const char *text,")
 assert "if (g_win.owner == idx) agents_view_append(g_win" in append, (
     "the scrollback may only be appended to when this conversation owns the "
     "window — an unfocused arrival must not touch the open chat"
@@ -289,7 +289,7 @@ assert "if (g_convs[i].seeded && g_convs[i].lines == 0)" in boot_loop, (
 # A value rule a shape check cannot see: bumping unconditionally would mark the
 # chat the user is looking at, and counting our own lines would mark a
 # conversation the user just wrote in.
-append_fn = fn_body(agents, "static void agents_store_append(int idx, bool from_me, const char *text)")
+append_fn = fn_body(agents, "static bool agents_store_append(int idx, bool from_me, const char *text,")
 assert "if (!from_me && !agents_is_on_screen(idx) && a.unread < 0xFFFF) a.unread++;" in append_fn, (
     "unread must count only THEIR lines, and only when the conversation is not "
     "the one on screen — reading it is the acknowledgement. It must ask the UI "

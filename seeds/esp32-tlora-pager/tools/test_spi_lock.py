@@ -217,7 +217,7 @@ assert panel_begin.index("park_spi_cs()") < panel_begin.index("disp_spi->begin")
 
 # --- SD side: bus lock inside agents_mux, never the other way round ----------
 assert "LOCK ORDER" in agents, "agents.cpp must state the agents_mux-first convention"
-append = fn_body(agents, "static void agents_store_append(")
+append = fn_body(agents, "static bool agents_store_append(")
 assert "HwSpiBusGuard" in append, "SD history append runs on the AsyncTCP task unlocked"
 assert append.index("HwSpiBusGuard") < append.index("g_store->open")
 
@@ -237,7 +237,7 @@ assert "HwSpiBusGuard" in clear, "agents_clear removes files without the bus loc
 # lock-order inversion guard: nothing takes agents_mux inside a bus-locked
 # region — textually, no agents_lock() call after a guard within one scope in
 # the guarded store helpers (they contain no agents_lock at all)
-for sig in ("static void agents_store_append(", "static void agents_sync_view(",
+for sig in ("static bool agents_store_append(", "static void agents_sync_view(",
             "static void agents_load_page(", "static bool agents_file_last("):
     body = fn_body(agents, sig)
     assert "agents_lock()" not in body, (

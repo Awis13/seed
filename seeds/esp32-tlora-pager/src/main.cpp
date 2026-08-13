@@ -1706,11 +1706,13 @@ static void conn_mgr_service() {
 /* Defined with the other UI helpers below; the store needs it as soon as it
  * starts counting unread, which is from the first message it stores. */
 static bool ui_conv_on_screen(int idx);
+static bool notify_event_distinct_cb(const char *source, const char *key);
 
 static void skills_init() {
     skill_notify_init();
     skill_progress_init();
     skill_agents_init();
+    notify_set_event_distinct_fn(notify_event_distinct_cb);
     /* C2: the send ladder picks the WiFi rung only when the route home is PROVEN.
      * Hand it the cached C1 verdict; the probe stays off the send path. */
     agents_set_reachability(gateway_reachable);
@@ -2163,6 +2165,48 @@ static bool ui_page_render(int ordinal) {
 // MICRON_NS_NOTIFY records are walked, so a SYSTEM/FOREIGN page can never enter
 // the notify ring. Graceful no-SD: an empty/absent archive yields nothing on the
 // first rank and the ring simply stays empty — notify still works in RAM.
+static void notify_reconcile_restored_chats();
+static bool notify_chat_retry_pending = false;
+static unsigned long notify_chat_retry_at = 0;
+struct NotifyChatInflight {
+    bool active;
+    char conversation[CONV_ID_LEN];
+    NotifyEventId event;
+};
+static NotifyChatInflight notify_chat_inflight[CONV_MAX] = {};
+
+static int notify_chat_inflight_find(const char *conversation) {
+    if (!conversation || !conversation[0]) return -1;
+    for (int i = 0; i < CONV_MAX; i++)
+        if (notify_chat_inflight[i].active &&
+            strcmp(notify_chat_inflight[i].conversation, conversation) == 0)
+            return i;
+    return -1;
+}
+
+static bool notify_chat_inflight_add(const char *conversation,
+                                     const NotifyEventId *event) {
+    if (!conversation || !conversation[0] || !notify_event_id_valid(event) ||
+        notify_chat_inflight_find(conversation) >= 0) return false;
+    size_t conversation_n = strnlen(conversation, CONV_ID_LEN);
+    if (conversation_n >= CONV_ID_LEN) return false;
+    for (int i = 0; i < CONV_MAX; i++) {
+        if (notify_chat_inflight[i].active) continue;
+        notify_chat_inflight[i].active = true;
+        memcpy(notify_chat_inflight[i].conversation,
+               conversation, conversation_n + 1);
+        notify_chat_inflight[i].event = *event;
+        return true;
+    }
+    return false;
+}
+
+static void notify_chat_inflight_remove(const char *conversation,
+                                        const NotifyEventId *event) {
+    int i = notify_chat_inflight_find(conversation);
+    if (i >= 0 && notify_event_id_equal(&notify_chat_inflight[i].event, event))
+        memset(&notify_chat_inflight[i], 0, sizeof(notify_chat_inflight[i]));
+}
 static void notify_restore_from_archive() {
     time_t now = time(NULL);
     unsigned long now_ms = millis();
@@ -2178,6 +2222,7 @@ static void notify_restore_from_archive() {
         if (notify_restore_one(&nr, now, now_ms)) restored++;
     }
     notify_restore_finish(restored);   // drop ttls that ran out while powered off
+    notify_reconcile_restored_chats();
 }
 
 // UTF-8 draft: keep room for ~40 Cyrillic codepoints (2–3 bytes each).
@@ -2943,9 +2988,7 @@ static void ui_agent_sessions_refresh();
 static void ui_open_agent_chat(int idx);
 static void ui_agent_chat_refresh();
 static void ui_open_agent_act();
-static int agents_index_from_source(const char *src);
 static bool notify_is_chat(const NotifyView &v);
-static int agents_index_for_card(const NotifyView &v);
 static void ui_enter_agent_from_notify(uint32_t id, const NotifyView &v);
 static void ui_open_menu();
 static void ui_open_info();
@@ -3178,44 +3221,186 @@ static void ui_open_menu() {
     ui_note_input();
 }
 
-static int agents_index_from_source(const char *src) {
-    if (!src || !src[0]) return -1;
-    // notify source is short: "claude", "hermes"
-    return agents_find(src);
+static bool notify_event_distinct_cb(const char *source, const char *key) {
+    NotifyChatResolution resolution = agents_notify_chat_resolve_snapshot(source, key);
+    return resolution.conversation >= 0;
 }
 
-// Does a conversation with this literal id exist? The lookup the pure
-// classifier (notify_card_is_chat) injects — same join agents_index_from_source
-// uses, so the device decision and the host-tested one stay one logic.
-static bool notify_conv_exists_cb(const char *id, void * /*ctx*/) {
-    return id && id[0] && agents_find(id) >= 0;
+static char notify_chat_normalized[NOTIFY_BODY_LEN];
+
+/* Resolve and normalize together. Every classifier, feed filter and router uses
+ * this one plan, so a card cannot be hidden under one conversation rule and
+ * then routed under another. */
+static NotifyChatResolution notify_chat_candidate(const NotifyView &v) {
+    agents_normalize_inbound(v.body, notify_chat_normalized,
+                             sizeof(notify_chat_normalized));
+    return agents_notify_chat_resolve_snapshot(v.source, v.key);
 }
 
-/* Chat vs real notification — THE one decision (mirrors the pure
- * notify_card_is_chat() the host suite pins, and the ONLY signal the five
- * dispatch sites route through, so they cannot drift):
- *   chat = the card resolves to an existing agent conversation, by its source
- *          (opencode / claude / hermes …) OR by a legacy "-chat" door prefix.
- *          It lands in that conversation's thread + badges, like a known
- *          mesh/LXMF peer's message — no invite card, no severity page.
- *   page = everything else — a genuine notification (HA / sensor / service with
- *          no conversation): full severity card, reply works as before.
- * Chat rooms (AGENTS menu) are separate from the message queue. */
+/* A resolved, valid card becomes a chat row only after its backing door is
+ * read. Fresh and ambiguous restored doors remain visible until routing has
+ * succeeded and notify_ack_id has archived that fact. */
 static bool notify_is_chat(const NotifyView &v) {
-    return notify_card_is_chat(v.source, v.key, notify_conv_exists_cb, nullptr);
+    NotifyChatResolution resolution = notify_chat_candidate(v);
+    return !v.unread && resolution.conversation >= 0 &&
+           notify_chat_normalized[0] != '\0';
 }
 
-// The conversation a chat card resolves to (>= 0), or -1. Resolution order
-// mirrors notify_is_chat: source names a conversation, else a "-chat" door
-// prefix ("hermes-chat" → "hermes") does. Kept in step with the classifier so a
-// card notify_is_chat() accepts always yields a valid index.
-static int agents_index_for_card(const NotifyView &v) {
-    int ax = agents_index_from_source(v.source);
-    if (ax >= 0) return ax;
-    char prefix[NOTIFY_KEY_LEN];
-    if (notify_chat_door_prefix(v.key, prefix, sizeof(prefix)) > 0)
-        return agents_find(prefix);
-    return -1;
+struct NotifyChatRestoreItem {
+    uint32_t id;
+    NotifyChatRestoreOrder order;
+};
+
+/* Restored cards never pass through loop()'s arrival branch. Snapshot their
+ * order first, then replay oldest-first so one empty thread preserves the
+ * original chronology. Exact durable event identity makes a crash-window
+ * replay an ACK-only operation; absent origin is appended and ACKed only after
+ * the full JSONL record persists. Legacy cards without an identity stay visible
+ * because text, client key and the recyclable ring id are not safe evidence. */
+static void notify_reconcile_restored_chats() {
+    static NotifyView view;
+    static NotifyChatRestoreItem items[NOTIFY_MAX];
+    bool blocked[CONV_MAX] = {};
+    bool retry_needed = false;
+    int count = 0;
+    for (int i = 0; i < NOTIFY_MAX; i++) {
+        if (!notify_view(i, view)) break;
+        if (!view.unread || count >= NOTIFY_MAX) continue;
+        NotifyChatResolution resolution = notify_chat_candidate(view);
+        if (resolution.conversation < 0 || !notify_chat_normalized[0] ||
+            !notify_event_id_valid(&view.event_id)) continue;
+        items[count].id = view.id;
+        items[count].order.card_epoch = view.created_epoch;
+        items[count].order.restore_rank = (uint8_t)i;
+        count++;
+    }
+    for (int i = 1; i < count; i++) {
+        NotifyChatRestoreItem item = items[i];
+        int j = i;
+        while (j > 0 && notify_chat_restore_before(item.order,
+                                                    items[j - 1].order)) {
+            items[j] = items[j - 1];
+            j--;
+        }
+        items[j] = item;
+    }
+    for (int i = 0; i < count; i++) {
+        if (!notify_view_by_id(items[i].id, view, nullptr, nullptr) || !view.unread)
+            continue;
+        NotifyChatResolution resolution = notify_chat_candidate(view);
+        int ax = resolution.conversation;
+        if (ax < 0 || ax >= CONV_MAX || !notify_chat_normalized[0]) continue;
+        NotifyChatThreadState thread = {
+            agents_has_origin(ax, view.id, view.key,
+                              &view.event_id)
+        };
+        NotifyChatAction action = notify_chat_reconcile_plan(
+            &resolution, notify_chat_normalized, view.created_epoch, &thread);
+        bool accepted = (action == NOTIFY_CHAT_ACK_ALREADY_ROUTED);
+        if (action == NOTIFY_CHAT_ROUTE_THEN_ACK && !blocked[ax])
+            accepted = agents_restore_inbound(ax,
+                                               notify_chat_normalized,
+                                               view.id, view.key, &view.event_id);
+        NotifyChatDrainResult result = notify_chat_drain_result(blocked[ax], accepted);
+        if (result == NOTIFY_CHAT_DRAIN_KEEP_FAILED) blocked[ax] = true;
+        if (result != NOTIFY_CHAT_DRAIN_ACK_ROUTED) {
+            retry_needed = true;
+            continue;
+        }
+        notify_ack_id(view.id);
+    }
+    if (retry_needed) {
+        notify_chat_retry_pending = true;
+        notify_chat_retry_at = millis() + 1000;
+    }
+    /* Boot reconciliation is store repair, not a user-visible arrival/input.
+     * notify_ack_id is still used for its archive write-through, but its normal
+     * runtime repaint/ring hints must not leak into the first loop pass. */
+    notify_ring_acked = false;
+    display_force = false;
+}
+
+/* A single arrival latch is only a repaint signal: on each signal, snapshot and
+ * drain every fresh unread chat door oldest-first. This makes a burst lossless
+ * even when producers overwrite notify_arrived_id before loop() runs. A failed
+ * append blocks newer messages for that conversation during this pass, while
+ * other conversations may continue. Exact event origins make retries safe. */
+static bool notify_reconcile_pending_chats(HwUiScreen scr) {
+    (void)scr;
+    static const int DRAIN_BATCH = 4;
+    static NotifyView view;
+    static NotifyChatRestoreItem items[NOTIFY_MAX];
+    bool queued[CONV_MAX] = {};
+    bool retry_needed = false;
+    int attempted = 0;
+    int count = 0;
+    for (int i = 0; i < NOTIFY_MAX; i++) {
+        if (!notify_view(i, view)) break;
+        if (!view.unread || count >= NOTIFY_MAX ||
+            !notify_event_id_valid(&view.event_id)) continue;
+        NotifyChatResolution resolution = notify_chat_candidate(view);
+        if (resolution.conversation < 0 || !notify_chat_normalized[0]) continue;
+        items[count].id = view.id;
+        items[count].order.card_epoch = view.created_epoch;
+        items[count].order.restore_rank = (uint8_t)i;
+        count++;
+    }
+    for (int i = 1; i < count; i++) {
+        NotifyChatRestoreItem item = items[i];
+        int j = i;
+        while (j > 0 && notify_chat_restore_before(item.order,
+                                                    items[j - 1].order)) {
+            items[j] = items[j - 1];
+            j--;
+        }
+        items[j] = item;
+    }
+    for (int i = 0; i < count; i++) {
+        if (!notify_view_by_id(items[i].id, view, nullptr, nullptr) || !view.unread)
+            continue;
+        NotifyChatResolution resolution = notify_chat_candidate(view);
+        int ax = resolution.conversation;
+        if (ax < 0 || ax >= CONV_MAX || !notify_chat_normalized[0]) continue;
+        if (attempted >= DRAIN_BATCH) { retry_needed = true; continue; }
+        if (queued[ax] || notify_chat_inflight_find(resolution.id) >= 0) {
+            retry_needed = true;
+            continue;
+        }
+        attempted++;
+        if (notify_chat_inflight_add(resolution.id, &view.event_id) &&
+            agents_chat_door_enqueue(ax, resolution.id, view.source,
+                                     notify_chat_normalized, view.id,
+                                     view.key, &view.event_id)) {
+            queued[ax] = true;
+        } else {
+            notify_chat_inflight_remove(resolution.id, &view.event_id);
+            retry_needed = true;
+        }
+    }
+    return retry_needed;
+}
+
+static void notify_take_chat_completions(HwUiScreen scr) {
+    AgentDoorCompletion done;
+    while (agents_chat_door_take_completion(done)) {
+        notify_chat_inflight_remove(done.conversation, &done.event);
+        NotifyView view;
+        bool same_card = notify_view_by_id(done.id, view, nullptr, nullptr) &&
+                         notify_event_id_equal(&view.event_id, &done.event);
+        if (done.accepted && same_card &&
+            notify_ack_identity(done.id, &done.event)) {
+            int current_idx = agents_notify_chat_resolve_snapshot(
+                done.conversation, "").conversation;
+            if (scr == HW_UI_AGENT_CHAT && agent_focus == current_idx) {
+                ui_agent_chat_refresh();
+                ui_note_wake();
+            }
+            notify_chat_retry_at = millis();
+        } else {
+            notify_chat_retry_at = millis() + 1000;
+        }
+        notify_chat_retry_pending = true;
+    }
 }
 
 static void agents_head_time(uint32_t ts, char *out, size_t out_n) {
@@ -3404,6 +3589,16 @@ static void ui_open_msglist() {
     for (int i = 0; i < NOTIFY_MAX && nc < FEED_MAX_CARDS; i++) {
         NotifyView v;
         if (!notify_view(i, v)) break;
+        // A successfully routed chat door must not sit beside its conversation
+        // row. notify_is_chat uses the same resolver/normalizer as live and boot
+        // routing, and requires the archived ACK: unresolved, invalid and
+        // ambiguous unread doors stay visible instead of disappearing silently.
+        // Lock-free on purpose: notify_is_chat -> agents_find needs no
+        // agents_lock here because agents_delete only runs on this same loop
+        // task (ui_agent_act_confirm); the residual race is a conversation
+        // minted between this scan and the merge below, which shows both rows
+        // for ONE repaint and heals on the next.
+        if (notify_is_chat(v)) continue;
         snprintf(card_titles[nc], sizeof(card_titles[0]), "%s", v.title);
         cards[nc].id = v.id;
         cards[nc].epoch = v.created_epoch;
@@ -3720,7 +3915,8 @@ static void ui_open_net() {
 
 // Enter the chat room from a chat-door notify (ack + open).
 static void ui_enter_agent_from_notify(uint32_t id, const NotifyView &v) {
-    int ax = agents_index_for_card(v);
+    NotifyChatResolution resolution = notify_chat_candidate(v);
+    int ax = resolution.conversation;
     if (ax < 0) return;
     notify_ack_id(id);
     notify_card_id = 0;
@@ -4616,7 +4812,10 @@ void loop() {
     }
 
     uint32_t arrived_id = 0;
-    if (notify_take_arrival(&arrived_id) || display_force) {
+    bool got_notify_arrival = notify_take_arrival(&arrived_id);
+    bool notify_chat_retry_due = notify_chat_retry_pending &&
+        (long)(millis() - notify_chat_retry_at) >= 0;
+    if (got_notify_arrival || display_force || notify_chat_retry_due) {
         display_force = false;
         // Room not on screen: the arrival flag must not survive to be claimed
         // by a later, unrelated repaint of the room.
@@ -4624,26 +4823,20 @@ void loop() {
         NotifyView v;
         HwUiScreen scr = hw_ui_screen();
         bool on_clock = (scr == HW_UI_CLOCK);
+        notify_take_chat_completions(scr);
+        if (got_notify_arrival || notify_chat_retry_due) {
+            bool retry_after_drain = notify_reconcile_pending_chats(scr);
+            notify_chat_retry_pending = retry_after_drain;
+            if (notify_chat_retry_pending) notify_chat_retry_at = millis() + 1000;
+        }
         if (arrived_id && notify_view_by_id(arrived_id, v, NULL, NULL)) {
-            if (notify_is_chat(v)) {
-                // A chat (an agent talking back): land it in its conversation
-                // thread + badge, exactly like a known mesh/LXMF peer's message
-                // (agents_on_inbound is what their off-loop drain calls too).
-                // NEVER pop an invite or a severity card, and never yank the
-                // user into a screen — display_force from agents_on_inbound
-                // repaints the feed/room badge on the next pass. The card the
-                // gateway raised stays in the feed for now (its de-duplication
-                // against this conversation line is a later commit).
-                int ax = agents_index_for_card(v);
-                if (ax >= 0) {
-                    if (v.body[0]) agents_on_inbound(agents_id(ax), v.body, true);
-                    // If that very room is open, refresh it live and wake once;
-                    // otherwise stay calm and let the badge speak.
-                    if (scr == HW_UI_AGENT_CHAT && agent_focus == ax) {
-                        ui_agent_chat_refresh();
-                        ui_note_wake();  // real inbound message, not a repaint
-                    }
-                }
+            NotifyChatResolution resolution = notify_chat_candidate(v);
+            bool is_pending_chat = resolution.conversation >= 0 &&
+                                   notify_chat_normalized[0] &&
+                                   notify_event_id_valid(&v.event_id);
+            if (is_pending_chat) {
+                /* The bounded drain above handled it or deliberately left it
+                 * visible for retry. Never misrender a failed chat as severity. */
             } else if (on_clock || scr == HW_UI_MENU || scr == HW_UI_AGENTS ||
                        scr == HW_UI_MSGLIST || scr == HW_UI_INFO) {
                 // Real message from any service: severity colours (info/warn/crit).

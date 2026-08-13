@@ -814,12 +814,17 @@ static uint32_t mesh_on_private_text(const uint8_t *from_pubkey,
             if (idx >= 0 && agents_transport(idx) != CONV_AGENT) idx = -1;
             if (idx >= 0) {
                 bool from_me = (r->side == 'u');
-                agents_push_line(idx, from_me, r->buf);
-                /* Genuine mesh chat arrival: same wake as the WiFi door path.
-                 * Set before display_force (loop consumes them together). */
-                g_agents_real_inbound = true;
-                display_force = true;
-                id = 1;  /* non-zero = handled */
+                if (agents_push_line(idx, from_me, r->buf)) {
+                    /* Genuine mesh chat arrival: same wake as the WiFi door path.
+                     * Set before display_force (loop consumes them together). */
+                    g_agents_real_inbound = true;
+                    display_force = true;
+                    id = 1;  /* non-zero = handled */
+                } else {
+                    /* Preserve the message as a retryable visible card when the
+                     * conversation store cannot durably append it. */
+                    id = notify_ingest("info", r->agent, "CHAT", r->buf, NULL);
+                }
             } else {
                 /* unknown agent → notify card */
                 id = notify_ingest("info", r->agent, "CHAT", r->buf, NULL);

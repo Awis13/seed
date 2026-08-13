@@ -33,6 +33,10 @@ static void test_roundtrip(void) {
     r.id = 0xDEADBEEF;
     r.ttl_s = 3600;
     r.created_epoch = 1765432100u;
+    r.event_id.epoch_hi = UINT64_C(0x12345678ABCDEF01);
+    r.event_id.epoch_lo = UINT64_C(0x0FEDCBA987654321);
+    r.event_id.counter = 77;
+    r.event_distinct = 1;
     r.level = 2;          /* crit */
     r.unread = 1;
     snprintf(r.source, sizeof(r.source), "home-rig");
@@ -50,6 +54,8 @@ static void test_roundtrip(void) {
     assert(o.id == r.id);
     assert(o.ttl_s == r.ttl_s);
     assert(o.created_epoch == r.created_epoch);
+    assert(notify_event_id_equal(&o.event_id, &r.event_id));
+    assert(o.event_distinct == 1);
     assert(o.level == r.level);
     assert(o.unread == 1);
     assert(strcmp(o.source, "home-rig") == 0);
@@ -59,6 +65,96 @@ static void test_roundtrip(void) {
     /* The record type has NO options/chosen member at all (see notify_record.h):
      * the reply options are ephemeral UI and are structurally un-persistable — a
      * historical card round-trips as a plain notification. */
+}
+
+static void test_v1_backward_compatibility(void) {
+    notify_rec r;
+    memset(&r, 0, sizeof(r));
+    r.id = 42;
+    r.ttl_s = 60;
+    r.created_epoch = 1765432100u;
+    r.level = 1;
+    r.unread = 1;
+    snprintf(r.title, sizeof(r.title), "legacy");
+
+    uint8_t buf[NOTIFY_REC_MAX];
+    size_t n = notify_rec_encode(&r, buf, sizeof(buf));
+    assert(n > NOTIFY_REC_HEAD);
+
+    notify_rec out;
+    assert(notify_rec_decode(buf, n, &out) == 1);
+    assert(out.id == 42);
+    assert(!notify_event_id_valid(&out.event_id));
+    assert(strcmp(out.title, "legacy") == 0);
+}
+
+static void test_event_identity_and_reservation(void) {
+    NotifyEventReservation first, rebooted;
+    assert(notify_event_reservation_plan(0, 65536, &first));
+    assert(first.first == 1 && first.limit == 65536);
+    assert(notify_event_reservation_plan(first.limit, 65536, &rebooted));
+    assert(rebooted.first == 65537 && rebooted.limit == 131072);
+    assert(!notify_event_reservation_plan(UINT64_MAX - 1, 2, &rebooted));
+
+    NotifyEventId next = {11, 22, 65535}, issued = {};
+    assert(notify_event_ram_take(&next, 65536, &issued));
+    assert(issued.counter == 65535 && next.counter == 65536);
+    assert(notify_event_ram_take(&next, 65536, &issued));
+    assert(issued.counter == 65536 && next.counter == 65537);
+    assert(!notify_event_ram_take(&next, 65536, &issued));
+    assert(!notify_event_id_valid(&issued));
+
+    /* Pristine NVS and every partial/corrupt tuple rotate to a fresh epoch.
+     * Only a complete typed tuple with a nonzero reserved high-water may
+     * continue the existing epoch. */
+    assert(notify_event_epoch_must_rotate(0, 0, 0, 0, 0, 0, 0, 0, 0));
+    assert(notify_event_epoch_must_rotate(1, 1, 1, 1, 1, 1, 11, 22, 0));
+    assert(notify_event_epoch_must_rotate(1, 1, 2, 1, 1, 0, 11, 22, 0));
+    assert(notify_event_epoch_must_rotate(1, 1, 2, 1, 0, 1, 11, 22, 65536));
+    assert(!notify_event_epoch_must_rotate(1, 1, 2, 1, 1, 1, 11, 22, 0));
+    assert(!notify_event_epoch_must_rotate(1, 1, 2, 1, 1, 1, 11, 22, 65536));
+
+    /* Numeric ring ids and client keys may repeat after archive/NVS loss. The
+     * independently persisted epoch makes the new event distinct. */
+    NotifyEventId old_event = {
+        UINT64_C(0x1111111111111111), UINT64_C(0x2222222222222222), 7
+    };
+    NotifyEventId same_event = old_event;
+    NotifyEventId after_nvs_loss = {
+        UINT64_C(0x3333333333333333), UINT64_C(0x4444444444444444), 7
+    };
+    char old_hex[NOTIFY_EVENT_HEX_CAP];
+    assert(notify_event_id_format(&old_event, old_hex, sizeof(old_hex)));
+    assert(notify_event_id_equal(&old_event, &same_event));
+    assert(!notify_event_id_equal(&old_event, &after_nvs_loss));
+    assert(notify_event_origin_matches(9, "hermes-chat", old_hex,
+                                       9, "hermes-chat", &same_event));
+    assert(!notify_event_origin_matches(9, "hermes-chat", old_hex,
+                                        9, "hermes-chat", &after_nvs_loss));
+
+    char akey[NOTIFY_ARCHIVE_EVENTKEY_CAP], bkey[NOTIFY_ARCHIVE_EVENTKEY_CAP];
+    const char *a = notify_rec_archive_event_key(
+        "hermes-chat", 9, &old_event, true, akey, sizeof(akey));
+    const char *b = notify_rec_archive_event_key(
+        "hermes-chat", 10, &after_nvs_loss, true, bkey, sizeof(bkey));
+    assert(strcmp(a, b) != 0); /* same logical door, distinct archived events */
+    assert(strlen(a) == 32 && strlen(b) == 32); /* injective 192-bit base64url */
+
+    char source_only_a[NOTIFY_ARCHIVE_EVENTKEY_CAP];
+    char source_only_b[NOTIFY_ARCHIVE_EVENTKEY_CAP];
+    assert(strcmp(notify_rec_archive_event_key(
+                      "opencode-pager", 9, &old_event, true,
+                      source_only_a, sizeof(source_only_a)),
+                  notify_rec_archive_event_key(
+                      "opencode-pager", 10, &after_nvs_loss, true,
+                      source_only_b, sizeof(source_only_b))) != 0);
+    NotifyEventId no_event = {};
+    char fail_safe[NOTIFY_ARCHIVE_EVENTKEY_CAP];
+    assert(strcmp(notify_rec_archive_event_key(
+                      "opencode-pager", 99, &no_event, true,
+                      fail_safe, sizeof(fail_safe)), "#99") == 0);
+    assert(!notify_rec_key_replaces("hermes-chat"));
+    assert(notify_rec_key_replaces("raid-tank"));
 }
 
 /* --- unread flip survives: the acked state is what round-trips ------------- */
@@ -146,6 +242,10 @@ static void test_hostile(void) {
 
     /* truncate the tail (a length prefix now runs past the buffer) */
     assert(notify_rec_decode(buf, n - 1, &o) == 0);
+
+    /* A tagged identity extension is all-or-nothing; a torn suffix is corrupt. */
+    buf[n] = NOTIFY_REC_EVENT_TAG;
+    assert(notify_rec_decode(buf, n + 1, &o) == 0);
 
     /* a lying title length that overruns: hand-build head + title_len = 200 with
      * no bytes behind it. head is 15 bytes, then source_len(0), then title_len. */
@@ -476,6 +576,8 @@ static void test_graceful_empty(void) {
 
 int main(void) {
     test_roundtrip();
+    test_v1_backward_compatibility();
+    test_event_identity_and_reservation();
     test_unread_and_empty_fields();
     test_bounding();
     test_hostile();

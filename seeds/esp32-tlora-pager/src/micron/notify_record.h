@@ -19,7 +19,8 @@
  *
  * WHAT IS ARCHIVED, AND WHAT IS NOT
  * ---------------------------------
- * Persisted: id, level, unread, ttl_s, created_epoch, source, title, body, key.
+ * Persisted: id, event identity, level, unread, ttl_s, created_epoch, source,
+ * title, body, key.
  * Those are exactly the fields that must survive a reboot — the card's identity,
  * its unread badge, its ttl clock (aged against created_epoch), and its text.
  *
@@ -40,7 +41,8 @@
  *   + 1 + title (<=60)   = 61
  *   + 2 + body  (<=240)  = 242
  *   + 1 + key   (<=24)   = 25
- *   ------------------------------ NOTIFY_REC_MAX = 360 bytes  (< 512)
+ *   + tagged event identity       = 26
+ *   ------------------------------ NOTIFY_REC_MAX = 386 bytes  (< 512)
  *
  * Strings are length-prefixed and bounded to their field caps, so an over-long
  * body or an embedded NUL is truncated at the field boundary and the whole blob
@@ -64,12 +66,98 @@
 
 #define NOTIFY_REC_VER    1
 #define NOTIFY_REC_HEAD  15   /* ver id ttl epoch level unread */
+#define NOTIFY_REC_EVENT_TAG 0xE1u
+#define NOTIFY_REC_EVENT_SUFFIX 26 /* tag + 128-bit epoch + u64 counter + flags */
 
 /* Worst-case encoded size (see the budget note). The device sizes its enqueue
  * buffer to this; it is well under HISTORY_PAYLOAD_CAP (512). */
 #define NOTIFY_REC_MAX (NOTIFY_REC_HEAD + 1 + (NR_SOURCE_CAP - 1) \
                         + 1 + (NR_TITLE_CAP - 1) + 2 + (NR_BODY_CAP - 1) \
-                        + 1 + (NR_KEY_CAP - 1))
+                        + 1 + (NR_KEY_CAP - 1) + NOTIFY_REC_EVENT_SUFFIX)
+
+typedef struct {
+    uint64_t epoch_hi;
+    uint64_t epoch_lo;
+    uint64_t counter;
+} NotifyEventId;
+
+typedef struct {
+    uint64_t first;
+    uint64_t limit;
+} NotifyEventReservation;
+
+static inline int notify_event_reservation_plan(uint64_t old_limit,
+                                                uint64_t block,
+                                                NotifyEventReservation *out) {
+    if (!out || block == 0 || old_limit > UINT64_MAX - block) return 0;
+    out->first = old_limit + 1;
+    out->limit = old_limit + block;
+    return 1;
+}
+
+static inline int notify_event_epoch_must_rotate(int any_key,
+                                                 int ready_u8, uint8_t state,
+                                                 int epoch_hi_u64,
+                                                 int epoch_lo_u64,
+                                                 int counter_hi_u64,
+                                                 uint64_t epoch_hi,
+                                                 uint64_t epoch_lo,
+                                                 uint64_t counter_hi) {
+    (void)counter_hi;
+    if (!any_key) return 1; /* pristine initialization */
+    return !ready_u8 || state != 2 || !epoch_hi_u64 || !epoch_lo_u64 ||
+           !counter_hi_u64 || epoch_hi == 0 || epoch_lo == 0;
+}
+
+static inline int notify_event_id_valid(const NotifyEventId *id) {
+    return id && id->epoch_hi != 0 && id->epoch_lo != 0 && id->counter != 0;
+}
+
+/* Consume an already-reserved identity from RAM. The device wraps this tiny
+ * operation in a critical section; Preferences/NVS is deliberately absent
+ * from the live producer path. Exhaustion fails closed with a zero identity. */
+static inline int notify_event_ram_take(NotifyEventId *next, uint64_t limit,
+                                        NotifyEventId *out) {
+    if (!out) return 0;
+    memset(out, 0, sizeof(*out));
+    if (!notify_event_id_valid(next) || next->counter > limit) return 0;
+    *out = *next;
+    next->counter++;
+    return 1;
+}
+
+static inline int notify_event_id_equal(const NotifyEventId *a,
+                                        const NotifyEventId *b) {
+    return notify_event_id_valid(a) && notify_event_id_valid(b) &&
+           a->epoch_hi == b->epoch_hi && a->epoch_lo == b->epoch_lo &&
+           a->counter == b->counter;
+}
+
+#define NOTIFY_EVENT_HEX_CAP 49
+
+static inline int notify_event_id_format(const NotifyEventId *id,
+                                         char *out, size_t out_n) {
+    if (!notify_event_id_valid(id) || !out || out_n < NOTIFY_EVENT_HEX_CAP)
+        return 0;
+    int n = snprintf(out, out_n, "%016llx%016llx%016llx",
+                     (unsigned long long)id->epoch_hi,
+                     (unsigned long long)id->epoch_lo,
+                     (unsigned long long)id->counter);
+    return n == NOTIFY_EVENT_HEX_CAP - 1;
+}
+
+static inline int notify_event_origin_matches(uint32_t stored_id,
+                                              const char *stored_key,
+                                              const char *stored_event,
+                                              uint32_t wanted_id,
+                                              const char *wanted_key,
+                                              const NotifyEventId *wanted_event) {
+    char expected[NOTIFY_EVENT_HEX_CAP];
+    return stored_id == wanted_id && stored_key && wanted_key && stored_event &&
+           strcmp(stored_key, wanted_key) == 0 &&
+           notify_event_id_format(wanted_event, expected, sizeof(expected)) &&
+           strcmp(stored_event, expected) == 0;
+}
 
 /* The persisted projection of a Notification. POD, no Arduino types: created_ms
  * is intentionally absent (device-relative), options/chosen absent (ephemeral). */
@@ -77,6 +165,8 @@ typedef struct {
     uint32_t id;
     uint32_t ttl_s;
     uint32_t created_epoch;   /* seconds since epoch, 0 when the clock was unset */
+    NotifyEventId event_id;   /* stable identity for one raised event */
+    uint8_t event_distinct;   /* archive/replacement identity follows chat plan */
     uint8_t  level;
     uint8_t  unread;          /* 0 / 1 */
     char     source[NR_SOURCE_CAP];
@@ -97,12 +187,20 @@ static inline void notify_rec_put_u32(uint8_t *b, uint32_t v) {
     b[2] = (uint8_t)((v >> 16) & 0xFFu);
     b[3] = (uint8_t)((v >> 24) & 0xFFu);
 }
+static inline void notify_rec_put_u64(uint8_t *b, uint64_t v) {
+    notify_rec_put_u32(b, (uint32_t)v);
+    notify_rec_put_u32(b + 4, (uint32_t)(v >> 32));
+}
 static inline uint16_t notify_rec_get_u16(const uint8_t *b) {
     return (uint16_t)((uint16_t)b[0] | ((uint16_t)b[1] << 8));
 }
 static inline uint32_t notify_rec_get_u32(const uint8_t *b) {
     return (uint32_t)b[0] | ((uint32_t)b[1] << 8) |
            ((uint32_t)b[2] << 16) | ((uint32_t)b[3] << 24);
+}
+static inline uint64_t notify_rec_get_u64(const uint8_t *b) {
+    return (uint64_t)notify_rec_get_u32(b) |
+           ((uint64_t)notify_rec_get_u32(b + 4) << 32);
 }
 
 /* Bounded C-string length: stop at the first NUL or at cap-1, whichever comes
@@ -127,6 +225,7 @@ static inline size_t notify_rec_encode(const notify_rec *r, uint8_t *out, size_t
     size_t kl = notify_rec__slen(r->key,    NR_KEY_CAP);
 
     size_t need = (size_t)NOTIFY_REC_HEAD + 1 + sl + 1 + tl + 2 + bl + 1 + kl;
+    if (notify_event_id_valid(&r->event_id)) need += NOTIFY_REC_EVENT_SUFFIX;
     if (need > cap) return 0;
 
     size_t o = 0;
@@ -142,6 +241,14 @@ static inline size_t notify_rec_encode(const notify_rec *r, uint8_t *out, size_t
     notify_rec_put_u16(out + o, (uint16_t)bl); o += 2;
     if (bl) { memcpy(out + o, r->body, bl); o += bl; }
     out[o++] = (uint8_t)kl; if (kl) { memcpy(out + o, r->key, kl); o += kl; }
+
+    if (notify_event_id_valid(&r->event_id)) {
+        out[o++] = NOTIFY_REC_EVENT_TAG;
+        notify_rec_put_u64(out + o, r->event_id.epoch_hi); o += 8;
+        notify_rec_put_u64(out + o, r->event_id.epoch_lo); o += 8;
+        notify_rec_put_u64(out + o, r->event_id.counter);  o += 8;
+        out[o++] = r->event_distinct ? 1 : 0;
+    }
 
     return o;
 }
@@ -188,6 +295,26 @@ static inline int notify_rec_decode(const uint8_t *buf, size_t avail, notify_rec
     if (!notify_rec__get_field(buf, avail, &o, 2, tmp.body,   NR_BODY_CAP))   return 0;
     if (!notify_rec__get_field(buf, avail, &o, 1, tmp.key,    NR_KEY_CAP))    return 0;
 
+    /* Version 1 readers ignored trailing bytes, so the tagged suffix extends
+     * the existing frame without invalidating any archived v1 card. A missing
+     * suffix is a legacy zero identity; a partial or unknown suffix is corrupt. */
+    if (o < avail) {
+        size_t suffix_n = avail - o;
+        if ((suffix_n != NOTIFY_REC_EVENT_SUFFIX && suffix_n != 25) ||
+            buf[o++] != NOTIFY_REC_EVENT_TAG) return 0;
+        tmp.event_id.epoch_hi = notify_rec_get_u64(buf + o); o += 8;
+        tmp.event_id.epoch_lo = notify_rec_get_u64(buf + o); o += 8;
+        tmp.event_id.counter  = notify_rec_get_u64(buf + o); o += 8;
+        if (!notify_event_id_valid(&tmp.event_id)) return 0;
+        if (suffix_n == NOTIFY_REC_EVENT_SUFFIX)
+            tmp.event_distinct = buf[o++] ? 1 : 0;
+        else {
+            size_t key_n = strlen(tmp.key);
+            tmp.event_distinct = key_n > 5 &&
+                strcmp(tmp.key + key_n - 5, "-chat") == 0;
+        }
+    }
+
     *out = tmp;
     return 1;
 }
@@ -232,6 +359,50 @@ static inline const char *notify_rec_archive_key(const char *key, uint32_t id,
     }
     snprintf(out, cap, "%c%u", NOTIFY_ARCHIVE_IDKEY_SENTINEL, (unsigned)id);
     return out;
+}
+
+static inline int notify_rec_is_chat_door_key(const char *key) {
+    if (!key) return 0;
+    size_t n = strlen(key);
+    return n > 5 && strcmp(key + n - 5, "-chat") == 0;
+}
+
+static inline int notify_rec_key_replaces(const char *key) {
+    return key && key[0] && !notify_rec_is_chat_door_key(key);
+}
+
+#define NOTIFY_ARCHIVE_EVENTKEY_CAP 33
+
+static inline const char *notify_rec_archive_event_key(
+        const char *key, uint32_t id, const NotifyEventId *event,
+        int event_distinct,
+        char *out, size_t out_n) {
+    if (event_distinct && notify_event_id_valid(event) &&
+        out && out_n >= NOTIFY_ARCHIVE_EVENTKEY_CAP) {
+        static const char alphabet[] =
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+        uint8_t raw[24];
+        notify_rec_put_u64(raw, event->epoch_hi);
+        notify_rec_put_u64(raw + 8, event->epoch_lo);
+        notify_rec_put_u64(raw + 16, event->counter);
+        size_t o = 0;
+        for (size_t i = 0; i < sizeof(raw); i += 3) {
+            uint32_t v = ((uint32_t)raw[i] << 16) |
+                         ((uint32_t)raw[i + 1] << 8) | raw[i + 2];
+            out[o++] = alphabet[(v >> 18) & 63u];
+            out[o++] = alphabet[(v >> 12) & 63u];
+            out[o++] = alphabet[(v >> 6) & 63u];
+            out[o++] = alphabet[v & 63u];
+        }
+        out[o] = '\0';
+        return out;
+    }
+    if (event_distinct && out && out_n >= NOTIFY_ARCHIVE_IDKEY_CAP) {
+        snprintf(out, out_n, "%c%lu", NOTIFY_ARCHIVE_IDKEY_SENTINEL,
+                 (unsigned long)id);
+        return out;
+    }
+    return notify_rec_archive_key(key, id, out, out_n);
 }
 
 /* --- delete tombstone: a card removed from the feed stays removed ------------
