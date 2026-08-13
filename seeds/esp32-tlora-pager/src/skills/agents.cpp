@@ -1908,22 +1908,16 @@ static bool transport_send_agent(int idx, const char *conv_id, const char *sessi
      * If this room last received an LXMF message, its reply goes back to THAT
      * sender over lxmf.delivery, not to the configured seed.pager peer — which
      * is a different node. A build/enqueue failure does NOT fall through to
-     * seed.pager: that peer is not the LXMF sender and would misdeliver, so the
-     * fault is put in the room (one short line) and the reply stops here. */
+     * seed.pager: that peer is not the LXMF sender and would misdeliver. */
     if (strcmp(conv_id, "claude") == 0) {
         uint8_t lxmf_dest[16];
         if (rns_lxmf_reply_target(session, lxmf_dest)) {
             const char *lx_why = nullptr;
             if (rns_send_lxmf_reply(lxmf_dest, text, &lx_why)) {
                 event_add("agent %s lxmf reply", conv_id);
-            } else {
-                char line[64];
-                snprintf(line, sizeof(line), "(lxmf: %s)",
-                         lx_why ? lx_why : "not sent");
-                agents_push_line(idx, false, line);
-                display_force = true;
+                return true;
             }
-            return true;
+            return false;
         }
     }
 
@@ -1971,26 +1965,7 @@ static bool transport_send_agent(int idx, const char *conv_id, const char *sessi
         }
     }
 
-    /* Nothing carried it. ONE short line — a second would push the just-typed
-     * message off the seven-row screen. Prefer the RNS cause when there is one
-     * (for `claude` the peer is the path the user configured, so naming what is
-     * wrong with it is the most actionable), else name why the WiFi/mesh rungs
-     * could not take it. */
-    if (rns_why) {
-        char line[64];
-        snprintf(line, sizeof(line), "(rns: %s)", rns_why);
-        agents_push_line(idx, false, line);
-    } else if (wifi_avail && reach != REACH_UP) {
-        agents_push_line(idx, false, "(no route home - mesh failed)");
-    } else if (wifi_avail) {
-        agents_push_line(idx, false, "(bridge offline)");
-    } else if (mesh_avail) {
-        agents_push_line(idx, false, "(mesh failed)");
-    } else {
-        agents_push_line(idx, false, "(no bridge / mesh)");
-    }
-    display_force = true;
-    return true;
+    return false;
 }
 
 /* CONV_LXMF: answer the sender this conversation was opened by. The address is
@@ -2103,7 +2078,22 @@ static bool agents_send(const char *agent_id, const char *text) {
     char delivery_key[NW_KEY_CAP];
     agents_delivery_key_next(delivery_key);
     agents_sent_key_commit(delivery_key);
-    transport_send(&g_convs[idx], cleaned, delivery_key);
+    bool sent = transport_send(&g_convs[idx], cleaned, delivery_key);
+    if (!sent && g_convs[idx].transport == CONV_AGENT) {
+        uint32_t out_id = outbox_enqueue(&g_outbox, OUTBOX_KIND_AGENT,
+                                         g_convs[idx].id,
+                                         g_convs[idx].sessions[g_convs[idx].active_idx],
+                                         delivery_key, cleaned);
+        if (out_id && outbox_persist()) {
+            agents_push_line(idx, false, "(~ queued)");
+            display_force = true;
+            return true;
+        }
+        if (out_id) outbox_remove(&g_outbox, out_id);
+        agents_push_line(idx, false, "(! outbox full)");
+        display_force = true;
+        return false;
+    }
     /* The room already carries the outcome (the backend puts one line in it on
      * failure), and the caller's contract has always been "accepted into the
      * thread", not "delivered" — GET /agents and the transport status routes

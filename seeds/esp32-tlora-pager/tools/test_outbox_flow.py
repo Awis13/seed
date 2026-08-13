@@ -21,4 +21,11 @@ assert "outbox_reply_mark(v.key)" in main
 assert 'delivery && delivery[0] ?' not in hw  # renderer uses explicit branch
 assert "if (delivery && delivery[0])" in hw
 
+agents = (ROOT / "src/skills/agents.cpp").read_text(encoding="utf-8")
+assert "outbox_enqueue(&g_outbox, OUTBOX_KIND_AGENT" in agents
+assert 'agents_push_line(idx, false, "(~ queued)")' in agents
+assert "transport_send_agent(idx, item->target, item->session" in main
+assert 'agents_push_line(idx, false, "(+ sent)")' in main
+assert 'agents_push_line(idx, false, "(! delivery failed)")' in main
+
 print("outbox flow tests: OK")

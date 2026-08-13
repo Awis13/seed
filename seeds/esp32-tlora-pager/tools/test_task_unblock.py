@@ -164,7 +164,7 @@ assert "void gps_request_fix(void)" in gps
 assert "gps_wake_requested" in gps[gps.index("static void gps_tick()") :]
 
 # --- 4. Connect timeouts on every loop-task HTTPClient site ------------------
-reply = main[main.index("static bool reply_upstream_http") :
+reply = main[main.index("static ReplyHttpResult reply_upstream_http") :
              main.index("static bool reply_upstream_mesh")]
 assert "http.setConnectTimeout(1000)" in reply, (
     "a black-holed gateway must cost ~1 s on the reply path"
@@ -2553,29 +2553,18 @@ assert "rns_link_up(" not in wrapper and "rns_link_up(" not in offer_code, (
     "the link check must NOT be inside the shared send path: refusing every "
     "offer made over a resolving link would make POST /rns/send flaky"
 )
-# 11f. A TOTAL FAILURE IS ONE SHORT LINE IN THE ROOM — and only on total
-# failure. C2 makes a successful send SILENT (the card just goes; a seven-row
-# screen is precious), so the room prints only when NO rung carried the message,
-# naming the single most actionable cause. The RNS reason wins when there is one
-# (for `claude` the peer is the path the user configured).
-assert 'snprintf(line, sizeof(line), "(rns: %s)", rns_why);' in send, (
-    "a total failure with an RNS cause must name it in the room"
+# 11f. A total ladder failure returns false to agents_send(), which persists the
+# same semantic message and delivery key in the durable outbox. The room shows
+# one compact state line instead of claiming a failed one-shot was sent.
+agent_send_at = agents.index("static bool agents_send(const char *agent_id, const char *text) {")
+agent_send = agents[agent_send_at:
+                    agents.index("static bool agents_on_inbound(", agent_send_at)]
+assert "return false;" in send, (
+    "a total ladder failure must reach the durable outbox caller"
 )
-assert '"(no route home - mesh failed)"' in send, (
-    "when the bridge is configured but the route home is NOT proven, the room "
-    "must say so — this is the captive/no-route case C2 stops blocking on"
-)
-assert send.index("if (rns_why) {") < send.index(
-    "} else if (wifi_avail && reach != REACH_UP) {"), (
-    "the RNS reason must REPLACE the other complaints rather than join them: "
-    "two lines per keystroke would push the typed message off the screen"
-)
-# The `why` values are static literals, so the room line needs no allocation and
-# the buffer is a small stack array on the 8 KB loop task.
-assert "char line[64];" in send, (
-    "the room line must be a small fixed buffer: this runs on the loop task "
-    "from the keyboard path, which is where the old oversized buffers overran"
-)
+assert "outbox_enqueue(&g_outbox, OUTBOX_KIND_AGENT" in agent_send
+assert 'agents_push_line(idx, false, "(~ queued)")' in agent_send
+assert 'agents_push_line(idx, false, "(! outbox full)")' in agent_send
 # 11g. AND IT MUST NOT PRINT THE OLD LIE. The room said "(bridge: claude not
 # wired yet)"-shaped things for a path that was dead; a bare bridge complaint
 # for `claude` is now wrong by construction.

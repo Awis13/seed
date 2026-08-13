@@ -37,7 +37,7 @@ assert "#define GW_TOKEN_MAX  128" in main
 # and only then: an empty token keeps the legacy header-less request.
 header = 'http.addHeader("Authorization", String("Bearer ") + gw_token);'
 
-reply = main[main.index("static bool reply_upstream_http") :]
+reply = main[main.index("static ReplyHttpResult reply_upstream_http") :]
 reply = reply[: reply.index("static bool reply_upstream_mesh")]
 assert header in reply, "POST /reply must carry the capability token"
 assert "if (gw_token[0])" in reply

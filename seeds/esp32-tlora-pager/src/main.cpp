@@ -2371,8 +2371,7 @@ static bool reply_upstream_mesh(const char *key, const char *text) {
     return mesh_client_send_to_gateway(frame, &ack, &est);
 }
 
-static void reply_upstream_poll() {
-    OutboxItem *item = outbox_oldest_pending(&g_outbox);
+static void outbox_reply_poll(OutboxItem *item) {
     if (!item || item->kind != OUTBOX_KIND_REPLY) return;
     uint32_t now = millis();
     if (item->next_try_ms && (int32_t)(now - item->next_try_ms) < 0) return;
@@ -2414,6 +2413,45 @@ static void reply_upstream_poll() {
     outbox_persist();
     event_add("reply upstream retry %u: %s", (unsigned)item->attempts,
               item->target);
+}
+
+static void outbox_agent_poll(OutboxItem *item) {
+    if (!item || item->kind != OUTBOX_KIND_AGENT) return;
+    uint32_t now = millis();
+    if (item->next_try_ms && (int32_t)(now - item->next_try_ms) < 0) return;
+    int idx = agents_find(item->target);
+    if (idx < 0 || g_convs[idx].transport != CONV_AGENT) {
+        item->state = OUTBOX_STATE_FAIL;
+        outbox_persist();
+        return;
+    }
+    item->state = OUTBOX_STATE_SENDING;
+    if (transport_send_agent(idx, item->target, item->session, item->text,
+                             item->delivery_key)) {
+        item->state = OUTBOX_STATE_SENT;
+        outbox_persist();
+        agents_push_line(idx, false, "(+ sent)");
+        display_force = true;
+        return;
+    }
+    item->attempts++;
+    if (item->attempts >= OUTBOX_ATTEMPTS_MAX) {
+        item->state = OUTBOX_STATE_FAIL;
+        item->next_try_ms = 0;
+        agents_push_line(idx, false, "(! delivery failed)");
+        display_force = true;
+    } else {
+        item->state = OUTBOX_STATE_QUEUED;
+        item->next_try_ms = now + outbox_retry_delay_ms(item->attempts);
+    }
+    outbox_persist();
+}
+
+static void outbox_poll() {
+    OutboxItem *item = outbox_oldest_pending(&g_outbox);
+    if (!item) return;
+    if (item->kind == OUTBOX_KIND_REPLY) outbox_reply_poll(item);
+    else if (item->kind == OUTBOX_KIND_AGENT) outbox_agent_poll(item);
 }
 
 static const char *outbox_reply_status(const char *key) {
@@ -4740,7 +4778,7 @@ void loop() {
     // Typed reply on its way to the gateway. ORDER: hand-placed — after the
     // keyboard drain above, so an Enter is carried on the pass that produced
     // it, and after the card has already painted its way back to the clock.
-    reply_upstream_poll();
+    outbox_poll();
 
     // Flush beacon: staged by conn_mgr_service() on the WiFi attach edge, sent
     // here on the loop task (off AsyncTCP), same deferral as the reply above.

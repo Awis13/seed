@@ -34,7 +34,7 @@ manual_ping = main[main.index("// ---- Mesh path: sparse private probe"):
                    main.index("static void kb_layout_save", main.index("// ---- Mesh path: sparse private probe"))]
 assert "!g_mesh_chat_tx.active && !mesh_client_ack_pending()" in manual_ping
 reply = main[main.index("static bool reply_upstream_mesh"):
-             main.index("static void reply_upstream_poll")]
+             main.index("static void outbox_reply_poll")]
 assert "mesh_client_ack_pending()" in reply, "R1 must not overwrite a C1 ACK"
 
 print("Mesh C1 ACK/retry policy tests: OK")
