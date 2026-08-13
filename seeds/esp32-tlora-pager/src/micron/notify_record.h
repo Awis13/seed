@@ -233,3 +233,39 @@ static inline const char *notify_rec_archive_key(const char *key, uint32_t id,
     snprintf(out, cap, "%c%u", NOTIFY_ARCHIVE_IDKEY_SENTINEL, (unsigned)id);
     return out;
 }
+
+/* --- delete tombstone: a card removed from the feed stays removed ------------
+ *
+ * Deleting a card writes a TOMBSTONE record to the archive under the card's
+ * (NS_NOTIFY, archive-key) identity — the SAME identity notify_rec_archive_key()
+ * derives for the card's data records. The archive is append-only and
+ * newest-wins: the tombstone is appended AFTER the card's data record, so it
+ * carries the higher seq and the index resolves that identity to it. The boot
+ * restorer reads the newest record for each identity and SKIPS the ones that are
+ * tombstones (notify_rec_is_tombstone), so a deleted card is never rebuilt into
+ * the RAM ring — the delete survives the reboot. A later re-add of the same key
+ * appends a fresh DATA record with a still-higher seq, which supersedes the
+ * tombstone (newest-wins again) and the card comes back.
+ *
+ * A tombstone is a one-byte payload whose first byte is a reserved marker a real
+ * notify_rec can never start with: a data record's first byte is NOTIFY_REC_VER
+ * (1), so NOTIFY_REC_TOMBSTONE is deliberately a distinct value. It is NOT a
+ * notify_rec — it carries no card fields, only the fact of deletion —
+ * so notify_rec_decode refuses it (wrong version byte) and the restorer tests
+ * notify_rec_is_tombstone() explicitly before ever decoding. */
+#define NOTIFY_REC_TOMBSTONE  0xEEu   /* first payload byte; != NOTIFY_REC_VER (1) */
+
+/* Encode a delete tombstone into `out` (cap must be >= 1). Returns the byte
+ * count written (1), or 0 if the buffer is too small. */
+static inline size_t notify_rec_tombstone_encode(uint8_t *out, size_t cap) {
+    if (!out || cap < 1) return 0;
+    out[0] = (uint8_t)NOTIFY_REC_TOMBSTONE;
+    return 1;
+}
+
+/* Is this archived payload a delete tombstone rather than a card record? A
+ * tombstone is recognised by its reserved first byte, which no notify_rec ever
+ * carries — so this can never mistake a real (possibly truncated) card for one. */
+static inline int notify_rec_is_tombstone(const uint8_t *buf, size_t len) {
+    return buf && len >= 1 && buf[0] == (uint8_t)NOTIFY_REC_TOMBSTONE;
+}

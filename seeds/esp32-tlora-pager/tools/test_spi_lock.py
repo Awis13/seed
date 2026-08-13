@@ -18,10 +18,25 @@ mc_target = (ROOT / "src" / "mesh" / "mc_target.cpp").read_text(encoding="utf-8"
 
 
 def fn_body(text, sig, terminator="\n}"):
-    """Slice from a function signature to its closing brace at column 0."""
+    """Slice a function DEFINITION.
+
+    The guard is not decoration: the firmware forward-declares many of these
+    near the top of their file, and `text.index(sig)` happily lands on the
+    declaration. The slice then runs from there to the end of some unrelated
+    later function, so an assertion against it — especially an ABSENCE
+    assertion — can pass on code that has nothing to do with the function under
+    test. That is a pin that looks green and checks nothing. A slice whose head
+    reaches a ';' before its first '{' is therefore rejected outright.
+    """
     start = text.index(sig)
     end = text.index(terminator, start)
-    return text[start : end + len(terminator)]
+    body = text[start : end + len(terminator)]
+    head = body[: body.index("{")] if "{" in body else body
+    assert ";" not in head, (
+        f"fn_body({sig!r}) matched a forward declaration, not the definition — "
+        "the assertions below would be checking unrelated code"
+    )
+    return body
 
 
 # --- the lock exists, is non-recursive, and documents the invariant ----------
@@ -68,11 +83,13 @@ PAINT_ENTRIES = [
     "void hw_ui_show_wifi(",
     "void hw_ui_show_wifi_list(",
     "void hw_ui_show_wifi_info(",
-    "void hw_ui_show_agents(",
+    "void hw_ui_show_inbox(",
     "void hw_ui_show_agent_sessions(",
     "int hw_ui_show_agent_chat(",
     "void hw_ui_show_agent_act(",
     "void hw_ui_show_msglist(",
+    "void hw_ui_show_contacts(",
+    "void hw_ui_show_net(",
     "void hw_ui_show_reply(",
     "void hw_ui_show_info(",
     # Micron page renderer: second paint consumer (cell grid + diff). Guards the
@@ -275,9 +292,15 @@ for sig in ("static void agents_sync_view(",
 
 # agents_sync_view keeps the size-shrink → full-rebuild guard (external
 # truncation across calls; a concurrent writer is excluded by agents_mux).
+# The sync cursor moved into the one shared scrollback window (the per-
+# conversation window was 12.5 KB a slot), so the guard is pinned there; the
+# invariant is unchanged — a file that shrank between calls forces a rebuild.
 sync = fn_body(agents, "static void agents_sync_view(")
-assert "sz < a.file_sync" in sync, (
+assert "sz < g_win.file_sync" in sync, (
     "agents_sync_view must keep the shrink-detect full-rebuild path"
+)
+assert "agents_window_take(idx)" in sync, (
+    "the shrink-detect path must empty the window, not just reset a counter"
 )
 
 # agents_session_refresh_counts counts newlines in bounded bus chunks + yields.

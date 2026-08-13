@@ -62,7 +62,7 @@ enum HwUiScreen : uint8_t {
     HW_UI_NOTIFY,
     HW_UI_CARD_ACT,  // Ack / Reply / Back after click-Enter on a card
     HW_UI_MENU,
-    HW_UI_AGENTS,      // Grok / Claude / Hermes list
+    HW_UI_AGENTS,      // Claude / Hermes list
     HW_UI_AGENT_CHAT,  // one agent thread
     HW_UI_AGENT_ACT,   // CLEAR / BACK inside a chat room
     HW_UI_AGENT_SESSIONS,  // session list inside one agent
@@ -77,6 +77,8 @@ enum HwUiScreen : uint8_t {
     HW_UI_WIFI_LIST,   // scan results or saved profiles list
     HW_UI_WIFI_INFO,   // multi-line WiFi/WG status
     HW_UI_PAGE,        // micron page view (system-layer store, wheel-paged)
+    HW_UI_CONTACTS,    // grouped Contacts: AI / LXMF / mesh, pick to open a chat
+    HW_UI_NET,         // sectioned network status: WiFi / Reticulum / mesh / tunnel
 };
 
 HwUiScreen hw_ui_screen();
@@ -195,8 +197,21 @@ void hw_ui_show_wifi_list(const char *header,
 // Multi-line WiFi/WG status (click = back).
 void hw_ui_show_wifi_info(const char *const *lines, int n_lines);
 
-// Agents list: GROK / CLAUDE / HERMES / BACK. selected is 0..3.
-void hw_ui_show_agents(int selected, bool bridge_ok);
+// The inbox: every conversation, newest first, plus a trailing BACK row.
+// labels[i] is the display name, glyphs[i] the one-letter transport tag
+// ('A' agent / 'M' mesh / 'L' lxmf) and unread[i] the arrival count (0 = none,
+// drawn as a * marker). `count` counts the CONVERSATION rows only; the renderer
+// adds BACK after them, so the caller's selected index runs 0..count inclusive.
+// Forget what was drawn, so the next show_inbox repaints even if `selected` is
+// unchanged. Needed whenever the ROWS changed rather than the selection.
+void hw_ui_inbox_invalidate(void);
+
+void hw_ui_show_inbox(const char *const *labels,
+                      const char *glyphs,
+                      const int *unread,
+                      int count,
+                      int selected,
+                      bool bridge_ok);
 
 // Session list inside one agent: N existing sessions + "NEW SESSION" + "BACK".
 // titles[i] short UTF-8, msgs[i] = message count (negative = no badge),
@@ -221,18 +236,55 @@ int hw_ui_show_agent_chat(const char *agent_name,
                           int *total_rows_out,
                           const char *footer);
 
-// In-chat sheet: CLEAR CHAT / BACK. selected is 0..1.
-void hw_ui_show_agent_act(int selected, const char *agent_name);
+// In-chat sheet. allow_delete true → CLEAR CHAT / DELETE / BACK (selected 0..2);
+// false (a seeded door) → CLEAR CHAT / BACK (selected 0..1).
+void hw_ui_show_agent_act(int selected, const char *agent_name, bool allow_delete);
 
-// Message list: title + level + unread flag per row (Nokia/pager inbox).
-// Unread rows get a * marker and bright title; read rows are dim.
-// levels are "info"/"warn"/"crit"; unread[i] true = NEW.
+// Unified Messages feed: one list of notification cards AND chat conversations,
+// merged by time (src/feed_view.h). Per row: title, a single glyph letter, an
+// origin flag and an unread flag. glyphs[i] is the row's tag character — a
+// severity letter (I/W/C) for a card, a transport letter (A/M/L) for a chat;
+// is_conv[i] true = chat row, false = card row; unread[i] true = NEW (gets a *
+// marker and a bright title, read rows are dim).
 #define HW_UI_MSGLIST_MAX 8
 void hw_ui_show_msglist(const char *const *titles,
-                        const char *const *levels,
+                        const char *glyphs,
+                        const bool *is_conv,
                         const bool *unread,
                         int count,
                         int selected);
+
+// Grouped Contacts screen: the rows contacts_build_rows produced, flattened to
+// primitive arrays so this header stays free of the model struct. Per row:
+//   labels[i]    — section title (header row) or contact name (contact row)
+//   is_header[i] — true = a non-selectable section divider (AI / LXMF / mesh)
+//   has_conv[i]  — contact row only: already has a thread (gets a small marker)
+// `selected` indexes a CONTACT row (the caller keeps selection off headers);
+// `note`, when non-NULL, is a short status line (e.g. the table-full refusal).
+#define HW_UI_CONTACTS_MAX 51   /* CONTACT_ROWS_MAX in src/contacts_view.h */
+void hw_ui_show_contacts(const char *const *labels,
+                         const bool *is_header,
+                         const bool *has_conv,
+                         int count,
+                         int selected,
+                         const char *note);
+
+// Sectioned network status screen: the rows net_build_rows produced, flattened
+// to primitive arrays so this header stays free of the model struct. Per row:
+//   labels[i]    — section title (header row) or value label (value row)
+//   values[i]    — value row only: the short value string ("" on a header)
+//   is_header[i] — true = a non-selectable amber section divider
+//   levels[i]    — value row status level (NetLevel: 0 OFF/1 OK/2 WARN/3 DOWN),
+//                  drawn as a colour-coded glyph left of the label
+// `top` is the first visible row (windowed scroll); the renderer clamps it.
+#define HW_UI_NET_MAX 14   /* NET_ROWS_MAX in src/net_view.h */
+#define HW_UI_NET_VIS 7    /* rows visible before scrolling */
+void hw_ui_show_net(const char *const *labels,
+                    const char *const *values,
+                    const bool *is_header,
+                    const uint8_t *levels,
+                    int count,
+                    int top);
 
 // Device info (version, IP, host, token, free heap).
 void hw_ui_show_info(const char *version,

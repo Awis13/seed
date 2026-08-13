@@ -1,22 +1,34 @@
 /*
- * skills/agents.cpp — pocket chat with remote agents (Grok / Claude / Hermes)
+ * skills/agents.cpp — pocket chat, on top of the CONVERSATION store
+ *
+ * WHAT CHANGED AND WHY. This used to be a table of exactly two AGENTS
+ * (`claude`, `hermes`), each addressable only by a room name and answerable only
+ * by handing its own id back to the bridge. Notification cards are the device's
+ * main feature and must be deliverable over EVERY transport, so a thread has to
+ * be able to arrive from an LXMF sender or a mesh peer too — and such a thread
+ * must remember WHERE to answer, which an agent id cannot express. The record is
+ * therefore a Conversation (see ../conv_store.h): it carries a `transport`, an
+ * opaque `reply_addr`, and a display `label` that no longer has to be the id.
+ * The two agents are now SEEDED conversations of transport CONV_AGENT, so this
+ * commit is a pure refactor — same screens, same API, same wire behaviour.
  *
  * Pager is the thin terminal. A bridge on the LAN does the real work:
  *   POST {bridge}/v1/chat  { "agent","session","text" }
  * Answers come back as ordinary /notify
- * (source=grok|claude|hermes|opencode|codex) or, when
+ * (source=claude|hermes) or, when
  * the bridge is missing, as a local stub line in the thread.
  *
  * SPIFFS:
  *   /agent_bridge.txt  — base URL, e.g. http://192.168.1.138:8090  (one line)
  *
  * History:
- *   Non-transient per-(agent, session) history lives on removable SD as an
- *   append-only JSONL file, one message per line:  {ts, from_me, text}.
+ *   Non-transient per-(conversation, session) history lives on removable SD as
+ *   an append-only JSONL file, one message per line:  {ts, from_me, text}.
  *   Only a small viewport window (the last AGENT_VIEW_MAX messages of the
  *   current session) is kept in RAM as an index; the rest stays on disk, so a
  *   "very long history" costs no extra static RAM. Multiple sessions exist per
- *   agent under the key (agent, session); one is active and selectable.
+ *   conversation under the key (conversation, session); one is active and
+ *   selectable.
  *   The chat screen scrolls the whole history page-by-page (older pages are
  *   loaded from disk on demand) and shows the message timestamp with the
  *   sender marker.
@@ -27,9 +39,11 @@
  *   Either way persistence is append-only JSONL, so behaviour is identical and
  *   there is no hardlock when the SD is missing.
  *
- *   Session registry is a tiny manifest  /agents_sessions.txt  (one
- *   "agent\tsession" line each) in the same store, so the session list
- *   survives reboots without needing SD directory iteration.
+ *   Thread registry is a tiny manifest  /conversations.txt  (one
+ *   "key\tlabel\ttransport\treply_hex\tdead" line each) in the same store, so
+ *   the room list survives reboots without needing SD directory iteration. The
+ *   legacy /agents_sessions.txt is still READ (2- and 3-field lines) so an
+ *   existing card keeps its rooms; only the new file is ever written.
  *
  * HTTP API on the seed:
  *   GET  /agents             — list + bridge status + per-agent sessions/history
@@ -42,9 +56,23 @@
 #include <SD.h>
 #include <SPI.h>
 
-#define AGENTS_N            5
-#define AGENT_ID_LEN        12
-#define AGENT_NAME_LEN      16
+#include "../agents_chat_route.h"  // chat-route seam: claude_route_incoming + pure planner
+#include "../conv_store.h"         // the conversation record: keys, manifest, transports
+#include "../mesh/contact_record.h" // /contacts3 layout: which peers this device has met
+#include "../transport.h"          // the backend contract: transport_send + the inbox doors
+#include "../rns/outbox.h"         // the OTHER half of that seam: rns_send_envelope + rns_peer_addr
+
+/* Conversation slots. A slot used to carry its own AGENT_VIEW_MAX viewport, so
+ * the table cost 12.6 KB per conversation and could not grow without spending
+ * static RAM the board does not have. The window is shared now (see ConvWindow)
+ * and a slot is ~840 bytes, so eight of them cost less than the two used to.
+ * g_conv_n is the LIVE count; slots above it are free for minted peers. */
+#define CONV_MAX            8   /* seeded + minted peers; ~840 B each now */
+#define CONV_SEEDED_N       2       /* claude + hermes, pre-created below */
+/* Kept as the capacity spelling the rest of the tree already uses (main.cpp
+ * sizes its UI copies with it; meshcore.cpp sizes its per-agent TX flags). */
+#define AGENTS_N            CONV_MAX
+#define AGENT_ID_LEN        CONV_ID_LEN
 /* One chat line / viewport cell. 512 stays: bridge + mesh multi-part chunks. */
 #define AGENT_TEXT_LEN      512
 /* RAM viewport window: the last N messages of the ACTIVE session per agent.
@@ -56,10 +84,8 @@
 #define AGENT_BRIDGE_LEN    96
 #define AGENT_BRIDGE_FILE   "/agent_bridge.txt"
 #define AGENT_BRIDGE_TMP    "/agent_bridge.tmp"
-#define AGENT_SESSION_LEN   24
-#define AGENT_SESSIONS_MAX  8       /* max sessions per agent (registry cap) */
-#define AGENT_MANIFEST      "/agents_sessions.txt"
-#define AGENT_LOG_PREFIX    "agent" /* flat store files /agent.<id>.<s>.jsonl */
+#define AGENT_SESSION_LEN   CONV_SESSION_LEN
+#define AGENT_SESSIONS_MAX  CONV_SESSIONS_MAX  /* rooms per conversation (cap) */
 /* JSONL line worst case: 2x escaped text + wrapper + newline. */
 #define AGENT_JSONL_MAX     (AGENT_TEXT_LEN * 2 + 64)
 /* Bus-hold budget for a whole-file session scan. A months-old session JSONL
@@ -76,31 +102,106 @@
 
 struct AgentLine {
     bool from_me;
-    uint32_t ts;            // unix seconds (C1 JSONL "ts"); 0 = unknown
+    uint32_t ts;            // unix seconds (the JSONL "ts"); 0 = unknown
     char text[AGENT_TEXT_LEN];
 };
 
-struct AgentSlot {
-    const char *id;     // "grok" / "claude" / "hermes" / "opencode" / "codex"
-    const char *name;   // UI label
+/* One conversation: a thread source with its own rooms, wire and return
+ * address. `id` is the storage id (no '.', it separates id from room in the
+ * on-disk key); `label` is what the screen shows; `reply_addr` is OPAQUE — its
+ * meaning is the transport's (agent-id bytes / LXMF source hash / mesh pubkey)
+ * and nothing in this file interprets it. */
+struct Conversation {
+    char id[CONV_ID_LEN];             // "claude" / "hermes"; later 8 hex of a peer
+    char label[CONV_LABEL_LEN];       // UI display name
+    uint8_t transport;                // CONV_AGENT / CONV_LXMF / CONV_MESH
+    uint8_t reply_len;                // bytes used in reply_addr (0 = unknown)
+    uint8_t reply_addr[CONV_REPLY_MAX];
+    /* Compiled in rather than discovered. A seeded conversation's ROUTE is
+     * re-derived at every load and never taken from the manifest — see
+     * conv_route_resolve() in ../transport.h for why that matters now that
+     * transport chooses the wire a reply leaves on. */
+    uint8_t seeded;
     char sessions[AGENT_SESSIONS_MAX][AGENT_SESSION_LEN];
     uint8_t n_sessions;
     uint8_t active_idx;         // into sessions[]
     uint32_t session_lines[AGENT_SESSIONS_MAX];  // persisted msg count per session
-    uint32_t file_sync;         // JSONL bytes already folded into view+lines
     uint32_t lines;             // total messages in the active session
-    uint8_t vn;                 // messages currently in the view window
-    uint32_t win_start;         // absolute line index of view[0] (tail or loaded page)
-    AgentLine view[AGENT_VIEW_MAX];   // window over the active session
+    /* Newest line of the active room, kept for the picker and GET /agents. This
+     * is ALL the RAM a conversation nobody is looking at needs: the scrollable
+     * window lives in g_win (one, shared) because only one conversation is ever
+     * on screen. Holding a 24-message window per conversation cost 12,480 of
+     * the record's 12,796 bytes and bought nothing — see ConvWindow below. */
+    AgentLine last;
+    /* Monotonic use stamp, for choosing an eviction victim (see conv_mint). */
+    uint32_t last_use;
+    /* Arrivals the user has not looked at. Counted only for a conversation
+     * that is NOT the one on screen — reading it IS the acknowledgement, so a
+     * line landing in the open chat was never unread. Cleared when the
+     * conversation takes the window (agents_thread_goto_tail), which is the
+     * same focus point everything else in this file hangs off. */
+    uint16_t unread;
+    /* Per-session liveness (live-room roster, README). 0 = alive/shown,
+     * 1 = dead/hidden from the room picker. MARK-NOT-DELETE: a dead room's
+     * JSONL history file is never removed — hiding is reversible (a later
+     * roster can un-mark it), deletion is not and is user-only. */
+    uint8_t session_dead[AGENT_SESSIONS_MAX];
 };
 
-static AgentSlot g_agents[AGENTS_N] = {
-    { "grok",     "GROK",     {}, 0, 0, {}, 0, 0, 0, 0, {} },
-    { "claude",   "CLAUDE",   {}, 0, 0, {}, 0, 0, 0, 0, {} },
-    { "hermes",   "HERMES",   {}, 0, 0, {}, 0, 0, 0, 0, {} },
-    { "opencode", "OPENCODE", {}, 0, 0, {}, 0, 0, 0, 0, {} },
-    { "codex",    "CODEX",    {}, 0, 0, {}, 0, 0, 0, 0, {} },
+/*
+ * THE ONE SCROLLBACK WINDOW.
+ *
+ * Every viewport caller in main.cpp passes agent_focus — the chat screen draws
+ * exactly one conversation — so the window is a property of the SCREEN, not of
+ * each conversation. It used to be per-conversation, which meant every slot
+ * carried a 24-message buffer that only mattered while that slot was the one
+ * being looked at, and made each new conversation cost 12.5 KB of static RAM.
+ * With one shared window a conversation costs ~840 bytes, so the table can hold
+ * real peers for LESS total RAM than two conversations used to take.
+ *
+ * `owner` is the conversation the window is currently loaded for. It changes
+ * only on an explicit focus (agents_thread_goto_tail / _goto_page, and the
+ * lazy focus in agents_thread_view), never as a side effect of a message
+ * arriving — an inbound line for a conversation nobody is reading must not
+ * blank the chat that IS open. Those conversations take the line into `last`
+ * and their counters; the full window is rebuilt from the JSONL when the user
+ * actually opens them, which is the same disk work the old code did on every
+ * room switch anyway. The disk is the store; this is only a display cache.
+ */
+struct ConvWindow {
+    int      owner;             // conversation index loaded here, -1 = none
+    uint32_t file_sync;         // JSONL bytes already folded into view
+    uint8_t  vn;                // messages currently in the window
+    uint32_t win_start;         // absolute line index of view[0] (tail or page)
+    AgentLine view[AGENT_VIEW_MAX];
 };
+static ConvWindow g_win = { -1, 0, 0, 0, {} };
+
+/* Bumped on every append/select so eviction can find the least-recently-used
+ * conversation without a timestamp (the clock is not trustworthy at boot). */
+static uint32_t g_conv_clock = 0;
+
+/* Manifest lines the table had no room for. Boot rewrites the file from the
+ * table, so those lines are dropped from disk in the same pass — this count is
+ * the only trace they leave. */
+static uint16_t g_conv_load_skipped = 0;
+/* Mesh lines naming a peer no contact backs — a hand-written route, or a
+ * contact file that was cleared. Counted for the same reason as the above. */
+static uint16_t g_conv_load_unknown = 0;
+
+/* The two bridge/gateway agents, pre-created as CONV_AGENT conversations. Their
+ * return address is the agent id's own bytes, which is exactly what the bridge
+ * and the MeshCore C1 DM have always used to answer them. Fields not named here
+ * are value-initialised (empty room list, empty viewport). */
+static Conversation g_convs[CONV_MAX] = {
+    { .id = "claude", .label = "CLAUDE", .transport = CONV_AGENT, .reply_len = 6,
+      .reply_addr = { 'c', 'l', 'a', 'u', 'd', 'e' }, .seeded = 1 },
+    { .id = "hermes", .label = "HERMES", .transport = CONV_AGENT, .reply_len = 6,
+      .reply_addr = { 'h', 'e', 'r', 'm', 'e', 's' }, .seeded = 1 },
+};
+/* Live conversations in g_convs[]. A constant today; the seam a later commit
+ * uses to append a peer conversation without touching every loop below. */
+static uint8_t g_conv_n = CONV_SEEDED_N;
 
 static char g_bridge[AGENT_BRIDGE_LEN] = "";
 static char g_session[AGENT_SESSION_LEN] = "pager";
@@ -111,7 +212,7 @@ static bool g_store_is_sd = false;
  * a lock) while send/inbound/view also take the same lock (nested). File IO
  * happens under the mutex, never under portENTER_CRITICAL — SD writes block.
  *
- * TWO locks, two concerns: agents_mux guards store STATE (g_agents, view
+ * TWO locks, two concerns: agents_mux guards store STATE (g_convs, view
  * windows, session registry); the shared SPI bus lock (HwSpiBusGuard /
  * hw_spi_bus_lock, hw_ui.h) guards the BUS the SD card shares with the
  * ST7796 and SX1262. These routes run on the AsyncTCP task while the loop
@@ -139,8 +240,28 @@ static unsigned long agents_now_s() {
     return millis() / 1000;
 }
 
-/* Forward decls (defined later in this TU; store section uses them early). */
-static void agents_view_append(AgentSlot &a, bool from_me, uint32_t ts,
+/* Is this conversation the one the chat screen is showing right now? Supplied
+ * by the UI (main.cpp) because only it knows which screen is up; the store must
+ * not guess from window ownership, which outlives the screen. */
+static bool (*g_agents_on_screen)(int idx) = nullptr;
+static bool agents_is_on_screen(int idx) {
+    return g_agents_on_screen && g_agents_on_screen(idx);
+}
+void agents_set_on_screen_hook(bool (*fn)(int idx)) { g_agents_on_screen = fn; }
+
+/* The ONE filesystem the MeshCore contact table lives on (src/mesh/mc_client).
+ * DECLARED, NOT INCLUDED: this file is barred from seeing mc_client.h at all,
+ * because the MeshCore stack belongs to the loop task and this file also runs
+ * on the keyboard and AsyncTCP tasks. This accessor touches no stack state — it
+ * names a filesystem — so it is the one symbol pulled across, by hand, where
+ * the ban stays visible. */
+namespace fs { class FS; }
+fs::FS &mesh_contacts_fs();
+
+/* Forward decls (defined later in this TU; store section uses them early).
+ * conv_peer_id (a peer's address -> its conversation id) is pure and lives in
+ * ../conv_store.h now, so no forward decl of it is needed here. */
+static void agents_view_append(ConvWindow &w, bool from_me, uint32_t ts,
                                const char *text);
 static int agents_find(const char *id);
 static int agents_session_add(int idx, const char *name);
@@ -151,6 +272,8 @@ int    agents_session_count(int idx);
 const char *agents_session_name(int idx, int i);
 bool   agents_session_is_active(int idx, int i);
 int    agents_session_msg_count(int idx, int i);
+bool   agents_session_is_dead(int idx, int i);   // live-room roster: hidden?
+int    agents_session_visible_count(int idx);    // non-dead session rows
 bool   agents_session_refresh_counts(int idx);   // recount all store sessions
 const char *agents_active_session(int idx);
 bool   agents_session_select(int idx, const char *name);
@@ -163,6 +286,22 @@ void   agents_thread_goto_tail(int idx);         // rewind to latest (sync)
 void   agents_thread_goto_page(int idx, uint32_t end_line);  // load older page
 int    agents_thread_view(int idx, char out[][AGENT_TEXT_LEN], bool *from_me,
                           uint32_t *ts_out, int max_lines);
+
+/* CONTACTS SCREEN enumeration (foundation for the grouped Contacts view).
+ * The AI bucket of that screen is the seeded doors, and any bucket's row is
+ * marked when the contact already has a thread. These expose exactly those two
+ * facts and nothing else of the conversation table. */
+int    agents_seeded_count(void);                // number of seeded AI doors
+bool   agents_seeded_at(int i, const char **id, const char **label,
+                        const uint8_t **reply, uint8_t *reply_len);
+bool   agents_has_conversation(const char *id);  // literal-id join (AI door)
+bool   agents_peer_has_conversation(const uint8_t *addr, uint8_t addr_len);
+// idx's opaque return address, into out[0..out_max); returns the byte count.
+uint8_t agents_reply_addr(int idx, uint8_t *out, uint8_t out_max);
+// Open the conversation this contact points at, or create it, and return its
+// slot (-1 if the table is full and refuses). See the definition for the rules.
+int    agents_open_or_create(uint8_t transport, const char *id, const char *label,
+                             const uint8_t *reply_addr, uint8_t addr_len);
 
 /* GPS location collaboration. gps.cpp is #include'd AFTER this file in the
  * same TU, so these are prototypes resolved to the gps.cpp section below.
@@ -179,7 +318,7 @@ void gps_request_fix(void);
 static void agents_on_inbound(const char *agent_id, const char *text,
                               bool real_inbound);
 
-/* A genuine arrival (mesh C1 RX, HTTP /agents/inbound, a GPS answer landing)
+/* A genuine arrival (a mesh chat frame, HTTP /agents/inbound, a GPS answer)
  * pushed a line into a room. loop() consumes it together with display_force:
  * if the room is open on screen, the repaint wakes the panel once. Synthetic
  * error lines never set this. Set BEFORE display_force so the loop cannot
@@ -192,13 +331,25 @@ static const char *agents_store_name() { return g_store_is_sd ? "sd" : "spiffs";
 
 static bool agents_store_ready() { return g_store != nullptr; }
 
-/* Flat key path (no directory on SPIFFS; FAT root on SD). Session is already
- * sanitised to [A-Za-z0-9._-]. */
-static String agents_log_path(const char *agent_id, const char *session) {
-    /* SPIFFS object-name limit is 32 bytes (31 usable incl. NUL). A suffix of
-     * ".jsonl" pushed the opencode agent's path past it — file never created,
-     * empty thread, black chat screen. Drop the extension; content stays JSONL. */
-    return String("/") + AGENT_LOG_PREFIX + "." + agent_id + "." + session;
+/* Flat key path (no directory on SPIFFS; FAT root on SD) for one thread of one
+ * conversation: /conv.<conv_id>[.<session>]. The old form was
+ * /agent.<id>.<session>, which had no guard on the SPIFFS object-name limit —
+ * a long room name produced a path the store silently refused to create, i.e.
+ * an empty thread and a black chat screen (the same trap that already cost the
+ * ".jsonl" extension). conv_log_path() now HOLDS that budget, folding an
+ * over-long key onto a fingerprinted name instead of overflowing it, and
+ * returns "" if it cannot — an empty path opens no file, so every caller
+ * degrades the way a missing store already does. Content stays JSONL. */
+static String agents_log_path(const char *conv_id, const char *session) {
+    char path[CONV_PATH_LEN];
+    if (!conv_log_path(path, sizeof(path), conv_id, session)) return String("");
+    return String(path);
+}
+
+/* Legacy key of the same thread, read once at boot so an existing card's
+ * history follows it into the new namespace (see agents_migrate_logs). */
+static String agents_legacy_log_path(const char *conv_id, const char *session) {
+    return String("/agent.") + conv_id + "." + session;
 }
 
 static void agents_session_sanitize(const char *in, char *out, size_t out_n) {
@@ -223,9 +374,21 @@ static void agents_session_sanitize(const char *in, char *out, size_t out_n) {
  * loop task from the keyboard path, and the old esc[1088]+line[1088] buffers
  * overran it (Stack canary / loopTask panic on Enter). */
 static void agents_store_append(int idx, bool from_me, const char *text) {
-    AgentSlot &a = g_agents[idx];
+    Conversation &a = g_convs[idx];
     uint32_t ts = agents_now_s();
-    agents_view_append(a, from_me, ts, text);
+    /* The picker's cache is updated for EVERY conversation; the scrollback
+     * window only when this conversation is the one on screen. A line arriving
+     * for a conversation nobody is reading must not disturb the open chat. */
+    a.last.from_me = from_me;
+    a.last.ts = ts;
+    snprintf(a.last.text, sizeof(a.last.text), "%s", text ? text : "");
+    a.last_use = ++g_conv_clock;
+    /* Their line, in a conversation nobody is READING. "Reading" is the chat
+     * screen being open on it — not window ownership: the window stays owned
+     * after the user walks back to the clock, so keying on it left every
+     * conversation they had ever opened permanently unable to go unread. */
+    if (!from_me && !agents_is_on_screen(idx) && a.unread < 0xFFFF) a.unread++;
+    if (g_win.owner == idx) agents_view_append(g_win, from_me, ts, text);
     if (!agents_store_ready()) return;
     String path = agents_log_path(a.id, a.sessions[a.active_idx]);
     /* Caller holds agents_mux (agents_push_line); bus lock second — order. */
@@ -265,25 +428,36 @@ static void agents_store_append(int idx, bool from_me, const char *text) {
     if (written > 0) {
         a.lines++;
         a.session_lines[a.active_idx]++;
-        a.file_sync += written;
+        if (g_win.owner == idx) g_win.file_sync += written;
     }
 }
 
-static void agents_view_append(AgentSlot &a, bool from_me, uint32_t ts,
+static void agents_view_append(ConvWindow &w, bool from_me, uint32_t ts,
                                const char *text) {
-    if (a.vn >= AGENT_VIEW_MAX) {
-        memmove(&a.view[0], &a.view[1], (AGENT_VIEW_MAX - 1) * sizeof(AgentLine));
-        a.view[AGENT_VIEW_MAX - 1].from_me = from_me;
-        a.view[AGENT_VIEW_MAX - 1].ts = ts;
-        snprintf(a.view[AGENT_VIEW_MAX - 1].text, sizeof(a.view[0].text),
+    if (w.vn >= AGENT_VIEW_MAX) {
+        memmove(&w.view[0], &w.view[1], (AGENT_VIEW_MAX - 1) * sizeof(AgentLine));
+        w.view[AGENT_VIEW_MAX - 1].from_me = from_me;
+        w.view[AGENT_VIEW_MAX - 1].ts = ts;
+        snprintf(w.view[AGENT_VIEW_MAX - 1].text, sizeof(w.view[0].text),
                  "%s", text ? text : "");
-        a.win_start++;
+        w.win_start++;
     } else {
-        a.view[a.vn].from_me = from_me;
-        a.view[a.vn].ts = ts;
-        snprintf(a.view[a.vn].text, sizeof(a.view[0].text), "%s", text ? text : "");
-        a.vn++;
+        w.view[w.vn].from_me = from_me;
+        w.view[w.vn].ts = ts;
+        snprintf(w.view[w.vn].text, sizeof(w.view[0].text), "%s", text ? text : "");
+        w.vn++;
     }
+}
+
+/* Hand the window to `idx` and empty it, so the next sync rebuilds from byte 0.
+ * The conversation's own line count is reset with it: the two are read back
+ * together by agents_sync_view and must not disagree. */
+static void agents_window_take(int idx) {
+    g_win.owner = idx;
+    g_win.file_sync = 0;
+    g_win.vn = 0;
+    g_win.win_start = 0;
+    if (idx >= 0 && idx < CONV_MAX) g_convs[idx].lines = 0;
 }
 
 /* Buffered JSONL line scanner. Reads the file in 512-byte blocks instead of
@@ -389,8 +563,13 @@ static void agents_scan_chunked(AgentJScanner &sc, char *lbuf, size_t lbuf_n,
  * file_sync (delta), append them to the window. On external truncation/resync
  * the window is rebuilt from zero. Caller holds the lock. */
 static void agents_sync_view(int idx) {
-    AgentSlot &a = g_agents[idx];
+    Conversation &a = g_convs[idx];
     if (!agents_store_ready()) return;
+    /* Syncing a conversation the window is not loaded for would fold its lines
+     * into someone else's scrollback, so the window is taken first. Taking it
+     * empties the window, which turns the delta-sync below into a full rebuild
+     * — the same work the old per-conversation code did on every room switch. */
+    if (g_win.owner != idx) agents_window_take(idx);
     String path = agents_log_path(a.id, a.sessions[a.active_idx]);
     /* Open + size/seek under one short bus burst; the line scan below bounds
      * its own bus hold (mux held throughout — see agents_scan_chunked). */
@@ -400,17 +579,16 @@ static void agents_sync_view(int idx) {
     {
         HwSpiBusGuard bus;
         if (!g_store->exists(path.c_str())) {
-            a.file_sync = 0; a.lines = 0; a.vn = 0; a.win_start = 0;
+            agents_window_take(idx);
             return;
         }
         f = g_store->open(path.c_str(), "r");
-        if (!f) { a.file_sync = 0; a.lines = 0; a.vn = 0; a.win_start = 0; return; }
+        if (!f) { agents_window_take(idx); return; }
         size_t sz = f.size();
-        if (sz < a.file_sync) {      // file shrank between calls → full rebuild
-            a.file_sync = 0; a.lines = 0; a.vn = 0; a.win_start = 0;
-        }
+        if (sz < g_win.file_sync)    // file shrank between calls → full rebuild
+            agents_window_take(idx);
         final_size = (uint32_t)sz;
-        do_scan = (a.file_sync < sz && f.seek(a.file_sync));
+        do_scan = (g_win.file_sync < sz && f.seek(g_win.file_sync));
     }
     if (do_scan) {
         char lbuf[AGENT_JSONL_MAX];
@@ -420,46 +598,294 @@ static void agents_sync_view(int idx) {
             bool from_me;
             uint32_t ts;
             if (line[0] && agents_jsonl_parse(line, from_me, ts, text, sizeof(text))) {
-                agents_view_append(a, from_me, ts, text);
+                agents_view_append(g_win, from_me, ts, text);
                 a.lines++;
+                /* The newest line read is also the picker's cached line. */
+                a.last.from_me = from_me;
+                a.last.ts = ts;
+                snprintf(a.last.text, sizeof(a.last.text), "%s", text);
             }
         });
     }
-    a.file_sync = final_size;
+    g_win.file_sync = final_size;
     a.session_lines[a.active_idx] = a.lines;
     { HwSpiBusGuard bus; f.close(); }
 }
 
-/* Load the session registry from the store manifest (one agent\tsession/line). */
-static void agents_manifest_load() {
-    HwSpiBusGuard bus;
-    if (!g_store || !g_store->exists(AGENT_MANIFEST)) return;
-    File f = g_store->open(AGENT_MANIFEST, "r");
+/*
+ * Find a conversation by id, or MINT one.
+ *
+ * A fixed table could not do this, and a transport needs it the moment a
+ * stranger's first message arrives: a peer has no slot until it speaks. The id is the caller's (for a peer, the first hex of its address);
+ * label, transport and return address come from the wire that met it.
+ *
+ * WHEN THE TABLE IS FULL, the least-recently-used NON-SEEDED conversation is
+ * evicted. Seeded conversations are the device's own doors — the user must
+ * always be able to reach them — so they are never candidates, and a table of
+ * nothing but seeded slots refuses (-1) instead of throwing one out.
+ *
+ * EVICTION IS NOT DELETION, which is what makes it safe: the slot is a RAM
+ * cache of a conversation whose history lives in its own /conv.<id> file, and
+ * that file is never touched here. If the evicted peer speaks again it is
+ * re-minted onto the same id, reopens the same log, and its history is still
+ * there — exactly the MARK-NOT-DELETE rule the dead-room roster already
+ * follows. Losing the slot costs a rebuild, not a conversation.
+ *
+ * Caller holds agents_mux. Returns the slot index, or -1.
+ */
+static int conv_mint(const char *id, const char *label, uint8_t transport,
+                     const uint8_t *addr, uint8_t addr_len, bool may_evict) {
+    if (!id || !id[0]) return -1;
+    int idx = agents_find(id);
+    if (idx >= 0) {
+        /* THE ID IS A HANDLE, NOT A CREDENTIAL. It is a prefix of the address,
+         * so a hit means "probably the same peer" — the full stored address and
+         * the wire are what make it certain. A mismatch is a different party
+         * arriving under a colliding prefix, and continuing would drop their
+         * message into someone else's thread and point that thread's replies at
+         * them. Refuse instead; the caller falls back to a card. */
+        Conversation &e = g_convs[idx];
+        if (e.transport != transport) return -1;
+        if (addr && addr_len) {
+            if (e.reply_len != addr_len) return -1;
+            if (memcmp(e.reply_addr, addr, addr_len) != 0) return -1;
+        }
+        return idx;                              /* find, before mint */
+    }
+
+    uint8_t seeded_of[CONV_MAX];
+    uint32_t use_of[CONV_MAX];
+    for (int i = 0; i < g_conv_n; i++) {
+        seeded_of[i] = g_convs[i].seeded;
+        use_of[i] = g_convs[i].last_use;
+    }
+    /* g_win.owner IS the conversation on screen — window ownership changes only
+     * on an explicit focus — so it is the slot the reader would be swapped out
+     * of, and it is protected. (Between boot and the first draw it is whichever
+     * conversation the init loop synced last, which is harmless: nothing can
+     * mint that early, and protecting the wrong slot only costs a different
+     * victim.) */
+    idx = conv_slot_plan(g_conv_n, CONV_MAX, seeded_of, use_of, g_win.owner,
+                         may_evict);
+    if (idx < 0) return -1;                      /* nothing may be evicted */
+    if (idx >= g_conv_n) {
+        g_conv_n = (uint8_t)(idx + 1);           /* took a free slot */
+    } else {
+        event_add("conv evict %s for %s", g_convs[idx].id, id);
+        if (g_win.owner == idx) agents_window_take(-1);
+    }
+
+    Conversation &a = g_convs[idx];
+    memset(&a, 0, sizeof(a));
+    snprintf(a.id, sizeof(a.id), "%s", id);
+    snprintf(a.label, sizeof(a.label), "%s", (label && label[0]) ? label : id);
+    a.transport = transport;
+    if (addr && addr_len) {
+        a.reply_len = (addr_len > CONV_REPLY_MAX) ? CONV_REPLY_MAX : addr_len;
+        memcpy(a.reply_addr, addr, a.reply_len);
+    }
+    a.seeded = 0;
+    a.last_use = ++g_conv_clock;
+    return idx;
+}
+
+/* Apply the conversation-level half of a manifest line: the fields that belong
+ * to the conversation rather than to one of its rooms. Repeating across a
+ * conversation's rooms is intentional and idempotent. */
+static void agents_conv_apply(Conversation &a, const ConvManifestLine &ml) {
+    if (ml.label[0]) snprintf(a.label, sizeof(a.label), "%s", ml.label);
+    /* The ROUTE is resolved, not assigned: a seeded conversation keeps the
+     * transport and return address the firmware compiled in, whatever the card
+     * says. /conversations.txt is user-editable and transport now chooses the
+     * wire a reply leaves on — see conv_route_resolve() in ../transport.h. */
+    conv_route_resolve(a.seeded != 0,
+                       a.transport, a.reply_addr, a.reply_len,
+                       ml.transport, ml.reply, ml.reply_len,
+                       &a.transport, a.reply_addr, &a.reply_len);
+}
+
+/*
+ * IDS OF THE MESH PEERS THIS DEVICE HAS ACTUALLY MET, read straight from
+ * /contacts3 rather than from the radio's table.
+ *
+ * WHY NOT ASK THE MESH: the radio comes up ~5 s after boot (the deferred
+ * bring-up in skill_meshcore_poll), and conversations are restored during
+ * setup — so at the moment this question is asked the mesh has no table at all.
+ * The file is the same file the mesh will read, and reading it needs no radio.
+ *
+ * WHAT IT BUYS: a mesh conversation is only restored when its id matches a
+ * contact, so a line typed into /conversations.txt by hand cannot conjure a
+ * correspondent the device never heard advertise. It is a SECOND barrier —
+ * the send already refuses an unknown peer — and this one stops the forged
+ * conversation from appearing at all rather than only from being answerable.
+ */
+static char g_conv_known_ids[CONV_MAX * 2][CONV_ID_LEN];
+static uint8_t g_conv_known_n = 0;
+
+static void agents_known_peers_load() {
+    g_conv_known_n = 0;
+    /* THE MESH'S filesystem, not the conversation store's. g_store is the SD
+     * card whenever one mounts, and the contact table is written to SPIFFS —
+     * reading it from g_store on a card-equipped device finds nothing, refuses
+     * every mesh conversation, and the manifest rewrite straight after this
+     * then deletes the very records 1a exists to keep. */
+    fs::FS &cfs = mesh_contacts_fs();
+    if (!cfs.exists(MESH_CONTACTS_PATH)) return;
+    File f = cfs.open(MESH_CONTACTS_PATH, "r");
     if (!f) return;
-    char ln[AGENT_ID_LEN + 1 + AGENT_SESSION_LEN + 2];
-    AgentJScanner sc(f);
-    while (sc.next(ln, sizeof(ln))) {
-        if (!ln[0]) continue;
-        char *tab = strchr(ln, '\t');
-        if (!tab || !tab[1]) continue;
-        *tab = '\0';
-        int idx = agents_find(ln);
-        if (idx >= 0) agents_session_add(idx, tab + 1);
+    uint8_t buf[MESH_CONTACT_REC_LEN];
+    while (g_conv_known_n < (uint8_t)(CONV_MAX * 2) &&
+           f.read(buf, sizeof(buf)) == (int)sizeof(buf)) {
+        MeshContactRec r;
+        mesh_contact_unpack(buf, &r);
+        conv_peer_id(r.pub_key, MESH_CONTACT_PUBKEY_LEN,
+                     g_conv_known_ids[g_conv_known_n],
+                     sizeof(g_conv_known_ids[0]));
+        if (g_conv_known_ids[g_conv_known_n][0]) g_conv_known_n++;
     }
     f.close();
+}
+
+static bool agents_peer_is_known(const char *id) {
+    for (uint8_t i = 0; i < g_conv_known_n; i++)
+        if (strcmp(g_conv_known_ids[i], id) == 0) return true;
+    return false;
+}
+
+/* Fold one parsed manifest line into the live registry. A line naming an
+ * unknown conversation is skipped rather than minting one: a room invented
+ * from a stale id is a room nothing can ever answer.
+ *
+ * A ROOM-LESS LINE IS A REAL LINE, not a malformed one. A conversation that has
+ * no rooms — the shape a peer gets, keyed on its address alone — still has to
+ * survive a reboot, so its line carries an empty session field and restores the
+ * conversation's own fields without adding a room. Dropping such a line (which
+ * this used to do) meant the store could describe a peer conversation on disk
+ * and then silently forget it on the next boot. */
+static void agents_manifest_apply(const ConvManifestLine &ml) {
+    /* THE LOADER RESTORES WHAT WAS THERE, peers included. A line for a
+     * conversation this build does not hold is a peer coming back after a
+     * reboot, which is the entire reason its record was written.
+     *
+     * WHAT THIS COSTS, stated rather than hidden: /conversations.txt is a file
+     * on a card a user can pull and edit, and a restored peer is not seeded, so
+     * conv_route_resolve() takes its transport and return address from that
+     * file. Someone holding the card can therefore author a conversation whose
+     * replies go where they choose. That is a physical-access threat and it is
+     * accepted deliberately: the alternative, refusing to restore anything,
+     * made every chat vanish on every reboot — a certainty rather than a
+     * threat. Once the MeshCore contact table persists, a restored peer can be
+     * required to match a known contact, and this narrows.
+     *
+     * Never evicts while loading: a manifest longer than the table fills it and
+     * stops, rather than letting later lines throw out earlier ones. */
+    /* A MESH conversation must name a peer this device has met. LXMF has no
+     * contact notion — anyone holding the address can write — so the same test
+     * cannot be applied there and is not pretended at. */
+    if (ml.transport == CONV_MESH && !agents_peer_is_known(ml.conv)) {
+        g_conv_load_unknown++;
+        return;
+    }
+    int idx = conv_mint(ml.conv, ml.label, ml.transport, ml.reply, ml.reply_len,
+                        false);
+    if (idx < 0) {
+        /* COUNTED, BECAUSE THE NEXT THING BOOT DOES IS REWRITE THIS FILE.
+         * skill_agents_init runs load, then migrate, then persist — and persist
+         * rebuilds /conversations.txt from the table, so a line that could not
+         * be restored is gone from disk the same boot. The /conv.<id> history
+         * survives; the route that named it does not, and silently. Only
+         * reachable when the table is smaller than the card expects (a build
+         * with a lower cap, or a card moved between builds), and refusing is
+         * still right — keeping what came first beats evicting it. But it must
+         * not happen without saying so. */
+        g_conv_load_skipped++;
+        return;
+    }
+    Conversation &a = g_convs[idx];
+    agents_conv_apply(a, ml);
+    if (!ml.session[0]) return;         /* conversation-level line: no room */
+    int si = agents_session_add(idx, ml.session);
+    if (si < 0) return;
+    a.session_dead[si] = ml.dead;
+}
+
+/* Read one manifest file through the shared parser. Both the new 5-field lines
+ * and the legacy 2/3-field ones are handled there, so this is format-blind. */
+static void agents_manifest_read(const char *path) {
+    if (!g_store || !g_store->exists(path)) return;
+    File f = g_store->open(path, "r");
+    if (!f) return;
+    char ln[CONV_MANIFEST_LINE_LEN];
+    ConvManifestLine ml;
+    AgentJScanner sc(f);
+    while (sc.next(ln, sizeof(ln))) {
+        if (conv_manifest_parse(ln, &ml)) agents_manifest_apply(ml);
+    }
+    f.close();
+}
+
+/* Load the room registry.
+ *
+ * MIGRATION: READ BOTH, WRITE ONE. The legacy manifest is read first and the
+ * new one on top, so a card that has both ends up with the new file's flags
+ * winning; every persist after that writes only /conversations.txt. This beats
+ * a rewrite-in-place migration because there is no half-migrated state to
+ * recover from — the legacy file is never edited or removed (deleting a user's
+ * data is not this code's call), it simply stops being authoritative once the
+ * new one exists. */
+static void agents_manifest_load() {
+    g_conv_load_skipped = 0;
+    g_conv_load_unknown = 0;
+    {
+        HwSpiBusGuard bus;
+        agents_known_peers_load();   /* who we have met, before who wrote */
+        agents_manifest_read(CONV_MANIFEST_LEGACY);
+        agents_manifest_read(CONV_MANIFEST);
+    }
+    /* The same breadcrumb shape the log migration leaves: silence means nothing
+     * was lost, and a number turns "where did that chat go" into a question
+     * with an answer. Outside the bus guard. */
+    if (g_conv_load_skipped)
+        event_add("conv load skipped %u (table full)", g_conv_load_skipped);
+    if (g_conv_load_unknown)
+        event_add("conv load refused %u (no mesh contact)", g_conv_load_unknown);
 }
 
 static void agents_manifest_persist() {
     if (!agents_store_ready()) return;
     String out;
-    for (int i = 0; i < AGENTS_N; i++) {
-        AgentSlot &a = g_agents[i];
+    char line[CONV_MANIFEST_LINE_LEN];
+    for (int i = 0; i < g_conv_n; i++) {
+        Conversation &a = g_convs[i];
+        /* EVERY CONVERSATION IS WRITTEN, peers included. Keeping a peer's route
+         * in RAM only meant it lived exactly as long as the power did, and this
+         * device is rebooted constantly — so a chat you were having disappeared
+         * along with any way to answer it. A conversation that cannot survive a
+         * battery change is not a conversation. The route is device state now,
+         * and that is what makes replying after a reboot possible at all. */
+        if (a.n_sessions == 0) {
+            /* A conversation with no rooms still needs a line, or it vanishes
+             * on the next boot — see agents_manifest_apply. The session field
+             * is empty and the dead flag is 0: liveness is a property of a
+             * room, and this conversation has none to mark. */
+            if (conv_manifest_format(line, sizeof(line), a.id, "", a.label,
+                                     a.transport, a.reply_addr, a.reply_len, 0)) {
+                out += line;
+                out += '\n';
+            }
+            continue;
+        }
         for (int j = 0; j < a.n_sessions; j++) {
-            out += a.id; out += '\t'; out += a.sessions[j]; out += '\n';
+            if (!conv_manifest_format(line, sizeof(line), a.id, a.sessions[j],
+                                      a.label, a.transport, a.reply_addr,
+                                      a.reply_len, a.session_dead[j]))
+                continue;
+            out += line;
+            out += '\n';
         }
     }
     HwSpiBusGuard bus;  /* write burst only — manifest text built above */
-    File f = g_store->open(AGENT_MANIFEST, "w");
+    File f = g_store->open(CONV_MANIFEST, "w");
     if (!f) return;
     f.print(out);
     f.close();
@@ -469,21 +895,21 @@ static void agents_manifest_persist() {
 
 static int agents_find(const char *id) {
     if (!id || !id[0]) return -1;
-    for (int i = 0; i < AGENTS_N; i++) {
-        if (strcmp(g_agents[i].id, id) == 0) return i;
+    for (int i = 0; i < g_conv_n; i++) {
+        if (strcmp(g_convs[i].id, id) == 0) return i;
     }
     return -1;
 }
 
 static int agents_session_exists(int idx, const char *name) {
-    AgentSlot &a = g_agents[idx];
+    Conversation &a = g_convs[idx];
     for (int i = 0; i < a.n_sessions; i++)
         if (strcmp(a.sessions[i], name) == 0) return i;
     return -1;
 }
 
 static int agents_session_add(int idx, const char *name) {
-    AgentSlot &a = g_agents[idx];
+    Conversation &a = g_convs[idx];
     if (!name || !name[0]) return -1;
     int ex = agents_session_exists(idx, name);
     if (ex >= 0) return ex;
@@ -494,31 +920,47 @@ static int agents_session_add(int idx, const char *name) {
 }
 
 const char *agents_active_session(int idx) {
-    if (idx < 0 || idx >= AGENTS_N) return "";
-    return g_agents[idx].sessions[g_agents[idx].active_idx];
+    if (idx < 0 || idx >= g_conv_n) return "";
+    return g_convs[idx].sessions[g_convs[idx].active_idx];
 }
 
 int agents_session_count(int idx) {
-    if (idx < 0 || idx >= AGENTS_N) return 0;
-    return g_agents[idx].n_sessions;
+    if (idx < 0 || idx >= g_conv_n) return 0;
+    return g_convs[idx].n_sessions;
 }
 
 const char *agents_session_name(int idx, int i) {
-    if (idx < 0 || idx >= AGENTS_N || i < 0 || i >= g_agents[idx].n_sessions)
+    if (idx < 0 || idx >= g_conv_n || i < 0 || i >= g_convs[idx].n_sessions)
         return "";
-    return g_agents[idx].sessions[i];
+    return g_convs[idx].sessions[i];
 }
 
 bool agents_session_is_active(int idx, int i) {
-    if (idx < 0 || idx >= AGENTS_N || i < 0 || i >= g_agents[idx].n_sessions)
+    if (idx < 0 || idx >= g_conv_n || i < 0 || i >= g_convs[idx].n_sessions)
         return false;
-    return (i == g_agents[idx].active_idx);
+    return (i == g_convs[idx].active_idx);
 }
 
 int agents_session_msg_count(int idx, int i) {
-    if (idx < 0 || idx >= AGENTS_N || i < 0 || i >= g_agents[idx].n_sessions)
+    if (idx < 0 || idx >= g_conv_n || i < 0 || i >= g_convs[idx].n_sessions)
         return 0;
-    return (int)g_agents[idx].session_lines[i];
+    return (int)g_convs[idx].session_lines[i];
+}
+
+/* Liveness of session i (live-room roster). true => dead/hidden from picker. */
+bool agents_session_is_dead(int idx, int i) {
+    if (idx < 0 || idx >= g_conv_n || i < 0 || i >= g_convs[idx].n_sessions)
+        return false;
+    return g_convs[idx].session_dead[i] != 0;
+}
+
+/* Count of live (non-dead) sessions — the number of rows the picker shows. */
+int agents_session_visible_count(int idx) {
+    if (idx < 0 || idx >= g_conv_n) return 0;
+    Conversation &a = g_convs[idx];
+    int c = 0;
+    for (int i = 0; i < a.n_sessions; i++) if (!a.session_dead[i]) c++;
+    return c;
 }
 
 /* Recount every session's persisted lines for the agent (cache the counts so
@@ -528,9 +970,9 @@ int agents_session_msg_count(int idx, int i) {
  * away from the RAM index, re-sync (delta or full) so win_start/lines stay
  * consistent with view[]. */
 bool agents_session_refresh_counts(int idx) {
-    if (idx < 0 || idx >= AGENTS_N || !agents_store_ready()) return false;
+    if (idx < 0 || idx >= g_conv_n || !agents_store_ready()) return false;
     agents_lock();
-    AgentSlot &a = g_agents[idx];
+    Conversation &a = g_convs[idx];
     for (int j = 0; j < a.n_sessions; j++) {
         String path = agents_log_path(a.id, a.sessions[j]);
         uint32_t cnt = 0;
@@ -563,27 +1005,38 @@ bool agents_session_refresh_counts(int idx) {
             { HwSpiBusGuard bus; f.close(); }
         }
         a.session_lines[j] = cnt;
-        if (j == a.active_idx && a.lines != cnt)
-            agents_sync_view(idx);   // re-anchor window + win_start to the file
+        if (j == a.active_idx && a.lines != cnt) {
+            /* Re-anchor the window to the file only when this conversation IS
+             * the window — otherwise taking it would blank the open chat, and
+             * an unfocused conversation needs nothing but an honest count. */
+            if (g_win.owner == idx) agents_sync_view(idx);
+            else                    a.lines = cnt;
+        }
     }
     agents_unlock();
     return true;
 }
 
-/* Select an existing session: rewind + reload the viewport from SD. */
+/* Select an existing session. Reloads the scrollback from SD when this
+ * conversation is the one on screen; for any other conversation only the active
+ * room and its count move, because reloading would hand the window away from
+ * the chat the user is actually reading. The off-loop route drain selects rooms
+ * on conversations nobody is looking at, which is exactly that case. */
 bool agents_session_select(int idx, const char *name) {
-    if (idx < 0 || idx >= AGENTS_N || !name || !name[0]) return false;
+    if (idx < 0 || idx >= g_conv_n || !name || !name[0]) return false;
     agents_lock();
     int in_list = agents_session_exists(idx, name);
     if (in_list < 0) { agents_unlock(); return false; }
-    g_agents[idx].active_idx = (uint8_t)in_list;
-    g_agents[idx].file_sync = 0;
-    g_agents[idx].lines = 0;
-    g_agents[idx].vn = 0;
-    g_agents[idx].win_start = 0;
-    agents_sync_view(idx);
-    g_agents[idx].win_start = (g_agents[idx].lines > g_agents[idx].vn)
-        ? (g_agents[idx].lines - g_agents[idx].vn) : 0;
+    Conversation &a = g_convs[idx];
+    a.active_idx = (uint8_t)in_list;
+    a.last_use = ++g_conv_clock;
+    if (g_win.owner == idx) {
+        agents_window_take(idx);            // empty it: a different room now
+        agents_sync_view(idx);
+        g_win.win_start = (a.lines > g_win.vn) ? (a.lines - g_win.vn) : 0;
+    } else {
+        a.lines = a.session_lines[in_list];
+    }
     agents_unlock();
     return true;
 }
@@ -591,9 +1044,9 @@ bool agents_session_select(int idx, const char *name) {
 /* Create a fresh session (or reuse an existing name) and make it active.
  * Returns the index in the session list, or -1 on full/empty. */
 int agents_session_create(int idx, const char *wanted, bool &created) {
-    if (idx < 0 || idx >= AGENTS_N) return -1;
+    if (idx < 0 || idx >= g_conv_n) return -1;
     agents_lock();
-    AgentSlot &a = g_agents[idx];
+    Conversation &a = g_convs[idx];
     char name[AGENT_SESSION_LEN];
     if (wanted && wanted[0]) {
         agents_session_sanitize(wanted, name, sizeof(name));
@@ -613,7 +1066,9 @@ int agents_session_create(int idx, const char *wanted, bool &created) {
         in_list = agents_session_add(idx, name);
     }
     a.active_idx = (uint8_t)in_list;
-    a.file_sync = 0; a.lines = 0; a.vn = 0; a.win_start = 0;
+    a.last_use = ++g_conv_clock;
+    a.lines = 0;
+    if (g_win.owner == idx) agents_window_take(idx);
     if (created) agents_manifest_persist();
     event_add("agent %s session %s %s", a.id,
               created ? "new" : "select", name);
@@ -627,27 +1082,28 @@ int agents_session_create(int idx, const char *wanted, bool &created) {
  * end_line (exclusive), by one forward scan (keeps a sliding window). Used for
  * scrolling back through very long history. Caller holds no lock (internal). */
 static void agents_load_page(int idx, uint32_t end_line) {
-    AgentSlot &a = g_agents[idx];
+    Conversation &a = g_convs[idx];
     if (!agents_store_ready()) return;
+    g_win.owner = idx;                  /* paging is an explicit focus */
     if (end_line > a.lines) end_line = a.lines;
     uint32_t keep_from = (end_line > AGENT_VIEW_MAX) ? (end_line - AGENT_VIEW_MAX) : 0;
     String path = agents_log_path(a.id, a.sessions[a.active_idx]);
     /* Page scan runs from byte 0; bound its bus hold in chunks (mux held). */
     File f;
     { HwSpiBusGuard bus; f = g_store->open(path.c_str(), "r"); }
-    if (!f) { a.vn = 0; a.win_start = 0; return; }
+    if (!f) { g_win.vn = 0; g_win.win_start = 0; return; }
     char lbuf[AGENT_JSONL_MAX];
     char text[AGENT_TEXT_LEN];
     uint32_t line_idx = 0;
-    a.vn = 0;
-    a.win_start = keep_from;
+    g_win.vn = 0;
+    g_win.win_start = keep_from;
     AgentJScanner sc(f);
     agents_scan_chunked(sc, lbuf, sizeof(lbuf), [&](char *line) {
         bool from_me;
         uint32_t ts;
         if (line[0] && line_idx >= keep_from && line_idx < end_line &&
             agents_jsonl_parse(line, from_me, ts, text, sizeof(text))) {
-            agents_view_append(a, from_me, ts, text);
+            agents_view_append(g_win, from_me, ts, text);
         }
         line_idx++;
     });
@@ -658,15 +1114,19 @@ static void agents_load_page(int idx, uint32_t end_line) {
  * was browsing an old page the window is stale, so force a full rebuild; if it
  * is already the tail, a cheap delta-sync folds any new arrivals. */
 void agents_thread_goto_tail(int idx) {
-    if (idx < 0 || idx >= AGENTS_N) return;
+    if (idx < 0 || idx >= g_conv_n) return;
     agents_lock();
-    AgentSlot &a = g_agents[idx];
-    bool at_tail = ((uint32_t)a.win_start + a.vn) >= a.lines;
-    if (!at_tail) {
-        a.file_sync = 0; a.lines = 0; a.vn = 0;
-    }
+    Conversation &a = g_convs[idx];
+    /* This is THE focus point: opening a chat calls it, so it is where the
+     * window changes hands. A window loaded for someone else is stale by
+     * definition and rebuilds; so does a window parked on an older page. */
+    bool at_tail = (g_win.owner == idx) &&
+                   (((uint32_t)g_win.win_start + g_win.vn) >= a.lines);
+    if (!at_tail) agents_window_take(idx);
+    a.last_use = ++g_conv_clock;
+    a.unread = 0;                       /* opening it is reading it */
     agents_sync_view(idx);
-    a.win_start = (a.lines > a.vn) ? (a.lines - a.vn) : 0;
+    g_win.win_start = (a.lines > g_win.vn) ? (a.lines - g_win.vn) : 0;
     agents_unlock();
 }
 
@@ -676,11 +1136,11 @@ void agents_thread_goto_tail(int idx) {
  * Page-load rescans the file from byte 0 (O(up-to-end)); realistic session
  * sizes are fast, and the newest page is always O(delta). */
 void agents_thread_goto_page(int idx, uint32_t end_line) {
-    if (idx < 0 || idx >= AGENTS_N) return;
+    if (idx < 0 || idx >= g_conv_n) return;
     agents_lock();
-    AgentSlot &a = g_agents[idx];
+    Conversation &a = g_convs[idx];
     if (end_line >= a.lines) {
-        a.vn = 0; a.win_start = a.lines;
+        g_win.owner = idx; g_win.vn = 0; g_win.win_start = a.lines;
     } else {
         agents_load_page(idx, end_line);
     }
@@ -688,30 +1148,32 @@ void agents_thread_goto_page(int idx, uint32_t end_line) {
 }
 
 uint32_t agents_thread_total(int idx) {
-    return (idx >= 0 && idx < AGENTS_N) ? g_agents[idx].lines : 0;
+    return (idx >= 0 && idx < g_conv_n) ? g_convs[idx].lines : 0;
 }
 
+/* The three below describe the WINDOW, so they answer for the conversation the
+ * window is loaded for. Asked about any other conversation they report the
+ * harmless "nothing scrolled, at the tail" state rather than another
+ * conversation's scroll position. */
 uint32_t agents_thread_start(int idx) {
-    return (idx >= 0 && idx < AGENTS_N) ? g_agents[idx].win_start : 0;
+    return (idx >= 0 && idx < g_conv_n && g_win.owner == idx) ? g_win.win_start : 0;
 }
 
 bool agents_thread_is_tail(int idx) {
-    if (idx < 0 || idx >= AGENTS_N) return true;
-    const AgentSlot &a = g_agents[idx];
-    return ((uint32_t)a.win_start + a.vn) >= a.lines;
+    if (idx < 0 || idx >= g_conv_n || g_win.owner != idx) return true;
+    return ((uint32_t)g_win.win_start + g_win.vn) >= g_convs[idx].lines;
 }
 
 uint32_t agents_thread_line_ts(int idx, int i) {
-    if (idx < 0 || idx >= AGENTS_N) return 0;
-    const AgentSlot &a = g_agents[idx];
-    return (i >= 0 && i < a.vn) ? a.view[i].ts : 0;
+    if (idx < 0 || idx >= g_conv_n || g_win.owner != idx) return 0;
+    return (i >= 0 && i < g_win.vn) ? g_win.view[i].ts : 0;
 }
 
 /* Read the very last message of the active session straight from the store
  * (used by GET /agents when the RAM window is a rewound page, not the tail). */
 static bool agents_file_last(int idx, char *text, size_t text_n,
                              bool *from_me, uint32_t *ts) {
-    AgentSlot &a = g_agents[idx];
+    Conversation &a = g_convs[idx];
     if (!agents_store_ready()) return false;
     String path = agents_log_path(a.id, a.sessions[a.active_idx]);
     /* GET /agents runs on the AsyncTCP task; scan the whole file for its last
@@ -752,7 +1214,7 @@ static int agents_utf8_len(const char *s) {
  * (locks itself; callers that already hold the recursive lock are fine). */
 static void agents_push_line(int idx, bool from_me, const char *text) {
     agents_lock();
-    if (idx < 0 || idx >= AGENTS_N || !text || !text[0]) {
+    if (idx < 0 || idx >= g_conv_n || !text || !text[0]) {
         agents_unlock();
         return;
     }
@@ -792,28 +1254,59 @@ static void agents_push_line(int idx, bool from_me, const char *text) {
 
 /* Chronological view (oldest first) for the scrollable chat. Synced from SD
  * first. Returns count. Caller may hold the lock (recursive + sync locks). */
-/* Copy the current window (oldest→newest) for the chat renderer. No disk
- * reads here — goto_tail / goto_page own the sync. ts_out[i] is the message
- * unix ts (0 = unknown). Returns count. Caller may hold the recursive lock. */
+/* Copy the current window (oldest→newest) for the chat renderer. goto_tail /
+ * goto_page own the sync, so this is normally a pure RAM copy. ts_out[i] is the
+ * message unix ts (0 = unknown). Returns count. Caller may hold the lock.
+ *
+ * The one disk case is a SAFETY NET: if the renderer asks for a conversation
+ * the window is not loaded for, it is loaded here rather than drawing an empty
+ * chat. Opening a chat calls agents_thread_goto_tail first, so this costs
+ * nothing in the normal path — and when it does fire it is the same scan that
+ * goto_tail would have run, on the same task. A blank thread is not an
+ * acceptable alternative. */
 int agents_thread_view(int idx, char out[][AGENT_TEXT_LEN], bool *from_me,
                        uint32_t *ts_out, int max_lines) {
-    if (idx < 0 || idx >= AGENTS_N || max_lines <= 0) return 0;
+    if (idx < 0 || idx >= g_conv_n || max_lines <= 0) return 0;
     int n = 0;
     agents_lock();
-    AgentSlot &a = g_agents[idx];
-    n = a.vn < max_lines ? a.vn : max_lines;
+    if (g_win.owner != idx) agents_thread_goto_tail(idx);
+    n = g_win.vn < max_lines ? g_win.vn : max_lines;
     for (int i = 0; i < n; i++) {
-        snprintf(out[i], AGENT_TEXT_LEN, "%s", a.view[i].text);
-        if (from_me) from_me[i] = a.view[i].from_me;
-        if (ts_out)  ts_out[i] = a.view[i].ts;
+        snprintf(out[i], AGENT_TEXT_LEN, "%s", g_win.view[i].text);
+        if (from_me) from_me[i] = g_win.view[i].from_me;
+        if (ts_out)  ts_out[i] = g_win.view[i].ts;
     }
     agents_unlock();
     return n;
 }
 
+/* List-model accessors (main.cpp builds its inbox snapshot from these under
+ * agents_lock; see ../inbox_view.h for what it does with them). */
+uint8_t agents_transport(int idx) {
+    return (idx >= 0 && idx < g_conv_n) ? g_convs[idx].transport : (uint8_t)CONV_AGENT;
+}
+uint16_t agents_unread(int idx) {
+    return (idx >= 0 && idx < g_conv_n) ? g_convs[idx].unread : 0;
+}
+uint32_t agents_last_use(int idx) {
+    return (idx >= 0 && idx < g_conv_n) ? g_convs[idx].last_use : 0;
+}
+/* Unix second of the newest message — the merge key the unified Messages feed
+ * (src/feed_view.h) orders a conversation on, against a card's created_epoch.
+ * NOT last_use, which is a boot-relative eviction counter and not comparable
+ * across the two stores. 0 when the thread has no dated message yet. */
+uint32_t agents_last_ts(int idx) {
+    return (idx >= 0 && idx < g_conv_n) ? g_convs[idx].last.ts : 0;
+}
+/* Rooms are an agent concept: a seeded conversation has them and its row opens
+ * the room picker, a minted peer has none and its row opens the chat. */
+bool agents_has_rooms(int idx) {
+    return (idx >= 0 && idx < g_conv_n) && g_convs[idx].n_sessions > 0;
+}
+
 static int agents_thread_count(int idx) {
-    if (idx < 0 || idx >= AGENTS_N) return 0;
-    return g_agents[idx].lines;
+    if (idx < 0 || idx >= g_conv_n) return 0;
+    return g_convs[idx].lines;
 }
 
 static void agents_bridge_load() {
@@ -837,7 +1330,7 @@ static bool agents_bridge_save(const char *url) {
     }
     if (strncmp(url, "http://", 7) != 0) return false;
     if (strlen(url) >= AGENT_BRIDGE_LEN) return false;
-    /* Atomic (C8): a power cut mid-write must never leave an empty bridge
+    /* Atomic: a power cut mid-write must never leave an empty bridge
      * file — agents_bridge_load treats it as "no bridge configured". */
     if (!write_spiffs_file_atomic(AGENT_BRIDGE_FILE, AGENT_BRIDGE_TMP,
                                   String(url)))
@@ -914,12 +1407,26 @@ static void agents_clean_text(const char *in, char *out, size_t out_n) {
     out[j] = '\0';
 }
 
-/* Optional mesh uplink (registered by meshcore skill). Same C1 framing as downlink. */
+/* Optional mesh uplink (registered by meshcore skill). Same framing as downlink. */
 typedef bool (*AgentsMeshUplinkFn)(const char *agent_id, const char *text);
 static AgentsMeshUplinkFn g_agents_mesh_uplink = nullptr;
 
 static void agents_set_mesh_uplink(AgentsMeshUplinkFn fn) {
     g_agents_mesh_uplink = fn;
+}
+
+/* Peer reply submit, registered the same way and for the same reason: THIS FILE
+ * MUST NOT TOUCH THE MESHCORE STACK. sendMessage allocates from the packet
+ * pool, runs the ECDH and arms the ACK — state the loop task drives with no
+ * lock — and a reply can originate on the AsyncTCP task (POST /agents/send
+ * resolves any conversation). So the mesh skill hands in a submit that only
+ * fills a slot, and the send happens on the loop task where the stack lives. */
+typedef bool (*AgentsMeshPeerSendFn)(const uint8_t *pubkey, const char *text,
+                                     const char **why);
+static AgentsMeshPeerSendFn g_agents_mesh_peer_send = nullptr;
+
+static void agents_set_mesh_peer_send(AgentsMeshPeerSendFn fn) {
+    g_agents_mesh_peer_send = fn;
 }
 
 /* ---- GPS location door-card ("where are you?" interception) ---------------
@@ -933,7 +1440,7 @@ static void agents_set_mesh_uplink(AgentsMeshUplinkFn fn) {
 
 #define AGENT_GPS_FRESH_S 60    /* mirror gps.cpp GPS_FRESH_S */
 
-static bool g_agents_gps_pending[AGENTS_N];
+static bool g_agents_gps_pending[CONV_MAX];
 
 /* Case-insensitive substring (lowercase only ASCII; needles are ASCII/Cyrillic). */
 static bool agents_ci_has(const char *hay, const char *needle) {
@@ -981,8 +1488,8 @@ static bool agents_loc_card(int idx) {
     }
     /* real_inbound: the fix can land minutes after the question — from the
      * user's side this is an answer arriving in the room, not an error line. */
-    agents_on_inbound(g_agents[idx].id, line, true);
-    event_add("agent %s gps %s", g_agents[idx].id, fresh ? "located" : "pending");
+    agents_on_inbound(g_convs[idx].id, line, true);
+    event_add("agent %s gps %s", g_convs[idx].id, fresh ? "located" : "pending");
     return fresh;
 }
 
@@ -999,7 +1506,7 @@ static bool agents_gps_intercept(int idx, const char *text) {
 /* gps.cpp on-fix hook: resolve every pending "where are you?" agent. Cheap
  * no-op when nothing is pending (runs once per RMC 'A', ~1/s). */
 static void agents_gps_on_fix(void) {
-    for (int i = 0; i < AGENTS_N; i++) {
+    for (int i = 0; i < g_conv_n; i++) {
         if (g_agents_gps_pending[i]) {
             g_agents_gps_pending[i] = false;
             agents_loc_card(i);
@@ -1017,11 +1524,231 @@ void agents_gps_pending(const char *agent_id) {
     }
 }
 
-/* Public: send a line as the user, into the agent's ACTIVE session.
- * Path: local thread/history → owned transport. OpenCode and Codex have
- * dedicated gateway inboxes and always use C1; the legacy /v1/chat bridge
- * would create a second, ambiguous consumer while WiFi is up.
- * Downlink reply uses the same C1 (or WiFi /agents/inbound). One chat loop. */
+/* Try to put this line on the wire as a Reticulum envelope. `claude` only.
+ *
+ * WHY `claude` AND NOT EVERY AGENT. The room this closes the loop for is the
+ * one whose INBOUND half already works: claude_route_incoming() above lands a
+ * peer's envelope in a `claude` room by session name, and this is the reply
+ * path for exactly that. `hermes`, the only other agent left in the registry,
+ * has its own chat door and no inbound RNS half at all; giving it an RNS uplink
+ * would be a second, ambiguous consumer answering into a room the peer never
+ * routes back to.
+ *
+ * THE SESSION FIELD IS THE ROOM'S OWN NAME, which is the whole reason this is
+ * not just "send some text": the peer routes its answer back by that name, so a
+ * message typed in room `claude-pager-channel` is answered into
+ * `claude-pager-channel` and not into whichever room happened to be newest.
+ * Room names are already sanitised to [A-Za-z0-9._-] within 23 usable bytes,
+ * which is exactly what the envelope accepts; a name that somehow is not comes
+ * back as "bad session name" rather than going out mislabelled.
+ *
+ * NOTHING HERE BLOCKS AND NOTHING HERE TOUCHES THE STACK. rns_send_envelope()
+ * validates, builds and enqueues under the producer spinlock and returns; the
+ * loop task resolves the path and encrypts. That is what makes it safe to call
+ * from here, which is the keyboard path on the loop task in one caller
+ * (ui_reply_submit) and the AsyncTCP task in the other (POST /agents/send).
+ *
+ * Returns true when the message is QUEUED, not when it is delivered — the
+ * outcome is in GET /rns/status. On false, *why is a short static literal
+ * naming the one thing that is wrong. */
+static bool agents_rns_uplink(const char *agent_id, const char *session,
+                              const char *text, const char **why) {
+    char peer[RNS_OUTBOX_ADDR_HEX + 1];
+    *why = nullptr;
+    if (strcmp(agent_id, "claude") != 0) return false;
+    /* The failure the user can actually fix, so it is named on its own rather
+     * than folded into whatever rns_send_envelope() would say about an empty
+     * destination. */
+    if (!rns_peer_addr(peer, sizeof(peer))) {
+        *why = "no peer address";
+        return false;
+    }
+    /* ASKED HERE AND NOT INSIDE THE SEND, because a room is the one caller that
+     * has somewhere else to go. The ring's retry ladder is built to hold a
+     * message while a path resolves, so POST /rns/send is right to accept one
+     * over a link that is momentarily down; a room would rather fall back to
+     * the bridge and say which path it used. */
+    if (!rns_link_up()) {
+        *why = "link down";
+        return false;
+    }
+    return rns_send_envelope(peer, session, text, why);
+}
+
+/* ---- transport backends --------------------------------------------------- *
+ *
+ * One backend per wire, each reached only through transport_send() below. The
+ * ladder that used to sit inline in agents_send() lives in the CONV_AGENT
+ * backend now, unchanged — which is the point: agents_send() no longer knows
+ * that `claude` has a Reticulum uplink and `hermes` does not. That is a
+ * property of the agent wire, and when the mesh messenger generalises it, only
+ * this backend changes. */
+
+/* CONV_AGENT: the existing ladder, byte for byte.
+ *
+ * The `claude` tests inside it are NOT dispatch — dispatch is done by the time
+ * we get here. They are this backend's internal routing, and both are load
+ * bearing: the LXMF origin table is keyed by ROOM NAME ALONE (lxmf_reply.h), so
+ * dropping the check would let a `hermes` room that merely shares a name with a
+ * `claude` room inherit its LXMF sender; and the Reticulum peer is a single
+ * configured address, so offering it to every agent would put `hermes` traffic
+ * on a link the user configured for something else. */
+static bool transport_send_agent(int idx, const char *conv_id, const char *session,
+                                 const char *text) {
+    /* LXMF-ORIGIN ROOMS ANSWER AS LXMF, and BEFORE the seed.pager uplink below.
+     * If this room last received an LXMF message, its reply goes back to THAT
+     * sender over lxmf.delivery, not to the configured seed.pager peer — which
+     * is a different node. A build/enqueue failure does NOT fall through to
+     * seed.pager: that peer is not the LXMF sender and would misdeliver, so the
+     * fault is put in the room (one short line) and the reply stops here. */
+    if (strcmp(conv_id, "claude") == 0) {
+        uint8_t lxmf_dest[16];
+        if (rns_lxmf_reply_target(session, lxmf_dest)) {
+            const char *lx_why = nullptr;
+            if (rns_send_lxmf_reply(lxmf_dest, text, &lx_why)) {
+                event_add("agent %s lxmf reply", conv_id);
+            } else {
+                char line[64];
+                snprintf(line, sizeof(line), "(lxmf: %s)",
+                         lx_why ? lx_why : "not sent");
+                agents_push_line(idx, false, line);
+                display_force = true;
+            }
+            return true;
+        }
+    }
+
+    /* RETICULUM FIRST FOR `claude`, and it is a real first: the bridge below is
+     * the fallback now, not the primary. `rns_why` doubles as "RNS was tried
+     * and did not take it", which is what makes the fallback visible instead of
+     * a silent downgrade to a path the user did not choose. */
+    const char *rns_why = nullptr;
+    if (agents_rns_uplink(conv_id, session, text, &rns_why)) {
+        event_add("agent %s rns uplink", conv_id);
+        return true;
+    }
+
+    /* Everything that reaches here tries the bridge first and the C1 DM after,
+     * which is the ladder the remaining pair has always wanted. */
+    bool wifi_ok = agents_bridge_post(conv_id, session, text);
+    bool mesh_ok = false;
+    if (!wifi_ok && g_agents_mesh_uplink) {
+        mesh_ok = g_agents_mesh_uplink(conv_id, text);
+        if (mesh_ok) event_add("agent %s mesh uplink", conv_id);
+    }
+    if (rns_why) {
+        /* ONE SHORT LINE, ALWAYS, and it replaces the bridge's own complaint
+         * rather than joining it: for `claude` the peer address is the path the
+         * user configured, so naming what is wrong with THAT is more use than
+         * naming what is wrong with the path they did not pick. Two lines for
+         * one keystroke would also push the message they just typed off a
+         * seven-row screen. */
+        char line[64];
+        snprintf(line, sizeof(line), "(rns: %s%s)", rns_why,
+                 (wifi_ok || mesh_ok) ? " - sent via bridge" : "");
+        agents_push_line(idx, false, line);
+        display_force = true;
+    } else if (!wifi_ok && !mesh_ok) {
+        if (g_bridge[0] && WiFi.status() != WL_CONNECTED)
+            agents_push_line(idx, false, "(offline - mesh failed)");
+        else if (g_bridge[0])
+            agents_push_line(idx, false, "(bridge offline)");
+        else if (g_agents_mesh_uplink)
+            agents_push_line(idx, false, "(mesh failed)");
+        else
+            agents_push_line(idx, false, "(no bridge / mesh)");
+        display_force = true;
+    }
+    return true;
+}
+
+/* CONV_LXMF: answer the sender this conversation was opened by. The address is
+ * the one the planner handed back — the conversation's own stored source hash,
+ * not a room-name lookup and not the configured Reticulum peer. */
+static bool transport_send_lxmf(const uint8_t *addr, const char *text,
+                                const char **why) {
+    return rns_send_lxmf_reply(addr, text, why);
+}
+
+/* CONV_MESH: a DM straight to the peer's public key.
+ *
+ * The address is the planner's output — this conversation's own stored key —
+ * and mesh_client_send_to_peer() resolves THAT peer's contact. It is not built
+ * on the gateway send and must never fall back to it: the gateway is a
+ * different node, so a fallback would deliver a private reply to a third party
+ * rather than fail. A refusal (radio down, peer not a known contact, or a
+ * private send already awaiting its ACK) comes back with a reason that the
+ * room shows, and the user can retry. */
+static bool transport_send_mesh(const uint8_t *addr, uint8_t addr_len,
+                                const char *text, const char **why) {
+    if (addr_len != TRANSPORT_MESH_ADDR_LEN) {
+        if (why) *why = "bad peer key";
+        return false;
+    }
+    if (!g_agents_mesh_peer_send) {
+        if (why) *why = "no mesh";
+        return false;
+    }
+    /* SUBMIT, not send: the radio belongs to the loop task and this can be
+     * running on AsyncTCP. Returns true when the reply is accepted for the
+     * next tick, which is the same "queued, not delivered" contract the
+     * Reticulum uplink has. */
+    return g_agents_mesh_peer_send(addr, text, why);
+}
+
+/*
+ * THE one outbound seam. Chosen by conv->transport, never by a conversation's
+ * name: adding a wire means adding a backend above, not another branch in the
+ * chat path. The active room is read off the conversation so no caller has to
+ * pass — or pick — one.
+ */
+bool transport_send(const struct Conversation *conv, const char *text) {
+    if (!conv || !text || !text[0]) return false;
+    int idx = agents_find(conv->id);
+    if (idx < 0) return false;
+
+    TransportTarget tgt;
+    tgt.transport = conv->transport;
+    tgt.reply_addr = conv->reply_addr;
+    tgt.reply_len = conv->reply_len;
+
+    uint8_t backend = TRANSPORT_BACKEND_NONE;
+    const uint8_t *addr = nullptr;
+    uint8_t addr_len = 0;
+    int plan = transport_plan(&tgt, &backend, &addr, &addr_len);
+
+    const char *why = nullptr;
+    bool ok = false;
+    if (plan != TRANSPORT_OK) {
+        why = (plan == TRANSPORT_NO_ADDRESS) ? "no return address"
+                                             : "unknown transport";
+    } else if (backend == TRANSPORT_BACKEND_AGENT) {
+        /* Owns its own in-room reporting (the bridge/RNS ladder's error lines). */
+        return transport_send_agent(idx, conv->id,
+                                    conv->sessions[conv->active_idx], text);
+    } else if (backend == TRANSPORT_BACKEND_LXMF) {
+        ok = transport_send_lxmf(addr, text, &why);
+        if (ok) event_add("conv %s lxmf reply", conv->id);
+    } else if (backend == TRANSPORT_BACKEND_MESH_PEER) {
+        ok = transport_send_mesh(addr, addr_len, text, &why);
+    }
+
+    if (!ok) {
+        /* One short line in the room, same shape the agent ladder uses: a
+         * seven-row screen cannot afford two, and a silent failure is how a
+         * message the user believes they sent disappears. */
+        char line[64];
+        snprintf(line, sizeof(line), "(send: %s)", why ? why : "not sent");
+        agents_push_line(idx, false, line);
+        display_force = true;
+    }
+    return ok;
+}
+
+/* Public: send a line as the user, into the conversation's ACTIVE room.
+ * Path: local thread/history → transport_send(), which picks the wire from the
+ * conversation record. Downlink replies arrive on the same wire (or WiFi
+ * /agents/inbound). One chat loop. */
 static bool agents_send(const char *agent_id, const char *text) {
     int idx = agents_find(agent_id);
     if (idx < 0 || !text || !text[0]) return false;
@@ -1040,27 +1767,11 @@ static bool agents_send(const char *agent_id, const char *text) {
     agents_unlock();
     display_force = true;
 
-    bool mesh_owned = strcmp(agent_id, "codex") == 0 ||
-                      strcmp(agent_id, "opencode") == 0;
-    bool wifi_ok = mesh_owned
-        ? false
-        : agents_bridge_post(agent_id, agents_active_session(idx), cleaned);
-    bool mesh_ok = false;
-    if ((mesh_owned || !wifi_ok) && g_agents_mesh_uplink) {
-        mesh_ok = g_agents_mesh_uplink(agent_id, cleaned);
-        if (mesh_ok) event_add("agent %s mesh uplink", agent_id);
-    }
-    if (!wifi_ok && !mesh_ok) {
-        if (g_bridge[0] && WiFi.status() != WL_CONNECTED)
-            agents_push_line(idx, false, "(offline - mesh failed)");
-        else if (g_bridge[0])
-            agents_push_line(idx, false, "(bridge offline)");
-        else if (g_agents_mesh_uplink)
-            agents_push_line(idx, false, "(mesh failed)");
-        else
-            agents_push_line(idx, false, "(no bridge / mesh)");
-        display_force = true;
-    }
+    transport_send(&g_convs[idx], cleaned);
+    /* The room already carries the outcome (the backend puts one line in it on
+     * failure), and the caller's contract has always been "accepted into the
+     * thread", not "delivered" — GET /agents and the transport status routes
+     * are where delivery is reported. */
     return true;
 }
 
@@ -1080,6 +1791,346 @@ static void agents_on_inbound(const char *agent_id, const char *text,
     display_force = true;
 }
 
+/*
+ * THE one inbound message door (declared in ../transport.h). A transport that
+ * has received a chat line hands it here instead of reaching into the store.
+ *
+ * `via` is CHECKED, not decoration: a conversation is only fed by the wire it
+ * lives on, so a sender on one transport cannot land a line in another's room
+ * by guessing its id. Creating a conversation for a peer nobody has met is the
+ * receive half and belongs with the receivers that need it, so an unknown
+ * peer_id is refused here rather than silently minted.
+ */
+bool inbox_deliver_msg(uint8_t via, const char *peer_id, const char *label,
+                       const char *text) {
+    if (!peer_id || !peer_id[0] || !text || !text[0]) return false;
+    int idx = agents_find(peer_id);
+    if (idx < 0) return false;
+    agents_lock();
+    Conversation &a = g_convs[idx];
+    bool wire_ok = (a.transport == via);
+    /* A sender's display name may change between messages; the id may not. */
+    if (wire_ok && label && label[0] && !a.seeded)
+        snprintf(a.label, sizeof(a.label), "%s", label);
+    agents_unlock();
+    if (!wire_ok) return false;
+    agents_on_inbound(a.id, text, true);   /* sets the arrival flag + repaint */
+    return true;
+}
+
+/* ---- chat-route seam: claude_route_incoming() ----------------------------- *
+ *
+ * A transport session (skills/rns.cpp) parses an incoming chat reply out of its
+ * envelope and hands it here to land in the correct on-screen "room" (session)
+ * of the `claude` agent, selected by name. The declaration + the pure planner
+ * (agents_route_plan / agents_route_sanitize) live in ../agents_chat_route.h.
+ *
+ * LOOP-SAFETY (non-negotiable): the transport calls this on the LOOP task right
+ * after rns_stack.loop(). A synchronous SD write there would seize the shared
+ * FSPI bus the history writer and the panel paint also live on. So the caller
+ * does ONLY RAM work (sanitise + registry snapshot + reason code under
+ * agents_mux) and hands the cleaned message to a dedicated off-loop FreeRTOS
+ * drain task via a by-value queue, then returns. The drain task
+ * (agents_route_task) is the ONLY place the route path touches SD: it
+ * selects/creates the room (manifest write), reloads the room view from SD, and
+ * appends the message (JSONL append) — all off the loop task. The screen
+ * updates when the drain task folds the line into the RAM view and raises
+ * display_force; it is never gated on the SD write. */
+
+/* One queued incoming reply, copied into the FreeRTOS queue by value so the
+ * caller never shares memory with the drain task. text is already cleaned and
+ * bounded (agents_clean_text) — the third untrusted-input barrier after the mac
+ * and the transport receiver. */
+struct AgentRouteItem {
+    uint8_t kind;                       /* 0 = chat message, 1 = roster, 2 = mesh peer message */
+    bool newest;                        /* empty name => newest-active room */
+    char session[AGENT_SESSION_LEN];    /* kind 0/1: room; kind 2: sender display name */
+    char text[AGENT_TEXT_LEN];          /* kind 0/2: cleaned message; kind 1: roster payload */
+    /* kind 2 only: the peer's public key — its identity and its return address.
+     * Carried by value like everything else here, so the drain task never
+     * shares memory with the radio callback that produced it. */
+    uint8_t peer[CONV_REPLY_MAX];
+    uint8_t peer_len;
+    uint8_t via;                        /* kind 2: CONV_MESH or CONV_LXMF */
+};
+
+#define AGENT_ROUTE_QUEUE_DEPTH  8      /* by-value queue: 8 x ~537 B ~= 4.3 KB */
+#define AGENT_ROUTE_TASK_STACK   8192   /* drain task does SD scans (sync_view lbuf) */
+#define AGENT_ROUTE_TASK_PRIO    1      /* same low prio as the history write task */
+
+static QueueHandle_t g_route_q    = nullptr;
+static TaskHandle_t  g_route_task = nullptr;
+
+/* Off-loop roster apply (kind==1): the ONLY place the roster path touches SD.
+ * Runs the pure reconcile against the claude agent's sessions[] and REPLACES
+ * the liveness view (full snapshot): listed rooms un-mark alive, unlisted rooms
+ * go dead only on a complete list (!incomplete); an incomplete list (+N) leaves
+ * unlisted rooms untouched. Never creates rooms for unknown labels (V1 does not
+ * auto-create — the roster reports liveness of KNOWN rooms). MARK-NOT-DELETE:
+ * the JSONL history is never removed. Persists the flags and repaints. */
+static void agents_roster_apply(int idx, const char *payload) {
+    if (idx < 0) return;
+    int nlive = 0, ndead = 0, incomplete = 0;
+    agents_lock();
+    Conversation &a = g_convs[idx];
+    const char *names[AGENT_SESSIONS_MAX];
+    int n = a.n_sessions;
+    if (n > AGENT_SESSIONS_MAX) n = AGENT_SESSIONS_MAX;
+    for (int i = 0; i < n; i++) names[i] = a.sessions[i];
+    uint8_t action[AGENT_SESSIONS_MAX];
+    agents_roster_reconcile(payload, names, n, action, &incomplete);
+    bool changed = false;
+    for (int i = 0; i < n; i++) {
+        uint8_t want = a.session_dead[i];       /* UNCHANGED keeps current view */
+        if (action[i] == AGENT_ROSTER_ALIVE)      want = 0;
+        else if (action[i] == AGENT_ROSTER_DEAD)  want = 1;
+        if (want != a.session_dead[i]) { a.session_dead[i] = want; changed = true; }
+    }
+    for (int i = 0; i < n; i++) { if (a.session_dead[i]) ndead++; else nlive++; }
+    if (changed) agents_manifest_persist();
+    agents_unlock();
+    event_add("agent claude roster live=%d dead=%d%s", nlive, ndead,
+              incomplete ? " +N" : "");
+    display_force = true;                        /* repaint the room picker */
+}
+
+/* The peer id derivation (conv_peer_id, first CONV_PEER_ID_BYTES of the address
+ * as hex) is pure and now lives in ../conv_store.h, so both this store and the
+ * Contacts screen key a peer the one way. */
+
+/* Off-loop half of a peer message (kind 2), for EITHER address-carrying wire:
+ * mint the conversation if this sender is new and append the line. All of it is
+ * SD work, which is exactly why it happens here and not in the receive
+ * callback. The wire is in item.via and the address width follows from it — a
+ * 32-byte mesh public key or a 16-byte LXMF source hash — but the identity
+ * rule is the same for both: the conversation is keyed on the address.
+ *
+ * ONLY AN ATTRIBUTED PEER MAY EVICT. A mesh contact exists because the mesh
+ * verified an advert against that key, so it has earned a slot. LXMF is
+ * address-based: anyone holding our announced address can write to us, so an
+ * LXMF sender may fill a FREE slot but never displace an existing conversation
+ * — otherwise a stranger could flood the table and push out the correspondents
+ * the user actually has. A full table sends it back as a card instead. */
+static bool agents_route_peer(const AgentRouteItem &item) {
+    char id[CONV_ID_LEN];
+    conv_peer_id(item.peer, item.peer_len, id, sizeof(id));
+    if (!id[0] || !item.text[0]) return false;
+
+    agents_lock();
+    bool existed = (agents_find(id) >= 0);
+    int idx = conv_mint(id, item.session, item.via, item.peer, item.peer_len,
+                        item.via == CONV_MESH);
+    if (idx < 0) {
+        /* Every slot is seeded or on screen. Dropping is the honest outcome:
+         * there is nowhere to put the conversation and the alternative is
+         * evicting the chat the user is reading. */
+        agents_unlock();
+        /* conv_mint refuses for two different reasons and they are not the same
+         * event: no free slot, or an id that collided with a conversation whose
+         * stored address or wire does not match. Reporting the second as the
+         * first would send someone looking at the table size. */
+        Serial.printf("[agents] peer route dropped: %s (no free slot, or id "
+                      "collided with a different address/transport)\n", id);
+        return false;
+    }
+    Conversation &a = g_convs[idx];
+    if (existed && item.session[0])
+        snprintf(a.label, sizeof(a.label), "%s", item.session);  /* name may change */
+    if (!existed) {
+        /* WRITTEN THE MOMENT THE PEER IS MET, not at the next unrelated save:
+         * a reboot between meeting someone and the next room-create would
+         * otherwise lose them, which is the whole failure this undoes. */
+        agents_manifest_persist();
+        event_add("conv new %s %s", item.via == CONV_MESH ? "mesh" : "lxmf", id);
+    }
+    agents_unlock();
+    /* Delivered through the door rather than appended here, so its wire check
+     * actually runs on this path: the door refuses a conversation whose
+     * transport is not the one the message came in on. conv_mint has already
+     * compared the full address; this is the second half of the same rule and
+     * the reason the door exists at all. */
+    return inbox_deliver_msg(item.via, id, item.session, item.text);
+}
+
+/* The off-loop drain: the ONLY SD I/O on the route path. Drains the queue
+ * forever, resolves the target room, reloads its view from SD and appends the
+ * reply — everything the caller must NOT do on the loop task. */
+static void agents_route_task(void *arg) {
+    (void)arg;
+    AgentRouteItem item;
+    int idx = agents_find("claude");
+    for (;;) {
+        if (xQueueReceive(g_route_q, &item, portMAX_DELAY) != pdTRUE) continue;
+        if (idx < 0) continue;
+        if (item.kind == 1) {              /* live-room roster: reconcile + persist */
+            agents_roster_apply(idx, item.text);
+            continue;
+        }
+        if (item.kind == 2) {              /* peer message: mint + append */
+            agents_route_peer(item);
+            continue;
+        }
+        if (!item.text[0]) continue;
+        agents_lock();
+        Conversation &a = g_convs[idx];
+        bool created = false;
+        if (item.newest) {
+            /* newest-active room. active_idx already points at the most-recently
+             * selected/created room; if the registry is somehow empty, mint a
+             * default. Re-pin to the tail ONLY when this conversation already
+             * holds the shared window: goto_tail is the focus point, so calling
+             * it here unconditionally would hand the window to an arriving
+             * reply and take it away from whatever the user is reading —
+             * losing their scroll position mid-read and costing a full JSONL
+             * rebuild per message under a burst. An unfocused conversation
+             * needs nothing here; the append below keeps its cached line and
+             * counters current, and the window is rebuilt when it is opened. */
+            if (a.n_sessions == 0) agents_session_create(idx, nullptr, created);
+            else if (g_win.owner == idx) agents_thread_goto_tail(idx);
+        } else {
+            /* Named room: switch to it (reloading its view from SD) if it
+             * exists, else create it. Both run here off the loop task, so the
+             * manifest write and the view scan are safe. A brand-new name with
+             * the registry full returns -1 and leaves active_idx unchanged; the
+             * header contract says DROP the line then rather than mis-route it
+             * into the previously-active room. */
+            if (agents_session_exists(idx, item.session) >= 0) {
+                agents_session_select(idx, item.session);
+            } else if (agents_session_create(idx, item.session, created) < 0) {
+                Serial.printf("[agents] chat-route drop: registry full for %s\n",
+                              item.session);
+                agents_unlock();
+                continue;
+            }
+        }
+        agents_push_line(idx, false, item.text);   /* view append + SD append */
+        g_agents_real_inbound = true;
+        display_force = true;
+        agents_unlock();
+    }
+}
+
+/* Transport entry point (declared in ../agents_chat_route.h). Land `text` into
+ * the `claude` agent's room `session` (empty/NULL => newest-active room).
+ * Loop-safe: RAM-only here, SD deferred to agents_route_task. `reason` may be
+ * NULL. Returns true when the reply was queued for the off-loop persist; false
+ * on a bad name (reason 2), a full registry (reason 1), an empty message, or a
+ * dead/full route queue (the bool is authoritative; reason carries 1/2 only for
+ * the two resolution rejects — never a synchronous SD fallback). */
+bool claude_route_incoming(const char *session, const char *text, int *reason) {
+    if (reason) *reason = AGENT_ROUTE_OK;
+    int idx = agents_find("claude");
+    if (idx < 0) return false;
+
+    /* LIVE-ROOM ROSTER CONTROL FRAME — field 3 == "*" (exactly one byte 0x2A).
+     * This test MUST come FIRST, before any sanitising: agents_session_sanitize
+     * strips '*' (outside [A-Za-z0-9._-]) to an empty name, which would deliver
+     * the room list into a room as a normal message reading e.g. "main,sonata"
+     * (README's #1 firmware rule). RAM-only on the caller (loop) task: copy the
+     * RAW payload into a queue item and hand it to the off-loop drain; the SD
+     * reconcile happens in agents_roster_task/apply. An empty payload
+     * (1|<addr>|*|) is a LEGAL frame meaning "no live sessions", so it is
+     * enqueued too (unlike the message path, which drops empty text). */
+    if (session && session[0] == '*' && session[1] == '\0') {
+        AgentRouteItem item;
+        memset(&item, 0, sizeof(item));
+        item.kind = 1;                                  /* roster, not a message */
+        snprintf(item.text, sizeof(item.text), "%s", text ? text : "");
+        if (!g_route_q || xQueueSend(g_route_q, &item, 0) != pdTRUE) return false;
+        return true;
+    }
+
+    /* Resolve name + reason against a RAM snapshot of the registry (no I/O). */
+    char resolved[AGENT_ROUTE_NAME_CAP];
+    int newest = 0;
+    int r;
+    agents_lock();
+    {
+        Conversation &a = g_convs[idx];
+        const char *names[AGENT_SESSIONS_MAX];
+        int n = a.n_sessions;
+        if (n > AGENT_SESSIONS_MAX) n = AGENT_SESSIONS_MAX;
+        for (int i = 0; i < n; i++) names[i] = a.sessions[i];
+        r = agents_route_plan(session, names, n, AGENT_SESSIONS_MAX,
+                              resolved, &newest);
+    }
+    agents_unlock();
+    if (r != AGENT_ROUTE_OK) { if (reason) *reason = r; return false; }
+
+    /* Clean the untrusted reply (third barrier) and bound it. Nothing left to
+     * show => nothing to land. */
+    AgentRouteItem item;
+    memset(&item, 0, sizeof(item));
+    agents_clean_text(text, item.text, sizeof(item.text));
+    if (!item.text[0]) return false;
+    item.newest = (newest != 0);
+    if (!item.newest) snprintf(item.session, sizeof(item.session), "%s", resolved);
+
+    /* Hand off to the drain task; 0-tick send never blocks the loop. A dead or
+     * full queue drops (false) rather than falling back to a synchronous SD
+     * write on the caller's task. */
+    if (!g_route_q || xQueueSend(g_route_q, &item, 0) != pdTRUE) return false;
+    return true;
+}
+
+/*
+ * A MeshCore peer's message (declared in ../transport.h). RAM ONLY: the radio
+ * callback that calls this runs on the loop task, so the message is cleaned,
+ * copied by value and handed to the off-loop drain — the mint, the manifest
+ * write and the JSONL append all happen there (agents_route_mesh). Returns
+ * false when there is nothing to land or the queue is dead/full, and the caller
+ * falls back to a card so the message is never simply lost.
+ */
+bool inbox_deliver_msg_mesh(const uint8_t *pubkey, uint8_t pubkey_len,
+                            const char *name, const char *text) {
+    if (!pubkey || pubkey_len != TRANSPORT_MESH_ADDR_LEN) return false;
+    if (!text || !text[0]) return false;
+    AgentRouteItem item;
+    memset(&item, 0, sizeof(item));
+    item.kind = 2;
+    item.via = CONV_MESH;
+    item.peer_len = pubkey_len;
+    memcpy(item.peer, pubkey, pubkey_len);
+    /* The sender's name is untrusted display text like any other inbound
+     * string — cleaned here, and bounded to the label field by the store. */
+    agents_clean_text(name, item.session, sizeof(item.session));
+    agents_clean_text(text, item.text, sizeof(item.text));
+    if (!item.text[0]) return false;
+    if (!g_route_q || xQueueSend(g_route_q, &item, 0) != pdTRUE) return false;
+    return true;
+}
+
+/*
+ * An LXMF sender's message (declared in ../transport.h). Same loop-safe shape
+ * as the mesh one — the LXMF receive also runs on the loop task, on both of its
+ * feeds — and the same off-loop drain lands it.
+ *
+ * The conversation is keyed on the 16-byte source hash, which is what makes
+ * this different from the room routing it replaces: that keyed the return
+ * address by THREAD NAME, so two senders who happened to use the same thread
+ * overwrote each other and a reply could go to the wrong one. A hash cannot
+ * collide by coincidence.
+ *
+ * Returns false when there is nothing to land or the queue is dead/full; the
+ * caller raises a card instead, so an LXMF message is never simply dropped.
+ */
+bool inbox_deliver_msg_lxmf(const uint8_t *source_hash, uint8_t hash_len,
+                            const char *name, const char *text) {
+    if (!source_hash || hash_len != TRANSPORT_LXMF_ADDR_LEN) return false;
+    if (!text || !text[0]) return false;
+    AgentRouteItem item;
+    memset(&item, 0, sizeof(item));
+    item.kind = 2;
+    item.via = CONV_LXMF;
+    item.peer_len = hash_len;
+    memcpy(item.peer, source_hash, hash_len);
+    agents_clean_text(name, item.session, sizeof(item.session));
+    agents_clean_text(text, item.text, sizeof(item.text));
+    if (!item.text[0]) return false;
+    if (!g_route_q || xQueueSend(g_route_q, &item, 0) != pdTRUE) return false;
+    return true;
+}
+
 /* Clear a session's history. Single agent → the ACTIVE session only (UI path);
  * "*"/empty → every session file + per-session counter for an agent (or all
  * agents). The session stays registered either way; the active one restarts
@@ -1089,7 +2140,7 @@ static bool agents_clear(const char *agent_id) {
     bool any = false;
     bool all = (!agent_id || !agent_id[0] || strcmp(agent_id, "*") == 0);
     auto clear_agent = [&](int i) -> void {
-        AgentSlot &a = g_agents[i];
+        Conversation &a = g_convs[i];
         if (all) {
             for (int j = 0; j < a.n_sessions; j++) {
                 if (agents_store_ready()) {
@@ -1100,7 +2151,8 @@ static bool agents_clear(const char *agent_id) {
                 }
                 a.session_lines[j] = 0;
             }
-            a.file_sync = 0; a.lines = 0; a.vn = 0; a.win_start = 0;
+            a.lines = 0;
+            if (g_win.owner == i) agents_window_take(i);
             agents_push_line(i, false, "chat cleared - type to talk");
         } else {
             if (agents_store_ready()) {
@@ -1108,14 +2160,15 @@ static bool agents_clear(const char *agent_id) {
                 HwSpiBusGuard bus;
                 g_store->remove(path.c_str());
             }
-            a.file_sync = 0; a.lines = 0; a.vn = 0; a.win_start = 0;
+            a.lines = 0;
+            if (g_win.owner == i) agents_window_take(i);
             a.session_lines[a.active_idx] = 0;
             agents_push_line(i, false, "chat cleared - type to talk");
         }
         any = true;
     };
     if (all) {
-        for (int i = 0; i < AGENTS_N; i++) clear_agent(i);
+        for (int i = 0; i < g_conv_n; i++) clear_agent(i);
     } else {
         int idx = agents_find(agent_id);
         if (idx >= 0) clear_agent(idx);
@@ -1125,28 +2178,197 @@ static bool agents_clear(const char *agent_id) {
     return any;
 }
 
-static int agents_count() { return AGENTS_N; }
+/* DELETE a whole conversation — DISTINCT from agents_clear.
+ *
+ * agents_clear empties the active room and re-seeds a "chat cleared" line: the
+ * conversation stays in the table and in /conversations.txt. DELETE removes it:
+ * every room's JSONL history file, the RAM slot (the live table is compacted so
+ * indices stay contiguous), and its line in the manifest (rewritten without it).
+ * After a reboot the conversation is therefore NOT restored — the whole point,
+ * on a device rebooted this often.
+ *
+ * SEEDED conversations (claude / hermes, the device's own doors) are REFUSED:
+ * they are re-created from firmware at every boot, so a delete could never stick,
+ * and the user must always be able to reach them. conv_mint already treats them
+ * as never-evictable for the same reason.
+ *
+ * Matched BY ID (agents_find), which is the recycle-safe key: if the slot changed
+ * hands under the open chat (the off-loop drain mints while a sheet is up), the
+ * id simply is not found and nothing is deleted, rather than the wrong thread
+ * being removed. Returns true when a conversation was removed. */
+static bool agents_delete(const char *conv_id) {
+    agents_lock();
+    int idx = agents_find(conv_id);
+    if (idx < 0 || g_convs[idx].seeded) { agents_unlock(); return false; }
+    Conversation &a = g_convs[idx];
+
+    /* Remove the history files. A peer with no rooms logs to the no-room path
+     * /conv.<id> (empty session); a conversation with rooms has one file each.
+     * Both are attempted, so no orphan JSONL is left behind. Explicit user
+     * delete, not the reversible MARK-NOT-DELETE the dead-room roster uses. */
+    if (agents_store_ready()) {
+        String p0 = agents_log_path(a.id, "");
+        if (p0.length()) { HwSpiBusGuard bus; g_store->remove(p0.c_str()); }
+        for (int j = 0; j < a.n_sessions; j++) {
+            String path = agents_log_path(a.id, a.sessions[j]);
+            if (path.length()) { HwSpiBusGuard bus; g_store->remove(path.c_str()); }
+        }
+    }
+
+    /* Drop the scrollback window if it was loaded for the deleted slot; a window
+     * owned by a HIGHER slot follows the compaction down by one. */
+    if (g_win.owner == idx) agents_window_take(-1);
+
+    /* Compact the live table: shift [idx+1 .. g_conv_n) down one so slot indices
+     * (which the manifest walk and every UI handle use) stay contiguous. */
+    for (int i = idx; i + 1 < g_conv_n; i++) g_convs[i] = g_convs[i + 1];
+    g_conv_n--;
+    memset(&g_convs[g_conv_n], 0, sizeof(g_convs[g_conv_n]));
+    if (g_win.owner > idx) g_win.owner--;
+
+    agents_manifest_persist();   /* rewrite /conversations.txt without the line */
+    agents_unlock();
+    display_force = true;
+    return true;
+}
+
+static int agents_count() { return g_conv_n; }
 
 static const char *agents_id(int i) {
-    return (i >= 0 && i < AGENTS_N) ? g_agents[i].id : "";
+    return (i >= 0 && i < g_conv_n) ? g_convs[i].id : "";
 }
 static const char *agents_name(int i) {
-    return (i >= 0 && i < AGENTS_N) ? g_agents[i].name : "";
+    return (i >= 0 && i < g_conv_n) ? g_convs[i].label : "";
+}
+/* Is conversation i a seeded door (claude / hermes)? The UI drops the DELETE
+ * action for these — they are re-created from firmware every boot, so a delete
+ * could never survive one. */
+static bool agents_is_seeded(int i) {
+    return (i >= 0 && i < g_conv_n) ? (g_convs[i].seeded != 0) : false;
 }
 static bool agents_bridge_ok() { return g_bridge[0] != '\0'; }
 static const char *agents_bridge_url() { return g_bridge; }
 
+/* ---- contacts-screen enumeration ------------------------------------------ */
+
+/* The seeded doors are the Contacts screen's AI bucket. They are never evicted
+ * and never relocate (conv_mint only ever appends and only ever evicts a
+ * non-seeded slot), so a pointer to one stays valid after the lock is dropped —
+ * which is the only reason returning the fields by pointer is safe here. */
+int agents_seeded_count(void) {
+    agents_lock();
+    int c = 0;
+    for (int i = 0; i < g_conv_n; i++) if (g_convs[i].seeded) c++;
+    agents_unlock();
+    return c;
+}
+
+/* The i-th seeded door (0-based over the seeded ones only). Fills whichever of
+ * id/label/reply the caller asked for and returns true, or false past the end.
+ * reply is the door's return address bytes — the agent-id bytes the bridge and
+ * the MeshCore C1 DM answer to. */
+bool agents_seeded_at(int i, const char **id, const char **label,
+                      const uint8_t **reply, uint8_t *reply_len) {
+    if (i < 0) return false;
+    agents_lock();
+    int seen = 0;
+    for (int k = 0; k < g_conv_n; k++) {
+        if (!g_convs[k].seeded) continue;
+        if (seen == i) {
+            Conversation &a = g_convs[k];
+            if (id) *id = a.id;
+            if (label) *label = a.label;
+            if (reply) *reply = a.reply_addr;
+            if (reply_len) *reply_len = a.reply_len;
+            agents_unlock();
+            return true;
+        }
+        seen++;
+    }
+    agents_unlock();
+    return false;
+}
+
+/* Does a conversation with this exact id already exist? The literal-id join, for
+ * an AI door (its id is its own name). */
+bool agents_has_conversation(const char *id) {
+    agents_lock();
+    bool has = (agents_find(id) >= 0);
+    agents_unlock();
+    return has;
+}
+
+/* Does a mesh / LXMF peer at this return address already have a conversation?
+ * The join key is conv_peer_id — the first CONV_PEER_ID_BYTES of the address as
+ * hex — the same id conv_mint stores a peer under, so a match here means the
+ * Contacts row should point at the existing thread rather than create one. */
+bool agents_peer_has_conversation(const uint8_t *addr, uint8_t addr_len) {
+    char id[CONV_ID_LEN];
+    conv_peer_id(addr, addr_len, id, sizeof(id));
+    if (!id[0]) return false;
+    return agents_has_conversation(id);
+}
+
+/* Copy conversation idx's opaque return address into out[0..out_max), returning
+ * the byte count. The Contacts screen carries an existing LXMF conversation's
+ * address into its row so open-or-create can mint on the same address the thread
+ * already answers to. Caller holds agents_lock (matches agents_transport et al.,
+ * which also read the table without taking it themselves). */
+uint8_t agents_reply_addr(int idx, uint8_t *out, uint8_t out_max) {
+    if (idx < 0 || idx >= g_conv_n || !out) return 0;
+    uint8_t n = g_convs[idx].reply_len;
+    if (n > out_max) n = out_max;
+    memcpy(out, g_convs[idx].reply_addr, n);
+    return n;
+}
+
+/*
+ * Open the conversation keyed on `id`, or create it, and return its slot.
+ *
+ * This is the Contacts screen's "start a chat with…": a picked contact row hands
+ * its {transport, id, reply} triple here and the caller lands in the returned
+ * slot's chat. find-before-mint means an AI door (its id is its literal name) or
+ * an existing peer (its id is conv_peer_id of the address) returns its LIVE slot
+ * rather than a duplicate; a peer with no slot yet is minted onto the same id
+ * and address a message from it would use.
+ *
+ * WHO MAY EVICT follows the receive path exactly (see agents_route_peer): only a
+ * mesh peer is cryptographically attributed and so may displace the LRU
+ * non-seeded slot when the table is full; AI doors already exist, and LXMF is
+ * address-based (anyone holding the address can write), so neither evicts — an
+ * LXMF row shown here is an EXISTING conversation and so always finds its slot.
+ * When nothing may be evicted the table is full and this returns -1; the caller
+ * surfaces that rather than dropping the user into a stranger's thread.
+ *
+ * A newly minted peer is persisted at once, so a chat started from Contacts
+ * survives a reboot the same as one met over the air.
+ */
+int agents_open_or_create(uint8_t transport, const char *id, const char *label,
+                          const uint8_t *reply_addr, uint8_t addr_len) {
+    if (!id || !id[0]) return -1;
+    agents_lock();
+    int idx = agents_find(id);
+    if (idx < 0) {
+        bool may_evict = (transport == CONV_MESH);
+        idx = conv_mint(id, label, transport, reply_addr, addr_len, may_evict);
+        if (idx >= 0) agents_manifest_persist();
+    }
+    agents_unlock();
+    return idx;
+}
+
 static const char *agents_describe() {
     return
         "# agents\n\n"
-        "Pocket chat with Grok / Claude / Hermes / OpenCode / Codex.\n"
+        "Pocket chat with Claude / Hermes.\n"
         "Uplink: WiFi bridge /v1/chat, else MeshCore C1|agent|…|u|… private DM\n"
-        "  (agent = grok|claude|hermes|opencode|codex).\n"
+        "  (agent = claude|hermes).\n"
         "Downlink: same C1 side=a (or WiFi /agents/inbound) — one loop.\n"
         "A \"where are you?\" / \"где ты\" message is answered locally with the\n"
         "GNSS fix (POST /gps/fix semantics) and never hits the bridge.\n\n"
-        "History: append-only JSONL on SD (fallback SPIFFS), keyed by\n"
-        "(agent, session); only a 24-message viewport is kept in RAM.\n\n"
+        "History: append-only JSONL on SD (fallback SPIFFS) at\n"
+        "`/conv.<conversation>[.<session>]`; only a 24-message viewport is kept\n"
+        "in RAM. Room registry: `/conversations.txt`.\n\n"
         "SPIFFS `/agent_bridge.txt` = base URL (http://host:port).\n";
 }
 
@@ -1170,12 +2392,16 @@ static void agents_register_routes(AsyncWebServer &server) {
         doc["store"] = agents_store_ready() ? agents_store_name() : "none";
         JsonArray arr = doc["agents"].to<JsonArray>();
         agents_lock();
-        for (int i = 0; i < AGENTS_N; i++) {
-            AgentSlot &a = g_agents[i];
+        for (int i = 0; i < g_conv_n; i++) {
+            Conversation &a = g_convs[i];
             JsonObject o = arr.add<JsonObject>();
             o["id"] = a.id;
-            o["name"] = a.name;
+            o["name"] = a.label;
             o["messages"] = a.lines;
+            o["transport"] = a.transport;
+            o["unread"] = a.unread;
+            o["last_use"] = a.last_use;
+            o["seeded"] = a.seeded ? true : false;
             o["active"] = a.sessions[a.active_idx];
             JsonArray sess = o["sessions"].to<JsonArray>();
             JsonArray smsg = o["session_msgs"].to<JsonArray>();
@@ -1183,10 +2409,14 @@ static void agents_register_routes(AsyncWebServer &server) {
                 sess.add(a.sessions[j]);
                 smsg.add(a.session_lines[j]);
             }
-            if (a.vn > 0) {
-                o["last"] = a.view[a.vn - 1].text;
-                o["last_from_me"] = a.view[a.vn - 1].from_me;
-                o["last_ts"] = a.view[a.vn - 1].ts;
+            /* The per-conversation cached line, which is the newest one
+             * appended whether or not this conversation holds the window —
+             * strictly more honest than reading a scrollback that may be
+             * parked on an older page. */
+            if (a.last.text[0]) {
+                o["last"] = a.last.text;
+                o["last_from_me"] = a.last.from_me;
+                o["last_ts"] = a.last.ts;
             }
             /* Honest tail for GET even when the RAM window is a rewound page. */
             if (!agents_thread_is_tail(i)) {
@@ -1219,7 +2449,7 @@ static void agents_register_routes(AsyncWebServer &server) {
         const char *text   = input["text"]   | "";
         const char *sess   = input["session"] | "";
         int idx = agents_find(agent);
-        if (idx < 0) { notify_send_error(req, 400, "agent must be grok, claude, hermes, opencode or codex"); return; }
+        if (idx < 0) { notify_send_error(req, 400, "unknown conversation"); return; }
         if (!text[0]) { notify_send_error(req, 400, "text required"); return; }
         if (sess[0]) {
             agents_lock();
@@ -1273,7 +2503,7 @@ static void agents_register_routes(AsyncWebServer &server) {
         free(body);
         const char *agent = input["agent"] | "";
         const char *text  = input["text"]  | "";
-        if (agents_find(agent) < 0) { notify_send_error(req, 400, "agent must be grok, claude, hermes, opencode or codex"); return; }
+        if (agents_find(agent) < 0) { notify_send_error(req, 400, "unknown conversation"); return; }
         if (!text[0]) { notify_send_error(req, 400, "text required"); return; }
         agents_on_inbound(agent, text, true);
         event_add("agent %s >> %s", agent, text);
@@ -1318,7 +2548,7 @@ static void agents_register_routes(AsyncWebServer &server) {
         const char *agent = input["agent"] | "";
         const char *sess  = input["session"] | "";
         int idx = agents_find(agent);
-        if (idx < 0) { notify_send_error(req, 400, "agent must be grok, claude, hermes, opencode or codex"); return; }
+        if (idx < 0) { notify_send_error(req, 400, "unknown conversation"); return; }
         if (!sess[0]) { notify_send_error(req, 400, "session required"); return; }
         agents_lock();
         bool ok = agents_session_select(idx, sess);
@@ -1346,7 +2576,7 @@ static void agents_register_routes(AsyncWebServer &server) {
         const char *agent = input["agent"] | "";
         const char *sess  = input["session"] | "";
         int idx = agents_find(agent);
-        if (idx < 0) { notify_send_error(req, 400, "agent must be grok, claude, hermes, opencode or codex"); return; }
+        if (idx < 0) { notify_send_error(req, 400, "unknown conversation"); return; }
         agents_lock();
         bool created = false;
         int r = agents_session_create(idx, sess[0] ? sess : nullptr, created);
@@ -1393,6 +2623,42 @@ static void agents_store_init() {
     event_add("agents store %s", agents_store_name());
 }
 
+/* One-shot rename of every known thread's log from the retired
+ * /agent.<id>.<session> key into /conv.<...>. Runs once at boot, AFTER the
+ * registry is loaded (that is what makes the set of threads known) and BEFORE
+ * the first view sync, so a card that was written by an older build shows its
+ * history in the new namespace instead of appearing empty. A thread that has
+ * already moved, or never had a legacy file, costs one exists() and nothing
+ * else. Nothing is deleted: a rename that fails leaves the legacy file exactly
+ * where it was. */
+static void agents_migrate_logs() {
+    if (!agents_store_ready()) return;
+    int moved = 0, skipped = 0, failed = 0;
+    {
+        HwSpiBusGuard bus;   /* one boot burst; released before event_add */
+        for (int i = 0; i < g_conv_n; i++) {
+            Conversation &a = g_convs[i];
+            for (int j = 0; j < a.n_sessions; j++) {
+                String from = agents_legacy_log_path(a.id, a.sessions[j]);
+                if (!g_store->exists(from.c_str())) continue;
+                String to = agents_log_path(a.id, a.sessions[j]);
+                /* BOTH files present. Reachable on the reflash workflow (a card
+                 * used by a new build, then an old one, then new again): each
+                 * half holds real messages and picking one silently discards
+                 * the other, so neither is touched and the split is REPORTED
+                 * instead — a count that appears in the event log is what turns
+                 * "my history looks short" into a diagnosable state. */
+                if (!to.length() || g_store->exists(to.c_str())) { skipped++; continue; }
+                if (g_store->rename(from.c_str(), to.c_str())) moved++;
+                else failed++;
+            }
+        }
+    }
+    if (moved || skipped || failed)
+        event_add("agents store logs moved=%d split=%d failed=%d",
+                  moved, skipped, failed);
+}
+
 static void skill_agents_init() {
     // Session default tag includes last 4 of chip for multi-pager later.
     uint64_t mac = ESP.getEfuseMac();
@@ -1405,24 +2671,55 @@ static void skill_agents_init() {
     /* Answer pending "where are you?" cards the moment a GPS fix lands. */
     gps_set_on_fix(agents_gps_on_fix);
 
-    for (int i = 0; i < AGENTS_N; i++) {
-        AgentSlot &a = g_agents[i];
-        a.active_idx = 0; a.file_sync = 0; a.lines = 0; a.vn = 0; a.win_start = 0;
-        for (int j = 0; j < AGENT_SESSIONS_MAX; j++) a.session_lines[j] = 0;
+    for (int i = 0; i < g_conv_n; i++) {
+        Conversation &a = g_convs[i];
+        a.active_idx = 0; a.lines = 0;
+        for (int j = 0; j < AGENT_SESSIONS_MAX; j++) {
+            a.session_lines[j] = 0;
+            a.session_dead[j] = 0;      // all rooms shown until a roster says otherwise
+        }
         agents_session_add(i, g_session);               // default always present
     }
-    agents_manifest_load();                             // existing sessions
-    // Guarantee at least the default survives a reboot.
+    agents_manifest_load();                             // existing rooms
+    agents_migrate_logs();      // retired /agent.* keys -> /conv.* (once)
+    // Guarantee at least the default survives a reboot, in the new format.
     agents_manifest_persist();
 
-    for (int i = 0; i < AGENTS_N; i++) {
+    for (int i = 0; i < g_conv_n; i++) {
+        /* One scan each: this fills lines / session_lines / the cached last
+         * line, which is all a conversation needs until it is opened. The
+         * window is left wherever the last scan put it and is rebuilt on the
+         * first draw (agents_thread_view's lazy focus), so the goto_tail that
+         * used to follow here is gone — after a long-history sync it saw a
+         * non-tail window and rebuilt the whole file a SECOND time, once per
+         * conversation, at boot. */
         agents_sync_view(i);
-        char intro[AGENT_TEXT_LEN];
-        snprintf(intro, sizeof(intro), "hi - type to talk to %s", g_agents[i].name);
-        if (g_agents[i].lines == 0)
+        /* The greeting belongs to the compiled-in doors only. A conversation
+         * minted for a peer must not have a line the device wrote to itself
+         * appear in its history. */
+        if (g_convs[i].seeded && g_convs[i].lines == 0) {
+            char intro[AGENT_TEXT_LEN];
+            snprintf(intro, sizeof(intro), "hi - type to talk to %s",
+                     g_convs[i].label);
             agents_push_line(i, false, intro);
-        agents_thread_goto_tail(i);
+        }
+        /* NOTHING FROM BOOT IS UNREAD. The greeting is a line the device wrote
+         * to itself, and no chat screen is up yet, so the arrival counter would
+         * otherwise start every seeded conversation at 1 and a fresh flash
+         * would come up showing *CLAUDE *HERMES with nothing behind the mark.
+         * The user was not there for any of this; unread means "arrived while
+         * you were away from it", and boot is not that. */
+        g_convs[i].unread = 0;
     }
+
+    /* Off-loop chat-route drain: the transport (rns.cpp) enqueues incoming
+     * replies from the loop task; this task performs all the route's SD I/O. */
+    g_route_q = xQueueCreate(AGENT_ROUTE_QUEUE_DEPTH, sizeof(AgentRouteItem));
+    if (g_route_q)
+        xTaskCreate(agents_route_task, "agt_route", AGENT_ROUTE_TASK_STACK,
+                    nullptr, AGENT_ROUTE_TASK_PRIO, &g_route_task);
+    Serial.printf("[agents] chat-route queue=%s depth=%d\n",
+                  g_route_q ? "ok" : "FAILED", AGENT_ROUTE_QUEUE_DEPTH);
 
     skill_register(&agents_skill);
     Serial.printf("[agents] session=%s bridge=%s store=%s/%s\n",

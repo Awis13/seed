@@ -32,9 +32,25 @@ main = (ROOT / "src" / "main.cpp").read_text(encoding="utf-8")
 
 
 def fn_body(text, sig, terminator="\n}"):
+    """Slice a function DEFINITION.
+
+    The guard is not decoration: the firmware forward-declares many of these
+    near the top of their file, and `text.index(sig)` happily lands on the
+    declaration. The slice then runs from there to the end of some unrelated
+    later function, so an assertion against it — especially an ABSENCE
+    assertion — can pass on code that has nothing to do with the function under
+    test. That is a pin that looks green and checks nothing. A slice whose head
+    reaches a ';' before its first '{' is therefore rejected outright.
+    """
     start = text.index(sig)
     end = text.index(terminator, start)
-    return text[start : end + len(terminator)]
+    body = text[start : end + len(terminator)]
+    head = body[: body.index("{")] if "{" in body else body
+    assert ";" not in head, (
+        f"fn_body({sig!r}) matched a forward declaration, not the definition — "
+        "the assertions below would be checking unrelated code"
+    )
+    return body
 
 
 # --- 0. the file is wired into the build and started at boot -----------------

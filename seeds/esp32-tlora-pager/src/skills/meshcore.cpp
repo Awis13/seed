@@ -32,6 +32,15 @@
 #include <stdio.h>
 #include "mesh/mc_client.h"
 #include "mesh/utf8_chunk.h"
+#include "../l1_frame.h"    /* pure L1 frame parse + byte reassembler (host-tested) */
+
+/* THE SHARED LXMF ROUTER lives in skills/rns.cpp, which main.cpp #includes AFTER
+ * this file into the same translation unit. Forward-declare it so the MeshCore
+ * "L1" receive path can drive the SAME parse/route/counter pipeline the Reticulum
+ * poll does — one router, two transports (see lxmf_ingest_wire in rns.cpp). It
+ * takes an LXMF opportunistic wire (source+sig+msgpack, no dest hash) and returns
+ * true iff it parsed and routed; it owns the rns_lxmf_dest_hash_ok gate. */
+static bool lxmf_ingest_wire(const uint8_t *wire, size_t len);
 
 #define MESH_ID_PATH       "/mesh_identity.id"
 #define MESH_PAIR_PATH     "/mesh_pair.json"
@@ -45,12 +54,20 @@
 #define MESH_PROBE_MAX_S       7200u  /* 2 h cap */
 /* After this many failed probes (or silence), icon → DOWN. */
 #define MESH_FAIL_DOWN         2
+/* "This DM was handled" where there is no card id to return. The caller only
+ * tests the result for zero (to bump dm_rx and mark the link alive), so any
+ * non-zero value does; naming it keeps it from reading as a real card id. The
+ * L1 branch uses the same sentinel. */
+#define MESH_RX_HANDLED        1u
 /* Wire keepalive: daemon silent bot; optional app pong MC|a for alive counter. */
+/* One pending peer reply; a chat line is bounded by AGENT_TEXT_LEN. */
+#define MESH_PEER_TX_TEXT_CAP  512
 #define MESH_KEEPALIVE_TEXT    "MC|k"
 #define MESH_ALIVE_PONG_TEXT   "MC|a"
 
 struct MeshPairInfo {
     bool     has_identity;
+    bool     want_identity;    /* no identity anywhere: mint one on radio bring-up */
     bool     has_meta;
     bool     radio_ready;      /* BaseChatMesh up — probe can TX */
     char     name[16];
@@ -153,7 +170,9 @@ static int mesh_ui_state() {
 
 /* Pending probe: send returns true; ACK callback sets last_ok. */
 static bool mesh_probe_awaiting_ack = false;
-static uint32_t mesh_on_private_text(const char *text);  /* fwd */
+static uint32_t mesh_on_private_text(const uint8_t *from_pubkey,
+                                    const char *from_name,
+                                    const char *text);  /* fwd */
 
 #define MESH_CHAT_TX_MAX_PARTS 32
 #define MESH_CHAT_TX_RETRIES   3
@@ -171,6 +190,94 @@ struct MeshChatTx {
     char frames[MESH_CHAT_TX_MAX_PARTS][160];
 };
 static MeshChatTx g_mesh_chat_tx = {};
+
+/*
+ * PEER REPLY HAND-OFF — the MeshCore stack is the LOOP TASK'S, and only its.
+ *
+ * BaseChatMesh::sendMessage allocates from the packet pool, runs the ECDH,
+ * touches the duplicate table and the dispatcher's TX queue, and arms
+ * expected_ack_crc — all state mesh_client_loop() drives on the loop task with
+ * no lock of its own. Calling it from anywhere else corrupts that state, and
+ * the corruption surfaces later as a panic with nothing pointing back at the
+ * caller. Every other producer already respects this: the agent uplink only
+ * fills g_mesh_chat_tx and returns, and the frames go out from the poll below.
+ *
+ * A peer reply is submitted the same way. POST /agents/send resolves any
+ * conversation and runs on the AsyncTCP task, so without this it would drive
+ * the radio underneath the loop task. One slot is enough: a reply is a
+ * keystroke, the drain is ~8 ms away, and a second submitted before the first
+ * leaves is refused with a reason the room shows rather than queued behind an
+ * unbounded backlog.
+ *
+ * WHAT THE SUBMIT ITSELF TOUCHES, stated plainly so "no stack call off the loop
+ * task" is not read as more absolute than it is: mesh_peer_tx_submit() runs
+ * mesh_client_ready() and mesh_client_knows_peer() on the CALLER's task. Both
+ * are read-only — a bounds-checked scan of a fixed contacts[] array — so they
+ * mutate nothing the loop task owns and cannot corrupt it; at worst a contact
+ * added in the same instant is missed, and the authoritative lookup runs again
+ * in the drain. They are here so the room can say "unknown peer" while the user
+ * is still looking at what they typed. The pin in tools/test_transport_pins.py
+ * bans the stack symbols BY FILE (skills/agents.cpp), which is a proxy for "not
+ * on an arbitrary task" and not a check of the task itself.
+ */
+struct MeshPeerTx {
+    volatile bool pending;
+    uint8_t peer[32];
+    char text[MESH_PEER_TX_TEXT_CAP];
+};
+static MeshPeerTx g_mesh_peer_tx = {};
+static portMUX_TYPE g_mesh_peer_mux = portMUX_INITIALIZER_UNLOCKED;
+
+/* Submitted from ANY task (keyboard on the loop task, HTTP on AsyncTCP). Does
+ * no radio work: it fills the slot and returns. */
+static bool mesh_peer_tx_submit(const uint8_t *pubkey, const char *text,
+                                const char **why) {
+    if (!pubkey || !text || !text[0]) {
+        if (why) *why = "nothing to send";
+        return false;
+    }
+    if (!g_mesh.radio_ready || !mesh_client_ready()) {
+        if (why) *why = "radio down";
+        return false;
+    }
+    /* Refused here rather than in the drain, so the room can say so while the
+     * user is still looking at what they typed. */
+    if (!mesh_client_knows_peer(pubkey)) {
+        if (why) *why = "unknown peer";
+        return false;
+    }
+    bool taken = false;
+    portENTER_CRITICAL(&g_mesh_peer_mux);
+    if (!g_mesh_peer_tx.pending) {
+        memcpy(g_mesh_peer_tx.peer, pubkey, sizeof(g_mesh_peer_tx.peer));
+        snprintf(g_mesh_peer_tx.text, sizeof(g_mesh_peer_tx.text), "%s", text);
+        g_mesh_peer_tx.pending = true;
+        taken = true;
+    }
+    portEXIT_CRITICAL(&g_mesh_peer_mux);
+    if (!taken && why) *why = "radio busy";
+    return taken;
+}
+
+/* Drained on the LOOP TASK from the mesh tick — the only place the peer send
+ * touches the stack. */
+static void mesh_peer_tx_poll() {
+    if (!g_mesh_peer_tx.pending) return;
+    if (!g_mesh.radio_ready || !mesh_client_ready()) return;
+    if (mesh_client_ack_pending()) return;   /* let the outstanding one finish */
+
+    uint8_t peer[32];
+    char text[MESH_PEER_TX_TEXT_CAP];
+    portENTER_CRITICAL(&g_mesh_peer_mux);
+    memcpy(peer, g_mesh_peer_tx.peer, sizeof(peer));
+    memcpy(text, g_mesh_peer_tx.text, sizeof(text));
+    g_mesh_peer_tx.pending = false;
+    portEXIT_CRITICAL(&g_mesh_peer_mux);
+
+    const char *why = nullptr;
+    if (!mesh_client_send_to_peer(peer, text, &why))
+        event_add("mesh peer send failed: %s", why ? why : "unknown");
+}
 
 static void mesh_chat_tx_fail(const char *reason) {
     char agent[13];
@@ -279,8 +386,8 @@ static bool mesh_probe_gateway(uint32_t *rtt_ms_out) {
     return true;
 }
 
-static void mesh_cb_dm(const char *from_name, const char *text) {
-    (void)from_name;
+static void mesh_cb_dm(const uint8_t *from_pubkey, const char *from_name,
+                       const char *text) {
     if (!text) return;
     /* App-level alive pong from gateway (or echo) — refresh M counter, no card. */
     if (strcmp(text, "K") == 0 || strcmp(text, MESH_KEEPALIVE_TEXT) == 0 ||
@@ -290,7 +397,7 @@ static void mesh_cb_dm(const char *from_name, const char *text) {
         event_add("mesh alive pong");
         return;
     }
-    mesh_on_private_text(text);
+    mesh_on_private_text(from_pubkey, from_name, text);
 }
 
 static void mesh_cb_ack(uint32_t rtt_ms) {
@@ -309,16 +416,24 @@ static void mesh_cb_log(const char *msg) {
 static bool mesh_load_identity() {
     g_mesh.has_identity = false;
     g_mesh.public_key_hex[0] = '\0';
-    if (!SPIFFS.exists(MESH_ID_PATH)) return false;
-    File f = SPIFFS.open(MESH_ID_PATH, "r");
-    if (!f) return false;
+    /* NVS is the source of truth after the boot migration (it survives a SPIFFS
+     * format); the /mesh_identity.id file is only a pre-migration fallback. Both
+     * hold the same 96-byte pub(32)+prv(64) blob, so the public-key prefix is
+     * read identically from either. This is a STATUS read; the crypto identity
+     * is loaded (and minted, when absent) in mc_client.cpp, which owns the RNG. */
     uint8_t blob[MESH_ID_BLOB_LEN];
-    size_t n = f.read(blob, sizeof(blob));
-    f.close();
+    size_t n = secret_store_get("mesh_id", blob, sizeof(blob));
     if (n != MESH_ID_BLOB_LEN) {
-        event_add("mesh identity size %u (want %u)",
-                  (unsigned)n, (unsigned)MESH_ID_BLOB_LEN);
-        return false;
+        if (!SPIFFS.exists(MESH_ID_PATH)) return false;
+        File f = SPIFFS.open(MESH_ID_PATH, "r");
+        if (!f) return false;
+        n = f.read(blob, sizeof(blob));
+        f.close();
+        if (n != MESH_ID_BLOB_LEN) {
+            event_add("mesh identity size %u (want %u)",
+                      (unsigned)n, (unsigned)MESH_ID_BLOB_LEN);
+            return false;
+        }
     }
     mesh_hex_of(blob, MESH_PUB_LEN, g_mesh.public_key_hex, sizeof(g_mesh.public_key_hex));
     snprintf(g_mesh.name, sizeof(g_mesh.name), "%.8s", g_mesh.public_key_hex);
@@ -454,9 +569,69 @@ static void mesh_reasm_append(MeshReasm *r, uint8_t part_i, uint8_t n_parts,
     if (part_i > r->got_count) r->got_count = part_i;
 }
 
+/* ---- L1: fragmented LXMF opportunistic wire over MeshCore ------------------
+ * The gateway splits an LXMF opportunistic wire (source+sig+msgpack, raw binary)
+ * into base64url chunks and sends them as text frames "L1|mid|i|n|<b64>" (see
+ * l1_frame.h for the format the fragmenter must match). The PARSE and the byte
+ * accumulation are the pure, host-tested l1_parse()/l1_reasm_feed(); this slot
+ * ring is only the TTL/lifecycle wrapper around L1Reasm, mirroring g_reasm above
+ * (millis() is why it is here and not in the pure header). On completion the whole
+ * LXMF wire goes to the ONE shared router, lxmf_ingest_wire() in rns.cpp — the
+ * same door the Reticulum poll uses. Separate slots (not the M1/C1 g_reasm) keep
+ * the byte-exact, gap-intolerant L1 policy off the text reassembler's best-effort
+ * path and leave the landed M1/C1 code untouched. */
+#define L1_SLOTS 2
+struct L1Slot {
+    bool     used;
+    char     mid[L1_MID_CAP];
+    uint32_t started_ms;
+    L1Reasm  r;
+};
+static L1Slot g_l1[L1_SLOTS];
+
+/* Disjoint MeshCore-LXMF counters (mesh status), mirroring rns.cpp's data_lxmf_*
+ * but never touching them: rx = wires reassembled AND accepted by the router,
+ * drop = a frame or reassembly rejected (bad parse/decode, forward gap, overflow,
+ * unplaceable wire). */
+static uint32_t g_mesh_lxmf_rx = 0;
+static uint32_t g_mesh_lxmf_drop = 0;
+
+static void l1_slot_gc() {
+    uint32_t now = millis();
+    for (int i = 0; i < L1_SLOTS; i++)
+        if (g_l1[i].used && (now - g_l1[i].started_ms) > MESH_REASM_TTL_MS)
+            g_l1[i].used = false;
+}
+
+/* Find or open the slot for `mid`; steals the oldest when full. */
+static L1Slot *l1_slot_get(const char *mid) {
+    l1_slot_gc();
+    for (int i = 0; i < L1_SLOTS; i++)
+        if (g_l1[i].used && strcmp(g_l1[i].mid, mid) == 0) return &g_l1[i];
+    for (int i = 0; i < L1_SLOTS; i++) {
+        if (!g_l1[i].used) {
+            memset(&g_l1[i], 0, sizeof(g_l1[i]));
+            g_l1[i].used = true;
+            snprintf(g_l1[i].mid, sizeof(g_l1[i].mid), "%s", mid);
+            g_l1[i].started_ms = millis();
+            return &g_l1[i];
+        }
+    }
+    int victim = 0;
+    for (int i = 1; i < L1_SLOTS; i++)
+        if (g_l1[i].started_ms < g_l1[victim].started_ms) victim = i;
+    memset(&g_l1[victim], 0, sizeof(g_l1[victim]));
+    g_l1[victim].used = true;
+    snprintf(g_l1[victim].mid, sizeof(g_l1[victim].mid), "%s", mid);
+    g_l1[victim].started_ms = millis();
+    return &g_l1[victim];
+}
+
 /* Called when MeshCore stack delivers a private text.
  * Also used by POST /mesh/inject for dry-run of the notify path. */
-static uint32_t mesh_on_private_text(const char *text) {
+static uint32_t mesh_on_private_text(const uint8_t *from_pubkey,
+                                    const char *from_name,
+                                    const char *text) {
     if (!text || !text[0]) return 0;
     uint32_t id = 0;
 
@@ -550,7 +725,15 @@ static uint32_t mesh_on_private_text(const char *text) {
         }
         mesh_reasm_append(r, (uint8_t)part_i, (uint8_t)n_parts, chunk);
         if (r->got_count >= r->n_parts && r->n_parts > 0) {
+            /* AGENT CONVERSATIONS ONLY. This frame names its target by id and
+             * carries a side marker, so `side=u` lands a line attributed to the
+             * USER. That was safe while ids were two compiled-in names; peers
+             * are minted with ids anyone in radio range can observe, and
+             * without this check a stranger could forge words into a peer's
+             * thread as if the user had typed them. The agent wire is the only
+             * one this frame belongs to. */
             int idx = agents_find(r->agent);
+            if (idx >= 0 && agents_transport(idx) != CONV_AGENT) idx = -1;
             if (idx >= 0) {
                 bool from_me = (r->side == 'u');
                 agents_push_line(idx, from_me, r->buf);
@@ -565,8 +748,57 @@ static uint32_t mesh_on_private_text(const char *text) {
             }
             r->used = false;
         }
+    } else if (strncmp(text, "L1|", 3) == 0) {
+        /* L1|mid|i|n|<base64url-chunk> — a fragment of an LXMF opportunistic wire.
+         * Parse + decode is pure (l1_frame.h); accumulate the bytes in this mid's
+         * slot; on the last part hand the whole wire to the shared LXMF router. */
+        L1Frame f;
+        if (!l1_parse(text, &f)) { g_mesh_lxmf_drop++; return 0; }
+        L1Slot *s = l1_slot_get(f.mid);
+        int rc = l1_reasm_feed(&s->r, &f);
+        if (rc < 0) {                     /* inconsistent n / gap / overflow */
+            s->used = false;
+            g_mesh_lxmf_drop++;
+            return 0;
+        }
+        if (rc == 1) {                    /* complete: the whole LXMF wire is in s->r.buf */
+            bool ok = lxmf_ingest_wire(s->r.buf, s->r.len);
+            s->used = false;
+            if (ok) { g_mesh_lxmf_rx++; id = 1; }   /* handled: bumps dm_rx below */
+            else    { g_mesh_lxmf_drop++; return 0; }
+        }
+        /* rc == 0: awaiting more parts (or a duplicate) — id stays 0, no dm_rx. */
     } else {
-        id = notify_ingest("info", "mesh", "MESH", text, NULL);
+        /* A PLAIN PRIVATE DM IS A MESSAGE FROM A PERSON, so it lands in a
+         * conversation rather than as a one-off card. Everything above this is
+         * a machine format (P1/M1 cards, C1 agent chat, L1 LXMF) and is
+         * untouched.
+         *
+         * KNOWN CONTACTS ONLY, and this is the whole policy. A contact exists
+         * because the mesh cryptographically attributed an advert to that
+         * public key, so "known" is a real check and not a name the sender
+         * chose. A stranger's DM keeps the OLD behaviour — a card — because the
+         * inbox is the user's own list of correspondents and this path runs on
+         * the loop task with no rate limit: opening it to anyone in radio range
+         * is a separate decision with its own throttling to design. Either way
+         * the message is shown: a known peer's lands in a conversation, a
+         * stranger's becomes a card. The ONE exception is the off-loop drain
+         * finding no free slot (every slot seeded or on screen) — the message is
+         * dropped with a log line, because by then this branch has already been
+         * taken and there is no card to fall back to. Unreachable as the table
+         * stands, with six evictable slots against two seeded ones.
+         *
+         * The HTTP inject route passes no key (there is no peer behind it), so
+         * it takes the card path too — it cannot conjure a conversation. */
+        if (from_pubkey && mesh_client_knows_peer(from_pubkey) &&
+            inbox_deliver_msg_mesh(from_pubkey, MESH_PUB_LEN, from_name, text)) {
+            id = MESH_RX_HANDLED;
+        } else {
+            /* Through the seam, not around it: this is the card door every
+             * transport is supposed to raise a card by. */
+            id = inbox_deliver_card(CONV_MESH, NULL, INBOX_SEV_INFO, "mesh",
+                                    "MESH", text);
+        }
     }
 
     if (id) {
@@ -605,6 +837,10 @@ static void mesh_status_json(JsonDocument &doc) {
     doc["radio"] = g_mesh.radio_state;
     doc["radio_ready"] = g_mesh.radio_ready;
     doc["dm_rx"] = g_mesh.dm_rx_count;
+    /* MeshCore-LXMF receive rung: LXMF wires reassembled off the radio (rx) and
+     * frames/reassemblies rejected (drop). Disjoint from rns.cpp's data_lxmf_*. */
+    doc["data_lxmf_mesh_rx"] = (unsigned long)g_mesh_lxmf_rx;
+    doc["data_lxmf_mesh_drop"] = (unsigned long)g_mesh_lxmf_drop;
     doc["policy"] = "private_dm_only";
     doc["link"] = mesh_ui_state();
     doc["probe_interval_s"] = g_mesh.probe_interval_s;
@@ -677,8 +913,10 @@ static int mesh_status_lines(char lines[][40], int max_lines) {
 }
 
 static void skill_meshcore_poll() {
-    /* Deferred radio start (~5s after boot): seed UI/WiFi already running. */
-    if (g_mesh.has_identity && !g_mesh.radio_ready &&
+    /* Deferred radio start (~5s after boot): seed UI/WiFi already running.
+     * want_identity brings the radio up even with no keys yet, so mc_client.cpp
+     * can mint an identity from radio noise on first boot / after a wipe. */
+    if ((g_mesh.has_identity || g_mesh.want_identity) && !g_mesh.radio_ready &&
         strcmp(g_mesh.radio_state, "radio_fail") != 0 &&
         millis() > 5000UL) {
         static bool tried = false;
@@ -686,6 +924,11 @@ static void skill_meshcore_poll() {
             tried = true;
             if (mesh_client_begin()) {
                 g_mesh.radio_ready = true;
+                /* A mint may have just happened inside begin(): re-read the now
+                 * present NVS identity so status (public key, name) is populated
+                 * and has_identity gates the keepalive below. */
+                if (!g_mesh.has_identity) mesh_load_identity();
+                g_mesh.want_identity = false;
                 snprintf(g_mesh.radio_state, sizeof(g_mesh.radio_state), "rx_on");
                 event_add("mesh radio RX/TX up");
             } else {
@@ -698,14 +941,29 @@ static void skill_meshcore_poll() {
     /* MeshCore stack — same loop task as display (shared SPI). */
     if (g_mesh.radio_ready) mesh_client_loop();
     mesh_chat_tx_poll();
+    mesh_peer_tx_poll();
 
     /* Sparse private keepalive — only when radio stack can TX. */
     if (!g_mesh.has_identity || !g_mesh.radio_ready) return;
     if (!g_mesh.heltec_pk_hex[0]) return;
     if (g_mesh_chat_tx.active) return;
-    if (mesh_client_ack_pending()) return;
 
     unsigned long now = millis();
+    /* A keepalive whose ACK never returns must not wedge the TX path forever.
+     * The chat path cancels a stale probe after 12s (see mesh_chat_tx_poll);
+     * do the same for the standalone keepalive so it recovers on its own
+     * instead of blocking every future probe — and the menu PING's mesh
+     * column, which shares this ack-pending gate. */
+    if (mesh_client_ack_pending()) {
+        if (now - mesh_client_last_send_ms() < 12000UL) return;
+        mesh_client_cancel_pending_ack();
+        if (mesh_probe_awaiting_ack) {
+            mesh_probe_awaiting_ack = false;
+            g_mesh.fail_streak++;
+            g_mesh.probe_fail_count++;
+        }
+    }
+
     unsigned long interval_ms = (unsigned long)g_mesh.probe_interval_s * 1000UL;
     if (g_mesh.last_probe_ms != 0 &&
         (now - g_mesh.last_probe_ms) < interval_ms) {
@@ -792,7 +1050,9 @@ static void meshcore_register_routes(AsyncWebServer &server) {
             snprintf(wire_buf, sizeof(wire_buf), "%s", body);
             free(body);
         }
-        uint32_t id = mesh_on_private_text(wire_buf);
+        /* No peer behind an HTTP inject: there is no key to attribute it to,
+         * so it cannot open or feed a conversation and takes the card path. */
+        uint32_t id = mesh_on_private_text(nullptr, nullptr, wire_buf);
         JsonDocument out;
         out["ok"] = id != 0;
         out["id"] = id;
@@ -878,6 +1138,7 @@ static void skill_meshcore_init() {
 
     mesh_client_set_callbacks(mesh_cb_dm, mesh_cb_ack, mesh_cb_log);
     agents_set_mesh_uplink(mesh_chat_uplink);
+    agents_set_mesh_peer_send(mesh_peer_tx_submit);
 
     if (g_mesh.has_identity) {
         /* Defer radio bring-up to poll() so WiFi/HTTP always come up first.
@@ -886,8 +1147,13 @@ static void skill_meshcore_init() {
         event_add("mesh pair %s probe %lus (radio deferred)",
                   g_mesh.name, (unsigned long)g_mesh.probe_interval_s);
     } else {
-        snprintf(g_mesh.radio_state, sizeof(g_mesh.radio_state), "no_keys");
-        event_add("mesh: no identity on SPIFFS");
+        /* No identity anywhere (fresh board, or one whose SPIFFS was wiped before
+         * the NVS store existed). RNS already self-generates; mesh now does too:
+         * bring the radio up so mc_client.cpp can mint a keypair from radio noise
+         * and persist it to NVS. */
+        g_mesh.want_identity = true;
+        snprintf(g_mesh.radio_state, sizeof(g_mesh.radio_state), "radio_deferred");
+        event_add("mesh: no identity, will mint on radio bring-up");
     }
     skill_register(&meshcore_skill);
     Serial.printf("[meshcore] paired=%d name=%s probe=%lus radio=%s\n",

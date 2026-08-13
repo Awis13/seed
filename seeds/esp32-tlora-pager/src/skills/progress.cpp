@@ -559,10 +559,10 @@ static const char *progress_describe() {
            "```\n"
            "curl -H \"Authorization: Bearer $TOKEN\" -H 'Content-Type: application/json' \\\n"
            "  -d '{\"label\":\"gates\",\"percent\":40,\"ttl_s\":600}' \\\n"
-           "  http://seed.local:8080/progress\n"
+           "  http://$NODE_IP:8080/progress\n"
            "curl -H \"Authorization: Bearer $TOKEN\" -H 'Content-Type: application/json' \\\n"
            "  -d '{\"label\":\"gates\",\"done\":true}' \\\n"
-           "  http://seed.local:8080/progress\n"
+           "  http://$NODE_IP:8080/progress\n"
            "```\n";
 }
 

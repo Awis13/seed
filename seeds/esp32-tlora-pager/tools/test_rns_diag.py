@@ -22,6 +22,7 @@ These asserts pin the shape so a later edit cannot quietly relabel the stack
 unit, drop the reset, or start iterating the live map from the HTTP handler.
 """
 
+import re
 from pathlib import Path
 
 ROOT = Path(__file__).parents[1]
@@ -56,8 +57,22 @@ route = slice_between(
 )
 
 # --- version bump so /health distinguishes this build ------------------------
-assert '#define SEED_VERSION        "0.9.66"' in main, (
-    "SEED_VERSION must bump to 0.9.66 for this build"
+# The intent is "the version moved for the build that added these fields", but
+# pinning the exact literal made that a fuse: the assert went red the moment a
+# LATER, unrelated commit bumped the version, blaming this diagnostic for
+# somebody else's edit. So the floor is pinned instead of the value — the
+# version must still parse and must not have regressed below the one these
+# fields shipped in, which is the part /health actually depends on. The sibling
+# pin in test_boot_resilience.py deliberately names no literal for the same
+# reason.
+DIAG_MIN_VERSION = (0, 9, 77)
+m = re.search(r'#define\s+SEED_VERSION\s+"(\d+)\.(\d+)\.(\d+)"', main)
+assert m, "SEED_VERSION must be a parseable dotted version in main.cpp"
+assert tuple(int(g) for g in m.groups()) >= DIAG_MIN_VERSION, (
+    "SEED_VERSION must not regress below the build that added these /rns/status "
+    "fields ({}); found {}".format(
+        ".".join(str(n) for n in DIAG_MIN_VERSION), m.group(0)
+    )
 )
 
 # --- 1. stack field: sampled on the loop task, unit baked into the name ------
@@ -131,6 +146,103 @@ assert "static char g_path_hash[RNS_PATH_HASH_MAX][33];" in rns, (
 # path_hashes_total reuses the already-published table size.
 assert "doc[\"path_hashes_total\"] = (unsigned long)g_rns_snap.paths;" in json_builder, (
     "path_hashes_total must reuse the published paths count"
+)
+
+
+# --- 4. the peer address: /rns.json round-trip and its validation ------------
+# There is no `rns_peer` setting anywhere else — the chat room's outgoing
+# message is addressed to this and to nothing else — so the three ends of it
+# have to meet: POST /rns/config writes it, rns_cfg_load() reads it back, and
+# GET /rns/status publishes it. A field written but never read, or read but
+# never published, is a peer the user has no way to confirm.
+cfg_route = slice_between(
+    rns,
+    'server.on(AsyncURIMatcher::exact("/rns/config")',
+    'server.on(AsyncURIMatcher::exact("/rns/send")',
+    "/rns/config route",
+)
+cfg_load = slice_between(
+    rns, "static bool rns_cfg_load()", "/* ---- connect task ----", "rns_cfg_load",
+)
+
+# WRITE. The upsert merges onto what is stored, so an explicit empty string is
+# the only way to clear a field; without the remove() branch a peer set once
+# could never be unset.
+assert 'if (!input["peer"].isNull())' in cfg_route, (
+    "POST /rns/config must accept a `peer` field"
+)
+assert 'cfg["peer"] = peer;' in cfg_route, "the peer must be merged into /rns.json"
+assert 'cfg.remove("peer");' in cfg_route, (
+    "an explicit empty string must CLEAR the peer: this is a merging upsert, so "
+    "there is no other way to unset it"
+)
+# VALIDATED WITH THE SAME FUNCTION `to` GOES THROUGH. Bytes::assignHex()
+# validates nothing — a typo decodes to a DIFFERENT hash and every message is
+# encrypted into the void with no error at either end — so the check has to
+# happen at the door or nowhere.
+assert "rns_addr_valid(peer.c_str())" in cfg_route, (
+    "the peer must be validated with rns_addr_valid(), the same 32-hex check "
+    "POST /rns/send puts a caller's `to` through"
+)
+assert 'notify_send_error(req, 400, "peer must be 32 hex characters")' in cfg_route, (
+    "a bad peer must be refused synchronously, with a reason the caller can act on"
+)
+# The handler still only writes SPIFFS and raises the dirty flag: applying is
+# the loop task's job, exactly as it already is for the endpoint.
+assert "g_rns_peer" not in cfg_route, (
+    "the AsyncTCP handler must not apply the peer; rns_cfg_load() on the loop "
+    "task re-reads the file, like it does for the endpoint"
+)
+
+# READ BACK. Same validation on the way in, and OUTSIDE the host branch: a
+# /rns.json with a bad host still has a peer worth addressing.
+assert 'doc["peer"]' in cfg_load, "rns_cfg_load() must read the peer back"
+assert "rns_addr_valid(p)" in cfg_load, (
+    "the stored peer must be validated on load too — the file is editable"
+)
+assert cfg_load.index('doc["peer"]') > cfg_load.index('doc["enabled"]'), (
+    "the peer must be read outside the valid-host branch: it is a destination "
+    "address, not part of the endpoint"
+)
+# ...and published in ONE store, not cleared-then-filled: a reader crossing the
+# middle of that would see no peer on a device that has one.
+assert "portENTER_CRITICAL(&g_rns_tx_mux);" in cfg_load and \
+       "memcpy(g_rns_peer, peer, sizeof(g_rns_peer));" in cfg_load, (
+    "the peer must be published in one locked store; its reader may be the "
+    "AsyncTCP task"
+)
+# A NEW PEER MUST NOT DROP THE LINK. rns_cfg_load()'s return value means
+# "redial", and the peer decides where a message is addressed, not which socket
+# is held open.
+ret = cfg_load[cfg_load.rindex("return ("):]
+assert "peer" not in ret, (
+    "the peer must not be in the endpoint-change comparison: changing it would "
+    "drop a live link for no reason"
+)
+
+# PUBLISHED. Through the snapshot, like every other loop-written string here.
+assert "memcpy(g_rns_snap.peer, g_rns_peer, sizeof(g_rns_snap.peer) - 1);" in publish, (
+    "the peer must be snapshotted on the loop task, one byte short, like host"
+)
+assert 'doc["peer"] = g_rns_snap.peer[0] ? g_rns_snap.peer : (const char *)nullptr;' \
+       in json_builder, (
+    "GET /rns/status must publish the peer from the snapshot, null when unset"
+)
+
+# --- 5. send_refused is no longer safe to read at its source -----------------
+# It was, while POST /rns/send was the only producer: the same AsyncTCP task
+# incremented it and served it. A line typed on the keyboard is now offered from
+# the LOOP task, so the read has to come through the snapshot like the rest.
+assert "g_rns_snap.send_refused = g_rns_outbox.refused;" in publish, (
+    "send_refused must be published from the loop task now that the loop task "
+    "can increment it"
+)
+assert 'doc["send_refused"] = (unsigned long)g_rns_snap.send_refused;' in json_builder, (
+    "the handler must read send_refused from the snapshot, not from the ring"
+)
+assert "g_rns_outbox.refused" not in json_builder, (
+    "the AsyncTCP handler must not read the ring's counter directly any more: "
+    "it is no longer the only task that writes it"
 )
 
 print("rns diag tests: OK")

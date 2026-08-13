@@ -105,6 +105,7 @@
  */
 
 #include "../micron/notify_record.h"
+#include "../transport.h"   /* the one card door: inbox_deliver_card + its plan */
 
 /* Forward decl: the off-loop archive enqueue is defined in skills/history.cpp,
  * which is #included AFTER this file in the unity build (main.cpp). Notify's
@@ -203,6 +204,10 @@ struct NotifyView {
     int8_t   chosen;
     uint8_t  opt_count;
     unsigned long age_s;
+    /* Arrival wall-clock second, 0 when the clock was unset. The unified
+     * Messages feed (src/feed_view.h) orders cards against conversations by
+     * this, the only stamp comparable across the two stores. */
+    uint32_t created_epoch;
     char source[NOTIFY_SOURCE_LEN];
     char title[NOTIFY_TITLE_LEN];
     char body[NOTIFY_BODY_LEN];
@@ -559,6 +564,53 @@ static void notify_archive_by_id(uint32_t id) {
     if (found) notify_archive_put(e);
 }
 
+/* --- Delete a card from the feed, and keep it deleted (ticket) ---
+ *
+ * DELETE is distinct from ACK: ack marks a card read (it stays in the ring and
+ * in the archive as a read card), delete removes it from the RAM ring AND writes
+ * an archive TOMBSTONE so the boot restore does not resurrect it. The tombstone
+ * lands on the card's OWN archive identity — the same (MICRON_NS_NOTIFY, key)
+ * notify_archive_put() used, derived here by notify_rec_archive_key() from the
+ * card's dedup key and id — so it is newest-wins over the card's data record and
+ * notify_restore_from_archive() skips the key on the next boot (see
+ * notify_record.h). The enqueue is the same 0-tick off-loop hand-off every other
+ * persist here uses, done OUTSIDE the spinlock with a stack copy of (key,id). */
+static void notify_archive_tombstone(const char *key, uint32_t id) {
+    char idkey[NOTIFY_ARCHIVE_IDKEY_CAP];
+    const char *akey = notify_rec_archive_key(key, id, idkey, sizeof(idkey));
+    uint8_t buf[NOTIFY_REC_MAX];
+    size_t n = notify_rec_tombstone_encode(buf, sizeof(buf));
+    if (n) history_enqueue(MICRON_NS_NOTIFY, akey, buf, n);
+}
+
+/* Remove the card carrying `id` from the RAM ring and tombstone it in the
+ * archive. Returns false when there is no such entry (so the UI can stay put).
+ * The card's dedup key is captured under the lock BEFORE the slot is freed,
+ * because the tombstone's archive identity is derived from that key + the id. */
+static bool notify_delete_id(uint32_t id) {
+    char key[NOTIFY_KEY_LEN];
+    key[0] = '\0';
+    bool found = false;
+
+    portENTER_CRITICAL(&notify_mux);
+    for (int i = 0; i < notify_len; i++) {
+        if (notify_slot[notify_order[i]].id != id) continue;
+        memcpy(key, notify_slot[notify_order[i]].key, sizeof(key));
+        notify_drop_at(i);
+        found = true;
+        break;
+    }
+    portEXIT_CRITICAL(&notify_mux);
+    if (!found) return false;
+
+    /* Write-through the tombstone off-loop, outside the lock — the archive's own
+       write task does the SD append. A deleted card must not come back on the
+       reboot this pager does so often. */
+    notify_archive_tombstone(key, id);
+    display_force = true;
+    return true;
+}
+
 /* --- Store operations (each takes the lock itself) --- */
 
 /*
@@ -683,6 +735,7 @@ static void notify_fill_view(const Notification &e, const NotifyOptions &op,
     out.chosen = e.chosen;
     out.opt_count = e.opt_count;
     out.age_s = notify_age_of(e, now, now_ms);
+    out.created_epoch = (uint32_t)(e.created_epoch > 0 ? e.created_epoch : 0);
     memcpy(out.source, e.source, sizeof(out.source));
     memcpy(out.title, e.title, sizeof(out.title));
     memcpy(out.body, e.body, sizeof(out.body));
@@ -1079,6 +1132,83 @@ static void notify_poll() {
     }
 }
 
+/* The severity a transport names must be the severity the screen shows. */
+static_assert(INBOX_SEV_INFO == NOTIFY_INFO, "inbox/notify severity must agree");
+static_assert(INBOX_SEV_WARN == NOTIFY_WARN, "inbox/notify severity must agree");
+static_assert(INBOX_SEV_CRIT == NOTIFY_CRIT, "inbox/notify severity must agree");
+
+/*
+ * RAISE A CARD — the single place a notification becomes visible.
+ *
+ * Pushing a card into the ring is not the same as raising one: the panel has to
+ * be woken, the arrival staged for loop() to consume, the LED ring armed, the
+ * sound requested and the event logged, and every one of those has to happen
+ * for every card no matter which wire brought it. That sequence used to be
+ * written out twice — once in POST /notify and once in the mesh ingest — which
+ * is exactly the shape where a transport quietly gets a card that does not ring
+ * or does not wake the screen. Both callers now converge here, and
+ * inbox_deliver_card() below is the transport-facing door onto it.
+ *
+ * The timestamps are taken here rather than by the caller: time() must not be
+ * called inside notify_push's critical section, and one stamp for the whole
+ * card is what makes its age self-consistent.
+ *
+ * Returns the card id, or 0 when the queue refused it.
+ */
+static uint32_t notify_raise(Notification &e, const NotifyOptions *opts,
+                             uint32_t *replaced_out) {
+    time_t now = time(NULL);
+    e.created_epoch = (now > TIME_VALID_EPOCH) ? now : 0;
+    e.created_ms = millis();
+
+    uint32_t replaced = 0;
+    uint32_t id = notify_push(e, opts, &replaced);
+    if (replaced_out) *replaced_out = replaced;
+    if (id == 0) return 0;
+
+    /* Staged, not acted on: loop() owns every screen change, and the flash
+       write happens there too. A critical message is written on the next pass
+       rather than after the coalescing window, because the reboot it is
+       reporting may not wait. */
+    notify_arrived_id = id;
+    notify_arrived = true;
+    notify_ring_level = e.level;
+    notify_ring_arrived = true;
+    notify_request_sound(e.level, e.source);
+    /* Persistence already happened inside notify_push (archive write-through). */
+    display_force = true;
+    event_add("notify %s: %s%s%s", notify_level_name(e.level),
+              e.source[0] ? e.source : "", e.source[0] ? ": " : "", e.title);
+    return id;
+}
+
+/*
+ * THE card door (declared in ../transport.h): one entry every transport raises
+ * a notification card through, so a card carried by mesh or LXMF is admitted,
+ * labelled, ranked and shown exactly like one that arrived over HTTP.
+ * Admission (title required, severity clamped, source defaulted per transport)
+ * is the pure inbox_card_plan(); the raise is notify_raise() above.
+ */
+uint32_t inbox_deliver_card(uint8_t via, const char *key, uint8_t sev,
+                            const char *source, const char *title,
+                            const char *body) {
+    InboxCardPlan plan;
+    if (!inbox_card_plan(via, sev, source, title, &plan)) return 0;
+
+    Notification e;
+    memset(&e, 0, sizeof(e));
+    e.level = plan.sev;
+    e.unread = true;
+    e.chosen = -1;   /* memset made it 0, which would read as "picked the first" */
+    e.opt_count = 0;
+    e.ttl_s = 0;
+    notify_copy_text(e.source, sizeof(e.source), plan.source);
+    notify_copy_text(e.title, sizeof(e.title), title);
+    notify_copy_text(e.body, sizeof(e.body), body ? body : "");
+    if (key && key[0]) notify_copy_text(e.key, sizeof(e.key), key);
+    return notify_raise(e, NULL, NULL);
+}
+
 /* Ingest without HTTP — same card path as POST /notify.
  * Used by MeshCore private DM (P1|…) and any future transport. */
 static uint32_t notify_ingest(const char *level_s,
@@ -1101,25 +1231,7 @@ static uint32_t notify_ingest(const char *level_s,
     notify_copy_text(e.title, sizeof(e.title), title ? title : "notify");
     notify_copy_text(e.body, sizeof(e.body), body ? body : "");
     if (key && key[0]) notify_copy_text(e.key, sizeof(e.key), key);
-
-    time_t now = time(NULL);
-    e.created_epoch = (now > TIME_VALID_EPOCH) ? now : 0;
-    e.created_ms = millis();
-
-    uint32_t replaced = 0;
-    uint32_t id = notify_push(e, NULL, &replaced);
-    if (id == 0) return 0;
-
-    notify_arrived_id = id;
-    notify_arrived = true;
-    notify_ring_level = e.level;
-    notify_ring_arrived = true;
-    notify_request_sound(e.level, e.source);
-    /* Persistence already happened inside notify_push (archive write-through). */
-    display_force = true;
-    event_add("notify %s: %s%s%s", notify_level_name(e.level),
-              e.source[0] ? e.source : "", e.source[0] ? ": " : "", e.title);
-    return id;
+    return notify_raise(e, NULL, NULL);
 }
 
 /*
@@ -1276,12 +1388,12 @@ static const char *notify_describe() {
            "```\n"
            "curl -H \"Authorization: Bearer $TOKEN\" -H 'Content-Type: application/json' \\\n"
            "  -d '{\"level\":\"crit\",\"source\":\"home-rig\",\"title\":\"RAID degraded\"}' \\\n"
-           "  http://seed.local:8080/notify\n"
+           "  http://$NODE_IP:8080/notify\n"
            "\n"
            "curl -H \"Authorization: Bearer $TOKEN\" -H 'Content-Type: application/json' \\\n"
            "  -d '{\"source\":\"claude\",\"title\":\"Deploy to prod?\",\"options\":[\"Yes\",\"No\",\"Later\"]}' \\\n"
-           "  http://seed.local:8080/notify\n"
-           "curl -H \"Authorization: Bearer $TOKEN\" http://seed.local:8080/notify/one?id=12\n"
+           "  http://$NODE_IP:8080/notify\n"
+           "curl -H \"Authorization: Bearer $TOKEN\" http://$NODE_IP:8080/notify/one?id=12\n"
            "```\n";
 }
 
@@ -1469,34 +1581,16 @@ static void notify_register_routes(AsyncWebServer &server) {
             }
         }
 
-        /* Both clocks are read before the lock: time() must not be called
-           inside a critical section, and one timestamp for the whole entry is
-           what makes its age self-consistent. */
-        time_t now = time(NULL);
-        e.created_epoch = (now > TIME_VALID_EPOCH) ? now : 0;
-        e.created_ms = millis();
-
+        /* This route validates its JSON and nothing more: the card itself is
+           raised through the one shared entry, so the HTTP transport gets the
+           same wake/ring/sound/log every other transport gets, by construction
+           rather than by keeping two copies in step. */
         uint32_t replaced = 0;
-        uint32_t id = notify_push(e, e.opt_count ? &opts : NULL, &replaced);
+        uint32_t id = notify_raise(e, e.opt_count ? &opts : NULL, &replaced);
         if (id == 0) {
             notify_send_error(req, 500, "queue full");
             return;
         }
-
-        /* Staged, not acted on: loop() owns every screen change, and the flash
-           write happens there too. A critical message is written on the next
-           pass rather than after the coalescing window, because the reboot it
-           is reporting may not wait. */
-        notify_arrived_id = id;
-        notify_arrived = true;
-        notify_ring_level = e.level;
-        notify_ring_arrived = true;
-        notify_request_sound(e.level, e.source);
-        /* Persistence already happened inside notify_push (archive write-through). */
-        display_force = true;
-
-        event_add("notify %s: %s%s%s", notify_level_name(e.level),
-                  e.source[0] ? e.source : "", e.source[0] ? ": " : "", e.title);
 
         JsonDocument doc;
         doc["ok"] = true;

@@ -36,7 +36,8 @@
 #include <stdarg.h>
 #include <time.h>
 #include <WiFi.h>
-#include <ESPmDNS.h>
+/* No mDNS header here: mDNS is deliberately off on this board — see the
+ * comment on the WiFi up/down transition in loop() for the crash it caused. */
 #include <SPIFFS.h>
 #include <Wire.h>
 #include <ESPAsyncWebServer.h>
@@ -49,6 +50,7 @@
 #include <Preferences.h>          // NVS-backed panic counter that survives poweron
 #include <HTTPClient.h>
 #include "boot_diag_decide.h"     // pure, host-tested NVS panic-counter decision
+#include "secret_store.h"         // format-safe per-device secrets in NVS (C1/C2)
 #include "board_pins.h"
 #include "hw_ui.h"
 #include "hw_input.h"
@@ -58,9 +60,33 @@
 #include "hw_sound.h"
 #include "hw_kb.h"
 #include "psram_alloc.h"          // psram_calloc_pref: park big buffers in PSRAM
+#include "ui_nav.h"               // pure, host-tested back-navigation policy
+
+// Bind the host-testable UiNavScreen ids to HwUiScreen so the two never drift.
+static_assert((int)UINAV_CLOCK          == (int)HW_UI_CLOCK,          "ui_nav enum drift");
+static_assert((int)UINAV_NOTIFY         == (int)HW_UI_NOTIFY,         "ui_nav enum drift");
+static_assert((int)UINAV_CARD_ACT       == (int)HW_UI_CARD_ACT,      "ui_nav enum drift");
+static_assert((int)UINAV_MENU           == (int)HW_UI_MENU,           "ui_nav enum drift");
+static_assert((int)UINAV_AGENTS         == (int)HW_UI_AGENTS,         "ui_nav enum drift");
+static_assert((int)UINAV_AGENT_CHAT     == (int)HW_UI_AGENT_CHAT,     "ui_nav enum drift");
+static_assert((int)UINAV_AGENT_ACT      == (int)HW_UI_AGENT_ACT,      "ui_nav enum drift");
+static_assert((int)UINAV_AGENT_SESSIONS == (int)HW_UI_AGENT_SESSIONS, "ui_nav enum drift");
+static_assert((int)UINAV_MSGLIST        == (int)HW_UI_MSGLIST,        "ui_nav enum drift");
+static_assert((int)UINAV_INFO           == (int)HW_UI_INFO,           "ui_nav enum drift");
+static_assert((int)UINAV_REPLY          == (int)HW_UI_REPLY,          "ui_nav enum drift");
+static_assert((int)UINAV_LAYOUT         == (int)HW_UI_LAYOUT,         "ui_nav enum drift");
+static_assert((int)UINAV_SETTINGS       == (int)HW_UI_SETTINGS,       "ui_nav enum drift");
+static_assert((int)UINAV_MESHCORE       == (int)HW_UI_MESHCORE,       "ui_nav enum drift");
+static_assert((int)UINAV_MESH_PING      == (int)HW_UI_MESH_PING,      "ui_nav enum drift");
+static_assert((int)UINAV_WIFI           == (int)HW_UI_WIFI,           "ui_nav enum drift");
+static_assert((int)UINAV_WIFI_LIST      == (int)HW_UI_WIFI_LIST,      "ui_nav enum drift");
+static_assert((int)UINAV_WIFI_INFO      == (int)HW_UI_WIFI_INFO,      "ui_nav enum drift");
+static_assert((int)UINAV_PAGE           == (int)HW_UI_PAGE,           "ui_nav enum drift");
+static_assert((int)UINAV_CONTACTS       == (int)HW_UI_CONTACTS,       "ui_nav enum drift");
+static_assert((int)UINAV_NET            == (int)HW_UI_NET,            "ui_nav enum drift");
 
 // ===== Configuration =====
-#define SEED_VERSION        "0.9.66"
+#define SEED_VERSION        "0.9.80"
 // Core clock: datasheet puts 240 vs 80 ~11.5mA apart on WAITI. Periph bus holds
 // at 80 for every PLL-fed core clock; go lower and RMT/I2S retimes. Same floor
 // as tembed idle policy (no light sleep — notify latency is the job).
@@ -469,7 +495,11 @@ static void hw_probe() {
 // ===== Globals =====
 static AsyncWebServer server(HTTP_PORT);
 static String auth_token = "";
-static String mdns_name = "";
+/* Node identifier ("seed-<mac suffix>"). A label only — it is shown on the
+ * INFO screen, on the clock face and in /capabilities so a node can be told
+ * apart in a fleet. It is NOT resolvable: mDNS is off (see loop()), and
+ * nothing registers it with a DNS server, so reach the node by IP. */
+static String node_name = "";
 static unsigned long boot_time = 0;
 
 /* Active credentials. Fixed buffers, not Arduino Strings: they are written on
@@ -480,7 +510,6 @@ static unsigned long boot_time = 0;
 static char wifi_ssid[33] = "";
 static char wifi_pass[65] = "";
 static bool wifi_user_off = false;
-static bool mdns_started = false;
 /* Background retry backoff. After an association loss (or a failed attempt)
  * the next try comes quickly — a router reboot or a walk back into range is
  * usually over in seconds — then the interval stretches until it reaches the
@@ -610,16 +639,32 @@ static bool clock_local_time(struct tm &out) {
 // ===== Auth =====
 
 static void token_load() {
-    auth_token = read_spiffs_file(TOKEN_FILE);
+    // NVS-first: the auth (OTA) token must be STABLE across a SPIFFS format.
+    // The old path re-read only the file and esp_random()-minted a new token
+    // whenever the file was gone — every format rotated it and locked out WiFi
+    // flashing. NVS is the source of truth after migration; the file is only a
+    // pre-migration fallback.
+    uint8_t buf[SECRET_VALUE_MAX];
+    size_t n = secret_store_get("auth_tok", buf, sizeof(buf));
+    if (n > 0) {
+        auth_token = String();
+        auth_token.reserve(n);
+        for (size_t i = 0; i < n; i++) auth_token += (char)buf[i];
+    } else {
+        auth_token = read_spiffs_file(TOKEN_FILE);
+    }
     auth_token.trim();
 
     if (auth_token.length() == 0) {
-        char buf[33];
+        char hex[33];
         for (int i = 0; i < 16; i++) {
-            snprintf(buf + i * 2, 3, "%02x", (uint8_t)esp_random());
+            snprintf(hex + i * 2, 3, "%02x", (uint8_t)esp_random());
         }
-        buf[32] = '\0';
-        auth_token = String(buf);
+        hex[32] = '\0';
+        auth_token = String(hex);
+        // Persist to NVS (survives a format) AND the file (back-compat).
+        secret_store_put("auth_tok", (const uint8_t *)auth_token.c_str(),
+                         auth_token.length());
         write_spiffs_file(TOKEN_FILE, auth_token);
     }
 }
@@ -833,12 +878,18 @@ static void wifi_setup() {
      * set before the first WiFi.mode() call to reach wifiLowLevelInit(). */
     WiFi.persistent(false);
     WiFi.mode(WIFI_STA);
+    /* Disable modem-sleep power save. The S3 default (WIFI_PS_MIN_MODEM) parks
+     * the radio between DTIM beacons; under the RNS/mesh/display load on core 1
+     * the association is not serviced in time and the AP drops us on a ~20 s
+     * cadence. WIFI_PS_NONE keeps the receiver awake — the standard fix for
+     * exactly this "WiFi keeps falling off" symptom on ESP32. */
+    WiFi.setSleep(false);
     /* Arduino-ESP32 defaults this to true and otherwise retries underneath our
      * scheduler, causing the same UI stalls the 20-minute cadence avoids. */
     WiFi.setAutoReconnect(false);
     String suffix = get_mac_suffix();
-    mdns_name = "seed-" + suffix;
-    mdns_name.toLowerCase();
+    node_name = "seed-" + suffix;
+    node_name.toLowerCase();
 
     // Start SNTP with the stored TZ before associating: the daemon is
     // non-blocking and keeps retrying on its own, so the clock also syncs after
@@ -924,7 +975,10 @@ static void handle_capabilities(AsyncWebServerRequest *request) {
     doc["version"] = SEED_VERSION;
     doc["seed"] = true;
     doc["board"] = hw.board;
-    doc["hostname"] = mdns_name;
+    /* Identifier, not an address: mDNS is off on this board, so this name
+     * resolves nowhere. Per the capabilities spec the field is a "node
+     * hostname or identifier"; talk to the node on wifi_ip below. */
+    doc["hostname"] = node_name;
 
     // Chip
     doc["chip"] = hw.chip_model;
@@ -1328,7 +1382,7 @@ static void handle_skill(AsyncWebServerRequest *request) {
 
     String s = "# ESP32 Seed - T-Lora Pager\n\n";
     s += "Host: " + ip + ":" + String(HTTP_PORT) + "\n";
-    s += "mDNS: " + mdns_name + ".local\n";
+    s += "Name: " + node_name + " (identifier; mDNS is off, reach it by IP)\n";
     s += "WiFi mode: STA only; no provisioning AP\n\n";
     s += "Auth: `Authorization: Bearer <token>` (except /health)\n\n";
     s += "## Grow cycle\n\n";
@@ -1531,6 +1585,12 @@ static void handle_wifi_networks_post(AsyncWebServerRequest *request) {
 // ===== Skills =====
 // Included into this TU so they share auth, SPIFFS, event_add, display_force.
 // build_src_filter excludes skills/ from separate compilation (same as tembed).
+#include "inbox_view.h"   // the inbox list model: order, transport glyph, unread
+#include "feed_view.h"    // the unified Messages feed: cards + chats merged by time
+#include "contacts_view.h"      // the grouped Contacts model: AI / LXMF / mesh rows
+#include "net_view.h"           // the sectioned Network-status model (pure)
+static_assert(HW_UI_NET_MAX == NET_ROWS_MAX, "net status row cap drift");
+#include "mesh/contacts_enum.h" // /contacts3 enumeration for the mesh bucket
 #include "skills/notify.cpp"
 // After notify: reuses notify_send_json / notify_send_error / notify_ingest_p1.
 #include "skills/progress.cpp"
@@ -1542,10 +1602,86 @@ static void handle_wifi_networks_post(AsyncWebServerRequest *request) {
 #include "skills/gps.cpp"    // after notify: reuses notify_send_json; uses hw_ui_expand_ok
 #include "skills/rns.cpp"    // Reticulum bring-up; uses write_spiffs_file_atomic
 
+// ===== Connection coordinator =====
+// Pure policy in src/conn_mgr.h; this is the thin device half that reads the
+// real transport accessors, runs one coordinator step, and dispatches the
+// returned actions to the EXISTING recover entrypoints (never re-implementing
+// them). Placed here, after every skill translation unit is included, so the
+// per-transport statics (wg_is_up, g_rns_*, g_mesh, ...) are in scope.
+//
+// Called once per loop() pass, throttled to CONN_MGR_TICK_MS. On the happy path
+// (every wanted layer up) conn_mgr_step() returns all-false and this writes
+// nothing — no behaviour change when the network is healthy.
+#include "conn_mgr.h"
+static ConnMgrState g_conn_mgr;
+
+static void conn_mgr_service() {
+    static uint32_t last = 0;
+    uint32_t now = millis();
+    if (last != 0 && (now - last) < CONN_MGR_TICK_MS) return;
+    last = now ? now : 1;
+
+    ConnMgrInputs in;
+    memset(&in, 0, sizeof(in));
+    in.now_ms = now;
+    in.wifi_wanted = !wifi_user_off && (wifi_net_count > 0 || wifi_ssid[0]);
+    in.wifi_connected = (WiFi.status() == WL_CONNECTED);
+    in.time_valid = (time(NULL) > TIME_VALID_EPOCH);
+    in.wg_wanted = g_wg_want && g_wg_cfg_ok;
+    in.wg_up = wg_is_up();
+    in.rns_wanted = g_rns_cfg_enabled && g_rns_cfg_ok;
+    in.rns_up = (g_rns_cs.load() == RNS_CS_CONNECTED);
+    in.mesh_wanted = g_mesh.has_identity && g_mesh.radio_ready &&
+                     g_mesh.heltec_pk_hex[0] != '\0';
+    in.mesh_up = (g_mesh.fail_streak < MESH_FAIL_DOWN);
+
+    ConnMgrActions a = conn_mgr_step(&g_conn_mgr, &in);
+
+    if (a.on_attach) event_add("conn: network attached");
+    if (a.on_lost) event_add("conn: network lost");
+
+    // WG bring-up / restart: hand it to wg.cpp's own deferred restart path
+    // (stop -> gap -> start on the loop task). g_wg_restart_req is exactly the
+    // signal the /wg/restart route raises, so this reuses that machinery.
+    if ((a.start_wg || a.restart_wg) && g_wg_want && g_wg_cfg_ok) {
+        g_wg_restart_req = true;
+        event_add("conn: %s wireguard", a.start_wg ? "start" : "restart");
+    }
+
+    // RNS: rearm the connect retry at its minimum backoff so the interface's
+    // own loop() picks it up on the next tick. No socket work here.
+    if (a.nudge_rns) {
+        g_rns_backoff_ms = RNS_TCP_BACKOFF_MIN_MS;
+        g_rns_next_try_ms = millis();
+        event_add("conn: nudge rns reconnect");
+    }
+
+    // mesh: clear the last-probe stamp so skill_meshcore_poll() fires a probe.
+    if (a.nudge_mesh) {
+        g_mesh.last_probe_ms = 0;
+        event_add("conn: nudge mesh probe");
+    }
+
+    // WiFi wedge escape: restart the STA ladder from its fastest rung. The
+    // threshold is past the ladder's own 20 min top rung, so this only fires if
+    // the ladder itself is stuck.
+    if (a.nudge_wifi) {
+        wifi_reconnect_request();
+        event_add("conn: nudge wifi ladder");
+    }
+}
+
+/* Defined with the other UI helpers below; the store needs it as soon as it
+ * starts counting unread, which is from the first message it stores. */
+static bool ui_conv_on_screen(int idx);
+
 static void skills_init() {
     skill_notify_init();
     skill_progress_init();
     skill_agents_init();
+    /* Only the UI knows which conversation is being read; the store must not
+     * infer it from window ownership, which outlives the screen. */
+    agents_set_on_screen_hook(ui_conv_on_screen);
     skill_meshcore_init();
     skill_backlight_init();
     skill_wg_init();
@@ -1577,7 +1713,8 @@ static void ui_clock_paint(const char *note) {
     if (WiFi.status() == WL_CONNECTED) {
         snprintf(addr, sizeof(addr), "%s", WiFi.localIP().toString().c_str());
         snprintf(row1l, sizeof(row1l), "RSSI %d dBm", (int)WiFi.RSSI());
-        snprintf(row1r, sizeof(row1r), "%s.local", mdns_name.c_str());
+        /* Plain node name, no ".local" — mDNS is off, nothing resolves it. */
+        snprintf(row1r, sizeof(row1r), "%s", node_name.c_str());
     } else {
         snprintf(addr, sizeof(addr), "offline");
         snprintf(row1l, sizeof(row1l), "WiFi offline");
@@ -1634,21 +1771,25 @@ static void ui_blank_wake_repaint() {
 // --- Front-panel state (encoder) --------------------------------------------
 // MENU items
 enum {
+    /* MESSAGES is now the single unified feed: notification cards and chat
+     * conversations merged by time. The old separate AGENTS entry is retired —
+     * chats are reachable straight from here (src/feed_view.h). */
     MENU_MESSAGES = 0,
-    MENU_AGENTS,
     MENU_MESHCORE,
     MENU_WIFI,
     MENU_SETTINGS,
     MENU_INFO,
+    MENU_CONTACTS,
     MENU_BACK,
     MENU_COUNT
 };
-// Card action sheet (click / Enter on a notification)
-enum { CARD_ACT_ACK = 0, CARD_ACT_REPLY, CARD_ACT_BACK, CARD_ACT_COUNT };
-// Agents list: 0..4 = agents, 5 = BACK
-enum { AGENTS_BACK = 5, AGENTS_LIST_COUNT = 6 };
-// In-chat menu (click while in agent chat room)
-enum { AGENT_ACT_CLEAR = 0, AGENT_ACT_BACK, AGENT_ACT_COUNT };
+// Card action sheet (click / Enter on a notification). DELETE removes the card
+// from the feed for good (RAM ring + an archive tombstone); it survives reboot.
+enum { CARD_ACT_ACK = 0, CARD_ACT_REPLY, CARD_ACT_DELETE, CARD_ACT_BACK, CARD_ACT_COUNT };
+// In-chat menu (click while in agent chat room). DELETE removes the whole
+// conversation (history + manifest + slot); CLEAR only empties the active room.
+// DELETE is offered only for non-seeded conversations (see agent_act_del_ok).
+enum { AGENT_ACT_CLEAR = 0, AGENT_ACT_DELETE, AGENT_ACT_BACK, AGENT_ACT_COUNT };
 // Layout picker: 0=ABC 1=PHON 2=RU 3=BACK
 enum { LAYOUT_BACK = 3, LAYOUT_LIST_COUNT = 4 };
 // SETTINGS: 0=LAYOUT 1=BACKLIGHT 2=AUTO-DIM 3=BACK
@@ -1676,6 +1817,10 @@ static int menu_sel = 0;
 static int card_act_sel = 0;
 static int agents_sel = 0;
 static int agent_act_sel = 0;
+// The in-chat sheet drops the DELETE row for a seeded conversation (claude /
+// hermes): those doors are re-created from firmware every boot, so a delete
+// could never stick. Set when the sheet opens; drives its row count + mapping.
+static bool agent_act_del_ok = false;
 static int layout_sel = 0;
 static int settings_sel = 0;
 static int mesh_sel = 0;
@@ -1720,13 +1865,95 @@ static uint32_t ag_chat_ts[AGENT_THREAD_MAX];
 static const char *ag_chat_ptrs[AGENT_THREAD_MAX];
 // Session-list screen rows: N sessions + "NEW SESSION" + "BACK".
 // ag_sess_msgs[i] < 0 ⇒ no message-count badge on that row.
+/* Inbox snapshot. Built under agents_lock() and drawn from — never a live
+ * pointer into the conversation table, which the off-loop drain mints into and
+ * evicts from while the panel is painting. */
+static char        ag_inbox_labels[CONV_MAX][CONV_LABEL_LEN];
+static const char *ag_inbox_ptrs[CONV_MAX];
+static char        ag_inbox_glyphs[CONV_MAX];
+static int         ag_inbox_unread[CONV_MAX];
+static char        ag_inbox_ids[CONV_MAX][CONV_ID_LEN];  /* what each row displayed */
+static uint8_t     ag_inbox_slot[CONV_MAX];     /* row -> conversation index */
+static bool        ag_inbox_rooms[CONV_MAX];    /* row opens rooms, not a chat */
+static int         ag_inbox_n = 0;              /* conversation rows (BACK extra) */
+
+/* Snapshot the conversation table into the row arrays, newest first. */
+static_assert(CONV_MAX <= INBOX_MAX_ROWS,
+              "the inbox model must be able to order every conversation slot");
+
+/* The store's "is the user reading this?" test. The chat screen being up on
+ * this conversation is the only thing that counts as reading it. */
+static bool ui_conv_on_screen(int idx) {
+    return hw_ui_screen() == HW_UI_AGENT_CHAT && agent_focus == idx;
+}
+
+static void ui_inbox_build() {
+    InboxConvView v[CONV_MAX];
+    InboxRow rows[CONV_MAX];
+    int n = 0;
+    agents_lock();
+    int total = agents_count();
+    for (int i = 0; i < total && n < CONV_MAX; i++) {
+        v[n].slot = (uint8_t)i;
+        v[n].id = agents_id(i);
+        v[n].label = agents_name(i);
+        v[n].transport = agents_transport(i);
+        v[n].last_use = agents_last_use(i);
+        v[n].unread = agents_unread(i);
+        v[n].has_rooms = agents_has_rooms(i) ? 1 : 0;
+        n++;
+    }
+    int rn = inbox_build_rows(v, n, rows, CONV_MAX);
+    for (int i = 0; i < rn; i++) {
+        snprintf(ag_inbox_labels[i], sizeof(ag_inbox_labels[i]), "%s", rows[i].label);
+        ag_inbox_ptrs[i] = ag_inbox_labels[i];
+        ag_inbox_glyphs[i] = rows[i].glyph;
+        ag_inbox_unread[i] = (int)rows[i].unread;
+        ag_inbox_slot[i] = rows[i].slot;
+        ag_inbox_rooms[i] = rows[i].has_rooms != 0;
+        snprintf(ag_inbox_ids[i], sizeof(ag_inbox_ids[i]), "%s", rows[i].id);
+    }
+    agents_unlock();
+    ag_inbox_n = rn;
+}
+
+/* Repaint from a REBUILT snapshot: the rows changed, so the renderer's
+ * selection memo has to be dropped or it decides nothing needs drawing. */
+static void ui_inbox_refresh(int selected) {
+    ui_inbox_build();
+    hw_ui_inbox_invalidate();
+    hw_ui_show_inbox(ag_inbox_ptrs, ag_inbox_glyphs, ag_inbox_unread,
+                     ag_inbox_n, selected, agents_bridge_ok());
+}
+
+static void ui_inbox_render(int selected) {
+    hw_ui_show_inbox(ag_inbox_ptrs, ag_inbox_glyphs, ag_inbox_unread,
+                     ag_inbox_n, selected, agents_bridge_ok());
+}
+
 static char ag_sess_titles[AGENT_SESSIONS_MAX + 2][AGENT_SESSION_LEN + 2];
 static int  ag_sess_msgs[AGENT_SESSIONS_MAX + 2];
 static bool ag_sess_active[AGENT_SESSIONS_MAX + 2];
 static const char *ag_sess_ptrs[AGENT_SESSIONS_MAX + 2];
+// Live-room roster: dead sessions are hidden from the picker, so a display row
+// is not the raw session index. ag_sess_row2idx maps the row shown to the real
+// session index; ag_sess_vis_n is the count of visible (non-dead) rows drawn.
+static int ag_sess_row2idx[AGENT_SESSIONS_MAX];
+static int ag_sess_vis_n = 0;
 static int msglist_sel = 0;
-// Cached ids for the visible msglist rows (map row → notify id).
-static uint32_t msglist_ids[HW_UI_MSGLIST_MAX];
+// Tagged handle for one unified-feed row: the Messages feed mixes notification
+// cards and chat conversations, so a row opens by one of two handles. A card
+// row carries its notify id; a conversation row carries its table slot and the
+// id it displayed (revalidated before opening, so a recycled slot cannot drop
+// the user into a stranger's thread — see the HW_UI_MSGLIST click handler).
+struct MsgHandle {
+    bool     is_conv;                 // false = notify card, true = conversation
+    uint32_t card_id;                 // card handle (is_conv == false)
+    uint8_t  slot;                    // conversation slot (is_conv == true)
+    bool     rooms;                   // conv opens a room picker vs a chat
+    char     conv_id[CONV_ID_LEN];    // what the conv row displayed
+};
+static MsgHandle msglist_h[HW_UI_MSGLIST_MAX];
 static int msglist_count = 0;
 // Notify card currently shown (for ack-on-click / reply).
 static uint32_t notify_card_id = 0;
@@ -1848,6 +2075,9 @@ static void notify_restore_from_archive() {
     for (int rank = 0; rank < NOTIFY_MAX; rank++) {
         history_record rec;
         if (!history_restore_at(MICRON_NS_NOTIFY, rank, &rec)) break;  // past the last
+        // A deleted card's newest archived record is a tombstone (newest-wins over
+        // its data record): skip the identity so a delete survives the reboot.
+        if (notify_rec_is_tombstone(rec.payload, rec.len)) continue;
         notify_rec nr;
         if (!notify_rec_decode(rec.payload, rec.len, &nr)) continue;   // skip a bad body
         if (notify_restore_one(&nr, now, now_ms)) restored++;
@@ -1920,7 +2150,18 @@ static void mesh_gw_load() {
 }
 
 static void gw_token_load() {
-    String stored = read_spiffs_file(GW_TOKEN_PATH);
+    // NVS-first (source of truth after migration); the SPIFFS file is only a
+    // pre-migration fallback. An absent token is legitimate (none provisioned),
+    // and leaves gw_token empty exactly as before.
+    String stored;
+    uint8_t buf[SECRET_VALUE_MAX];
+    size_t n = secret_store_get("gw_tok", buf, sizeof(buf));
+    if (n > 0) {
+        stored.reserve(n);
+        for (size_t i = 0; i < n; i++) stored += (char)buf[i];
+    } else {
+        stored = read_spiffs_file(GW_TOKEN_PATH);
+    }
     stored.trim();
     snprintf(gw_token, sizeof(gw_token), "%s", stored.c_str());
 }
@@ -2101,6 +2342,7 @@ static void ui_open_meshcore() {
 }
 
 static void ui_reply_paint();  // defined later (WiFi password reuses reply face)
+static void ui_open_net();     // sectioned network status; defined with Contacts below
 
 static void ui_open_wifi() {
     wifi_sel = 0;
@@ -2115,41 +2357,6 @@ static void ui_wifi_paint_list() {
         ptrs[i] = wifi_list_titles[i];
     const char *hdr = (wifi_list_mode == WIFI_LIST_PROFILES) ? "PROFILES" : "SCAN";
     hw_ui_show_wifi_list(hdr, ptrs, wifi_list_count, wifi_list_sel);
-    ui_note_input();
-}
-
-static void ui_wifi_show_status() {
-    static char lines[12][42];
-    static const char *ptrs[12];
-    int n = 0;
-    auto add = [&](const char *fmt, ...) {
-        if (n >= 12) return;
-        va_list ap;
-        va_start(ap, fmt);
-        vsnprintf(lines[n], sizeof(lines[0]), fmt, ap);
-        va_end(ap);
-        ptrs[n] = lines[n];
-        n++;
-    };
-    if (WiFi.status() == WL_CONNECTED) {
-        add("SSID %s", WiFi.SSID().c_str());
-        add("IP   %s", WiFi.localIP().toString().c_str());
-        add("RSSI %d dBm", (int)WiFi.RSSI());
-    } else {
-        add("WiFi %s", wifi_user_off ? "OFF (mesh only)" : "STA offline");
-    }
-    add("profiles %d  idx %d", wifi_net_count, wifi_net_idx);
-    for (int i = 0; i < wifi_net_count && n < 10; i++) {
-        add("%c %s", (i == wifi_net_idx) ? '*' : ' ', wifi_nets[i].ssid);
-    }
-    switch (wg_ui_state()) {
-    case WG_UI_OK:    add("WG  UP (tunnel)"); break;
-    case WG_UI_WAIT:  add("WG  wait"); break;
-    case WG_UI_STALE: add("WG  stale"); break;
-    case WG_UI_DOWN:  add("WG  DOWN"); break;
-    default:          add("WG  off / no config"); break;
-    }
-    hw_ui_show_wifi_info(ptrs, n);
     ui_note_input();
 }
 
@@ -2175,7 +2382,7 @@ static void ui_wifi_toggle() {
             Serial.println("[wifi] user toggled ON — no saved profile");
         }
     }
-    ui_wifi_show_status();
+    ui_open_net();
     ui_note_input();
 }
 
@@ -2594,7 +2801,6 @@ static void ui_open_msglist();  // defined below
 static void ui_open_notify_id(uint32_t id);
 static void ui_open_card_act();
 static void ui_card_act_confirm();
-static void ui_open_agents();
 static void ui_open_agent_sessions(int idx);
 static void ui_agent_sessions_refresh();
 static void ui_open_agent_chat(int idx);
@@ -2605,6 +2811,37 @@ static bool notify_is_chat_door(const NotifyView &v);
 static int agents_index_from_door(const NotifyView &v);
 static void ui_show_agent_invite_from_view(const NotifyView &v, uint32_t id);
 static void ui_enter_agent_from_notify(uint32_t id, const NotifyView &v);
+static void ui_open_menu();
+static void ui_open_info();
+
+// Navigate to `target` (a UiNavScreen id) by rebuilding its content — the same
+// open helpers the per-screen BACK rows call. Used only for the small set of
+// screens ui_nav_back_target() can hand back.
+static void ui_go_to_screen(uint8_t target) {
+    switch (target) {
+    case UINAV_CLOCK:          ui_go_clock(NULL);                 break;
+    case UINAV_MENU:           ui_open_menu();                    break;
+    case UINAV_MSGLIST:        ui_open_msglist();                 break;
+    case UINAV_NOTIFY:         ui_open_notify_id(notify_card_id); break;
+    case UINAV_AGENT_CHAT:     ui_open_agent_chat(agent_focus);   break;
+    case UINAV_AGENT_SESSIONS: ui_open_agent_sessions(agent_focus); break;
+    case UINAV_SETTINGS:       ui_open_settings();                break;
+    case UINAV_MESHCORE:       ui_open_meshcore();                break;
+    case UINAV_WIFI:           ui_open_wifi();                    break;
+    default:                   ui_go_clock(NULL);                 break;
+    }
+}
+
+// One "go back" step from the current face — the BACKSPACE key's navigation
+// action and the shared spec for the BACK rows. No-op on CLOCK (root) and on the
+// text-entry editor (REPLY handles BACKSPACE as delete-a-char before this runs).
+static void ui_go_back() {
+    HwUiScreen scr = hw_ui_screen();
+    if (!ui_nav_backspace_goes_back((uint8_t)scr)) return;
+    bool has_rooms = (scr == HW_UI_AGENT_CHAT) && agents_has_rooms(agent_focus);
+    ui_go_to_screen(ui_nav_back_target((uint8_t)scr, has_rooms));
+    hw_haptic_notify(0);
+}
 
 // first_utf8: optional first character (UTF-8); NULL/empty = empty draft.
 static void ui_open_reply(uint32_t id, const char *title, const char *first_utf8) {
@@ -2709,10 +2946,17 @@ static void ui_on_key(const char *u) {
         return;
     }
 
+    // Backspace = go back one screen on every navigation face. On the text-entry
+    // editor (REPLY) it still deletes a character — handled by that screen's
+    // block below, so it is excluded here.
+    if (c0 == '\b' && !ui_nav_is_text_entry((uint8_t)scr)) {
+        ui_go_back();
+        return;
+    }
+
     // From a card: typing jumps straight into reply.
     // Enter: agent door → open chat; else Ack·Reply sheet.
     if (scr == HW_UI_NOTIFY && notify_card_id) {
-        if (c0 == '\b') return;
         if (c0 == '\n') {
             NotifyView v;
             if (notify_view_by_id(notify_card_id, v, NULL, NULL) &&
@@ -2796,21 +3040,15 @@ static void ui_open_menu() {
     ui_note_input();
 }
 
-static void ui_open_agents() {
-    agents_sel = 0;
-    hw_ui_show_agents(agents_sel, agents_bridge_ok());
-    ui_note_input();
-}
-
 static int agents_index_from_source(const char *src) {
     if (!src || !src[0]) return -1;
-    // notify source is short: "hermes", "grok", "claude", "opencode", "codex"
+    // notify source is short: "claude", "hermes"
     return agents_find(src);
 }
 
 /* Chat-door vs real message:
  *   door  = client id ends with "-chat" (bridge posts "hermes-chat",
- *           "opencode-chat", "codex-chat" etc.)
+ *           "claude-chat" etc.)
  *   page  = everything else — full severity card (info/warn/crit colours),
  *           from any service/agent; reply works as before.
  * Chat rooms (AGENTS menu) are separate from the message queue. */
@@ -2823,7 +3061,7 @@ static bool notify_is_chat_door(const NotifyView &v) {
 static int agents_index_from_door(const NotifyView &v) {
     if (!notify_is_chat_door(v)) return -1;
     // Prefer source; fall back to key prefix "hermes-chat" → "hermes",
-    // "opencode-chat" → "opencode", "codex-chat" → "codex"
+    // "claude-chat" → "claude"
     int ax = agents_index_from_source(v.source);
     if (ax >= 0) return ax;
     char id[AGENT_ID_LEN];
@@ -2892,16 +3130,23 @@ static void ui_open_agent_chat(int idx) {
  * When the session registry is full the NEW row turns into a visible
  * "MAX n SESSIONS" note and is not selectable — no silent refusal. */
 static void ui_agent_sessions_refresh() {
-    int n = agents_session_count(agent_focus);
-    bool full = (n >= AGENT_SESSIONS_MAX);
-    int total = n + 2;
-    for (int i = 0; i < n; i++) {
-        snprintf(ag_sess_titles[i], sizeof(ag_sess_titles[0]), "%s",
+    int all = agents_session_count(agent_focus);
+    // Registry capacity is over ALL sessions (dead rooms still hold a slot), so
+    // the "NEW" row disables on the full registry regardless of what is hidden.
+    bool full = (all >= AGENT_SESSIONS_MAX);
+    int n = 0;  // visible (non-dead) rows
+    for (int i = 0; i < all; i++) {
+        if (agents_session_is_dead(agent_focus, i)) continue;  // roster: hidden
+        snprintf(ag_sess_titles[n], sizeof(ag_sess_titles[0]), "%s",
                  agents_session_name(agent_focus, i));
-        ag_sess_msgs[i] = agents_session_msg_count(agent_focus, i);
-        ag_sess_active[i] = agents_session_is_active(agent_focus, i);
-        ag_sess_ptrs[i] = ag_sess_titles[i];
+        ag_sess_msgs[n] = agents_session_msg_count(agent_focus, i);
+        ag_sess_active[n] = agents_session_is_active(agent_focus, i);
+        ag_sess_ptrs[n] = ag_sess_titles[n];
+        ag_sess_row2idx[n] = i;
+        n++;
     }
+    ag_sess_vis_n = n;
+    int total = n + 2;
     if (full)
         snprintf(ag_sess_titles[n], sizeof(ag_sess_titles[0]),
                  "MAX %d SESSIONS", AGENT_SESSIONS_MAX);
@@ -2928,25 +3173,51 @@ static void ui_open_agent_sessions(int idx) {
     if (idx >= agents_count()) idx = agents_count() - 1;
     agent_focus = idx;
     agents_session_refresh_counts(idx);
+    // Select the active session's VISIBLE row (dead rooms are hidden, so the
+    // row is not the raw index). If the active room is itself dead it is not in
+    // the list; fall back to the first visible row (0) — refresh clamps into
+    // the NEW/BACK tail when nothing is visible.
     agent_sess_sel = 0;
-    for (int i = 0; i < agents_session_count(idx); i++)
-        if (agents_session_is_active(idx, i)) { agent_sess_sel = i; break; }
+    int vis_row = 0;
+    for (int i = 0; i < agents_session_count(idx); i++) {
+        if (agents_session_is_dead(idx, i)) continue;
+        if (agents_session_is_active(idx, i)) { agent_sess_sel = vis_row; break; }
+        vis_row++;
+    }
     ui_agent_sessions_refresh();
 }
 
+// The in-chat sheet has a variable row count: CLEAR / DELETE / BACK for a peer
+// conversation, CLEAR / BACK for a seeded door (DELETE dropped). These two map a
+// visible row index onto the stable AGENT_ACT_* action for the current layout.
+static int agent_act_row_count() { return agent_act_del_ok ? 3 : 2; }
+static int agent_act_row_action(int sel) {
+    if (agent_act_del_ok) return sel;                 // 0=CLEAR 1=DELETE 2=BACK
+    return (sel == 0) ? AGENT_ACT_CLEAR : AGENT_ACT_BACK;  // 0=CLEAR 1=BACK
+}
+
 static void ui_open_agent_act() {
-    agent_act_sel = AGENT_ACT_CLEAR;
-    hw_ui_show_agent_act(agent_act_sel, agents_name(agent_focus));
+    agent_act_sel = 0;
+    agent_act_del_ok = !agents_is_seeded(agent_focus);
+    hw_ui_show_agent_act(agent_act_sel, agents_name(agent_focus), agent_act_del_ok);
     ui_note_input();
 }
 
 static void ui_agent_act_confirm() {
-    if (agent_act_sel == AGENT_ACT_CLEAR) {
+    int act = agent_act_row_action(agent_act_sel);
+    if (act == AGENT_ACT_CLEAR) {
         agents_clear(agents_id(agent_focus));
         hw_haptic_notify(0);
         ui_open_agent_chat(agent_focus);
+    } else if (act == AGENT_ACT_DELETE) {
+        // Whole conversation gone — history, manifest line and RAM slot — matched
+        // by id (recycle-safe), so it does not come back on the next boot. Then
+        // the unified feed, which recomputes without it.
+        agents_delete(agents_id(agent_focus));
+        hw_haptic_notify(0);
+        ui_open_msglist();
     } else {
-        ui_open_agents();
+        ui_open_msglist();   // BACK from the in-chat sheet → the unified feed
     }
 }
 
@@ -2955,38 +3226,344 @@ static void ui_open_info() {
     snprintf(ver, sizeof(ver), "v%s", SEED_VERSION);
     String ip = (WiFi.status() == WL_CONNECTED)
         ? WiFi.localIP().toString() : String("");
-    hw_ui_show_info(ver, mdns_name.c_str(), ip.c_str(),
+    hw_ui_show_info(ver, node_name.c_str(), ip.c_str(),
                     auth_token.c_str(), ESP.getFreeHeap(),
                     notify_unread_count());
     ui_note_input();
 }
 
-// Build msglist from newest-first notify views (up to HW_UI_MSGLIST_MAX).
-// Unread flags drive the Nokia-style * NEW markers on the list face.
+// One notify level → one severity letter, the glyph a card row shows in the
+// unified feed (conversation rows show a transport glyph instead).
+static char msglist_sev_letter(uint8_t level) {
+    const char *n = notify_level_name(level);
+    if (n[0] == 'c' || n[0] == 'C') return 'C';
+    if (n[0] == 'w' || n[0] == 'W') return 'W';
+    return 'I';
+}
+
+// Build the unified Messages feed: notification cards AND chat conversations,
+// merged into one list ordered by unix time, newest first (src/feed_view.h).
+// Cards sort on created_epoch, conversations on last.ts; the row's tagged
+// handle (card id vs conv slot+id) is cached so a click opens the right thing.
 static void ui_open_msglist() {
-    static char titles[HW_UI_MSGLIST_MAX][41];
-    static char levels[HW_UI_MSGLIST_MAX][8];
+    static char titles[HW_UI_MSGLIST_MAX][FEED_LABEL_LEN];
+    static char glyphs[HW_UI_MSGLIST_MAX];
+    static bool is_conv[HW_UI_MSGLIST_MAX];
     static bool unread[HW_UI_MSGLIST_MAX];
     static const char *title_ptrs[HW_UI_MSGLIST_MAX];
-    static const char *level_ptrs[HW_UI_MSGLIST_MAX];
 
-    msglist_count = 0;
-    for (int i = 0; i < NOTIFY_MAX && msglist_count < HW_UI_MSGLIST_MAX; i++) {
+    // Cards out of the notify queue (newest first). Titles are copied into a
+    // scratch that outlives the merge, so the view can point at them.
+    FeedCardView cards[FEED_MAX_CARDS];
+    static char card_titles[FEED_MAX_CARDS][NOTIFY_TITLE_LEN];
+    int nc = 0;
+    for (int i = 0; i < NOTIFY_MAX && nc < FEED_MAX_CARDS; i++) {
         NotifyView v;
         if (!notify_view(i, v)) break;
-        msglist_ids[msglist_count] = v.id;
-        snprintf(titles[msglist_count], sizeof(titles[0]), "%s", v.title);
-        snprintf(levels[msglist_count], sizeof(levels[0]), "%s",
-                 notify_level_name(v.level));
-        unread[msglist_count] = v.unread;
+        snprintf(card_titles[nc], sizeof(card_titles[0]), "%s", v.title);
+        cards[nc].id = v.id;
+        cards[nc].epoch = v.created_epoch;
+        cards[nc].title = card_titles[nc];
+        cards[nc].sev = msglist_sev_letter(v.level);
+        cards[nc].unread = v.unread ? 1 : 0;
+        nc++;
+    }
+
+    // Conversations out of the live table, then merge — both under the lock,
+    // because the view points into the table until feed_build_rows copies each
+    // label and id out. After it returns the rows are self-contained.
+    FeedConvView convs[CONV_MAX];
+    FeedRow rows[HW_UI_MSGLIST_MAX];
+    int rn = 0;
+    agents_lock();
+    int total = agents_count();
+    int nv = 0;
+    for (int i = 0; i < total && nv < CONV_MAX; i++) {
+        convs[nv].slot = (uint8_t)i;
+        convs[nv].id = agents_id(i);
+        convs[nv].label = agents_name(i);
+        convs[nv].epoch = agents_last_ts(i);
+        convs[nv].transport = agents_transport(i);
+        convs[nv].unread = agents_unread(i);
+        convs[nv].has_rooms = agents_has_rooms(i) ? 1 : 0;
+        nv++;
+    }
+    rn = feed_build_rows(cards, nc, convs, nv, rows, HW_UI_MSGLIST_MAX);
+    agents_unlock();
+
+    msglist_count = 0;
+    for (int i = 0; i < rn && msglist_count < HW_UI_MSGLIST_MAX; i++) {
+        const FeedRow &r = rows[i];
+        snprintf(titles[msglist_count], sizeof(titles[0]), "%s", r.label);
         title_ptrs[msglist_count] = titles[msglist_count];
-        level_ptrs[msglist_count] = levels[msglist_count];
+        glyphs[msglist_count] = r.glyph;
+        is_conv[msglist_count] = (r.origin == FEED_CONV);
+        unread[msglist_count] = (r.mark != ' ');
+        MsgHandle &h = msglist_h[msglist_count];
+        if (r.origin == FEED_CONV) {
+            h.is_conv = true;
+            h.slot = r.slot;
+            h.rooms = r.has_rooms != 0;
+            h.card_id = 0;
+            snprintf(h.conv_id, sizeof(h.conv_id), "%s", r.id);
+        } else {
+            h.is_conv = false;
+            h.card_id = r.card_id;
+            h.slot = 0;
+            h.rooms = false;
+            h.conv_id[0] = '\0';
+        }
         msglist_count++;
     }
     if (msglist_sel >= msglist_count) msglist_sel = msglist_count > 0 ? msglist_count - 1 : 0;
     if (msglist_sel < 0) msglist_sel = 0;
-    hw_ui_show_msglist(title_ptrs, level_ptrs, unread, msglist_count, msglist_sel);
+    hw_ui_show_msglist(title_ptrs, glyphs, is_conv, unread, msglist_count, msglist_sel);
     ui_note_input();
+}
+
+// ===== Contacts screen =====
+// The grouped "who can I write to" list. The rows contacts_build_rows produces
+// ARE the tagged handle array: a clicked contact row carries its own
+// {transport, id, reply} so open-or-create can act on it after the input arrays
+// are gone (src/contacts_view.h). Selection only ever lands on a contact row;
+// header rows are non-selectable dividers.
+static ContactRow contacts_rows[CONTACT_ROWS_MAX];
+static int contacts_count = 0;
+static int contacts_sel = 0;
+// Flattened view arrays for the renderer (labels point into contacts_rows, which
+// is static, so the pointers stay valid until the next rebuild).
+static const char *contacts_labels[CONTACT_ROWS_MAX];
+static bool contacts_is_header[CONTACT_ROWS_MAX];
+static bool contacts_has_conv[CONTACT_ROWS_MAX];
+
+// First contact (non-header) row at or after `from`, stepping by dir (+1/-1);
+// -1 if there is none in that direction. This is how selection skips headers.
+static int contacts_next_contact(int from, int dir) {
+    for (int i = from; i >= 0 && i < contacts_count; i += dir)
+        if (contacts_rows[i].kind == CONTACT_ROW_CONTACT) return i;
+    return -1;
+}
+
+// Flatten contacts_rows into the primitive view arrays and paint. `note` is an
+// optional short status line (e.g. the table-full refusal), else NULL.
+static void ui_contacts_render(const char *note) {
+    for (int i = 0; i < contacts_count; i++) {
+        contacts_labels[i] = contacts_rows[i].label;
+        contacts_is_header[i] = (contacts_rows[i].kind == CONTACT_ROW_HEADER);
+        contacts_has_conv[i] = (contacts_rows[i].has_conversation != 0);
+    }
+    hw_ui_show_contacts(contacts_labels, contacts_is_header, contacts_has_conv,
+                        contacts_count, contacts_sel, note);
+    ui_note_input();
+}
+
+// Build the three bucket candidate arrays and run contacts_build_rows.
+//   AI   = seeded doors (always have a slot).
+//   mesh = /contacts3 peers (id + has_conversation derived from the public key).
+//   LXMF = EXISTING LXMF conversations only — no manual address-add this commit
+//          (that is the future address-book ticket).
+static void ui_open_contacts() {
+    // Candidate backing: contacts_build_rows COPIES label/id/reply into each
+    // row, so this only needs to outlive the build call below. ALL of these are
+    // file-/function-scope static (not loop-task stack): mrec alone is
+    // sizeof(MeshContactRec)*16 ~= 2.5 KB and, with the three candidate arrays,
+    // overflowed the loop task's stack and tripped the canary. Same idiom as
+    // ui_open_msglist's static titles/handles above — rebuilt in full each call
+    // (the n_ai/n_mesh/n_lxmf loops overwrite every slot before build reads it),
+    // reached only from the loop task, so reuse across renders is safe. These are
+    // this screen's OWN statics; they are not shared with the msglist buffers.
+    static ContactCandidate ai[CONTACT_BUCKET_CAP];
+    static ContactCandidate mesh[CONTACT_BUCKET_CAP];
+    static ContactCandidate lxmf[CONTACT_BUCKET_CAP];
+    static MeshContactRec   mrec[CONTACT_BUCKET_CAP];
+    static char mesh_ids[CONTACT_BUCKET_CAP][CONV_ID_LEN];
+    static char lx_ids[CONTACT_BUCKET_CAP][CONV_ID_LEN];
+    static char lx_labels[CONTACT_BUCKET_CAP][CONV_LABEL_LEN];
+    static uint8_t lx_reply[CONTACT_BUCKET_CAP][CONV_REPLY_MAX];
+    static uint8_t lx_reply_len[CONTACT_BUCKET_CAP];
+
+    // AI: the seeded doors. They always have a slot (has_conversation = true) and
+    // their return address is the agent-id bytes the bridge answers to. The
+    // pointers agents_seeded_at hands back stay valid after its lock drops — a
+    // seeded slot never moves or is evicted (see agents.cpp).
+    int n_ai = 0;
+    int seeded = agents_seeded_count();
+    for (int i = 0; i < seeded && n_ai < CONTACT_BUCKET_CAP; i++) {
+        const char *id = NULL, *label = NULL;
+        const uint8_t *reply = NULL;
+        uint8_t rlen = 0;
+        if (!agents_seeded_at(i, &id, &label, &reply, &rlen)) break;
+        ai[n_ai].label = label;
+        ai[n_ai].id = id;
+        ai[n_ai].transport = CONV_AGENT;
+        ai[n_ai].has_conversation = 1;
+        ai[n_ai].reply = reply;
+        ai[n_ai].reply_len = rlen;
+        n_ai++;
+    }
+
+    // Mesh: peers this device has met (/contacts3, loop-safe file read). The id
+    // and the has_conversation flag both derive from the 32-byte public key the
+    // same way conv_mint keys a peer, so a row that maps to an existing thread is
+    // marked and opens it rather than making a duplicate.
+    int nmesh = mesh_contacts_list(mrec, CONTACT_BUCKET_CAP);
+    int n_mesh = 0;
+    for (int i = 0; i < nmesh && n_mesh < CONTACT_BUCKET_CAP; i++) {
+        conv_peer_id(mrec[i].pub_key, MESH_CONTACT_PUBKEY_LEN,
+                     mesh_ids[n_mesh], sizeof(mesh_ids[0]));
+        if (!mesh_ids[n_mesh][0]) continue;   // key too short to key on: skip
+        mesh[n_mesh].label = mrec[i].name;
+        mesh[n_mesh].id = mesh_ids[n_mesh];
+        mesh[n_mesh].transport = CONV_MESH;
+        mesh[n_mesh].has_conversation =
+            agents_peer_has_conversation(mrec[i].pub_key,
+                                         MESH_CONTACT_PUBKEY_LEN) ? 1 : 0;
+        mesh[n_mesh].reply = mrec[i].pub_key;
+        mesh[n_mesh].reply_len = MESH_CONTACT_PUBKEY_LEN;
+        n_mesh++;
+    }
+
+    // LXMF: existing LXMF conversations only. Snapshot the table under the lock,
+    // then build the rows — contacts_build_rows copies each id/label/reply out,
+    // so the rows are self-contained once it returns and the lock can drop.
+    int n_lxmf = 0;
+    agents_lock();
+    int total = agents_count();
+    for (int i = 0; i < total && n_lxmf < CONTACT_BUCKET_CAP; i++) {
+        if (agents_transport(i) != CONV_LXMF) continue;
+        snprintf(lx_ids[n_lxmf], sizeof(lx_ids[0]), "%s", agents_id(i));
+        snprintf(lx_labels[n_lxmf], sizeof(lx_labels[0]), "%s", agents_name(i));
+        lx_reply_len[n_lxmf] = agents_reply_addr(i, lx_reply[n_lxmf],
+                                                 CONV_REPLY_MAX);
+        lxmf[n_lxmf].label = lx_labels[n_lxmf];
+        lxmf[n_lxmf].id = lx_ids[n_lxmf];
+        lxmf[n_lxmf].transport = CONV_LXMF;
+        lxmf[n_lxmf].has_conversation = 1;   // it exists: that IS the thread
+        lxmf[n_lxmf].reply = lx_reply[n_lxmf];
+        lxmf[n_lxmf].reply_len = lx_reply_len[n_lxmf];
+        n_lxmf++;
+    }
+    contacts_count = contacts_build_rows(ai, n_ai, lxmf, n_lxmf, mesh, n_mesh,
+                                         contacts_rows, CONTACT_ROWS_MAX);
+    agents_unlock();
+
+    // Land the selection on the first contact row (headers are not selectable).
+    contacts_sel = contacts_next_contact(0, +1);
+    if (contacts_sel < 0) contacts_sel = 0;
+    ui_contacts_render(NULL);
+}
+
+// A picked contact opens its chat or creates one, then lands there. On a full
+// table that refuses (only a brand-new mesh peer can hit this), surface it and
+// stay on the list rather than crash.
+static void ui_contacts_open_selected() {
+    if (contacts_count == 0) { ui_open_menu(); return; }
+    if (contacts_sel < 0 || contacts_sel >= contacts_count) return;
+    const ContactRow &r = contacts_rows[contacts_sel];
+    if (r.kind != CONTACT_ROW_CONTACT) return;   // never open a header
+    int slot = agents_open_or_create(r.transport, r.id, r.label,
+                                     r.reply_len ? r.reply : NULL, r.reply_len);
+    if (slot < 0) {
+        event_add("contacts open refused (table full): %s", r.id);
+        hw_haptic_notify(0);
+        ui_contacts_render("CONTACTS FULL - CLEAR A CHAT");
+        return;
+    }
+    hw_haptic_notify(0);
+    ui_open_agent_chat(slot);
+}
+
+// ===== Network status screen =====
+// The sectioned "how am I connected" screen (WiFi / Reticulum / mesh / tunnel).
+// Read-only: it snapshots the live per-transport accessors into a NetStatus and
+// runs the pure net_build_rows model (src/net_view.h); it changes NO
+// connectivity behaviour. Reached from the WiFi menu's STATUS entry — folded in
+// there rather than as a new top-level menu item because the main menu is
+// already seven rows (MESSAGES..BACK) and an eighth would run off the 222 px
+// panel, whereas the WiFi menu's "STATUS" is the natural home for a network
+// status view and needs no new row anywhere.
+static NetRow      net_rows[NET_ROWS_MAX];
+static int         net_count = 0;
+static int         net_top = 0;
+// Flattened view arrays for the renderer (labels/values point into net_rows,
+// which is static, so the pointers stay valid until the next rebuild).
+static const char *net_labels[NET_ROWS_MAX];
+static const char *net_values[NET_ROWS_MAX];
+static bool        net_is_header[NET_ROWS_MAX];
+static uint8_t     net_levels[NET_ROWS_MAX];
+
+static void ui_net_render() {
+    for (int i = 0; i < net_count; i++) {
+        net_labels[i] = net_rows[i].label;
+        net_values[i] = net_rows[i].value;
+        net_is_header[i] = (net_rows[i].kind == NET_ROW_HEADER);
+        net_levels[i] = net_rows[i].level;
+    }
+    hw_ui_show_net(net_labels, net_values, net_is_header, net_levels,
+                   net_count, net_top);
+    ui_note_input();
+}
+
+// Snapshot every transport's live status and build the sectioned rows. All
+// scratch is file-/function-scope static (loop task, tight stack — same rule as
+// ui_open_contacts): net_build_rows COPIES each label/value into net_rows, so
+// these value buffers only need to outlive the build call. g_mesh / g_rns_* /
+// WiFi are read directly on the loop task exactly as conn_mgr_service() and
+// ui_clock_paint() do — those globals are loop-task owned, so no extra lock.
+static void ui_open_net() {
+    static char wifi_ssid_s[NET_VALUE_LEN];
+    static char wifi_ip_s[NET_VALUE_LEN];
+    static char rns_addr_s[NET_VALUE_LEN];
+    static char mesh_key_s[NET_VALUE_LEN];
+    static char mesh_rf_s[NET_VALUE_LEN];
+
+    NetStatus s;
+    memset(&s, 0, sizeof(s));
+
+    // WiFi.
+    bool wc = (WiFi.status() == WL_CONNECTED);
+    s.wifi.wanted = !wifi_user_off && (wifi_net_count > 0 || wifi_ssid[0]);
+    s.wifi.connected = wc;
+    s.wifi.profiles = wifi_net_count;
+    if (wc) {
+        snprintf(wifi_ssid_s, sizeof(wifi_ssid_s), "%s", WiFi.SSID().c_str());
+        snprintf(wifi_ip_s, sizeof(wifi_ip_s), "%s",
+                 WiFi.localIP().toString().c_str());
+        s.wifi.ssid = wifi_ssid_s;
+        s.wifi.ip = wifi_ip_s;
+        s.wifi.rssi_dbm = (int)WiFi.RSSI();
+    }
+
+    // Reticulum.
+    s.rns.enabled = g_rns_cfg_enabled && g_rns_cfg_ok;
+    s.rns.has_identity = rns_identity_ok;
+    s.rns.link_up = (g_rns_cs.load() == RNS_CS_CONNECTED);
+    if (rns_identity_ok && rns_hexhash[0]) {
+        snprintf(rns_addr_s, sizeof(rns_addr_s), "%s", rns_hexhash);
+        s.rns.addr = rns_addr_s;
+    }
+
+    // MeshCore radio.
+    s.mesh.has_identity = g_mesh.has_identity;
+    s.mesh.ui_state = mesh_ui_state();
+    s.mesh.seen_age_s = mesh_alive_age_s();
+    if (g_mesh.public_key_hex[0]) {
+        snprintf(mesh_key_s, sizeof(mesh_key_s), "%.8s", g_mesh.public_key_hex);
+        s.mesh.key8 = mesh_key_s;
+    }
+    if (g_mesh.sf) {
+        snprintf(mesh_rf_s, sizeof(mesh_rf_s), "%.1f SF%u",
+                 g_mesh.freq, (unsigned)g_mesh.sf);
+        s.mesh.rf = mesh_rf_s;
+    }
+
+    // WireGuard tunnel.
+    s.tun.wanted = g_wg_want && g_wg_cfg_ok;
+    s.tun.ui_state = wg_ui_state();
+
+    net_count = net_build_rows(&s, net_rows, NET_ROWS_MAX);
+    net_top = 0;
+    ui_net_render();
 }
 
 // Show the agent "door" card (pretty invite). Does not enter the room yet.
@@ -3048,6 +3625,12 @@ static void ui_card_act_confirm() {
     } else if (card_act_sel == CARD_ACT_REPLY) {
         ui_open_reply(notify_card_id,
                       reply_title[0] ? reply_title : NULL, NULL);
+    } else if (card_act_sel == CARD_ACT_DELETE) {
+        // Gone for good: out of the RAM ring and tombstoned in the archive, so
+        // it does not come back on the next boot. Rebuild the feed around it.
+        notify_delete_id(notify_card_id);
+        notify_card_id = 0;
+        ui_open_msglist();
     } else {
         // BACK → re-show the card
         ui_open_notify_id(notify_card_id);
@@ -3070,8 +3653,6 @@ static void ui_on_click() {
         if (menu_sel == MENU_MESSAGES) {
             msglist_sel = 0;
             ui_open_msglist();
-        } else if (menu_sel == MENU_AGENTS) {
-            ui_open_agents();
         } else if (menu_sel == MENU_MESHCORE) {
             ui_open_meshcore();
         } else if (menu_sel == MENU_WIFI) {
@@ -3081,6 +3662,8 @@ static void ui_on_click() {
             ui_open_settings();
         } else if (menu_sel == MENU_INFO) {
             ui_open_info();
+        } else if (menu_sel == MENU_CONTACTS) {
+            ui_open_contacts();
         } else {
             ui_go_clock(NULL);
         }
@@ -3089,7 +3672,7 @@ static void ui_on_click() {
         if (wifi_sel == WIFI_ACT_BACK) {
             ui_open_menu();
         } else if (wifi_sel == WIFI_ACT_STATUS) {
-            ui_wifi_show_status();
+            ui_open_net();
         } else if (wifi_sel == WIFI_ACT_SCAN) {
             ui_wifi_do_scan();
         } else if (wifi_sel == WIFI_ACT_PROFILES) {
@@ -3149,22 +3732,47 @@ static void ui_on_click() {
         }
         break;
     case HW_UI_AGENTS:
-        if (agents_sel == AGENTS_BACK) {
+        if (agents_sel >= ag_inbox_n) {          /* the trailing BACK row */
             ui_open_menu();
         } else {
-            ui_open_agent_sessions(agents_sel);
+            /* THE SLOT MAY HAVE CHANGED HANDS since the list was drawn: the
+             * off-loop drain mints while the inbox sits open, and minting on a
+             * full table recycles a slot. Opening without checking would put
+             * the user in a stranger's thread under the name they picked. The
+             * check is one string compare against the id the row displayed;
+             * rebuilding the list on every scroll tick would cost a lock and a
+             * repaint per knob step instead. */
+            int slot = ag_inbox_slot[agents_sel];
+            InboxRow probe;
+            memset(&probe, 0, sizeof(probe));
+            snprintf(probe.id, sizeof(probe.id), "%s", ag_inbox_ids[agents_sel]);
+            agents_lock();
+            bool same = inbox_row_matches(&probe, agents_id(slot));
+            agents_unlock();
+            if (!same) {
+                /* Show what is actually there now rather than opening it —
+                 * and force the repaint, or the stale name stays on screen and
+                 * the next click opens the stranger under it. */
+                ui_inbox_refresh(agents_sel);
+                break;
+            }
+            // Land straight in the conversation's active (last-used) room, even
+            // when it has several — one tap to read/type. The room list stays
+            // reachable with BACKSPACE from inside the chat (see ui_go_back).
+            ui_open_agent_chat(slot);
         }
         break;
     case HW_UI_AGENT_SESSIONS: {
-        int n = agents_session_count(agent_focus);
-        if (agent_sess_sel < n) {  // existing session → open its chat
-            const char *nm = agents_session_name(agent_focus, agent_sess_sel);
+        int n = ag_sess_vis_n;   // visible (non-dead) rows drawn by the refresh
+        if (agent_sess_sel < n) {  // existing visible session → open its chat
+            int si = ag_sess_row2idx[agent_sess_sel];  // row → real session index
+            const char *nm = agents_session_name(agent_focus, si);
             if (nm && nm[0] && agents_session_select(agent_focus, nm)) {
                 hw_haptic_notify(0);
                 ui_open_agent_chat(agent_focus);
             }
         } else if (agent_sess_sel == n) {  // NEW SESSION
-            if (n >= AGENT_SESSIONS_MAX) {
+            if (agents_session_count(agent_focus) >= AGENT_SESSIONS_MAX) {
                 break;   // row is disabled (shown as "MAX n SESSIONS")
             }
             bool created = false;
@@ -3177,7 +3785,7 @@ static void ui_on_click() {
                 event_add("agent new session refused (full)");
             }
         } else {  // BACK
-            ui_open_agents();
+            ui_open_msglist();   // → the unified feed, not the retired list
         }
         break;
     }
@@ -3192,7 +3800,32 @@ static void ui_on_click() {
         if (msglist_count == 0) {
             ui_open_menu();
         } else {
-            ui_open_notify_id(msglist_ids[msglist_sel]);
+            const MsgHandle &h = msglist_h[msglist_sel];
+            if (!h.is_conv) {
+                ui_open_notify_id(h.card_id);
+            } else {
+                /* A conversation row. THE SLOT MAY HAVE CHANGED HANDS since the
+                 * feed was drawn: the off-loop drain mints while the list sits
+                 * open, and minting on a full table recycles a slot. Opening
+                 * without checking would put the user in a stranger's thread
+                 * under the name they picked — one string compare closes it,
+                 * the same guard the old Agents screen used. */
+                int slot = h.slot;
+                InboxRow probe;
+                memset(&probe, 0, sizeof(probe));
+                snprintf(probe.id, sizeof(probe.id), "%s", h.conv_id);
+                agents_lock();
+                bool same = inbox_row_matches(&probe, agents_id(slot));
+                agents_unlock();
+                if (!same) {
+                    /* Show what is actually there now rather than opening it. */
+                    ui_open_msglist();
+                    break;
+                }
+                // Straight into the active (last-used) room's chat; the room
+                // list stays reachable with BACKSPACE from the chat.
+                ui_open_agent_chat(slot);
+            }
         }
         break;
     case HW_UI_NOTIFY: {
@@ -3211,6 +3844,13 @@ static void ui_on_click() {
         break;
     case HW_UI_INFO:
         ui_open_menu();
+        break;
+    case HW_UI_CONTACTS:
+        ui_contacts_open_selected();
+        break;
+    case HW_UI_NET:
+        // Read-only status screen: click returns to the WiFi menu it opened from.
+        ui_open_wifi();
         break;
     case HW_UI_PAGE:
         // Click toggles the two input modes: OPEN the page for in-page scrolling,
@@ -3280,20 +3920,23 @@ static void ui_on_steps(int steps) {
         break;
     }
     case HW_UI_AGENTS: {
+        int n = ag_inbox_n + 1;          /* conversations + BACK */
+        if (n < 1) n = 1;
         agents_sel += steps;
-        while (agents_sel < 0) agents_sel += AGENTS_LIST_COUNT;
-        while (agents_sel >= AGENTS_LIST_COUNT) agents_sel -= AGENTS_LIST_COUNT;
-        hw_ui_show_agents(agents_sel, agents_bridge_ok());
+        while (agents_sel < 0) agents_sel += n;
+        while (agents_sel >= n) agents_sel -= n;
+        ui_inbox_render(agents_sel);
         break;
     }
     case HW_UI_AGENT_SESSIONS: {
-        int n = agents_session_count(agent_focus);
+        int n = ag_sess_vis_n;   // visible rows; NEW at n, BACK at n+1
         int cnt = n + 2;
         if (cnt <= 0) break;
         agent_sess_sel += steps;
         while (agent_sess_sel < 0) agent_sess_sel += cnt;
         while (agent_sess_sel >= cnt) agent_sess_sel -= cnt;
-        if (n >= AGENT_SESSIONS_MAX && agent_sess_sel == n) {
+        if (agents_session_count(agent_focus) >= AGENT_SESSIONS_MAX &&
+            agent_sess_sel == n) {
             // full registry — NEW row disabled: skip over it
             agent_sess_sel += (steps > 0) ? 1 : -1;
             if (agent_sess_sel < 0) agent_sess_sel = cnt - 1;
@@ -3303,10 +3946,11 @@ static void ui_on_steps(int steps) {
         break;
     }
     case HW_UI_AGENT_ACT: {
+        int n = agent_act_row_count();
         agent_act_sel += steps;
-        while (agent_act_sel < 0) agent_act_sel += AGENT_ACT_COUNT;
-        while (agent_act_sel >= AGENT_ACT_COUNT) agent_act_sel -= AGENT_ACT_COUNT;
-        hw_ui_show_agent_act(agent_act_sel, agents_name(agent_focus));
+        while (agent_act_sel < 0) agent_act_sel += n;
+        while (agent_act_sel >= n) agent_act_sel -= n;
+        hw_ui_show_agent_act(agent_act_sel, agents_name(agent_focus), agent_act_del_ok);
         break;
     }
     case HW_UI_LAYOUT: {
@@ -3345,6 +3989,33 @@ static void ui_on_steps(int steps) {
         if (msglist_sel >= msglist_count) msglist_sel = msglist_count - 1;
         ui_open_msglist();
         break;
+    case HW_UI_CONTACTS: {
+        // Move the selection by |steps| CONTACT rows, skipping section headers.
+        // Stops at the first/last contact rather than wrapping (headers make a
+        // wrap ambiguous, and clamping matches the other lists here).
+        if (contacts_count <= 0) break;
+        int dir = (steps > 0) ? 1 : -1;
+        int nsteps = (steps > 0) ? steps : -steps;
+        int cur = contacts_sel;
+        for (int s = 0; s < nsteps; s++) {
+            int nx = contacts_next_contact(cur + dir, dir);
+            if (nx < 0) break;   // no further contact this way: stay put
+            cur = nx;
+        }
+        contacts_sel = cur;
+        ui_contacts_render(NULL);
+        break;
+    }
+    case HW_UI_NET: {
+        // Read-only: the wheel scrolls the window. No selection to move; the
+        // renderer clamps net_top, so clamp to [0, count-1] here and let it frame.
+        if (net_count <= 0) break;
+        net_top += steps;
+        if (net_top < 0) net_top = 0;
+        if (net_top > net_count - 1) net_top = net_count - 1;
+        ui_net_render();
+        break;
+    }
     case HW_UI_NOTIFY: {
         // Scroll the queue: next/prev message by position in newest-first list.
         if (!notify_card_id) break;
@@ -3534,6 +4205,13 @@ void setup() {
     // STA associates.
     hw_ui_begin();
     storage_begin();  // SPIFFS mount → announced format → degraded continue
+    // Capture this device's real secrets into NVS, byte-for-byte, the moment
+    // storage is up and BEFORE any consumer (auth/gw/rns/mesh) loads one. NVS
+    // survives a SPIFFS format, so this is what keeps the live identity, RNS
+    // address and OTA token from changing after a data-partition wipe. Idempotent
+    // (a sentinel makes later boots a no-op); only run when the mount succeeded,
+    // so a failed mount cannot set the sentinel over files it never read.
+    if (storage_ok) secret_store_migrate_from_spiffs(SPIFFS);
     // Reclaim AW9364 from the boot pulse in hw_ui; load /backlight.json.
     backlight_begin();
     hw_input_begin();
@@ -3589,6 +4267,11 @@ void loop() {
     // begin, millis() settle gaps) — the AsyncTCP task never touches WiFi.
     wifi_reconnect_poll();
 
+    // Connection coordinator: observes the WiFi attach/lost edge, sequences
+    // bring-up (clock -> WG -> RNS), debounces WG flaps, and backs up each
+    // transport's own recovery if it wedges. No-op while everything is healthy.
+    conn_mgr_service();
+
     // WiFi reconnect — one non-blocking attempt per ladder rung while offline
     // (the driver's own auto-reconnect stays off: its retries underneath the
     // scheduler caused UI stalls). Every begin — boot included — stamps
@@ -3621,14 +4304,42 @@ void loop() {
         if (now_connected) {
             wifi_retry_step = 0;  /* next loss starts the ladder over */
             wifi_persist_profiles();
-            if (!mdns_started && MDNS.begin(mdns_name.c_str())) {
-                MDNS.addService("http", "tcp", HTTP_PORT);
-                MDNS.addService("seed", "tcp", HTTP_PORT);
-                mdns_started = true;
-            }
-        } else if (mdns_started) {
-            MDNS.end();
-            mdns_started = false;
+            /* mDNS used to be started here (begin + http/seed services).
+             * It is gone, and it must stay gone until internal DRAM is free
+             * again. The board boot-looped on an inbound multicast mDNS query;
+             * the coredump, decoded against the matching .elf, read:
+             *
+             *   tcpip_thread -> ethernet_input -> ip4_input -> udp_input
+             *     -> mdns_networking_lwip.c:176 receive() -> esp_log
+             *     -> vprintf -> uart_write -> _lock_acquire_recursive
+             *     -> lock_init_generic -> abort()
+             *
+             * That is not an mDNS bug. The component logged, the console lock
+             * allocated its mutex lazily on first use, the allocation failed
+             * for want of internal DRAM, and _lock_acquire_recursive aborts on
+             * failure — it has no way to report one. Static internal RAM had
+             * just gone from 58.1% to 65.0%, leaving ~114 KB for every task
+             * stack, lwIP, WiFi, the SD buffers and the heap. Any unsolicited
+             * packet that reached a logging path could have done it; mDNS just
+             * listens on a multicast group the network keeps talking to.
+             *
+             * Silencing the log would not have fixed it — it would have moved
+             * the abort to the next allocation. Removing the start is what
+             * takes the receive path off the tcpip thread for good.
+             *
+             * Since then the history index, the write-queue storage and the
+             * page/render buffers moved to PSRAM (src/psram_alloc.h), so the
+             * 65.0% above is no longer this build's figure: with the whole RNS
+             * stack linked in, static internal RAM is 61.1% (200112 B), leaving
+             * ~127 KB. The pressure is lower, not gone — and a link-time figure
+             * is not the number that aborted the board anyway; free internal
+             * heap at the moment of the packet is.
+             *
+             * Before reinstating this: measure free internal DRAM at runtime
+             * (esp_get_free_internal_heap_size / the RAM figure in `pio run`),
+             * and only then decide. The node is reachable by IP, and the
+             * fleet finds it that way. Convenience is not worth the boot loop.
+             */
         }
         if (hw_ui_screen() == HW_UI_CLOCK) {
             hw_ui_invalidate_clock();
@@ -3715,6 +4426,19 @@ void loop() {
             hw_haptic_notify(lvl);
             hw_sound_poll();        // prime DMA immediately
         }
+    }
+
+    // Inbox open when something arrives: the rows themselves changed — a new
+    // conversation may have been minted, an unread mark raised, the order
+    // moved — so the list is rebuilt and repainted. Without this the inbox
+    // shows the state it had when it was opened until the user leaves and
+    // comes back.
+    if (display_force && hw_ui_screen() == HW_UI_AGENTS) {
+        display_force = false;
+        bool real_in = g_agents_real_inbound;
+        g_agents_real_inbound = false;
+        ui_inbox_refresh(agents_sel);
+        if (real_in) ui_note_wake();
     }
 
     // Agent thread inbound (display_force) — refresh open chat room live.

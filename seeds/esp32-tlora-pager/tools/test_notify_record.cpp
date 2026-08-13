@@ -20,6 +20,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <vector>
 
 #include "../src/micron/notify_record.h"
 #include "../src/micron/history_store.h"
@@ -288,6 +289,182 @@ static void test_archive_key_no_collision(void) {
     assert(strlen(kMax) == 11 && micron_store_key_valid(kMax));
 }
 
+/* --- delete tombstone: a deleted card stays deleted across a reboot ---------
+ *
+ * This drives the EXACT device path end to end on the host: records are
+ * history_encode()d into one append-only archive buffer, the mount index is
+ * built from a streaming scan of it (history_reader), then the boot restore is
+ * replayed — newest identity first, decode the record at the resolved offset,
+ * and apply notify_restore_from_archive()'s decision:
+ *   - a tombstone (notify_rec_is_tombstone) is SKIPPED, so a deleted card does
+ *     not come back;
+ *   - a data record is restored.
+ * Newest-wins is what makes this correct: the tombstone is appended AFTER the
+ * card, so it outranks it; a later re-add outranks the tombstone in turn.
+ */
+
+/* A tiny stand-in for the device's append-only archive + its RAM index. */
+struct MockArchive {
+    std::vector<uint8_t> bytes;   /* the /hist.log image */
+    history_index        ix;
+    uint32_t             seq;     /* the writer's monotonic seq (g_hist_seq) */
+};
+
+static int mock_sink_write(void *ctx, const uint8_t *p, size_t n) {
+    std::vector<uint8_t> *v = (std::vector<uint8_t> *)ctx;
+    v->insert(v->end(), p, p + n);
+    return (int)n;
+}
+
+/* Append one record (payload already built) and index it, exactly as the device
+ * write task does: assign the next seq, capture the pre-append offset, encode,
+ * then observe. */
+static void mock_append(MockArchive &a, uint8_t ns, const char *key,
+                        const uint8_t *payload, uint16_t len) {
+    history_record rec;
+    memset(&rec, 0, sizeof(rec));
+    rec.ns = ns;
+    rec.seq = ++a.seq;
+    snprintf(rec.key, sizeof(rec.key), "%s", key);
+    rec.len = len;
+    if (len) memcpy(rec.payload, payload, len);
+
+    uint32_t off = (uint32_t)a.bytes.size();
+    history_sink sink;
+    sink.write = mock_sink_write;
+    sink.ctx = &a.bytes;
+    assert(history_encode(&sink, &rec) == 1);
+    history_index_observe(&a.ix, &rec, off);
+}
+
+static void mock_append_card(MockArchive &a, const char *akey,
+                             const notify_rec *r) {
+    uint8_t buf[NOTIFY_REC_MAX];
+    size_t n = notify_rec_encode(r, buf, sizeof(buf));
+    assert(n > 0);
+    mock_append(a, MICRON_NS_NOTIFY, akey, buf, (uint16_t)n);
+}
+
+static void mock_append_tombstone(MockArchive &a, const char *akey) {
+    uint8_t buf[NOTIFY_REC_MAX];
+    size_t n = notify_rec_tombstone_encode(buf, sizeof(buf));
+    assert(n == 1);
+    mock_append(a, MICRON_NS_NOTIFY, akey, buf, (uint16_t)n);
+}
+
+/* Replay notify_restore_from_archive() over the mock: return the ids restored,
+ * newest-first, tombstoned identities skipped. */
+static std::vector<uint32_t> mock_restore(MockArchive &a) {
+    std::vector<uint32_t> ids;
+    for (int rank = 0;; rank++) {
+        const history_index_entry *e =
+            history_index_ns_at(&a.ix, MICRON_NS_NOTIFY, rank);
+        if (!e) break;
+        /* decode the single record that starts at the resolved offset */
+        history_record rec;
+        size_t consumed = 0;
+        history_decode_status st = history_decode(a.bytes.data() + e->offset,
+                                                  a.bytes.size() - e->offset,
+                                                  &rec, &consumed);
+        assert(st == HISTORY_DECODE_OK);
+        if (notify_rec_is_tombstone(rec.payload, rec.len)) continue;  /* deleted */
+        notify_rec nr;
+        assert(notify_rec_decode(rec.payload, rec.len, &nr) == 1);
+        ids.push_back(nr.id);
+    }
+    return ids;
+}
+
+static bool mock_has(const std::vector<uint32_t> &v, uint32_t id) {
+    for (uint32_t x : v) if (x == id) return true;
+    return false;
+}
+
+static void test_tombstone_codec(void) {
+    /* The marker is a one-byte payload that is recognised as a tombstone, is NOT
+     * a decodable notify_rec, and cannot be produced by a real card (whose first
+     * byte is always NOTIFY_REC_VER). */
+    uint8_t buf[NOTIFY_REC_MAX];
+    assert(notify_rec_tombstone_encode(buf, sizeof(buf)) == 1);
+    assert(buf[0] == NOTIFY_REC_TOMBSTONE);
+    assert((unsigned)NOTIFY_REC_TOMBSTONE != (unsigned)NOTIFY_REC_VER);
+    assert(notify_rec_is_tombstone(buf, 1));
+
+    notify_rec o;
+    assert(notify_rec_decode(buf, 1, &o) == 0);   /* not a card */
+
+    /* A real card is never mistaken for a tombstone. */
+    notify_rec r;
+    memset(&r, 0, sizeof(r));
+    r.id = 9;
+    snprintf(r.title, sizeof(r.title), "hi");
+    size_t n = notify_rec_encode(&r, buf, sizeof(buf));
+    assert(n > 0);
+    assert(!notify_rec_is_tombstone(buf, n));
+
+    assert(notify_rec_tombstone_encode(buf, 0) == 0);   /* buffer too small */
+    assert(!notify_rec_is_tombstone(NULL, 1));
+    assert(!notify_rec_is_tombstone(buf, 0));
+}
+
+static void test_delete_survives_reboot(void) {
+    MockArchive a;
+    a.bytes.clear();
+    history_index_init(&a.ix);
+    a.seq = 0;
+
+    /* Two cards land: A (client key "raid", id 100) and B (keyless, id 5 ->
+     * archive key "#5"). */
+    notify_rec rA;
+    memset(&rA, 0, sizeof(rA));
+    rA.id = 100;
+    snprintf(rA.title, sizeof(rA.title), "A");
+    snprintf(rA.key, sizeof(rA.key), "raid");
+    char kbufA[NOTIFY_ARCHIVE_IDKEY_CAP];
+    const char *kA = notify_rec_archive_key(rA.key, rA.id, kbufA, sizeof(kbufA));
+
+    notify_rec rB;
+    memset(&rB, 0, sizeof(rB));
+    rB.id = 5;
+    snprintf(rB.title, sizeof(rB.title), "B");
+    char kbufB[NOTIFY_ARCHIVE_IDKEY_CAP];
+    const char *kB = notify_rec_archive_key(rB.key, rB.id, kbufB, sizeof(kbufB));
+
+    mock_append_card(a, kA, &rA);
+    mock_append_card(a, kB, &rB);
+
+    /* Boot restore sees both. */
+    std::vector<uint32_t> r1 = mock_restore(a);
+    assert(r1.size() == 2);
+    assert(mock_has(r1, 100) && mock_has(r1, 5));
+
+    /* DELETE card A: a tombstone lands on A's OWN archive identity (kA). It is
+     * appended after A, so newest-wins resolves kA to it. */
+    mock_append_tombstone(a, kA);
+    assert(history_index_get(&a.ix, MICRON_NS_NOTIFY, kA)->seq == a.seq);
+
+    /* Reboot: A is skipped (the delete survived), B still restores. */
+    std::vector<uint32_t> r2 = mock_restore(a);
+    assert(r2.size() == 1);
+    assert(!mock_has(r2, 100));   /* the tombstoned key is skipped */
+    assert(mock_has(r2, 5));
+
+    /* RE-ADD the same key later (a fresh card under "raid", id 200): its data
+     * record outranks the tombstone (newest-wins again), so the card comes back. */
+    notify_rec rA2;
+    memset(&rA2, 0, sizeof(rA2));
+    rA2.id = 200;
+    snprintf(rA2.title, sizeof(rA2.title), "A2");
+    snprintf(rA2.key, sizeof(rA2.key), "raid");
+    mock_append_card(a, kA, &rA2);
+
+    std::vector<uint32_t> r3 = mock_restore(a);
+    assert(r3.size() == 2);
+    assert(mock_has(r3, 200));    /* re-add overrode the tombstone */
+    assert(mock_has(r3, 5));
+    assert(!mock_has(r3, 100));   /* the old id stays gone; the key now holds 200 */
+}
+
 /* --- graceful empty: nothing indexed => nothing restored ------------------- */
 
 static void test_graceful_empty(void) {
@@ -305,6 +482,8 @@ int main(void) {
     test_index_newest_first();
     test_namespace_isolation();
     test_archive_key_no_collision();
+    test_tombstone_codec();
+    test_delete_survives_reboot();
     test_graceful_empty();
     printf("notify record + restore tests: OK\n");
     return 0;

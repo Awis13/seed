@@ -11,6 +11,15 @@ agents = (ROOT / "src" / "skills" / "agents.cpp").read_text(encoding="utf-8")
 
 assert "WiFi.softAP" not in main, "firmware must never raise a provisioning AP"
 assert "WIFI_AP" not in main, "firmware must remain STA-only"
+# mDNS stays off. An inbound multicast query reached the component's receive()
+# on the tcpip thread, which logged, which allocated the console lock, which
+# failed for want of internal DRAM, which aborted -- a boot loop. Removing the
+# start is what takes that receive path off the network stack; see the comment
+# on the link-up transition in main.cpp. Re-check free internal RAM before
+# reinstating any of this.
+assert "ESPmDNS.h" not in main, "the mDNS component must not be pulled back in"
+assert "MDNS.begin" not in main, "mDNS must never be started on this board"
+assert "MDNS.addService" not in main, "no mDNS service registration"
 assert not re.search(r"while\s*\(\s*WiFi\.status\(\)", main), (
     "boot/menu code must not block waiting for infrastructure Wi-Fi"
 )
@@ -60,10 +69,18 @@ confirm = main[main.index("// Auto-confirm after 60s") :]
 confirm = confirm[: confirm.index("// WiFi reconnect")]
 assert "WiFi.status()" not in confirm, "OTA confirmation must work mesh-only"
 
-send = agents[agents.index("static bool agents_send") :]
-send = send[: send.index("static void agents_on_inbound")]
-assert 'strcmp(agent_id, "codex") == 0' in send
-assert 'strcmp(agent_id, "opencode") == 0' in send
-assert "mesh_owned || !wifi_ok" in send
+# The bridge-first / mesh-fallback ladder moved into the CONV_AGENT transport
+# backend when the chat path started dispatching by the conversation's
+# transport; the Wi-Fi policy it encodes is unchanged, so the pin follows it.
+send = agents[agents.index("static bool transport_send_agent(") :]
+send = send[: send.index("\n/* CONV_LXMF:")]
+# grok/opencode/codex retired: only claude/hermes remain and neither is
+# mesh-owned, so the send path is a plain WiFi-bridge-first / mesh-fallback.
+# Matched on the bare ids so the pin still bites after the parameter rename.
+assert '"codex"' not in send
+assert '"opencode"' not in send
+assert "mesh_owned" not in send
+assert "bool wifi_ok = agents_bridge_post(conv_id, session, text);" in send
+assert "if (!wifi_ok && g_agents_mesh_uplink)" in send
 
 print("Wi-Fi/mesh boot policy tests: OK")
