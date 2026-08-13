@@ -1631,6 +1631,10 @@ static AttachBeaconState g_attach_beacon;
 #include "reachability.h"
 static ReachState g_reach;
 static void reachability_service(uint32_t now);
+// Defined below (after mesh_gw_url/gw_token); the send ladder in the
+// #include'd skills/agents.cpp — which expands ABOVE this point — is registered
+// with it in skills_init() via agents_set_reachability().
+static ReachStatus gateway_reachable();
 
 static void conn_mgr_service() {
     static uint32_t last = 0;
@@ -1706,6 +1710,9 @@ static void skills_init() {
     skill_notify_init();
     skill_progress_init();
     skill_agents_init();
+    /* C2: the send ladder picks the WiFi rung only when the route home is PROVEN.
+     * Hand it the cached C1 verdict; the probe stays off the send path. */
+    agents_set_reachability(gateway_reachable);
     /* Only the UI knows which conversation is being read; the store must not
      * infer it from window ownership, which outlives the screen. */
     agents_set_on_screen_hook(ui_conv_on_screen);
@@ -1928,8 +1935,8 @@ static void reachability_service(uint32_t now) {
 // Accessor for the send ladder (C2): the cached route-home verdict, no I/O.
 // UNKNOWN until the first probe (or once a past result goes stale), UP when the
 // gateway answered recently, DOWN on a recent failure or a down WiFi link.
-// Unused until C2 wires it into the send path — a foundation accessor, may be
-// GC-eligible for now (precedent: contacts_view/feed_view).
+// Registered with the agent-send ladder in skills_init() (agents_set_reachability);
+// transport_send_agent() reads it to gate the WiFi rung on a PROVEN route home.
 static ReachStatus gateway_reachable() {
     return reach_status(&g_reach, millis(), REACH_STALE_MS);
 }

@@ -2516,12 +2516,22 @@ assert "agents_rns_uplink(conv_id, session, text, &rns_why)" in send, (
     "the active session name must be the envelope's session field, so the "
     "answer comes back to the room the message was typed in"
 )
-# 11d. RNS IS FIRST, the bridge is the fallback — not the other way round.
-assert send.index("agents_rns_uplink(") < send.index("agents_bridge_post("), (
-    "RNS must be tried before the bridge; the bridge is the fallback now"
+# 11d. C2 (HERMES-LADDER): the rung is chosen by the CACHED route-home verdict,
+# not RNS-first. The WiFi/bridge rung is taken only when the gateway is PROVEN
+# reachable (agent_pick_transport over the registered reachability verdict), and
+# it sits ABOVE the RNS rung, which sits above the mesh uplink. So the bridge
+# POST now appears before the RNS uplink in source order — the reverse of the
+# pre-C2 ladder — but it fires only behind the REACH_UP gate.
+assert "agent_pick_transport(" in send, (
+    "the send ladder must choose its rung from the pure reachability picker"
 )
-assert send.index("agents_rns_uplink(") < send.index("g_agents_mesh_uplink"), (
-    "RNS must be tried before the mesh uplink too"
+assert send.index("AGENT_RUNG_WIFI") < send.index("AGENT_RUNG_RNS") < send.index(
+    "AGENT_RUNG_MESHCORE"), (
+    "the ladder order is WiFi, then Reticulum, then MeshCore"
+)
+assert send.index("agents_rns_uplink(conv_id") < send.index(
+    "g_agents_mesh_uplink(conv_id"), (
+    "the RNS rung's send must be tried before the mesh uplink's send"
 )
 # 11e. NO PEER IS ITS OWN REASON, because it is the one the user can fix.
 assert "rns_peer_addr(peer, sizeof(peer))" in uplink, (
@@ -2543,19 +2553,21 @@ assert "rns_link_up(" not in wrapper and "rns_link_up(" not in offer_code, (
     "the link check must NOT be inside the shared send path: refusing every "
     "offer made over a resolving link would make POST /rns/send flaky"
 )
-# 11f. EVERY FAILURE IS ONE SHORT LINE IN THE ROOM. This is the whole point of
-# the commit: the room used to print a bridge error for a path it was not even
-# trying. Silence would be worse.
-assert 'snprintf(line, sizeof(line), "(rns: %s%s)", rns_why,' in send, (
-    "an RNS refusal must be printed in the room, prefixed so the user can see "
-    "WHICH path refused"
+# 11f. A TOTAL FAILURE IS ONE SHORT LINE IN THE ROOM — and only on total
+# failure. C2 makes a successful send SILENT (the card just goes; a seven-row
+# screen is precious), so the room prints only when NO rung carried the message,
+# naming the single most actionable cause. The RNS reason wins when there is one
+# (for `claude` the peer is the path the user configured).
+assert 'snprintf(line, sizeof(line), "(rns: %s)", rns_why);' in send, (
+    "a total failure with an RNS cause must name it in the room"
 )
-assert '" - sent via bridge"' in send, (
-    "a fallback that succeeded must still be visible: the message went out on a "
-    "path the user did not choose"
+assert '"(no route home - mesh failed)"' in send, (
+    "when the bridge is configured but the route home is NOT proven, the room "
+    "must say so — this is the captive/no-route case C2 stops blocking on"
 )
-assert send.index("if (rns_why) {") < send.index("} else if (!wifi_ok && !mesh_ok) {"), (
-    "the RNS reason must REPLACE the bridge's complaint rather than join it: "
+assert send.index("if (rns_why) {") < send.index(
+    "} else if (wifi_avail && reach != REACH_UP) {"), (
+    "the RNS reason must REPLACE the other complaints rather than join them: "
     "two lines per keystroke would push the typed message off the screen"
 )
 # The `why` values are static literals, so the room line needs no allocation and

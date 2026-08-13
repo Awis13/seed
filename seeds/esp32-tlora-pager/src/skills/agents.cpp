@@ -61,6 +61,7 @@
 #include "../mesh/contact_record.h" // /contacts3 layout: which peers this device has met
 #include "../transport.h"          // the backend contract: transport_send + the inbox doors
 #include "../rns/outbox.h"         // the OTHER half of that seam: rns_send_envelope + rns_peer_addr
+#include "../agent_transport.h"    // C2: pure rung selection over the C1 reachability verdict
 
 /* Conversation slots. A slot used to carry its own AGENT_VIEW_MAX viewport, so
  * the table cost 12.6 KB per conversation and could not grow without spending
@@ -1415,6 +1416,19 @@ static void agents_set_mesh_uplink(AgentsMeshUplinkFn fn) {
     g_agents_mesh_uplink = fn;
 }
 
+/* Cached route-home verdict (HERMES-LADDER C1), registered by main.cpp. The
+ * ladder reads it to decide whether the WiFi rung is proven-reachable; it is a
+ * plain cache read (no probe on the send path). Registered rather than called
+ * directly because gateway_reachable() lives in main.cpp, which #includes this
+ * file BEFORE that function is defined. Null (never registered) reads as
+ * REACH_UNKNOWN, which keeps the send off the WiFi rung — the safe default. */
+typedef ReachStatus (*AgentReachFn)(void);
+static AgentReachFn g_agent_reach = nullptr;
+
+static void agents_set_reachability(AgentReachFn fn) {
+    g_agent_reach = fn;
+}
+
 /* Peer reply submit, registered the same way and for the same reason: THIS FILE
  * MUST NOT TOUCH THE MESHCORE STACK. sendMessage allocates from the packet
  * pool, runs the ECDH and arms the ACK — state the loop task drives with no
@@ -1575,6 +1589,27 @@ static bool agents_rns_uplink(const char *agent_id, const char *session,
     return rns_send_envelope(peer, session, text, why);
 }
 
+/* Is the Reticulum rung USABLE for this agent right now, WITHOUT sending? Mirrors
+ * the preconditions inside agents_rns_uplink() — the claude-only gate, a
+ * configured peer, and a live link — so the C2 ladder can decide the rung before
+ * it commits to one. On a `claude` room that cannot use RNS, *why names the
+ * fixable cause exactly as the send would; a non-claude room is gated silently
+ * (*why untouched) because that restriction is by design, not a fault the user
+ * can clear. Kept in lockstep with agents_rns_uplink(): change one, change both. */
+static bool agents_rns_rung_ok(const char *agent_id, const char **why) {
+    char peer[RNS_OUTBOX_ADDR_HEX + 1];
+    if (strcmp(agent_id, "claude") != 0) return false;
+    if (!rns_peer_addr(peer, sizeof(peer))) {
+        *why = "no peer address";
+        return false;
+    }
+    if (!rns_link_up()) {
+        *why = "link down";
+        return false;
+    }
+    return true;
+}
+
 /* ---- transport backends --------------------------------------------------- *
  *
  * One backend per wire, each reached only through transport_send() below. The
@@ -1618,47 +1653,69 @@ static bool transport_send_agent(int idx, const char *conv_id, const char *sessi
         }
     }
 
-    /* RETICULUM FIRST FOR `claude`, and it is a real first: the bridge below is
-     * the fallback now, not the primary. `rns_why` doubles as "RNS was tried
-     * and did not take it", which is what makes the fallback visible instead of
-     * a silent downgrade to a path the user did not choose. */
+    /* THE C2 LADDER (agent_transport.h). The rung is chosen by the CACHED
+     * route-home verdict, not by the WiFi LINK state: the WiFi rung is taken only
+     * when the gateway is PROVEN reachable (REACH_UP), so a captive/no-route WiFi
+     * no longer stalls the send before it can fall to Reticulum or MeshCore. Each
+     * rung's availability is decided BEFORE any send — a plain cache read for
+     * reachability (no probe here), a configured-bridge test, the RNS-rung
+     * preconditions, and a registered mesh uplink — so the pick never commits to
+     * a rung that cannot carry the message. */
+    ReachStatus reach = g_agent_reach ? g_agent_reach() : REACH_UNKNOWN;
+    bool wifi_avail = (g_bridge[0] != '\0');
     const char *rns_why = nullptr;
-    if (agents_rns_uplink(conv_id, session, text, &rns_why)) {
-        event_add("agent %s rns uplink", conv_id);
-        return true;
+    bool rns_avail = agents_rns_rung_ok(conv_id, &rns_why);
+    bool mesh_avail = (g_agents_mesh_uplink != nullptr);
+
+    AgentRung rung = agent_pick_transport(reach, wifi_avail, rns_avail, mesh_avail);
+
+    /* Drive the chosen rung's NATIVE send (no transport tunnelled over another).
+     * On a runtime failure of a USABLE rung — e.g. the gateway was proven
+     * reachable a moment ago but the POST still failed — fall to the next usable
+     * rung below it (WiFi -> RNS -> MeshCore) so a transient higher-rung fault
+     * does not drop the card. */
+    if (rung == AGENT_RUNG_WIFI) {
+        if (agents_bridge_post(conv_id, session, text)) {
+            event_add("agent %s bridge uplink", conv_id);
+            return true;
+        }
+        rung = rns_avail  ? AGENT_RUNG_RNS
+             : mesh_avail ? AGENT_RUNG_MESHCORE
+                          : AGENT_RUNG_NONE;
+    }
+    if (rung == AGENT_RUNG_RNS) {
+        if (agents_rns_uplink(conv_id, session, text, &rns_why)) {
+            event_add("agent %s rns uplink", conv_id);
+            return true;
+        }
+        rung = mesh_avail ? AGENT_RUNG_MESHCORE : AGENT_RUNG_NONE;
+    }
+    if (rung == AGENT_RUNG_MESHCORE && g_agents_mesh_uplink) {
+        if (g_agents_mesh_uplink(conv_id, text)) {
+            event_add("agent %s mesh uplink", conv_id);
+            return true;
+        }
     }
 
-    /* Everything that reaches here tries the bridge first and the C1 DM after,
-     * which is the ladder the remaining pair has always wanted. */
-    bool wifi_ok = agents_bridge_post(conv_id, session, text);
-    bool mesh_ok = false;
-    if (!wifi_ok && g_agents_mesh_uplink) {
-        mesh_ok = g_agents_mesh_uplink(conv_id, text);
-        if (mesh_ok) event_add("agent %s mesh uplink", conv_id);
-    }
+    /* Nothing carried it. ONE short line — a second would push the just-typed
+     * message off the seven-row screen. Prefer the RNS cause when there is one
+     * (for `claude` the peer is the path the user configured, so naming what is
+     * wrong with it is the most actionable), else name why the WiFi/mesh rungs
+     * could not take it. */
     if (rns_why) {
-        /* ONE SHORT LINE, ALWAYS, and it replaces the bridge's own complaint
-         * rather than joining it: for `claude` the peer address is the path the
-         * user configured, so naming what is wrong with THAT is more use than
-         * naming what is wrong with the path they did not pick. Two lines for
-         * one keystroke would also push the message they just typed off a
-         * seven-row screen. */
         char line[64];
-        snprintf(line, sizeof(line), "(rns: %s%s)", rns_why,
-                 (wifi_ok || mesh_ok) ? " - sent via bridge" : "");
+        snprintf(line, sizeof(line), "(rns: %s)", rns_why);
         agents_push_line(idx, false, line);
-        display_force = true;
-    } else if (!wifi_ok && !mesh_ok) {
-        if (g_bridge[0] && WiFi.status() != WL_CONNECTED)
-            agents_push_line(idx, false, "(offline - mesh failed)");
-        else if (g_bridge[0])
-            agents_push_line(idx, false, "(bridge offline)");
-        else if (g_agents_mesh_uplink)
-            agents_push_line(idx, false, "(mesh failed)");
-        else
-            agents_push_line(idx, false, "(no bridge / mesh)");
-        display_force = true;
+    } else if (wifi_avail && reach != REACH_UP) {
+        agents_push_line(idx, false, "(no route home - mesh failed)");
+    } else if (wifi_avail) {
+        agents_push_line(idx, false, "(bridge offline)");
+    } else if (mesh_avail) {
+        agents_push_line(idx, false, "(mesh failed)");
+    } else {
+        agents_push_line(idx, false, "(no bridge / mesh)");
     }
+    display_force = true;
     return true;
 }
 
