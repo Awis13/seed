@@ -22,32 +22,41 @@ assert "repaints and synthetic errors must not call this" in wake_decl, (
 )
 
 # --- the WHOLE notify_take_arrival consumption block -------------------------
-# Covers the chat-door branch, the severity-card branch, the compose branch and
-# the on_clock tail: exactly two wakes (door + severity card), no user-input
-# stamps, and nothing stamped after the branches either.
+# Covers the chat branch, the severity-card branch, the compose branch and the
+# on_clock tail: exactly two wakes (chat open-room + severity card), no
+# user-input stamps, and nothing stamped after the branches either.
 arrival = main[main.index("uint32_t arrived_id = 0;") :]
 arrival = arrival[: arrival.index("hw_sound_poll();")]
 assert arrival.count("ui_note_wake();") == 2, (
-    "the arrival block must wake exactly twice: chat-door branch + severity card"
+    "the arrival block must wake exactly twice: chat open-room + severity card"
 )
 assert "ui_note_input" not in arrival, (
     "an arriving card is a system event, not user input"
 )
-door = arrival[arrival.index("notify_is_chat_door") :]
+door = arrival[arrival.index("notify_is_chat(v)") :]
 door = door[: door.index("// Real message from any service")]
 assert "ui_note_wake();" in door, (
-    "a chat-door message landing in the open room must wake the panel"
+    "a chat message landing in the open room must wake the panel"
 )
 sev = arrival[arrival.index("// Real message from any service") :]
 sev = sev[: sev.index("} else {")]
 assert "ui_note_wake();" in sev, "an arriving severity card must light the screen"
 
-# --- the invite card reachable from the arrival path is a wake, not input ----
-invite = main[main.index(
-    "ui_show_agent_invite_from_view(const NotifyView &v, uint32_t id) {") :]
-invite = invite[: invite.index("static void ui_enter_agent_from_notify")]
-assert "ui_note_wake();" in invite and "ui_note_input" not in invite, (
-    "the agent invite card is reachable from loop() arrivals: system wake only"
+# --- an arriving chat lands in its thread, never as an invite/severity card ---
+# The loop() arrival chat branch mirrors the mesh/LXMF model: it delivers the
+# text with agents_on_inbound() and badges; it must NOT pop the agent invite or
+# a severity card, and must not stamp user input.
+chat_arr = arrival[arrival.index("notify_is_chat(v)") :]
+chat_arr = chat_arr[: chat_arr.index("// Real message from any service")]
+assert "agents_on_inbound(agents_id(ax), v.body, true)" in chat_arr, (
+    "an arriving chat must land in its conversation thread like a mesh/LXMF peer"
+)
+assert (
+    "hw_ui_show_agent_invite" not in chat_arr
+    and "hw_ui_show_notify" not in chat_arr
+), "an arriving chat must not pop an invite or a severity card"
+assert "ui_note_input" not in chat_arr, (
+    "an arriving chat is a system event, not user input"
 )
 
 # --- a chat repaint is not activity ------------------------------------------

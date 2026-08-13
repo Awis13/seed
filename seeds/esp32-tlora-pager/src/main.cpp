@@ -61,6 +61,7 @@
 #include "hw_kb.h"
 #include "psram_alloc.h"          // psram_calloc_pref: park big buffers in PSRAM
 #include "ui_nav.h"               // pure, host-tested back-navigation policy
+#include "notify_chat_class.h"    // pure, host-tested: incoming chat vs notification card
 
 // Bind the host-testable UiNavScreen ids to HwUiScreen so the two never drift.
 static_assert((int)UINAV_CLOCK          == (int)HW_UI_CLOCK,          "ui_nav enum drift");
@@ -2943,9 +2944,8 @@ static void ui_open_agent_chat(int idx);
 static void ui_agent_chat_refresh();
 static void ui_open_agent_act();
 static int agents_index_from_source(const char *src);
-static bool notify_is_chat_door(const NotifyView &v);
-static int agents_index_from_door(const NotifyView &v);
-static void ui_show_agent_invite_from_view(const NotifyView &v, uint32_t id);
+static bool notify_is_chat(const NotifyView &v);
+static int agents_index_for_card(const NotifyView &v);
 static void ui_enter_agent_from_notify(uint32_t id, const NotifyView &v);
 static void ui_open_menu();
 static void ui_open_info();
@@ -3098,7 +3098,7 @@ static void ui_on_key(const char *u) {
         if (c0 == '\n') {
             NotifyView v;
             if (notify_view_by_id(notify_card_id, v, NULL, NULL) &&
-                notify_is_chat_door(v)) {
+                notify_is_chat(v)) {
                 ui_enter_agent_from_notify(notify_card_id, v);
             } else {
                 ui_open_card_act();
@@ -3107,7 +3107,7 @@ static void ui_on_key(const char *u) {
         }
         NotifyView v;
         if (notify_view_by_id(notify_card_id, v, NULL, NULL)) {
-            if (notify_is_chat_door(v)) {
+            if (notify_is_chat(v)) {
                 ui_enter_agent_from_notify(notify_card_id, v);
                 if (utf8_is_printable(u)) ui_open_agent_compose(u);
                 return;
@@ -3184,32 +3184,38 @@ static int agents_index_from_source(const char *src) {
     return agents_find(src);
 }
 
-/* Chat-door vs real message:
- *   door  = client id ends with "-chat" (bridge posts "hermes-chat",
- *           "claude-chat" etc.)
- *   page  = everything else — full severity card (info/warn/crit colours),
- *           from any service/agent; reply works as before.
- * Chat rooms (AGENTS menu) are separate from the message queue. */
-static bool notify_is_chat_door(const NotifyView &v) {
-    if (!v.key[0]) return false;
-    size_t n = strlen(v.key);
-    return n >= 5 && strcmp(v.key + (n - 5), "-chat") == 0;
+// Does a conversation with this literal id exist? The lookup the pure
+// classifier (notify_card_is_chat) injects — same join agents_index_from_source
+// uses, so the device decision and the host-tested one stay one logic.
+static bool notify_conv_exists_cb(const char *id, void * /*ctx*/) {
+    return id && id[0] && agents_find(id) >= 0;
 }
 
-static int agents_index_from_door(const NotifyView &v) {
-    if (!notify_is_chat_door(v)) return -1;
-    // Prefer source; fall back to key prefix "hermes-chat" → "hermes",
-    // "claude-chat" → "claude"
+/* Chat vs real notification — THE one decision (mirrors the pure
+ * notify_card_is_chat() the host suite pins, and the ONLY signal the five
+ * dispatch sites route through, so they cannot drift):
+ *   chat = the card resolves to an existing agent conversation, by its source
+ *          (opencode / claude / hermes …) OR by a legacy "-chat" door prefix.
+ *          It lands in that conversation's thread + badges, like a known
+ *          mesh/LXMF peer's message — no invite card, no severity page.
+ *   page = everything else — a genuine notification (HA / sensor / service with
+ *          no conversation): full severity card, reply works as before.
+ * Chat rooms (AGENTS menu) are separate from the message queue. */
+static bool notify_is_chat(const NotifyView &v) {
+    return notify_card_is_chat(v.source, v.key, notify_conv_exists_cb, nullptr);
+}
+
+// The conversation a chat card resolves to (>= 0), or -1. Resolution order
+// mirrors notify_is_chat: source names a conversation, else a "-chat" door
+// prefix ("hermes-chat" → "hermes") does. Kept in step with the classifier so a
+// card notify_is_chat() accepts always yields a valid index.
+static int agents_index_for_card(const NotifyView &v) {
     int ax = agents_index_from_source(v.source);
     if (ax >= 0) return ax;
-    char id[AGENT_ID_LEN];
-    size_t n = strlen(v.key);
-    if (n <= 5) return -1;
-    size_t m = n - 5;
-    if (m >= sizeof(id)) m = sizeof(id) - 1;
-    memcpy(id, v.key, m);
-    id[m] = '\0';
-    return agents_find(id);
+    char prefix[NOTIFY_KEY_LEN];
+    if (notify_chat_door_prefix(v.key, prefix, sizeof(prefix)) > 0)
+        return agents_find(prefix);
+    return -1;
 }
 
 static void agents_head_time(uint32_t ts, char *out, size_t out_n) {
@@ -3712,20 +3718,9 @@ static void ui_open_net() {
     ui_net_render();
 }
 
-// Show the agent "door" card (pretty invite). Does not enter the room yet.
-static void ui_show_agent_invite_from_view(const NotifyView &v, uint32_t id) {
-    notify_card_id = id;
-    snprintf(reply_title, sizeof(reply_title), "%s", v.title);
-    int ax = agents_index_from_door(v);
-    const char *aname = (ax >= 0) ? agents_name(ax) : v.source;
-    hw_ui_show_agent_invite(aname, v.body, notify_unread_count());
-    // Reachable from the loop() arrival path: a system wake, not user input.
-    ui_note_wake();
-}
-
 // Enter the chat room from a chat-door notify (ack + open).
 static void ui_enter_agent_from_notify(uint32_t id, const NotifyView &v) {
-    int ax = agents_index_from_door(v);
+    int ax = agents_index_for_card(v);
     if (ax < 0) return;
     notify_ack_id(id);
     notify_card_id = 0;
@@ -3741,9 +3736,10 @@ static void ui_open_notify_id(uint32_t id) {
         ui_open_msglist();
         return;
     }
-    // Only *-chat doors open the invite; real pages keep severity colours.
-    if (notify_is_chat_door(v)) {
-        ui_show_agent_invite_from_view(v, id);
+    // A chat card opens straight into its room (the picker handles multi-session);
+    // real pages keep severity colours.
+    if (notify_is_chat(v)) {
+        ui_enter_agent_from_notify(id, v);
         return;
     }
     notify_card_id = id;
@@ -3987,10 +3983,10 @@ static void ui_on_click() {
         }
         break;
     case HW_UI_NOTIFY: {
-        // Chat door → open room. Severity page → Ack / Reply / Back.
+        // Chat card → open room. Severity page → Ack / Reply / Back.
         NotifyView v;
         if (notify_card_id && notify_view_by_id(notify_card_id, v, NULL, NULL) &&
-            notify_is_chat_door(v)) {
+            notify_is_chat(v)) {
             ui_enter_agent_from_notify(notify_card_id, v);
         } else {
             ui_open_card_act();
@@ -4629,19 +4625,24 @@ void loop() {
         HwUiScreen scr = hw_ui_screen();
         bool on_clock = (scr == HW_UI_CLOCK);
         if (arrived_id && notify_view_by_id(arrived_id, v, NULL, NULL)) {
-            if (notify_is_chat_door(v)) {
-                // Chat reply door (id "hermes-chat" etc.) — not a severity page.
-                int ax = agents_index_from_door(v);
-                if (ax >= 0 && scr == HW_UI_AGENT_CHAT && agent_focus == ax) {
-                    notify_ack_id(arrived_id);
-                    ui_agent_chat_refresh();
-                    ui_note_wake();  // real inbound message, not a repaint
-                } else if (ax >= 0 && scr == HW_UI_REPLY && agent_compose &&
-                           agent_focus == ax) {
-                    // Typing in that room — leave compose; thread updates later.
-                } else {
-                    // Pretty door: open chat from it. Full text is in the room.
-                    ui_show_agent_invite_from_view(v, arrived_id);
+            if (notify_is_chat(v)) {
+                // A chat (an agent talking back): land it in its conversation
+                // thread + badge, exactly like a known mesh/LXMF peer's message
+                // (agents_on_inbound is what their off-loop drain calls too).
+                // NEVER pop an invite or a severity card, and never yank the
+                // user into a screen — display_force from agents_on_inbound
+                // repaints the feed/room badge on the next pass. The card the
+                // gateway raised stays in the feed for now (its de-duplication
+                // against this conversation line is a later commit).
+                int ax = agents_index_for_card(v);
+                if (ax >= 0) {
+                    if (v.body[0]) agents_on_inbound(agents_id(ax), v.body, true);
+                    // If that very room is open, refresh it live and wake once;
+                    // otherwise stay calm and let the badge speak.
+                    if (scr == HW_UI_AGENT_CHAT && agent_focus == ax) {
+                        ui_agent_chat_refresh();
+                        ui_note_wake();  // real inbound message, not a repaint
+                    }
                 }
             } else if (on_clock || scr == HW_UI_MENU || scr == HW_UI_AGENTS ||
                        scr == HW_UI_MSGLIST || scr == HW_UI_INFO) {
