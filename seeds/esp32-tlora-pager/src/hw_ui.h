@@ -161,7 +161,8 @@ void hw_ui_show_layout(int selected, int current_layout);
 // bl_label e.g. "full"/"day"/"room"/"night"; idle_word "on"/"off".
 void hw_ui_show_settings(int selected,
                          const char *bl_label,
-                         const char *idle_word);
+                         const char *idle_word,
+                         bool silent);
 
 // MeshCore menu: STATUS / PING GW / BACK. selected 0..2
 void hw_ui_show_meshcore(int selected);

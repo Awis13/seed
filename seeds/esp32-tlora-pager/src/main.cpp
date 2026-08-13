@@ -1755,6 +1755,8 @@ static void skills_init() {
 
 // Build one second of the home clock face (tembed look, 480x222).
 // Lives after notify.cpp so it can read unread/crit without a second copy.
+static bool settings_silent = false;
+
 static void ui_clock_paint(const char *note) {
     if (!hw_ui_ready()) return;
 
@@ -1788,6 +1790,8 @@ static void ui_clock_paint(const char *note) {
         /* LOCK takes the note row so pocket mode is obvious. */
         snprintf(row2, sizeof(row2), "LOCKED  long CAPS unlock");
     }
+    if (settings_silent && row2[0] == '\0')
+        snprintf(row2, sizeof(row2), "SILENT");
     if (note && note[0]) snprintf(row2, sizeof(row2), "%s", note);
 
     // Progress borrows the note row when it is free (same rule as tembed).
@@ -1855,13 +1859,14 @@ enum { CARD_ACT_ACK = 0, CARD_ACT_REPLY, CARD_ACT_DELETE, CARD_ACT_BACK, CARD_AC
 enum { AGENT_ACT_CLEAR = 0, AGENT_ACT_DELETE, AGENT_ACT_BACK, AGENT_ACT_COUNT };
 // Layout picker: 0=ABC 1=PHON 2=RU 3=BACK
 enum { LAYOUT_BACK = 3, LAYOUT_LIST_COUNT = 4 };
-// SETTINGS: 0=LAYOUT 1=BACKLIGHT 2=AUTO-DIM 3=BACK
+// SETTINGS: 0=LAYOUT 1=BACKLIGHT 2=AUTO-DIM 3=SILENT 4=BACK
 enum {
     SETTINGS_LAYOUT = 0,
     SETTINGS_BACKLIGHT = 1,
     SETTINGS_AUTODIM = 2,
-    SETTINGS_BACK = 3,
-    SETTINGS_LIST_COUNT = 4
+    SETTINGS_SILENT = 3,
+    SETTINGS_BACK = 4,
+    SETTINGS_LIST_COUNT = 5
 };
 // MeshCore menu: 0=STATUS 1=PING 2=BACK
 enum { MESH_ACT_STATUS = 0, MESH_ACT_PING = 1, MESH_ACT_BACK = 2, MESH_LIST_COUNT = 3 };
@@ -2207,11 +2212,35 @@ static unsigned long ui_last_input_ms = 0;
 #define UI_IDLE_REPLY_MS  60000
 #define KB_LAYOUT_PATH    "/kb_layout.txt"
 #define KB_LAYOUT_TMP     "/kb_layout.tmp"
+#define SETTINGS_PATH     "/settings.json"
+#define SETTINGS_TMP      "/settings.tmp"
 
 static_assert(BL_IDLE_DIM_MS > UI_IDLE_MS,
               "backlight must not dim while a message card can still be on screen");
 
 static void ui_note_input() { ui_last_input_ms = millis(); }
+
+static void settings_save() {
+    JsonDocument doc;
+    doc["silent"] = settings_silent;
+    String body;
+    serializeJson(doc, body);
+    write_spiffs_file_atomic(SETTINGS_PATH, SETTINGS_TMP, body);
+}
+
+static void settings_load() {
+    String body = read_spiffs_file(SETTINGS_PATH);
+    if (!body.length()) return;
+    JsonDocument doc;
+    if (deserializeJson(doc, body)) return;
+    if (doc["silent"].is<bool>()) settings_silent = doc["silent"].as<bool>();
+}
+
+static void settings_toggle_silent() {
+    settings_silent = !settings_silent;
+    settings_save();
+    hw_haptic_notify(1);
+}
 
 // SYSTEM events only (a message arriving): wake the panel and restart the
 // idle/dim countdown once per event; repaints and synthetic errors must not call this.
@@ -2221,7 +2250,7 @@ static void ui_note_wake() { ui_last_input_ms = millis(); }
 static void ui_open_settings() {
     char bl[BL_LABEL_MAX];
     bl_level_label(backlight_wanted(), bl, sizeof(bl));
-    hw_ui_show_settings(settings_sel, bl, bl_idle_word());
+    hw_ui_show_settings(settings_sel, bl, bl_idle_word(), settings_silent);
     ui_note_input();
 }
 
@@ -3121,7 +3150,7 @@ static void ui_reply_submit() {
         const char *aid = agents_id(agent_focus);
         if (agents_send(aid, reply_buf)) {
             hw_haptic_notify(0);
-            hw_sound_notify(0);
+            if (!settings_silent) hw_sound_notify(0);
         }
         reply_buf[0] = '\0';
         reply_mode = REPLY_MODE_NONE;
@@ -3137,7 +3166,7 @@ static void ui_reply_submit() {
     bool queued = false;
     if (notify_set_reply(notify_card_id, reply_buf)) {
         hw_haptic_notify(0);
-        hw_sound_notify(0);
+        if (!settings_silent) hw_sound_notify(0);
         event_add("reply id=%lu: %s", (unsigned long)notify_card_id, reply_buf);
         // Read the card back rather than sending reply_buf: the store cleaned
         // and truncated it, and what goes upstream must be what GET /notify/one
@@ -4099,6 +4128,9 @@ static void ui_on_click() {
         } else if (settings_sel == SETTINGS_AUTODIM) {
             backlight_idle_toggle();
             ui_open_settings();
+        } else if (settings_sel == SETTINGS_SILENT) {
+            settings_toggle_silent();
+            ui_open_settings();
         }
         break;
     case HW_UI_MESHCORE:
@@ -4584,6 +4616,7 @@ void setup() {
     hw_sound_begin();
     hw_kb_begin();
     kb_layout_load(); // SPIFFS /kb_layout.txt → EN / RU PHON / RU
+    settings_load();  // SPIFFS /settings.json; missing keys keep defaults
     mesh_gw_load();   // SPIFFS /mesh_gw.txt → home Heltec daemon URL
     gw_token_load();  // SPIFFS /gw_token.txt → gateway capability token
     hw_probe();
@@ -4737,7 +4770,7 @@ void loop() {
         }
         if (hw_kb_take_lock_changed()) {
             hw_haptic_notify(hw_kb_locked() ? 1 : 0);
-            if (hw_kb_locked()) hw_sound_notify(0);
+            if (hw_kb_locked() && !settings_silent) hw_sound_notify(0);
             if (hw_ui_screen() == HW_UI_CLOCK) {
                 hw_ui_invalidate_clock();
                 ui_clock_paint(hw_kb_locked() ? "LOCKED" : "unlocked");
@@ -4750,6 +4783,15 @@ void loop() {
             if (hw_ui_screen() == HW_UI_REPLY) ui_reply_paint();
             else if (hw_ui_screen() == HW_UI_LAYOUT)
                 hw_ui_show_layout(layout_sel, (int)hw_kb_layout());
+        }
+        if (hw_kb_take_silent_toggle()) {
+            settings_toggle_silent();
+            if (hw_ui_screen() == HW_UI_SETTINGS) ui_open_settings();
+            else if (hw_ui_screen() == HW_UI_CLOCK) {
+                hw_ui_invalidate_clock();
+                ui_clock_paint(settings_silent ? "SILENT ON" : "SILENT OFF");
+            }
+            ui_note_input();
         }
     }
 
@@ -4791,7 +4833,7 @@ void loop() {
         uint8_t lvl = 0;
         char src[NOTIFY_SOURCE_LEN];
         if (notify_take_sound_arrival(&lvl, src, sizeof(src))) {
-            hw_sound_notify(lvl);   // amp + queue before haptic I2C
+            if (!settings_silent) hw_sound_notify(lvl);
             hw_haptic_notify(lvl);
             hw_sound_poll();        // prime DMA immediately
         }

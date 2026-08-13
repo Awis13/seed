@@ -44,6 +44,10 @@ void hw_kb_reset_mods();
 // True once after a layout change (cycle or set); UI clears via this read.
 bool hw_kb_take_layout_changed();
 
+// True once after ALT+S is pressed. The shortcut is consumed before the symbol
+// layer emits '/', so it never leaks into a draft.
+bool hw_kb_take_silent_toggle();
+
 // Keyboard lock (pocket / bag). Long-press CAPS (~0.7s) toggles.
 // While locked: all keys ignored except CAPS long-press to unlock.
 // ALT+CAPS layout cycle is also blocked while locked.

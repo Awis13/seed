@@ -635,6 +635,7 @@ static int layout_cur_drawn = -1;
 static int settings_sel_drawn = -1;
 static char settings_bl_cache[12];
 static char settings_idle_cache[8];
+static int settings_silent_cache = -1;
 static int mesh_sel_drawn = -1;
 static int wifi_sel_drawn = -1;
 static int wifi_list_sel_drawn = -1;
@@ -808,6 +809,7 @@ void hw_ui_show_clock() {
     wifi_list_n_drawn = -1;
     settings_bl_cache[0] = '\0';
     settings_idle_cache[0] = '\0';
+    settings_silent_cache = -1;
     mesh_sel_drawn = -1;
     msglist_sel_drawn = -1;
     msglist_top_drawn = -1;
@@ -1298,14 +1300,15 @@ void hw_ui_show_layout(int selected, int current_layout) {
     layout_cur_drawn = current_layout;
 }
 
-// SETTINGS: LAYOUT / BACKLIGHT / AUTO-DIM / BACK
-static const int SETTINGS_N = 4;
+// SETTINGS: LAYOUT / BACKLIGHT / AUTO-DIM / SILENT / BACK
+static const int SETTINGS_N = 5;
 static const int SETTINGS_ROW0_Y = 48;
 static const int SETTINGS_ROW_H = 34;
 static const int SETTINGS_BAR_H = 28;
 
 static void settings_draw_row(int i, bool on,
-                              const char *bl_label, const char *idle_word) {
+                              const char *bl_label, const char *idle_word,
+                              bool silent) {
     uint16_t y = (uint16_t)(SETTINGS_ROW0_Y + i * SETTINGS_ROW_H);
     uint16_t bar_y = y - 4;
     uint16_t bar_w = PANEL_W - 2 * MARGIN;
@@ -1315,6 +1318,7 @@ static void settings_draw_row(int i, bool on,
                               bl_label && bl_label[0] ? bl_label : "?");
     else if (i == 2) snprintf(label, sizeof(label), "AUTO-DIM %s",
                               idle_word && idle_word[0] ? idle_word : "?");
+    else if (i == 3) snprintf(label, sizeof(label), "SILENT %s", silent ? "ON" : "OFF");
     else snprintf(label, sizeof(label), "BACK");
     if (on) {
         tft_fill_rect(MARGIN, bar_y, bar_w, SETTINGS_BAR_H, COL_ACCENT);
@@ -1327,7 +1331,8 @@ static void settings_draw_row(int i, bool on,
 
 void hw_ui_show_settings(int selected,
                          const char *bl_label,
-                         const char *idle_word) {
+                         const char *idle_word,
+                         bool silent) {
     if (!panel_ok) return;
     if (selected < 0) selected = 0;
     if (selected >= SETTINGS_N) selected = SETTINGS_N - 1;
@@ -1336,13 +1341,14 @@ void hw_ui_show_settings(int selected,
 
     bool labels_same =
         (strncmp(settings_bl_cache, bl_label, sizeof(settings_bl_cache) - 1) == 0) &&
-        (strncmp(settings_idle_cache, idle_word, sizeof(settings_idle_cache) - 1) == 0);
+        (strncmp(settings_idle_cache, idle_word, sizeof(settings_idle_cache) - 1) == 0) &&
+        settings_silent_cache == (silent ? 1 : 0);
     HwSpiBusGuard bus;
 
     if (screen == HW_UI_SETTINGS && settings_sel_drawn >= 0 &&
         settings_sel_drawn != selected && labels_same) {
-        settings_draw_row(settings_sel_drawn, false, bl_label, idle_word);
-        settings_draw_row(selected, true, bl_label, idle_word);
+        settings_draw_row(settings_sel_drawn, false, bl_label, idle_word, silent);
+        settings_draw_row(selected, true, bl_label, idle_word, silent);
         settings_sel_drawn = selected;
         return;
     }
@@ -1354,10 +1360,11 @@ void hw_ui_show_settings(int selected,
     tft_fill_rect(0, 0, PANEL_W, 22, COL_ACCENT);
     tft_draw_text(MARGIN, 4, "SETTINGS", COL_BG, COL_ACCENT, 2);
     for (int i = 0; i < SETTINGS_N; i++)
-        settings_draw_row(i, i == selected, bl_label, idle_word);
+        settings_draw_row(i, i == selected, bl_label, idle_word, silent);
     settings_sel_drawn = selected;
     snprintf(settings_bl_cache, sizeof(settings_bl_cache), "%s", bl_label);
     snprintf(settings_idle_cache, sizeof(settings_idle_cache), "%s", idle_word);
+    settings_silent_cache = silent ? 1 : 0;
 }
 
 static void mesh_draw_row(int i, bool on) {

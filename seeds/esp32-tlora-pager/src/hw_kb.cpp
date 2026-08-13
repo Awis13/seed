@@ -38,6 +38,7 @@ static bool symbol = false;
 static bool alt_held = false;
 static HwKbLayout layout = HW_KB_LAYOUT_EN;
 static bool layout_changed = false;
+static bool silent_toggle = false;
 static bool kb_locked = false;
 static bool lock_changed = false;
 static uint32_t caps_down_ms = 0;
@@ -269,6 +270,12 @@ bool hw_kb_take_layout_changed() {
     return c;
 }
 
+bool hw_kb_take_silent_toggle() {
+    bool changed = silent_toggle;
+    silent_toggle = false;
+    return changed;
+}
+
 void hw_kb_reset_mods() {
     caps = false;
     symbol = false;
@@ -371,6 +378,11 @@ bool hw_kb_read(char *out, size_t out_sz) {
     uint8_t row = k / 10;
     uint8_t col = k % 10;
     if (row >= 4 || col >= 10) return false;
+
+    if (pressed && alt_held && row == 1 && col == 1) {
+        silent_toggle = true;  // ALT+S
+        return false;
+    }
 
     bool use_sym = alt_held;
     if (use_sym) {
