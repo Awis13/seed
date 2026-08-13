@@ -480,6 +480,11 @@ static const uint8_t *font_glyph(uint32_t cp) {
     // En/em dash → ASCII -
     if (cp == 0x2013 || cp == 0x2014 || cp == 0x2212)
         return &FONT5X7[('-' - 0x20) * 5];
+    // Right arrow → visible ASCII chevron. The compact 5x7 font has no native
+    // U+2192 glyph; rendering '?' made route/status text look like a missing
+    // character on the device.
+    if (cp == 0x2192)
+        return &FONT5X7[('>' - 0x20) * 5];
     // Middle dot · (chat headers "CLAUDE · s123") → ASCII .
     if (cp == 0x00B7)
         return &FONT5X7[('.' - 0x20) * 5];

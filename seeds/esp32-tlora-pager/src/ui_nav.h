@@ -90,12 +90,10 @@ static inline bool ui_nav_backspace_goes_back(uint8_t screen) {
     return !ui_nav_is_text_entry(screen) && screen != UINAV_CLOCK;
 }
 
-// Forward-open policy for an AI conversation row (from the feed or the contacts
-// list): a conversation with more than one session opens the session picker so
-// the user chooses a room instead of being dropped into the last-active one; a
-// single-session (or freshly created) conversation opens the chat directly, so
-// the common case keeps its one-tap open. session_count is agents_session_count
-// for the slot — the same count that gates the picker's capacity and rows.
+// Forward-open policy for a conversation row: always enter its active chat.
+// Multi-session conversations still expose their picker by backing out of the
+// chat, so the common "tap Hermes and read/reply" path remains one tap.
 static inline uint8_t ui_nav_conv_open_target(int session_count) {
-    return session_count > 1 ? UINAV_AGENT_SESSIONS : UINAV_AGENT_CHAT;
+    (void)session_count;
+    return UINAV_AGENT_CHAT;
 }
