@@ -1622,6 +1622,20 @@ static ConnMgrState g_conn_mgr;
 #include "attach_beacon.h"
 static AttachBeaconState g_attach_beacon;
 
+// Cached route-home reachability (ticket HERMES-LADDER / C1, foundation only).
+// Pure cadence + staleness policy in src/reachability.h; the bounded GET that
+// feeds it lives in reachability_service(), defined below once mesh_gw_url and
+// gw_token are in scope. Driven here on the loop task at the conn-mgr cadence so
+// the verdict is always warm when the send ladder (C2) asks for it — the send
+// path never blocks on a probe.
+#include "reachability.h"
+static ReachState g_reach;
+static void reachability_service(uint32_t now);
+// Defined below (after mesh_gw_url/gw_token); the send ladder in the
+// #include'd skills/agents.cpp — which expands ABOVE this point — is registered
+// with it in skills_init() via agents_set_reachability().
+static ReachStatus gateway_reachable();
+
 static void conn_mgr_service() {
     static uint32_t last = 0;
     uint32_t now = millis();
@@ -1681,6 +1695,11 @@ static void conn_mgr_service() {
         wifi_reconnect_request();
         event_add("conn: nudge wifi ladder");
     }
+
+    // Keep the cached route-home verdict warm for the send ladder (C2). Shares
+    // this loop-task cadence; the probe itself is bounded and self-throttled by
+    // reach_should_probe(), so most ticks are a no-op.
+    reachability_service(now);
 }
 
 /* Defined with the other UI helpers below; the store needs it as soon as it
@@ -1691,6 +1710,9 @@ static void skills_init() {
     skill_notify_init();
     skill_progress_init();
     skill_agents_init();
+    /* C2: the send ladder picks the WiFi rung only when the route home is PROVEN.
+     * Hand it the cached C1 verdict; the probe stays off the send path. */
+    agents_set_reachability(gateway_reachable);
     /* Only the UI knows which conversation is being read; the store must not
      * infer it from window ownership, which outlives the screen. */
     agents_set_on_screen_hook(ui_conv_on_screen);
@@ -1864,6 +1886,61 @@ static char mesh_gw_url[96] = MESH_GW_DEFAULT;
 // here can reallocate under the reader and dangle its c_str(); a torn char
 // buffer costs at worst one 401, which the caller can simply retry.
 static char gw_token[GW_TOKEN_MAX + 1] = "";
+
+// ---- Route-home reachability, device half (HERMES-LADDER / C1) --------------
+// Runs on the loop task from conn_mgr_service(). Keeps g_reach current so the
+// send ladder (C2) can read gateway_reachable() without ever blocking on a
+// network call. The probe is a single bounded GET {mesh_gw_url}/ping, gated by
+// the pure two-speed cadence in reachability.h; a black-holed gateway costs
+// ~1 s (connect cap) at most and only at the probe cadence, never per send.
+static void reachability_service(uint32_t now) {
+    // No WiFi link means home is not reachable OVER WIFI — record DOWN without a
+    // request. This is cheap and keeps the verdict fresh (and DOWN, not stale
+    // UNKNOWN) while the link is gone; when WiFi returns the fast down-cadence
+    // re-probes for real.
+    if (WiFi.status() != WL_CONNECTED) {
+        reach_record(&g_reach, now, false);
+        return;
+    }
+    if (!reach_should_probe(&g_reach, now, REACH_UP_INTERVAL_MS,
+                            REACH_DOWN_INTERVAL_MS, REACH_STALE_MS))
+        return;
+    if (!mesh_gw_url[0]) {   // no gateway configured: nothing to prove
+        reach_record(&g_reach, now, false);
+        return;
+    }
+
+    // Bounded GET, mirroring ui_mesh_ping_step_http(): 1 s connect cap so a
+    // black-holed gateway does not eat the full read window, a short read
+    // window, and ANY HTTP status counts as "route proven" (a 401/403 is the
+    // gateway refusing the token, not a dead WiFi path). Buffer is static: this
+    // runs on the loop task, whose stack is shallow.
+    static char url[128];
+    snprintf(url, sizeof(url), "%s/ping?t=%lu", mesh_gw_url, (unsigned long)now);
+    bool up = false;
+    HTTPClient http;
+    http.setConnectTimeout(1000);
+    http.setTimeout(2000);
+    if (http.begin(url)) {
+        if (gw_token[0]) {
+            http.addHeader("Authorization", String("Bearer ") + gw_token);
+        }
+        int code = http.GET();
+        http.end();
+        up = (code > 0);   // any status => reachable; <=0 is timeout/conn-fail
+    }
+    reach_record(&g_reach, now, up);
+}
+
+// Accessor for the send ladder (C2): the cached route-home verdict, no I/O.
+// UNKNOWN until the first probe (or once a past result goes stale), UP when the
+// gateway answered recently, DOWN on a recent failure or a down WiFi link.
+// Registered with the agent-send ladder in skills_init() (agents_set_reachability);
+// transport_send_agent() reads it to gate the WiFi rung on a PROVEN route home.
+static ReachStatus gateway_reachable() {
+    return reach_status(&g_reach, millis(), REACH_STALE_MS);
+}
+
 static int agent_focus = 0;   // which agent chat is open (0..AGENTS_N-1)
 static bool agent_compose = false;  // REPLY screen is for agent, not notify
 static int agent_scroll = -1;       // visual row; -1 = pin to latest
