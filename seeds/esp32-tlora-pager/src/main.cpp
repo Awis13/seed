@@ -1615,6 +1615,13 @@ static_assert(HW_UI_NET_MAX == NET_ROWS_MAX, "net status row cap drift");
 #include "conn_mgr.h"
 static ConnMgrState g_conn_mgr;
 
+// Fast "I'm back, flush my queued cards" beacon on the WiFi attach edge
+// (ticket CARD-DELIVERY / C3). Pure decision + wire in src/attach_beacon.h; the
+// attach edge only STAGES it here, the blocking POST is deferred to
+// flush_beacon_poll() on the loop task (mirrors reply_upstream_poll / card_ack).
+#include "attach_beacon.h"
+static AttachBeaconState g_attach_beacon;
+
 static void conn_mgr_service() {
     static uint32_t last = 0;
     uint32_t now = millis();
@@ -1639,6 +1646,11 @@ static void conn_mgr_service() {
 
     if (a.on_attach) event_add("conn: network attached");
     if (a.on_lost) event_add("conn: network lost");
+
+    // Stage a flush beacon on a genuine attach (rate-limited against flaps). The
+    // POST itself is deferred to flush_beacon_poll() — nothing blocking here.
+    if (attach_beacon_decide(&g_attach_beacon, a.on_attach, now))
+        event_add("conn: flush beacon staged");
 
     // WG bring-up / restart: hand it to wg.cpp's own deferred restart path
     // (stop -> gap -> start on the loop task). g_wg_restart_req is exactly the
@@ -2293,6 +2305,48 @@ static void reply_upstream_poll() {
     }
     reply_up_pending = false;
     event_add("reply upstream unreachable: %s (kept on device)", key);
+}
+
+// POST {gw}/flush {"id":…} — the attach flush beacon (CARD-DELIVERY / C3). Runs
+// on the loop task, off AsyncTCP, same blocking-HTTP discipline as
+// reply_upstream_http (1 s connect cap so a black-holed gateway does not freeze
+// the panel). True only on 2xx: the gateway saw us and will flush the outbox.
+static bool flush_beacon_http() {
+    if (WiFi.status() != WL_CONNECTED) return false;
+    if (!mesh_gw_url[0]) return false;
+
+    char url[sizeof(mesh_gw_url) + 8];
+    if (!attach_beacon_endpoint(mesh_gw_url, url, sizeof(url))) return false;
+    char body[ATTACH_BEACON_BODY_CAP];
+    if (!attach_beacon_body(node_name.c_str(), body, sizeof(body))) return false;
+
+    HTTPClient http;
+    http.setConnectTimeout(1000);
+    http.setTimeout(5000);
+    if (!http.begin(url)) return false;
+    http.addHeader("Content-Type", "application/json");
+    if (gw_token[0]) {
+        http.addHeader("Authorization", String("Bearer ") + gw_token);
+    }
+    int code = http.POST(body);
+    http.end();
+    return code >= 200 && code < 300;
+}
+
+// Emit any staged flush beacon. One-shot: WiFi is the attach edge's uplink, so
+// if the POST does not land now we DROP it rather than hold it pending and
+// hammer a black-holed gateway once per loop pass — the mesh probe and RNS
+// announce remain the slow presence backstop, and the next genuine attach
+// re-stages (subject to the rate-limit floor).
+static void flush_beacon_poll() {
+    if (!g_attach_beacon.pending) return;
+    if (flush_beacon_http()) {
+        g_attach_beacon.pending = false;
+        event_add("flush beacon wifi ok: %s", node_name.c_str());
+        return;
+    }
+    g_attach_beacon.pending = false;
+    event_add("flush beacon unreachable (dropped)");
 }
 
 // Pull one JSON string field "key":"value" into out (best-effort, no nested).
@@ -4415,6 +4469,10 @@ void loop() {
     // keyboard drain above, so an Enter is carried on the pass that produced
     // it, and after the card has already painted its way back to the clock.
     reply_upstream_poll();
+
+    // Flush beacon: staged by conn_mgr_service() on the WiFi attach edge, sent
+    // here on the loop task (off AsyncTCP), same deferral as the reply above.
+    flush_beacon_poll();
 
     // Speaker + haptic FIRST — before any full-screen SPI paint can delay the
     // cue. (Boot tone worked; notify was silent when paint ran first.)
