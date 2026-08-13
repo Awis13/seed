@@ -62,6 +62,7 @@
 #include "psram_alloc.h"          // psram_calloc_pref: park big buffers in PSRAM
 #include "ui_nav.h"               // pure, host-tested back-navigation policy
 #include "notify_chat_class.h"    // pure, host-tested: incoming chat vs notification card
+#include "outbox.h"               // durable canonical outbound message store
 
 // Bind the host-testable UiNavScreen ids to HwUiScreen so the two never drift.
 static_assert((int)UINAV_CLOCK          == (int)HW_UI_CLOCK,          "ui_nav enum drift");
@@ -592,6 +593,29 @@ static bool write_spiffs_file_atomic(const char *path, const char *tmp_path,
     if (!write_spiffs_file(tmp_path, content)) return false;
     SPIFFS.remove(path);
     return SPIFFS.rename(tmp_path, path);
+}
+
+#define OUTBOX_FILE "/outbox.bin"
+#define OUTBOX_TMP  "/outbox.tmp"
+static OutboxStore g_outbox;
+static uint8_t g_outbox_snapshot[OUTBOX_SNAPSHOT_MAX];
+
+static bool outbox_persist() {
+    size_t len = outbox_encode(&g_outbox, g_outbox_snapshot,
+                               sizeof(g_outbox_snapshot));
+    if (!len) return false;
+    String body((const char *)g_outbox_snapshot, (unsigned int)len);
+    return write_spiffs_file_atomic(OUTBOX_FILE, OUTBOX_TMP, body);
+}
+
+static void outbox_load() {
+    outbox_init(&g_outbox);
+    String body = read_spiffs_file(OUTBOX_FILE);
+    if (!body.length()) return;
+    if (!outbox_decode(&g_outbox, (const uint8_t *)body.c_str(), body.length())) {
+        outbox_init(&g_outbox);
+        event_add("outbox snapshot invalid");
+    }
 }
 
 // Raised by notify endpoints; loop() paints and clears it. The endpoints never
@@ -4468,6 +4492,7 @@ void setup() {
     // STA associates.
     hw_ui_begin();
     storage_begin();  // SPIFFS mount → announced format → degraded continue
+    outbox_load();    // durable outgoing replies survive an offline reboot
     // Capture this device's real secrets into NVS, byte-for-byte, the moment
     // storage is up and BEFORE any consumer (auth/gw/rns/mesh) loads one. NVS
     // survives a SPIFFS format, so this is what keeps the live identity, RNS
