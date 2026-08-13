@@ -51,7 +51,13 @@ static inline bool ui_nav_is_text_entry(uint8_t screen) {
 // backs out to its room list (so the list stays reachable after we drop the
 // intermediate stop and open the active room directly); a single-room chat backs
 // straight to the unified feed.
-static inline uint8_t ui_nav_back_target(uint8_t screen, bool has_rooms) {
+//
+// sessions_origin only matters for AGENT_SESSIONS: the picker can be entered
+// forward from the unified feed (MSGLIST) or from the contacts list (CONTACTS),
+// so it backs out to whichever list opened it. Defaults to MSGLIST — the
+// historical target and the value every non-forward path passes.
+static inline uint8_t ui_nav_back_target(uint8_t screen, bool has_rooms,
+                                         uint8_t sessions_origin = UINAV_MSGLIST) {
     switch (screen) {
     case UINAV_NOTIFY:         return UINAV_MSGLIST;
     case UINAV_CARD_ACT:       return UINAV_NOTIFY;
@@ -59,7 +65,7 @@ static inline uint8_t ui_nav_back_target(uint8_t screen, bool has_rooms) {
     case UINAV_AGENTS:         return UINAV_MENU;
     case UINAV_AGENT_CHAT:     return has_rooms ? UINAV_AGENT_SESSIONS : UINAV_MSGLIST;
     case UINAV_AGENT_ACT:      return UINAV_AGENT_CHAT;
-    case UINAV_AGENT_SESSIONS: return UINAV_MSGLIST;
+    case UINAV_AGENT_SESSIONS: return sessions_origin;
     case UINAV_MSGLIST:        return UINAV_MENU;
     case UINAV_INFO:           return UINAV_MENU;
     case UINAV_LAYOUT:         return UINAV_SETTINGS;
@@ -80,4 +86,14 @@ static inline uint8_t ui_nav_back_target(uint8_t screen, bool has_rooms) {
 // entry and it is not the root clock).
 static inline bool ui_nav_backspace_goes_back(uint8_t screen) {
     return !ui_nav_is_text_entry(screen) && screen != UINAV_CLOCK;
+}
+
+// Forward-open policy for an AI conversation row (from the feed or the contacts
+// list): a conversation with more than one session opens the session picker so
+// the user chooses a room instead of being dropped into the last-active one; a
+// single-session (or freshly created) conversation opens the chat directly, so
+// the common case keeps its one-tap open. session_count is agents_session_count
+// for the slot — the same count that gates the picker's capacity and rows.
+static inline uint8_t ui_nav_conv_open_target(int session_count) {
+    return session_count > 1 ? UINAV_AGENT_SESSIONS : UINAV_AGENT_CHAT;
 }

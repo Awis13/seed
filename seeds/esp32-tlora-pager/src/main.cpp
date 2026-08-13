@@ -1946,6 +1946,11 @@ static bool agent_compose = false;  // REPLY screen is for agent, not notify
 static int agent_scroll = -1;       // visual row; -1 = pin to latest
 static int agent_scroll_total = 0;  // last known wrapped row count
 static int agent_sess_sel = 0;      // selected row on the agent SESSIONS list
+// Where the agent flow was entered from, so the session picker backs out to the
+// list that opened it (the unified feed or the contacts list) rather than always
+// the feed. Set at the forward entry points and left untouched by the internal
+// chat<->picker navigation, so it survives a round trip through a room.
+static uint8_t agent_origin = UINAV_MSGLIST;
 // Chat window copy: only the current viewport (AGENT_THREAD_MAX lines) — the
 // full history lives on SD, so no whole-thread RAM snapshot is held.
 static char ag_chat_lines[AGENT_THREAD_MAX][AGENT_TEXT_LEN];
@@ -2944,6 +2949,7 @@ static void ui_show_agent_invite_from_view(const NotifyView &v, uint32_t id);
 static void ui_enter_agent_from_notify(uint32_t id, const NotifyView &v);
 static void ui_open_menu();
 static void ui_open_info();
+static void ui_open_contacts();
 
 // Navigate to `target` (a UiNavScreen id) by rebuilding its content — the same
 // open helpers the per-screen BACK rows call. Used only for the small set of
@@ -2959,6 +2965,7 @@ static void ui_go_to_screen(uint8_t target) {
     case UINAV_SETTINGS:       ui_open_settings();                break;
     case UINAV_MESHCORE:       ui_open_meshcore();                break;
     case UINAV_WIFI:           ui_open_wifi();                    break;
+    case UINAV_CONTACTS:       ui_open_contacts();               break;
     default:                   ui_go_clock(NULL);                 break;
     }
 }
@@ -2970,7 +2977,7 @@ static void ui_go_back() {
     HwUiScreen scr = hw_ui_screen();
     if (!ui_nav_backspace_goes_back((uint8_t)scr)) return;
     bool has_rooms = (scr == HW_UI_AGENT_CHAT) && agents_has_rooms(agent_focus);
-    ui_go_to_screen(ui_nav_back_target((uint8_t)scr, has_rooms));
+    ui_go_to_screen(ui_nav_back_target((uint8_t)scr, has_rooms, agent_origin));
     hw_haptic_notify(0);
 }
 
@@ -3601,7 +3608,15 @@ static void ui_contacts_open_selected() {
         return;
     }
     hw_haptic_notify(0);
-    ui_open_agent_chat(slot);
+    // A multi-session AI door opens its room picker; a single-session one (a
+    // freshly created conversation always has exactly one) opens the chat
+    // directly, so a first contact tap does not land on an empty picker. The
+    // picker backs out to this contacts list.
+    agent_origin = UINAV_CONTACTS;
+    if (ui_nav_conv_open_target(agents_session_count(slot)) == UINAV_AGENT_SESSIONS)
+        ui_open_agent_sessions(slot);
+    else
+        ui_open_agent_chat(slot);
 }
 
 // ===== Network status screen =====
@@ -3714,6 +3729,9 @@ static void ui_enter_agent_from_notify(uint32_t id, const NotifyView &v) {
     if (ax < 0) return;
     notify_ack_id(id);
     notify_card_id = 0;
+    // A chat-door notify lives in the feed, so a picker reached by backing out of
+    // this chat backs on to the feed.
+    agent_origin = UINAV_MSGLIST;
     ui_open_agent_chat(ax);
 }
 
@@ -3916,7 +3934,9 @@ static void ui_on_click() {
                 event_add("agent new session refused (full)");
             }
         } else {  // BACK
-            ui_open_msglist();   // → the unified feed, not the retired list
+            // Back to whatever list opened the picker (the unified feed or the
+            // contacts list), not the retired agents list.
+            ui_go_to_screen(agent_origin);
         }
         break;
     }
@@ -3953,9 +3973,16 @@ static void ui_on_click() {
                     ui_open_msglist();
                     break;
                 }
-                // Straight into the active (last-used) room's chat; the room
-                // list stays reachable with BACKSPACE from the chat.
-                ui_open_agent_chat(slot);
+                // A multi-session conversation opens its room picker so the user
+                // chooses rather than landing silently in the last-used room; a
+                // single-session one opens the chat directly (one-tap). Either
+                // way the picker backs out to this feed.
+                agent_origin = UINAV_MSGLIST;
+                if (ui_nav_conv_open_target(agents_session_count(slot))
+                        == UINAV_AGENT_SESSIONS)
+                    ui_open_agent_sessions(slot);
+                else
+                    ui_open_agent_chat(slot);
             }
         }
         break;

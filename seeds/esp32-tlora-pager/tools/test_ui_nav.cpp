@@ -73,6 +73,29 @@ int main(void) {
     assert(ui_nav_back_target(UINAV_AGENT_CHAT, true)  == UINAV_AGENT_SESSIONS);
     assert(ui_nav_back_target(UINAV_AGENT_CHAT, false) == UINAV_MSGLIST);
 
+    // AGENT_SESSIONS: the session picker can be entered forward from the feed or
+    // the contacts list, so it backs out to whichever opened it. The origin is
+    // ignored for every other screen (has_rooms drives AGENT_CHAT, not this).
+    assert(ui_nav_back_target(UINAV_AGENT_SESSIONS, false, UINAV_MSGLIST)
+           == UINAV_MSGLIST);
+    assert(ui_nav_back_target(UINAV_AGENT_SESSIONS, false, UINAV_CONTACTS)
+           == UINAV_CONTACTS);
+    // Default origin (no third argument) stays the feed, matching every
+    // non-forward caller.
+    assert(ui_nav_back_target(UINAV_AGENT_SESSIONS, false) == UINAV_MSGLIST);
+    // Origin does not leak into other screens' back targets.
+    assert(ui_nav_back_target(UINAV_AGENT_CHAT, true, UINAV_CONTACTS)
+           == UINAV_AGENT_SESSIONS);
+    assert(ui_nav_back_target(UINAV_MSGLIST, false, UINAV_CONTACTS) == UINAV_MENU);
+
+    // Forward-open policy: >1 session opens the picker; one or zero opens the
+    // chat directly (a freshly created conversation has exactly one session, a
+    // mesh peer has none).
+    assert(ui_nav_conv_open_target(0) == UINAV_AGENT_CHAT);
+    assert(ui_nav_conv_open_target(1) == UINAV_AGENT_CHAT);
+    assert(ui_nav_conv_open_target(2) == UINAV_AGENT_SESSIONS);
+    assert(ui_nav_conv_open_target(7) == UINAV_AGENT_SESSIONS);
+
     printf("ui nav tests: OK\n");
     return 0;
 }
