@@ -218,7 +218,29 @@ static void test_cap_keeps_newest(void) {
     assert(out[2].slot == 2 && out[2].epoch == 300);
 }
 
-/* --- 7. one store empty ----------------------------------------------------- */
+/* --- 7. the display capacity does not cut the merged feed back to eight ---- */
+
+static void test_full_feed_exceeds_legacy_eight(void) {
+    FeedCardView cards[FEED_MAX_CARDS];
+    FeedConvView convs[FEED_MAX_CONVS];
+    FeedRow out[FEED_ORDER_MAX];
+    for (int i = 0; i < FEED_MAX_CARDS; i++)
+        cards[i] = card((uint32_t)(100 + i), (uint32_t)(1000 - i),
+                        "card", 'I', 0);
+    for (int i = 0; i < FEED_MAX_CONVS; i++)
+        convs[i] = conv((uint8_t)i, "peer", "chat",
+                        (uint32_t)(500 - i), CONV_MESH, 0, 0);
+
+    int n = feed_build_rows(cards, FEED_MAX_CARDS, convs, FEED_MAX_CONVS,
+                            out, FEED_ORDER_MAX);
+    assert(FEED_ORDER_MAX > 8);
+    assert(n == FEED_ORDER_MAX);
+    assert(out[0].card_id == 100);
+    assert(out[FEED_MAX_CARDS].origin == FEED_CONV);
+    assert(out[n - 1].slot == FEED_MAX_CONVS - 1);
+}
+
+/* --- 8. one store empty ----------------------------------------------------- */
 
 static void test_single_source(void) {
     FeedCardView cards[2] = {
@@ -242,7 +264,7 @@ static void test_single_source(void) {
     assert(out[0].slot == 1 && out[1].slot == 0);
 }
 
-/* --- 8. bounds and degenerate input ---------------------------------------- */
+/* --- 9. bounds and degenerate input ---------------------------------------- */
 
 static void test_bounds(void) {
     FeedRow out[FEED_ORDER_MAX];
@@ -272,6 +294,24 @@ static void test_bounds(void) {
     assert(feed_build_rows(&big, 1, NULL, 0, out, FEED_ORDER_MAX) == 1);
     assert(strlen(out[0].label) == FEED_LABEL_LEN - 1);
 
+    /* A long multibyte title is cut before a whole code point, never between
+     * UTF-8 bytes. This is the exact input the timestamped renderer receives. */
+    char multibyte[64];
+    for (size_t i = 0; i < sizeof(multibyte) - 2; i += 2) {
+        multibyte[i] = (char)0xD0;
+        multibyte[i + 1] = (char)0xA1;
+    }
+    multibyte[sizeof(multibyte) - 2] = '\0';
+    FeedCardView utf = card(10, 5, multibyte, 'I', 0);
+    assert(feed_build_rows(&utf, 1, NULL, 0, out, FEED_ORDER_MAX) == 1);
+    size_t pos = 0;
+    while (out[0].label[pos]) {
+        size_t width = feed_utf8_char_bytes(out[0].label + pos);
+        assert(width == 2);
+        pos += width;
+    }
+    assert(pos < strlen(multibyte));
+
     /* A card with no title yields an empty label rather than a guess. */
     FeedCardView noname = card(9, 5, NULL, 'I', 0);
     assert(feed_build_rows(&noname, 1, NULL, 0, out, FEED_ORDER_MAX) == 1);
@@ -281,7 +321,7 @@ static void test_bounds(void) {
     assert(feed_build_rows(&c, 0, &v, 0, out, FEED_ORDER_MAX) == 0);
 }
 
-/* --- 9. Bug2a: a chat's door card is filtered out of the card scan ----------
+/* --- 10. Bug2a: a chat's door card is filtered out of the card scan ---------
  *
  * Models the ui_open_msglist card scan by value: each raw card carries the
  * source and key the store holds; the scan offers a card to the feed ONLY if
@@ -369,6 +409,7 @@ int main(void) {
     test_ties_are_stable();
     test_zero_epoch_is_oldest();
     test_cap_keeps_newest();
+    test_full_feed_exceeds_legacy_eight();
     test_single_source();
     test_bounds();
     test_door_card_filtered_from_scan();

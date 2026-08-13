@@ -1990,6 +1990,8 @@ struct MsgHandle {
 };
 static MsgHandle msglist_h[HW_UI_MSGLIST_MAX];
 static int msglist_count = 0;
+static_assert(HW_UI_MSGLIST_MAX == FEED_ORDER_MAX,
+              "the unified feed must expose every merged row");
 // Notify card currently shown (for ack-on-click / reply).
 static uint32_t notify_card_id = 0;
 static char reply_title[NOTIFY_TITLE_LEN];
@@ -3514,18 +3516,20 @@ static char msglist_sev_letter(uint8_t level) {
 // handle (card id vs conv slot+id) is cached so a click opens the right thing.
 static void ui_open_msglist() {
     static char titles[HW_UI_MSGLIST_MAX][FEED_LABEL_LEN];
+    static char times[HW_UI_MSGLIST_MAX][6];
     static char glyphs[HW_UI_MSGLIST_MAX];
     static bool is_conv[HW_UI_MSGLIST_MAX];
     static bool unread[HW_UI_MSGLIST_MAX];
     static const char *title_ptrs[HW_UI_MSGLIST_MAX];
+    static const char *time_ptrs[HW_UI_MSGLIST_MAX];
 
     // Cards out of the notify queue (newest first). Titles are copied into a
     // scratch that outlives the merge, so the view can point at them.
-    FeedCardView cards[FEED_MAX_CARDS];
+    static FeedCardView cards[FEED_MAX_CARDS];
     static char card_titles[FEED_MAX_CARDS][NOTIFY_TITLE_LEN];
+    static NotifyView v;
     int nc = 0;
     for (int i = 0; i < NOTIFY_MAX && nc < FEED_MAX_CARDS; i++) {
-        NotifyView v;
         if (!notify_view(i, v)) break;
         // A successfully routed chat door must not sit beside its conversation
         // row. notify_is_chat uses the same resolver/normalizer as live and boot
@@ -3549,8 +3553,8 @@ static void ui_open_msglist() {
     // Conversations out of the live table, then merge — both under the lock,
     // because the view points into the table until feed_build_rows copies each
     // label and id out. After it returns the rows are self-contained.
-    FeedConvView convs[CONV_MAX];
-    FeedRow rows[HW_UI_MSGLIST_MAX];
+    static FeedConvView convs[CONV_MAX];
+    static FeedRow rows[HW_UI_MSGLIST_MAX];
     int rn = 0;
     agents_lock();
     int total = agents_count();
@@ -3573,6 +3577,8 @@ static void ui_open_msglist() {
         const FeedRow &r = rows[i];
         snprintf(titles[msglist_count], sizeof(titles[0]), "%s", r.label);
         title_ptrs[msglist_count] = titles[msglist_count];
+        agents_head_time(r.epoch, times[msglist_count], sizeof(times[0]));
+        time_ptrs[msglist_count] = times[msglist_count];
         glyphs[msglist_count] = r.glyph;
         is_conv[msglist_count] = (r.origin == FEED_CONV);
         unread[msglist_count] = (r.mark != ' ');
@@ -3594,7 +3600,8 @@ static void ui_open_msglist() {
     }
     if (msglist_sel >= msglist_count) msglist_sel = msglist_count > 0 ? msglist_count - 1 : 0;
     if (msglist_sel < 0) msglist_sel = 0;
-    hw_ui_show_msglist(title_ptrs, glyphs, is_conv, unread, msglist_count, msglist_sel);
+    hw_ui_show_msglist(title_ptrs, time_ptrs, glyphs, is_conv, unread,
+                       msglist_count, msglist_sel);
     ui_note_input();
 }
 

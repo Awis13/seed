@@ -16,7 +16,7 @@
  *
  * WHAT IS PURE HERE, AND WHY IT MATTERS. Ordering is a decision; drawing is not.
  * Interleaving two sources by time is the one part a screenshot cannot confirm
- * and a person cannot eyeball once there are eight rows from two origins — so it
+ * and a person cannot eyeball once there are many rows from two origins — so it
  * is done in a function with no Arduino and no panel, and proved in
  * tools/test_feed_view.cpp by VALUE. This mirrors inbox_view.h, whose glyphs,
  * unread mark and CONV_ID_LEN it reuses rather than re-declaring.
@@ -104,6 +104,32 @@ struct FeedSortItem {
     uint8_t  idx;      /* index into the matching input array                    */
 };
 
+static inline size_t feed_utf8_char_bytes(const char *s) {
+    if (!s || !s[0]) return 0;
+    const unsigned char *p = (const unsigned char *)s;
+    if (p[0] < 0x80) return 1;
+    if ((p[0] & 0xE0) == 0xC0 && p[1] && (p[1] & 0xC0) == 0x80) return 2;
+    if ((p[0] & 0xF0) == 0xE0 && p[1] && p[2] &&
+        (p[1] & 0xC0) == 0x80 && (p[2] & 0xC0) == 0x80) return 3;
+    if ((p[0] & 0xF8) == 0xF0 && p[1] && p[2] && p[3] &&
+        (p[1] & 0xC0) == 0x80 && (p[2] & 0xC0) == 0x80 &&
+        (p[3] & 0xC0) == 0x80) return 4;
+    return 1;
+}
+
+static inline void feed_copy_label(char *out, size_t out_n, const char *src) {
+    if (!out || out_n == 0) return;
+    if (!src) src = "";
+    size_t used = 0;
+    while (src[used]) {
+        size_t n = feed_utf8_char_bytes(src + used);
+        if (n == 0 || used + n >= out_n) break;
+        memcpy(out + used, src + used, n);
+        used += n;
+    }
+    out[used] = '\0';
+}
+
 static inline void feed_emit_card(const FeedCardView &c, FeedRow &r) {
     r.origin = FEED_CARD;
     r.epoch = c.epoch;
@@ -114,10 +140,7 @@ static inline void feed_emit_card(const FeedCardView &c, FeedRow &r) {
     r.mark = c.unread ? INBOX_UNREAD_MARK : ' ';
     r.has_rooms = 0;
     r.id[0] = '\0';
-    size_t j = 0;
-    if (c.title)
-        for (; c.title[j] && j + 1 < sizeof(r.label); j++) r.label[j] = c.title[j];
-    r.label[j] = '\0';
+    feed_copy_label(r.label, sizeof(r.label), c.title);
 }
 
 static inline void feed_emit_conv(const FeedConvView &c, FeedRow &r) {
@@ -133,10 +156,7 @@ static inline void feed_emit_conv(const FeedConvView &c, FeedRow &r) {
     if (c.id)
         for (; c.id[k] && k + 1 < sizeof(r.id); k++) r.id[k] = c.id[k];
     r.id[k] = '\0';
-    size_t j = 0;
-    if (c.label)
-        for (; c.label[j] && j + 1 < sizeof(r.label); j++) r.label[j] = c.label[j];
-    r.label[j] = '\0';
+    feed_copy_label(r.label, sizeof(r.label), c.label);
 }
 
 /*
@@ -166,7 +186,9 @@ static inline int feed_build_rows(const FeedCardView *cards, int nc,
     if (nc > FEED_MAX_CARDS) nc = FEED_MAX_CARDS;
     if (nv > FEED_MAX_CONVS) nv = FEED_MAX_CONVS;
 
-    FeedSortItem it[FEED_ORDER_MAX];
+    /* Firmware calls this on the loop task. Keep the merge workspace out of
+     * its small stack; callers consume the completed rows before the next call. */
+    static FeedSortItem it[FEED_ORDER_MAX];
     int count = 0;
     for (int i = 0; i < nc && count < FEED_ORDER_MAX; i++) {
         it[count].epoch = cards[i].epoch;

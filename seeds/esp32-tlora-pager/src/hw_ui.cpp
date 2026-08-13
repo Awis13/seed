@@ -10,6 +10,7 @@
 #include "micron/micron_layout.h"  // pure page layout -> grid (C3)
 #include "box_glyphs.h"            // box-drawing + block glyphs for micron pages
 #include "conv_store.h"             // CONV_LABEL_LEN: the inbox row label width
+#include "feed_view.h"              // FEED_LABEL_LEN for UTF-8-safe feed titles
 #include "net_view.h"               // NetLevel + net_level_glyph: network status screen
 #include "boot_logo.h"             // PURE b33pr boot-splash decrypt logic
 #include "psram_alloc.h"           // psram_calloc_pref: micron grids in PSRAM
@@ -641,7 +642,7 @@ static int wifi_list_n_drawn = -1;
 static int msglist_sel_drawn = -1;
 static int msglist_top_drawn = -1;
 static int msglist_count_drawn = -1;
-static uint8_t msglist_unread_mask = 0;  // bit i = unread for partial-redraw guard
+static uint32_t msglist_unread_mask = 0;  // bit i = unread for partial-redraw guard
 static int clock_bar_drawn = -1;  // progress band; -1 = bare ground
 
 // Geometry of big time block (measured once at first paint)
@@ -2004,16 +2005,38 @@ static uint16_t msglist_glyph_color(char g, bool is_conv) {
     return COL_INFO;
 }
 
-static uint8_t msglist_mask_of(const bool *unread, int count) {
-    uint8_t m = 0;
+static uint32_t msglist_mask_of(const bool *unread, int count) {
+    uint32_t m = 0;
     if (!unread) return 0;
-    for (int i = 0; i < count && i < 8; i++)
-        if (unread[i]) m |= (uint8_t)(1u << i);
+    for (int i = 0; i < count && i < HW_UI_MSGLIST_MAX; i++)
+        if (unread[i]) m |= (uint32_t)(1u << i);
     return m;
 }
 
-// Row:  [*| ][W]  Title…     — * only when NEW; title bright vs dim.
+static void msglist_copy_title(const char *raw, char *out, size_t out_n) {
+    if (!out || out_n == 0) return;
+    if (!raw) raw = "";
+    size_t used = 0;
+    int glyphs = 0;
+    while (raw[used] && glyphs < 25) {
+        uint32_t cp = 0;
+        int n = utf8_next(raw + used, &cp);
+        if (n <= 0 || used + (size_t)n >= out_n) break;
+        used += (size_t)n;
+        glyphs++;
+    }
+    bool clipped = raw[used] != '\0';
+    memcpy(out, raw, used);
+    if (clipped && used + 3 < out_n) {
+        memcpy(out + used, "...", 3);
+        used += 3;
+    }
+    out[used] = '\0';
+}
+
+// Row:  [*| ][W]  Title…                  HH:MM
 static void msglist_draw_row(const char *const *titles,
+                             const char *const *times,
                              const char *glyphs,
                              const bool *is_conv,
                              const bool *unread,
@@ -2044,21 +2067,20 @@ static void msglist_draw_row(const char *const *titles,
     // Severity letter chip
     tft_draw_text(MARGIN + 30, y + 4, letter, chip_fg, bg, 2);
 
-    // Title — truncate so it never crashes the right edge (scale-2 ~12px/glyph)
+    // Title — truncate by code point so Cyrillic remains valid UTF-8.
     const char *raw = (titles && titles[i] && titles[i][0]) ? titles[i] : "(no title)";
-    char t[36];
-    // ~28 glyphs fit after mark+chip (x≈54 … 468)
-    snprintf(t, sizeof(t), "%s", raw);
-    if (strlen(t) > 28) {
-        t[27] = '.';
-        t[26] = '.';
-        t[25] = '.';
-        t[28] = '\0';
-    }
+    static char t[FEED_LABEL_LEN];
+    msglist_copy_title(raw, t, sizeof(t));
     tft_draw_text(MARGIN + 52, y + 4, t, title_fg, bg, 2);
+
+    const char *stamp = (times && times[i]) ? times[i] : "";
+    if (stamp[0])
+        tft_draw_text_r(PANEL_W - MARGIN - 4, y + 8, stamp,
+                        on ? COL_BG : COL_DIM, bg, 1);
 }
 
 void hw_ui_show_msglist(const char *const *titles,
+                        const char *const *times,
                         const char *glyphs,
                         const bool *is_conv,
                         const bool *unread,
@@ -2072,7 +2094,7 @@ void hw_ui_show_msglist(const char *const *titles,
     if (count > 0 && selected >= count) selected = count - 1;
 
     int top = (count > 0) ? msglist_top_for(selected, count) : 0;
-    uint8_t mask = msglist_mask_of(unread, count);
+    uint32_t mask = msglist_mask_of(unread, count);
     HwSpiBusGuard bus;
 
     // Same list + unread set + scroll window → only move the selection bar.
@@ -2086,10 +2108,10 @@ void hw_ui_show_msglist(const char *const *titles,
         int old_row = msglist_sel_drawn - top;
         int new_row = selected - top;
         if (old_row >= 0 && old_row < MSGLIST_VIS)
-            msglist_draw_row(titles, glyphs, is_conv, unread, msglist_sel_drawn,
+            msglist_draw_row(titles, times, glyphs, is_conv, unread, msglist_sel_drawn,
                              (uint16_t)(MSGLIST_ROW0_Y + old_row * MSGLIST_ROW_H), false);
         if (new_row >= 0 && new_row < MSGLIST_VIS)
-            msglist_draw_row(titles, glyphs, is_conv, unread, selected,
+            msglist_draw_row(titles, times, glyphs, is_conv, unread, selected,
                              (uint16_t)(MSGLIST_ROW0_Y + new_row * MSGLIST_ROW_H), true);
         msglist_sel_drawn = selected;
         return;
@@ -2138,7 +2160,7 @@ void hw_ui_show_msglist(const char *const *titles,
     for (int row = 0; row < MSGLIST_VIS; row++) {
         int i = top + row;
         if (i >= count) break;
-        msglist_draw_row(titles, glyphs, is_conv, unread, i,
+        msglist_draw_row(titles, times, glyphs, is_conv, unread, i,
                          (uint16_t)(MSGLIST_ROW0_Y + row * MSGLIST_ROW_H),
                          i == selected);
         // Subtle separator between rows (Symbian-era lists had rules)

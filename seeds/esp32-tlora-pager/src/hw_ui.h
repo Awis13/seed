@@ -225,12 +225,14 @@ void hw_ui_show_agent_act(int selected, const char *agent_name, bool allow_delet
 
 // Unified Messages feed: one list of notification cards AND chat conversations,
 // merged by time (src/feed_view.h). Per row: title, a single glyph letter, an
-// origin flag and an unread flag. glyphs[i] is the row's tag character — a
+// origin flag, an unread flag and a local HH:MM timestamp. glyphs[i] is the row's tag character — a
 // severity letter (I/W/C) for a card, a transport letter (A/M/L) for a chat;
 // is_conv[i] true = chat row, false = card row; unread[i] true = NEW (gets a *
-// marker and a bright title, read rows are dim).
-#define HW_UI_MSGLIST_MAX 8
+// marker and a bright title, read rows are dim). times[i] may be empty when the
+// message was recorded before wall-clock sync.
+#define HW_UI_MSGLIST_MAX 20
 void hw_ui_show_msglist(const char *const *titles,
+                        const char *const *times,
                         const char *glyphs,
                         const bool *is_conv,
                         const bool *unread,
