@@ -65,6 +65,7 @@
 #include "outbox.h"               // durable canonical outbound message store
 #include "utf8_text.h"            // code-point-safe display labels
 #include "settings_policy.h"      // pure auto-lock timing policy
+#include "wifi_profile_store.h"   // format-safe NVS Wi-Fi profile store
 
 // Bind the host-testable UiNavScreen ids to HwUiScreen so the two never drift.
 static_assert((int)UINAV_CLOCK          == (int)HW_UI_CLOCK,          "ui_nav enum drift");
@@ -538,6 +539,7 @@ static unsigned long wifi_retry_interval_ms() {
 
 /* Multi-profile STA: try each known network in order on boot / reconnect. */
 #define WIFI_MAX_NETS 6
+static_assert(WIFI_MAX_NETS == WIFI_PROFILE_MAX, "Wi-Fi profile cap drift");
 struct WifiNet {
     char ssid[33];
     char pass[65];
@@ -760,6 +762,17 @@ static bool wifi_nets_upsert(const char *ssid, const char *pass) {
 }
 
 static bool wifi_persist_profiles() {
+    WifiProfileSet stored = {};
+    stored.count = (uint8_t)wifi_net_count;
+    stored.active = wifi_net_count ? (uint8_t)wifi_net_idx : 0;
+    for (int i = 0; i < wifi_net_count; i++) {
+        snprintf(stored.entries[i].ssid, sizeof(stored.entries[i].ssid),
+                 "%s", wifi_nets[i].ssid);
+        snprintf(stored.entries[i].pass, sizeof(stored.entries[i].pass),
+                 "%s", wifi_nets[i].pass);
+    }
+    bool nvs_ok = wifi_profile_nvs_save(&stored);
+
     JsonDocument doc;
     if (wifi_net_count > 0) {
         doc["ssid"] = wifi_nets[wifi_net_idx].ssid;
@@ -781,16 +794,17 @@ static bool wifi_persist_profiles() {
     // WiFi and the mesh radio bring-up keep both cores busy. A flash write
     // stalls the other core via a tiny fixed-stack IPC task, so skip the
     // write entirely when nothing changed.
-    if (read_spiffs_file(WIFI_CONFIG_FILE) == json) return true;
-    return write_spiffs_file(WIFI_CONFIG_FILE, json);
+    bool file_ok = read_spiffs_file(WIFI_CONFIG_FILE) == json ||
+                   write_spiffs_file(WIFI_CONFIG_FILE, json);
+    return nvs_ok || file_ok;  // legacy file is a failure-safe fallback only
 }
 
-static void wifi_load_config() {
+static bool wifi_load_legacy_config() {
     wifi_nets_clear();
     String json = read_spiffs_file(WIFI_CONFIG_FILE);
-    if (json.length() == 0) return;
+    if (json.length() == 0) return false;
     JsonDocument doc;
-    if (deserializeJson(doc, json) != DeserializationError::Ok) return;
+    if (deserializeJson(doc, json) != DeserializationError::Ok) return false;
 
     if (doc["networks"].is<JsonArray>()) {
         JsonArray arr = doc["networks"].as<JsonArray>();
@@ -823,6 +837,27 @@ static void wifi_load_config() {
     } else if (wifi_net_count > 0) {
         wifi_nets_set_active(0);
     }
+    return wifi_net_count > 0;
+}
+
+static void wifi_load_config() {
+    wifi_nets_clear();
+    WifiProfileSet stored = {};
+    if (wifi_profile_nvs_load(&stored)) {
+        for (uint8_t i = 0; i < stored.count; i++) {
+            snprintf(wifi_nets[i].ssid, sizeof(wifi_nets[i].ssid),
+                     "%s", stored.entries[i].ssid);
+            snprintf(wifi_nets[i].pass, sizeof(wifi_nets[i].pass),
+                     "%s", stored.entries[i].pass);
+        }
+        wifi_net_count = stored.count;
+        if (wifi_net_count) wifi_nets_set_active(stored.active);
+        return;
+    }
+    /* First NVS boot, or both CRC-protected slots damaged: keep the legacy
+       profiles and retry migration. A SPIFFS format cannot affect a valid NVS
+       slot, so this fallback is needed only before migration or after damage. */
+    if (wifi_load_legacy_config()) wifi_persist_profiles();
 }
 
 static bool wifi_save_config(const String &ssid, const String &pass) {
