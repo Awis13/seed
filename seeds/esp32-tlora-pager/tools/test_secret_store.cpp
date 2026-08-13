@@ -21,7 +21,10 @@
  *   - an oversize file is rejected, not truncated;
  *   - the sentinel makes a second run a pure no-op (idempotent);
  *   - a transient put failure WITHHOLDS the sentinel and the next run retries
- *     only the missing key (the C1-review self-heal guard).
+ *     only the missing key (the C1-review self-heal guard);
+ *   - the DEVICE wrappers put/get/has/del (secret_store.cpp, compiled against
+ *     the tools/host_arduino Preferences mock): put -> del -> get returns 0,
+ *     and del of an absent key is a successful no-op (GW-TOKEN-401).
  */
 
 #include <assert.h>
@@ -435,6 +438,44 @@ static void test_ops_guard(void) {
     assert(secret_migrate_run(&ops) == -1);     /* NULL function pointers */
 }
 
+/* --- 9. device wrappers: secret_store_del (GW-TOKEN-401) --------------------- *
+ * These run the REAL secret_store.cpp (linked into this binary) over the
+ * tools/host_arduino Preferences mock — the delete the /gw/token clear path
+ * depends on, not a fake re-encode of it. */
+
+static void test_device_del(void) {
+    uint8_t out[16];
+    const uint8_t v[5] = {0xde, 0xad, 0xbe, 0xef, 0x01};
+
+    /* del of a key that was never stored is a successful no-op */
+    assert(!secret_store_has("gw_tok"));
+    assert(secret_store_del("gw_tok"));
+    assert(secret_store_get("gw_tok", out, sizeof(out)) == 0);
+
+    /* put -> visible -> del -> get returns 0 (the clear-then-reboot pin) */
+    assert(secret_store_put("gw_tok", v, sizeof(v)));
+    assert(secret_store_has("gw_tok"));
+    assert(secret_store_get("gw_tok", out, sizeof(out)) == sizeof(v));
+    assert(memcmp(out, v, sizeof(v)) == 0);
+    assert(secret_store_del("gw_tok"));
+    assert(!secret_store_has("gw_tok"));
+    assert(secret_store_get("gw_tok", out, sizeof(out)) == 0);
+
+    /* a second del after the delete is again a no-op */
+    assert(secret_store_del("gw_tok"));
+
+    /* a delete only touches its own key */
+    assert(secret_store_put("auth_tok", v, sizeof(v)));
+    assert(secret_store_del("gw_tok"));
+    assert(secret_store_get("auth_tok", out, sizeof(out)) == sizeof(v));
+    assert(secret_store_del("auth_tok"));
+    assert(!secret_store_has("auth_tok"));
+
+    /* malformed names are refused, matching put/get/has */
+    assert(!secret_store_del(NULL));
+    assert(!secret_store_del(""));
+}
+
 int main(void) {
     test_mapping_shape();
     test_should_copy_truth_table();
@@ -446,6 +487,7 @@ int main(void) {
     test_sentinel_short_circuits();
     test_put_failure_withholds_sentinel();
     test_ops_guard();
+    test_device_del();
     printf("secret store tests: OK\n");
     return 0;
 }

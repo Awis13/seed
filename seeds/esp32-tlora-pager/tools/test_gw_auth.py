@@ -61,7 +61,7 @@ assert '"no auth"' in ping, "unauthorized must be visually distinct"
 assert '"no reply"' in ping, "unreachable must be visually distinct"
 
 # Provisioning route: exact matcher, device auth, collected body freed,
-# atomic persist, in-RAM copy updated.
+# in-RAM copy updated, persistence STAGED for the loop task.
 route_reg = 'server.on(AsyncURIMatcher::exact("/gw/token"), HTTP_POST'
 assert route_reg in main, "POST /gw/token must be registered with an exact matcher"
 route = main[main.index(route_reg) :]
@@ -69,8 +69,22 @@ route = route[: route.index("}, NULL, handle_body_collect);")]
 assert "if (!require_auth(req)) return;" in route
 assert "notify_take_body(req)" in route
 assert "free(body);" in route, "the collected body must be freed"
-assert "write_spiffs_file_atomic(GW_TOKEN_PATH, GW_TOKEN_TMP, tok)" in route
-assert "SPIFFS.remove(GW_TOKEN_PATH)" in route, "an empty body must clear the file"
+# GW-TOKEN-401: the handler runs on the AsyncTCP task and must not touch NVS
+# (Preferences) or SPIFFS itself — there is no precedent of either from that
+# task in this tree (the boot loaders run before the server starts). It stages
+# the value in the fixed slot and raises the flag; gw_token_persist_poll()
+# on the loop task performs the writes.
+assert "write_spiffs_file_atomic" not in route, (
+    "no SPIFFS write on the AsyncTCP task — persistence is deferred to the loop"
+)
+assert "SPIFFS.remove" not in route, (
+    "no SPIFFS remove on the AsyncTCP task — the clear is deferred to the loop"
+)
+assert "secret_store_" not in route, (
+    "no NVS access on the AsyncTCP task — the dual write runs in the poll"
+)
+assert 'snprintf(gw_token_stage, sizeof(gw_token_stage), "%s", tok.c_str());' in route
+assert "gw_token_persist_pending = true;" in route
 assert 'snprintf(gw_token, sizeof(gw_token), "%s", tok.c_str());' in route, (
     "the in-RAM copy must update without a reboot"
 )
@@ -90,8 +104,8 @@ assert "send an empty body to clear" in route, (
     "an explicit empty JSON token string must 400 and point at the clear path"
 )
 assert route.index('is<const char *>') < route.index(
-    "SPIFFS.remove(GW_TOKEN_PATH)"
-), "the JSON validation must run before anything can clear the file"
+    "gw_token_persist_pending = true;"
+), "the JSON validation must run before anything can stage a clear"
 assert "raw body or JSON string token; empty body clears" in main, (
     "the /skill row must describe the tightened clear semantics"
 )
@@ -105,6 +119,50 @@ for leak in ('event_add("gateway token %s", tok',
     assert leak not in route, f"token value leak shape found: {leak!r}"
 assert route.count("event_add(") == 1, (
     "exactly one event line, and it carries set/cleared, never the token"
+)
+
+# GW-TOKEN-401 (loop side): the deferred persist is a dual write hitting the
+# stores the LOADER reads. gw_token_load() is NVS-first once the boot
+# migration has sealed, so a rotation that only rewrote the SPIFFS file was
+# shadowed by the stale NVS value on the next boot (permanent 401), and a
+# clear that only removed the file resurrected from NVS. Both ways, both
+# stores.
+poll_anchor = "static void gw_token_persist_poll()"
+assert poll_anchor in main, "the loop task must own gateway-token persistence"
+poll = main[main.index(poll_anchor) :]
+poll = poll[: poll.index("\nstatic ", 1)]
+assert 'secret_store_put("gw_tok"' in poll, (
+    "set must write NVS — the loader's source of truth after migration"
+)
+assert "write_spiffs_file_atomic(GW_TOKEN_PATH, GW_TOKEN_TMP" in poll, (
+    "set must retain the SPIFFS write (pre-migration back-compat)"
+)
+assert 'secret_store_del("gw_tok"' in poll, (
+    "clear must erase the NVS key, not just the file"
+)
+assert "SPIFFS.remove(GW_TOKEN_PATH)" in poll, "clear must still remove the file"
+assert "gw_token_persist_pending = false;" in poll
+# Drain order pin: the flag is cleared BEFORE the snapshot (and thus before
+# any persist). The reverse order loses a rotation that lands between the
+# snapshot and the clear — the drain clobbers the writer's re-raise and
+# durably persists the OLDER token (silent stale-wins, the bug class this
+# ticket kills). Cleared-first, a mid-snapshot writer re-raises the flag and
+# the next pass persists the full newest value.
+assert poll.index("gw_token_persist_pending = false;") < poll.index(
+    'snprintf(tok, sizeof(tok), "%s", gw_token_stage)'
+), "the pending flag must be cleared before the stage snapshot"
+assert poll.index("gw_token_persist_pending = false;") < poll.index(
+    'secret_store_put("gw_tok"'
+), "the pending flag must be cleared before any persist runs"
+# The staging slot mirrors the s3 rule for gw_token itself: a fixed char
+# buffer plus a volatile flag, written by snprintf on the AsyncTCP task and
+# snapshot-read on the loop task — never an Arduino String.
+assert "static volatile bool gw_token_persist_pending" in main
+assert "static char gw_token_stage[GW_TOKEN_MAX + 1]" in main
+assert "static String gw_token_stage" not in main
+# And the poll is actually driven from loop(), or the staged value never lands.
+assert "gw_token_persist_poll();" in main[main.index("void loop()") :], (
+    "loop() must drain the staged token"
 )
 
 # The provisioned token must never be committed.

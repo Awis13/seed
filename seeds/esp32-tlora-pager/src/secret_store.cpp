@@ -54,6 +54,17 @@ bool secret_store_put(const char *name, const uint8_t *buf, size_t len) {
     return wrote == len;
 }
 
+bool secret_store_del(const char *name) {
+    if (!name || !name[0]) return false;
+    Preferences prefs;
+    if (!prefs.begin(SECRET_NVS_NS, false)) return false;  // read-write
+    // Preferences::remove() fails on an absent key; an absent key is already
+    // the state a delete asks for, so report success without a write.
+    bool gone = prefs.isKey(name) ? prefs.remove(name) : true;
+    prefs.end();
+    return gone;
+}
+
 // ---- Migration ops: back the pure driver with real NVS + real FS -----------
 
 namespace {

@@ -2361,6 +2361,56 @@ static void gw_token_load() {
     snprintf(gw_token, sizeof(gw_token), "%s", stored.c_str());
 }
 
+// Staged by POST /gw/token on the AsyncTCP task, drained here on the loop
+// task. NVS (Preferences) and SPIFFS writes stay off AsyncTCP — the same
+// deferral handle_wifi_post uses for the WiFi driver; the boot-time loaders
+// are no precedent, they run before the server starts. One slot, newest wins:
+// a second POST before the drain replaces the staged value, and the drain
+// clears the flag BEFORE snapshotting, so a rotation landing mid-drain
+// re-raises the flag and its full value is persisted on the next pass (at
+// worst one torn intermediate persist, then convergence on the newest).
+static volatile bool gw_token_persist_pending = false;
+static char gw_token_stage[GW_TOKEN_MAX + 1] = "";
+
+static void gw_token_persist_poll() {
+    if (!gw_token_persist_pending) return;
+    // Clear the flag BEFORE the snapshot. A writer landing mid-snapshot
+    // re-raises it: this pass may persist a torn value once, the next pass
+    // persists the full newest value — newest always wins. The reverse order
+    // (snapshot, then clear) would clobber a raise that arrived between the
+    // two and durably persist the OLDER token — the stale-wins bug class
+    // this route exists to kill.
+    gw_token_persist_pending = false;
+    static char tok[GW_TOKEN_MAX + 1];   // static: stays off the loop stack
+    snprintf(tok, sizeof(tok), "%s", gw_token_stage);
+    if (tok[0]) {
+        // Dual write, NVS first: gw_token_load() reads NVS as the source of
+        // truth once the boot migration has sealed (token_load() precedent),
+        // so a rotation that only rewrote the SPIFFS file was shadowed by the
+        // stale NVS value on the next boot — a permanent 401 against the
+        // gateway. The file write stays for pre-migration back-compat.
+        bool nvs_ok = secret_store_put("gw_tok", (const uint8_t *)tok,
+                                       strlen(tok));
+        bool fs_ok = write_spiffs_file_atomic(GW_TOKEN_PATH, GW_TOKEN_TMP,
+                                              String(tok));
+        if (!nvs_ok || !fs_ok)
+            event_add("gateway token persist failed (nvs=%d fs=%d)",
+                      (int)nvs_ok, (int)fs_ok);
+    } else {
+        // Clear must erase BOTH stores: removing only the SPIFFS file leaves
+        // the NVS copy to resurrect the cleared token on the next boot — the
+        // same failure the set path logs, so this half logs it too.
+        bool nvs_ok = secret_store_del("gw_tok");
+        // SPIFFS.remove() returns false for an already-absent file; absent is
+        // the state a clear asks for, not a failure.
+        bool fs_ok = !SPIFFS.exists(GW_TOKEN_PATH) ||
+                     SPIFFS.remove(GW_TOKEN_PATH);
+        if (!nvs_ok || !fs_ok)
+            event_add("gateway token clear failed (nvs=%d fs=%d)",
+                      (int)nvs_ok, (int)fs_ok);
+    }
+}
+
 // ---- Reply upstream ---------------------------------------------------------
 //
 // A reply typed on a card is stored on the device and read back by whoever is
@@ -4652,12 +4702,14 @@ static void setup_routes() {
         if (tok.length() > GW_TOKEN_MAX) {
             notify_send_error(req, 400, "token too long"); return;
         }
-        if (tok.length() == 0) {
-            SPIFFS.remove(GW_TOKEN_PATH);
-        } else if (!write_spiffs_file_atomic(GW_TOKEN_PATH, GW_TOKEN_TMP, tok)) {
-            notify_send_error(req, 500, "failed to save token"); return;
-        }
+        // AsyncTCP task: no NVS (Preferences) and no SPIFFS writes here.
+        // Update the in-RAM copy (live for /ping and reply at once), stage
+        // the same value, and respond now — gw_token_persist_poll() on the
+        // loop task makes it durable a tick later (NVS + SPIFFS dual write
+        // on set, dual erase on clear).
         snprintf(gw_token, sizeof(gw_token), "%s", tok.c_str());
+        snprintf(gw_token_stage, sizeof(gw_token_stage), "%s", tok.c_str());
+        gw_token_persist_pending = true;
         event_add("gateway token %s", gw_token[0] ? "set" : "cleared");
         JsonDocument doc;
         doc["ok"] = true;
@@ -4918,6 +4970,10 @@ void loop() {
     // Flush beacon: staged by conn_mgr_service() on the WiFi attach edge, sent
     // here on the loop task (off AsyncTCP), same deferral as the reply above.
     flush_beacon_poll();
+
+    // Rotated gateway token: staged by POST /gw/token (AsyncTCP task),
+    // persisted here on the loop task (NVS + SPIFFS), same deferral as above.
+    gw_token_persist_poll();
 
     // Speaker + haptic FIRST — before any full-screen SPI paint can delay the
     // cue. (Boot tone worked; notify was silent when paint ran first.)
