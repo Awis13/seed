@@ -64,6 +64,7 @@
 #include "notify_chat_class.h"    // pure, host-tested: incoming chat vs notification card
 #include "outbox.h"               // durable canonical outbound message store
 #include "utf8_text.h"            // code-point-safe display labels
+#include "settings_policy.h"      // pure auto-lock timing policy
 
 // Bind the host-testable UiNavScreen ids to HwUiScreen so the two never drift.
 static_assert((int)UINAV_CLOCK          == (int)HW_UI_CLOCK,          "ui_nav enum drift");
@@ -1756,6 +1757,7 @@ static void skills_init() {
 // Build one second of the home clock face (tembed look, 480x222).
 // Lives after notify.cpp so it can read unread/crit without a second copy.
 static bool settings_silent = false;
+static uint16_t settings_autolock_s = 0;
 
 static void ui_clock_paint(const char *note) {
     if (!hw_ui_ready()) return;
@@ -1788,7 +1790,7 @@ static void ui_clock_paint(const char *note) {
     }
     if (hw_kb_locked()) {
         /* LOCK takes the note row so pocket mode is obvious. */
-        snprintf(row2, sizeof(row2), "LOCKED  long CAPS unlock");
+        snprintf(row2, sizeof(row2), "LOCKED  hold USER unlock");
     }
     if (settings_silent && row2[0] == '\0')
         snprintf(row2, sizeof(row2), "SILENT");
@@ -1859,14 +1861,15 @@ enum { CARD_ACT_ACK = 0, CARD_ACT_REPLY, CARD_ACT_DELETE, CARD_ACT_BACK, CARD_AC
 enum { AGENT_ACT_CLEAR = 0, AGENT_ACT_DELETE, AGENT_ACT_BACK, AGENT_ACT_COUNT };
 // Layout picker: 0=ABC 1=PHON 2=RU 3=BACK
 enum { LAYOUT_BACK = 3, LAYOUT_LIST_COUNT = 4 };
-// SETTINGS: 0=LAYOUT 1=BACKLIGHT 2=AUTO-DIM 3=SILENT 4=BACK
+// SETTINGS: LAYOUT / BACKLIGHT / AUTO-DIM / SILENT / AUTOLOCK / BACK
 enum {
     SETTINGS_LAYOUT = 0,
     SETTINGS_BACKLIGHT = 1,
     SETTINGS_AUTODIM = 2,
     SETTINGS_SILENT = 3,
-    SETTINGS_BACK = 4,
-    SETTINGS_LIST_COUNT = 5
+    SETTINGS_AUTOLOCK = 4,
+    SETTINGS_BACK = 5,
+    SETTINGS_LIST_COUNT = 6
 };
 // MeshCore menu: 0=STATUS 1=PING 2=BACK
 enum { MESH_ACT_STATUS = 0, MESH_ACT_PING = 1, MESH_ACT_BACK = 2, MESH_LIST_COUNT = 3 };
@@ -2223,6 +2226,7 @@ static void ui_note_input() { ui_last_input_ms = millis(); }
 static void settings_save() {
     JsonDocument doc;
     doc["silent"] = settings_silent;
+    doc["autolock_s"] = settings_autolock_s;
     String body;
     serializeJson(doc, body);
     write_spiffs_file_atomic(SETTINGS_PATH, SETTINGS_TMP, body);
@@ -2234,12 +2238,23 @@ static void settings_load() {
     JsonDocument doc;
     if (deserializeJson(doc, body)) return;
     if (doc["silent"].is<bool>()) settings_silent = doc["silent"].as<bool>();
+    if (doc["autolock_s"].is<uint16_t>()) {
+        uint16_t value = doc["autolock_s"].as<uint16_t>();
+        if (settings_autolock_valid(value)) settings_autolock_s = value;
+    }
 }
 
 static void settings_toggle_silent() {
     settings_silent = !settings_silent;
     settings_save();
     hw_haptic_notify(1);
+}
+
+static const char *settings_autolock_word() {
+    if (settings_autolock_s == 30) return "30S";
+    if (settings_autolock_s == 60) return "1M";
+    if (settings_autolock_s == 300) return "5M";
+    return "OFF";
 }
 
 // SYSTEM events only (a message arriving): wake the panel and restart the
@@ -2250,7 +2265,8 @@ static void ui_note_wake() { ui_last_input_ms = millis(); }
 static void ui_open_settings() {
     char bl[BL_LABEL_MAX];
     bl_level_label(backlight_wanted(), bl, sizeof(bl));
-    hw_ui_show_settings(settings_sel, bl, bl_idle_word(), settings_silent);
+    hw_ui_show_settings(settings_sel, bl, bl_idle_word(), settings_silent,
+                        settings_autolock_word());
     ui_note_input();
 }
 
@@ -4131,6 +4147,11 @@ static void ui_on_click() {
         } else if (settings_sel == SETTINGS_SILENT) {
             settings_toggle_silent();
             ui_open_settings();
+        } else if (settings_sel == SETTINGS_AUTOLOCK) {
+            settings_autolock_s = settings_autolock_next(settings_autolock_s);
+            settings_save();
+            hw_haptic_notify(0);
+            ui_open_settings();
         }
         break;
     case HW_UI_MESHCORE:
@@ -4746,18 +4767,19 @@ void loop() {
     }
 
     // Front panel: encoder + click (must run before screens consume edges).
-    // Pocket lock (long CAPS): swallow wheel + click — keys already silent in
+    // Pocket lock: swallow wheel + click — keys are already silent in
     // hw_kb. Still poll+drain so detents don't queue and fire after unlock.
     hw_input_poll();
     int steps = hw_input_steps();
     bool click = hw_input_click();
+    if (hw_input_long_press()) hw_kb_set_locked(!hw_kb_locked());
     if (!hw_kb_locked()) {
         if (steps) ui_on_steps(steps);
         if (click) ui_on_click();
     }
 
     // Keyboard → UTF-8 into reply / open compose from card.
-    // ALT+CAPS cycles layout; long CAPS = full lock (kb + wheel). Refresh badges.
+    // ALT+CAPS cycles layout; held USER toggles full lock. Refresh badges.
     // Any key also wakes a blanked panel (stamps idle clock).
     {
         char u8[5];
@@ -4793,6 +4815,12 @@ void loop() {
             }
             ui_note_input();
         }
+    }
+
+    if (settings_autolock_due(settings_autolock_s,
+                              millis() - ui_last_input_ms,
+                              hw_kb_locked())) {
+        hw_kb_set_locked(true);
     }
 
     // Idle policy owns brightness; drive pulses after the decision.

@@ -162,7 +162,8 @@ void hw_ui_show_layout(int selected, int current_layout);
 void hw_ui_show_settings(int selected,
                          const char *bl_label,
                          const char *idle_word,
-                         bool silent);
+                         bool silent,
+                         const char *autolock_word);
 
 // MeshCore menu: STATUS / PING GW / BACK. selected 0..2
 void hw_ui_show_meshcore(int selected);

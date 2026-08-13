@@ -16,5 +16,17 @@ assert "hw_kb_take_silent_toggle()" in main
 assert "pressed && alt_held && row == 1 && col == 1" in kb
 assert '"SILENT %s", silent ? "ON" : "OFF"' in ui
 assert 'snprintf(row2, sizeof(row2), "SILENT");' in main
+assert 'doc["autolock_s"] = settings_autolock_s;' in main
+assert "settings_autolock_valid(value)" in main
+assert "hw_input_long_press()" in main
+assert "hw_kb_set_locked(!hw_kb_locked())" in main
+assert "settings_autolock_due(settings_autolock_s" in main
+assert '"AUTOLOCK %s", autolock_word' in ui
+
+input_cpp = (root / "src/hw_input.cpp").read_text(encoding="utf-8")
+assert "INPUT_LONG_MS          1000" in input_cpp
+assert "!long_fired && (t - key_down_at) < INPUT_CLICK_MAX_MS" in input_cpp
+assert "pending_click = false;" in input_cpp
+assert "kb_toggle_lock" not in kb and "CAPS_LONG_MS" not in kb
 
 print("settings policy tests: OK")

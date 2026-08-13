@@ -122,7 +122,8 @@ assert len(tmps) == len(set(tmps)), (
 # /notify.tmp is gone (ticket C3): notify persistence moved off the loop-task
 # SPIFFS snapshot onto the off-loop history archive.
 expected = {"/gw_token.tmp", "/gps.tmp", "/backlight.tmp",
-            "/kb_layout.tmp", "/agent_bridge.tmp", "/outbox.tmp"}
+            "/kb_layout.tmp", "/agent_bridge.tmp", "/outbox.tmp",
+            "/settings.tmp"}
 assert set(tmps) == expected, f"unexpected tmp set: {sorted(set(tmps))}"
 
 print("unify pattern tests: OK")

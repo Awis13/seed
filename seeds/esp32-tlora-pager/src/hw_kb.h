@@ -48,8 +48,8 @@ bool hw_kb_take_layout_changed();
 // layer emits '/', so it never leaks into a draft.
 bool hw_kb_take_silent_toggle();
 
-// Keyboard lock (pocket / bag). Long-press CAPS (~0.7s) toggles.
-// While locked: all keys ignored except CAPS long-press to unlock.
+// Keyboard lock (pocket / bag), controlled by held USER in main.
+// While locked all keyboard keys are ignored.
 // ALT+CAPS layout cycle is also blocked while locked.
 bool hw_kb_locked();
 void hw_kb_set_locked(bool on);
