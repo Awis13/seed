@@ -665,11 +665,14 @@ static void clock_measure() {
 static void draw_field(char *cache, size_t n, const char *text,
                        int32_t x, int32_t y, uint8_t scale, uint16_t color,
                        char align /* 'L','C','R' */, uint16_t pad_px) {
-    if (!clock_dirty && strncmp(cache, text, n - 1) == 0) return;
-    snprintf(cache, n, "%s", text);
+    static char next[64];
+    if (n > sizeof(next)) n = sizeof(next);
+    utf8_text_copy(next, n, text, SIZE_MAX, false);
+    if (!clock_dirty && strcmp(cache, next) == 0) return;
+    memcpy(cache, next, strlen(next) + 1);
 
     // Erase pad region then draw
-    uint16_t tw = text_width(text, scale);
+    uint16_t tw = text_width(next, scale);
     uint16_t th = 7 * scale;
     int32_t ex = x;
     if (align == 'C') ex = x - (int32_t)pad_px / 2;
@@ -677,9 +680,9 @@ static void draw_field(char *cache, size_t n, const char *text,
     if (ex < 0) ex = 0;
     tft_fill_rect((uint16_t)ex, (uint16_t)y, pad_px, th + 2, COL_BG);
 
-    if (align == 'C') tft_draw_text_c((uint16_t)x, (uint16_t)y, text, color, COL_BG, scale);
-    else if (align == 'R') tft_draw_text_r((uint16_t)x, (uint16_t)y, text, color, COL_BG, scale);
-    else tft_draw_text((uint16_t)x, (uint16_t)y, text, color, COL_BG, scale);
+    if (align == 'C') tft_draw_text_c((uint16_t)x, (uint16_t)y, next, color, COL_BG, scale);
+    else if (align == 'R') tft_draw_text_r((uint16_t)x, (uint16_t)y, next, color, COL_BG, scale);
+    else tft_draw_text((uint16_t)x, (uint16_t)y, next, color, COL_BG, scale);
     (void)tw;
 }
 
@@ -1458,25 +1461,25 @@ static void ping_draw_path_column(int cx, bool ok,
     uint16_t muted = ok ? COL_TIME : COL_DIM;
 
     /* label above icon */
-    int lab_w = (int)strlen(label) * 12;  // scale-2 cell ≈12px
+    int lab_w = (int)text_width(label, 2);
     tft_draw_text((uint16_t)(cx - lab_w / 2), 30, label, muted, COL_BG, 2);
 
     draw_icon(cx, 88, col);
 
     /* big OK / NO */
     const char *word = ok ? "OK" : "NO";
-    int ww = (int)strlen(word) * 18;  // scale 3
+    int ww = (int)text_width(word, 3);
     tft_draw_text((uint16_t)(cx - ww / 2), 130, word, col, COL_BG, 3);
 
     /* strength lines — slightly smaller */
     uint16_t y = 162;
     if (sub1 && sub1[0]) {
-        int sw = (int)strlen(sub1) * 12;
+        int sw = (int)text_width(sub1, 2);
         tft_draw_text((uint16_t)(cx - sw / 2), y, sub1, muted, COL_BG, 2);
         y = (uint16_t)(y + 22);
     }
     if (sub2 && sub2[0]) {
-        int sw = (int)strlen(sub2) * 6;
+        int sw = (int)text_width(sub2, 1);
         tft_draw_text((uint16_t)(cx - sw / 2), y, sub2, COL_DIM, COL_BG, 1);
     }
 }

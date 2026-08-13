@@ -35,6 +35,16 @@ assert "hw_ui_show_mesh_ping_result(mesh_ok, mesh_s1, mesh_s2);" in main
 assert "if (mesh_ok) hw_haptic_notify(0);" in main
 assert "ping_draw_wifi_icon" not in hw
 assert "ping_draw_path_column(PANEL_W / 2, mesh_ok" in hw
+for text, scale in (("label", 2), ("word", 3), ("sub1", 2), ("sub2", 1)):
+    assert f"text_width({text}, {scale})" in hw
+path_column = hw[hw.index("static void ping_draw_path_column(") :
+                 hw.index("void hw_ui_show_mesh_ping_result(")]
+assert "strlen(" not in path_column
+
+# Cached clock fields compare and draw the same code-point-safe bounded text.
+draw_field = hw[hw.index("static void draw_field(") : hw.index("// ---- boot splash")]
+assert "utf8_text_copy(next, n, text, SIZE_MAX, false);" in draw_field
+assert "strcmp(cache, next)" in draw_field
 
 # INFO no longer duplicates network/message state, and the old WiFi INFO name
 # now describes its actual scan/connect-progress role.
