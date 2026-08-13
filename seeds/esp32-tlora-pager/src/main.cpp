@@ -83,6 +83,7 @@ static_assert((int)UINAV_WIFI_LIST      == (int)HW_UI_WIFI_LIST,      "ui_nav en
 static_assert((int)UINAV_WIFI_INFO      == (int)HW_UI_WIFI_INFO,      "ui_nav enum drift");
 static_assert((int)UINAV_PAGE           == (int)HW_UI_PAGE,           "ui_nav enum drift");
 static_assert((int)UINAV_CONTACTS       == (int)HW_UI_CONTACTS,       "ui_nav enum drift");
+static_assert((int)UINAV_NET            == (int)HW_UI_NET,            "ui_nav enum drift");
 
 // ===== Configuration =====
 #define SEED_VERSION        "0.9.80"
@@ -1587,6 +1588,8 @@ static void handle_wifi_networks_post(AsyncWebServerRequest *request) {
 #include "inbox_view.h"   // the inbox list model: order, transport glyph, unread
 #include "feed_view.h"    // the unified Messages feed: cards + chats merged by time
 #include "contacts_view.h"      // the grouped Contacts model: AI / LXMF / mesh rows
+#include "net_view.h"           // the sectioned Network-status model (pure)
+static_assert(HW_UI_NET_MAX == NET_ROWS_MAX, "net status row cap drift");
 #include "mesh/contacts_enum.h" // /contacts3 enumeration for the mesh bucket
 #include "skills/notify.cpp"
 // After notify: reuses notify_send_json / notify_send_error / notify_ingest_p1.
@@ -2339,6 +2342,7 @@ static void ui_open_meshcore() {
 }
 
 static void ui_reply_paint();  // defined later (WiFi password reuses reply face)
+static void ui_open_net();     // sectioned network status; defined with Contacts below
 
 static void ui_open_wifi() {
     wifi_sel = 0;
@@ -2353,41 +2357,6 @@ static void ui_wifi_paint_list() {
         ptrs[i] = wifi_list_titles[i];
     const char *hdr = (wifi_list_mode == WIFI_LIST_PROFILES) ? "PROFILES" : "SCAN";
     hw_ui_show_wifi_list(hdr, ptrs, wifi_list_count, wifi_list_sel);
-    ui_note_input();
-}
-
-static void ui_wifi_show_status() {
-    static char lines[12][42];
-    static const char *ptrs[12];
-    int n = 0;
-    auto add = [&](const char *fmt, ...) {
-        if (n >= 12) return;
-        va_list ap;
-        va_start(ap, fmt);
-        vsnprintf(lines[n], sizeof(lines[0]), fmt, ap);
-        va_end(ap);
-        ptrs[n] = lines[n];
-        n++;
-    };
-    if (WiFi.status() == WL_CONNECTED) {
-        add("SSID %s", WiFi.SSID().c_str());
-        add("IP   %s", WiFi.localIP().toString().c_str());
-        add("RSSI %d dBm", (int)WiFi.RSSI());
-    } else {
-        add("WiFi %s", wifi_user_off ? "OFF (mesh only)" : "STA offline");
-    }
-    add("profiles %d  idx %d", wifi_net_count, wifi_net_idx);
-    for (int i = 0; i < wifi_net_count && n < 10; i++) {
-        add("%c %s", (i == wifi_net_idx) ? '*' : ' ', wifi_nets[i].ssid);
-    }
-    switch (wg_ui_state()) {
-    case WG_UI_OK:    add("WG  UP (tunnel)"); break;
-    case WG_UI_WAIT:  add("WG  wait"); break;
-    case WG_UI_STALE: add("WG  stale"); break;
-    case WG_UI_DOWN:  add("WG  DOWN"); break;
-    default:          add("WG  off / no config"); break;
-    }
-    hw_ui_show_wifi_info(ptrs, n);
     ui_note_input();
 }
 
@@ -2413,7 +2382,7 @@ static void ui_wifi_toggle() {
             Serial.println("[wifi] user toggled ON — no saved profile");
         }
     }
-    ui_wifi_show_status();
+    ui_open_net();
     ui_note_input();
 }
 
@@ -3504,6 +3473,99 @@ static void ui_contacts_open_selected() {
     ui_open_agent_chat(slot);
 }
 
+// ===== Network status screen =====
+// The sectioned "how am I connected" screen (WiFi / Reticulum / mesh / tunnel).
+// Read-only: it snapshots the live per-transport accessors into a NetStatus and
+// runs the pure net_build_rows model (src/net_view.h); it changes NO
+// connectivity behaviour. Reached from the WiFi menu's STATUS entry — folded in
+// there rather than as a new top-level menu item because the main menu is
+// already seven rows (MESSAGES..BACK) and an eighth would run off the 222 px
+// panel, whereas the WiFi menu's "STATUS" is the natural home for a network
+// status view and needs no new row anywhere.
+static NetRow      net_rows[NET_ROWS_MAX];
+static int         net_count = 0;
+static int         net_top = 0;
+// Flattened view arrays for the renderer (labels/values point into net_rows,
+// which is static, so the pointers stay valid until the next rebuild).
+static const char *net_labels[NET_ROWS_MAX];
+static const char *net_values[NET_ROWS_MAX];
+static bool        net_is_header[NET_ROWS_MAX];
+static uint8_t     net_levels[NET_ROWS_MAX];
+
+static void ui_net_render() {
+    for (int i = 0; i < net_count; i++) {
+        net_labels[i] = net_rows[i].label;
+        net_values[i] = net_rows[i].value;
+        net_is_header[i] = (net_rows[i].kind == NET_ROW_HEADER);
+        net_levels[i] = net_rows[i].level;
+    }
+    hw_ui_show_net(net_labels, net_values, net_is_header, net_levels,
+                   net_count, net_top);
+    ui_note_input();
+}
+
+// Snapshot every transport's live status and build the sectioned rows. All
+// scratch is file-/function-scope static (loop task, tight stack — same rule as
+// ui_open_contacts): net_build_rows COPIES each label/value into net_rows, so
+// these value buffers only need to outlive the build call. g_mesh / g_rns_* /
+// WiFi are read directly on the loop task exactly as conn_mgr_service() and
+// ui_clock_paint() do — those globals are loop-task owned, so no extra lock.
+static void ui_open_net() {
+    static char wifi_ssid_s[NET_VALUE_LEN];
+    static char wifi_ip_s[NET_VALUE_LEN];
+    static char rns_addr_s[NET_VALUE_LEN];
+    static char mesh_key_s[NET_VALUE_LEN];
+    static char mesh_rf_s[NET_VALUE_LEN];
+
+    NetStatus s;
+    memset(&s, 0, sizeof(s));
+
+    // WiFi.
+    bool wc = (WiFi.status() == WL_CONNECTED);
+    s.wifi.wanted = !wifi_user_off && (wifi_net_count > 0 || wifi_ssid[0]);
+    s.wifi.connected = wc;
+    s.wifi.profiles = wifi_net_count;
+    if (wc) {
+        snprintf(wifi_ssid_s, sizeof(wifi_ssid_s), "%s", WiFi.SSID().c_str());
+        snprintf(wifi_ip_s, sizeof(wifi_ip_s), "%s",
+                 WiFi.localIP().toString().c_str());
+        s.wifi.ssid = wifi_ssid_s;
+        s.wifi.ip = wifi_ip_s;
+        s.wifi.rssi_dbm = (int)WiFi.RSSI();
+    }
+
+    // Reticulum.
+    s.rns.enabled = g_rns_cfg_enabled && g_rns_cfg_ok;
+    s.rns.has_identity = rns_identity_ok;
+    s.rns.link_up = (g_rns_cs.load() == RNS_CS_CONNECTED);
+    if (rns_identity_ok && rns_hexhash[0]) {
+        snprintf(rns_addr_s, sizeof(rns_addr_s), "%s", rns_hexhash);
+        s.rns.addr = rns_addr_s;
+    }
+
+    // MeshCore radio.
+    s.mesh.has_identity = g_mesh.has_identity;
+    s.mesh.ui_state = mesh_ui_state();
+    s.mesh.seen_age_s = mesh_alive_age_s();
+    if (g_mesh.public_key_hex[0]) {
+        snprintf(mesh_key_s, sizeof(mesh_key_s), "%.8s", g_mesh.public_key_hex);
+        s.mesh.key8 = mesh_key_s;
+    }
+    if (g_mesh.sf) {
+        snprintf(mesh_rf_s, sizeof(mesh_rf_s), "%.1f SF%u",
+                 g_mesh.freq, (unsigned)g_mesh.sf);
+        s.mesh.rf = mesh_rf_s;
+    }
+
+    // WireGuard tunnel.
+    s.tun.wanted = g_wg_want && g_wg_cfg_ok;
+    s.tun.ui_state = wg_ui_state();
+
+    net_count = net_build_rows(&s, net_rows, NET_ROWS_MAX);
+    net_top = 0;
+    ui_net_render();
+}
+
 // Show the agent "door" card (pretty invite). Does not enter the room yet.
 static void ui_show_agent_invite_from_view(const NotifyView &v, uint32_t id) {
     notify_card_id = id;
@@ -3610,7 +3672,7 @@ static void ui_on_click() {
         if (wifi_sel == WIFI_ACT_BACK) {
             ui_open_menu();
         } else if (wifi_sel == WIFI_ACT_STATUS) {
-            ui_wifi_show_status();
+            ui_open_net();
         } else if (wifi_sel == WIFI_ACT_SCAN) {
             ui_wifi_do_scan();
         } else if (wifi_sel == WIFI_ACT_PROFILES) {
@@ -3786,6 +3848,10 @@ static void ui_on_click() {
     case HW_UI_CONTACTS:
         ui_contacts_open_selected();
         break;
+    case HW_UI_NET:
+        // Read-only status screen: click returns to the WiFi menu it opened from.
+        ui_open_wifi();
+        break;
     case HW_UI_PAGE:
         // Click toggles the two input modes: OPEN the page for in-page scrolling,
         // or (when already open) CLOSE back to paging between pages.
@@ -3938,6 +4004,16 @@ static void ui_on_steps(int steps) {
         }
         contacts_sel = cur;
         ui_contacts_render(NULL);
+        break;
+    }
+    case HW_UI_NET: {
+        // Read-only: the wheel scrolls the window. No selection to move; the
+        // renderer clamps net_top, so clamp to [0, count-1] here and let it frame.
+        if (net_count <= 0) break;
+        net_top += steps;
+        if (net_top < 0) net_top = 0;
+        if (net_top > net_count - 1) net_top = net_count - 1;
+        ui_net_render();
         break;
     }
     case HW_UI_NOTIFY: {

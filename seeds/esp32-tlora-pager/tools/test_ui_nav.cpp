@@ -57,6 +57,12 @@ int main(void) {
     assert(ui_nav_backspace_goes_back(UINAV_CONTACTS));
     assert(!ui_nav_is_text_entry(UINAV_CONTACTS));
 
+    // Network status backs out to the WiFi menu it was opened from, and BACKSPACE
+    // navigates (it is a read-only status list, not a text-entry field).
+    assert(ui_nav_back_target(UINAV_NET, false)           == UINAV_WIFI);
+    assert(ui_nav_backspace_goes_back(UINAV_NET));
+    assert(!ui_nav_is_text_entry(UINAV_NET));
+
     // Root and editor: no navigation (return self).
     assert(ui_nav_back_target(UINAV_CLOCK, false) == UINAV_CLOCK);
     assert(ui_nav_back_target(UINAV_REPLY, false) == UINAV_REPLY);

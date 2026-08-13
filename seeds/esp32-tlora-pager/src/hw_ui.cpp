@@ -10,6 +10,7 @@
 #include "micron/micron_layout.h"  // pure page layout -> grid (C3)
 #include "box_glyphs.h"            // box-drawing + block glyphs for micron pages
 #include "conv_store.h"             // CONV_LABEL_LEN: the inbox row label width
+#include "net_view.h"               // NetLevel + net_level_glyph: network status screen
 #include "boot_logo.h"             // PURE b33pr boot-splash decrypt logic
 #include "psram_alloc.h"           // psram_calloc_pref: micron grids in PSRAM
 
@@ -2357,6 +2358,97 @@ void hw_ui_show_contacts(const char *const *labels,
         tft_draw_text_r(PANEL_W - MARGIN, PANEL_H - 14, "back = menu",
                         COL_DIM, COL_BG, 1);
     }
+}
+
+// ---- Network status screen -------------------------------------------------
+// Sectioned like Contacts: amber section headers with a hairline, value rows
+// with a colour-coded status glyph in its own column so the eye can run the
+// health down the list without reading the values. Full redraw each call — the
+// list is short and rebuilt on open and on every wheel step. All row content
+// comes from the caller's static arrays (net_view rows flattened in main.cpp);
+// this renderer keeps no dynamic buffers of its own.
+static const int NET_ROW0_Y = 30;
+static const int NET_ROW_H   = 24;
+
+// The colour a status level is drawn in (the glyph and, dimly, the value).
+static uint16_t net_level_color(uint8_t level) {
+    switch (level) {
+        case NET_LVL_OK:   return COL_INFO;   // teal
+        case NET_LVL_WARN: return COL_WARN;   // orange
+        case NET_LVL_DOWN: return COL_CRIT;   // red
+        default:           return COL_DIM;    // NET_LVL_OFF: slate
+    }
+}
+
+void hw_ui_show_net(const char *const *labels,
+                    const char *const *values,
+                    const bool *is_header,
+                    const uint8_t *levels,
+                    int count,
+                    int top) {
+    if (!panel_ok) return;
+    if (count < 0) count = 0;
+    if (count > HW_UI_NET_MAX) count = HW_UI_NET_MAX;
+    // Clamp the scroll window so `top` always frames real rows.
+    int maxtop = count - HW_UI_NET_VIS;
+    if (maxtop < 0) maxtop = 0;
+    if (top < 0) top = 0;
+    if (top > maxtop) top = maxtop;
+
+    screen = HW_UI_NET;
+    HwSpiBusGuard bus;
+    tft_fill(COL_BG);
+
+    tft_fill_rect(0, 0, PANEL_W, 22, COL_ACCENT);
+    tft_draw_text(MARGIN, 4, "NETWORK", COL_BG, COL_ACCENT, 2);
+    // Scroll hint on the right when the list overflows the window.
+    if (count > HW_UI_NET_VIS) {
+        char pos[16];
+        snprintf(pos, sizeof(pos), "%d/%d", top + 1, count);
+        tft_draw_text_r(PANEL_W - MARGIN, 6, pos, COL_BG, COL_ACCENT, 1);
+    }
+    tft_hline(0, 22, PANEL_W, COL_RULE);
+
+    if (count == 0) {
+        tft_draw_text(MARGIN, 80, "NO STATUS", COL_DIM, COL_BG, 2);
+        tft_draw_text(MARGIN, PANEL_H - 16, "click = back", COL_DIM, COL_BG, 1);
+        return;
+    }
+
+    for (int row = 0; row < HW_UI_NET_VIS; row++) {
+        int i = top + row;
+        if (i >= count) break;
+        uint16_t y = (uint16_t)(NET_ROW0_Y + row * NET_ROW_H);
+        const char *lab = (labels && labels[i]) ? labels[i] : "";
+        if (is_header && is_header[i]) {
+            // Section divider: amber title + hairline. Never a status glyph.
+            char t[16];
+            snprintf(t, sizeof(t), "%s", lab[0] ? lab : "?");
+            tft_draw_text(MARGIN, y + 2, t, COL_ACCENT, COL_BG, 1);
+            tft_hline(MARGIN, (uint16_t)(y + 16), PANEL_W - 2 * MARGIN, COL_RULE);
+            continue;
+        }
+        uint8_t lvl = levels ? levels[i] : (uint8_t)NET_LVL_OFF;
+        uint16_t gcol = net_level_color(lvl);
+        // Status glyph in its own column (scale 2, level-coloured).
+        char g[2] = { net_level_glyph(lvl), '\0' };
+        tft_draw_text(MARGIN + 8, y + 2, g, gcol, COL_BG, 2);
+        // Label (dim) then value (warm white), indented past the glyph.
+        char l[16];
+        snprintf(l, sizeof(l), "%s", lab[0] ? lab : "");
+        tft_draw_text(MARGIN + 30, y + 2, l, COL_DIM, COL_BG, 2);
+        const char *val = (values && values[i]) ? values[i] : "";
+        char v[28];
+        snprintf(v, sizeof(v), "%s", val);
+        if (strlen(v) > 16) { v[15] = v[14] = v[13] = '.'; v[16] = '\0'; }
+        tft_draw_text(MARGIN + 156, y + 2, v, COL_TIME, COL_BG, 2);
+    }
+
+    tft_hline(0, PANEL_H - 18, PANEL_W, COL_RULE);
+    tft_draw_text(MARGIN, PANEL_H - 14, "+ ok  ~ warn  ! down  - off",
+                  COL_DIM, COL_BG, 1);
+    tft_draw_text_r(PANEL_W - MARGIN, PANEL_H - 14, "back = wifi",
+                    COL_DIM, COL_BG, 1);
 }
 
 void hw_ui_show_reply(const char *title,

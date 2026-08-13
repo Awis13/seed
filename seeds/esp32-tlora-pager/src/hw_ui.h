@@ -78,6 +78,7 @@ enum HwUiScreen : uint8_t {
     HW_UI_WIFI_INFO,   // multi-line WiFi/WG status
     HW_UI_PAGE,        // micron page view (system-layer store, wheel-paged)
     HW_UI_CONTACTS,    // grouped Contacts: AI / LXMF / mesh, pick to open a chat
+    HW_UI_NET,         // sectioned network status: WiFi / Reticulum / mesh / tunnel
 };
 
 HwUiScreen hw_ui_screen();
@@ -267,6 +268,23 @@ void hw_ui_show_contacts(const char *const *labels,
                          int count,
                          int selected,
                          const char *note);
+
+// Sectioned network status screen: the rows net_build_rows produced, flattened
+// to primitive arrays so this header stays free of the model struct. Per row:
+//   labels[i]    — section title (header row) or value label (value row)
+//   values[i]    — value row only: the short value string ("" on a header)
+//   is_header[i] — true = a non-selectable amber section divider
+//   levels[i]    — value row status level (NetLevel: 0 OFF/1 OK/2 WARN/3 DOWN),
+//                  drawn as a colour-coded glyph left of the label
+// `top` is the first visible row (windowed scroll); the renderer clamps it.
+#define HW_UI_NET_MAX 14   /* NET_ROWS_MAX in src/net_view.h */
+#define HW_UI_NET_VIS 7    /* rows visible before scrolling */
+void hw_ui_show_net(const char *const *labels,
+                    const char *const *values,
+                    const bool *is_header,
+                    const uint8_t *levels,
+                    int count,
+                    int top);
 
 // Device info (version, IP, host, token, free heap).
 void hw_ui_show_info(const char *version,

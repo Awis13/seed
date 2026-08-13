@@ -33,6 +33,7 @@ enum UiNavScreen : uint8_t {
     UINAV_WIFI_INFO,
     UINAV_PAGE,
     UINAV_CONTACTS,
+    UINAV_NET,
 };
 
 // BACKSPACE on a text-entry screen deletes a character; everywhere else it
@@ -70,6 +71,7 @@ static inline uint8_t ui_nav_back_target(uint8_t screen, bool has_rooms) {
     case UINAV_WIFI_INFO:      return UINAV_WIFI;
     case UINAV_PAGE:           return UINAV_CLOCK;
     case UINAV_CONTACTS:       return UINAV_MENU;
+    case UINAV_NET:            return UINAV_WIFI;  // reached from the WiFi menu
     default:                   return screen;  // CLOCK, REPLY: no back
     }
 }
