@@ -1867,7 +1867,6 @@ static int wifi_list_count = 0;
 static char wifi_list_titles[HW_UI_WIFI_LIST_MAX][36];
 static uint8_t net_origin = UINAV_WIFI;
 static char wifi_list_ssids[HW_UI_WIFI_LIST_MAX][33];
-static bool wifi_compose = false;           // REPLY screen = enter WiFi password
 static char wifi_pending_ssid[33] = "";
 
 // Home MeshCore gateway (Heltec daemon). Overridable via SPIFFS /mesh_gw.txt
@@ -1943,7 +1942,13 @@ static ReachStatus gateway_reachable() {
 }
 
 static int agent_focus = 0;   // which agent chat is open (0..AGENTS_N-1)
-static bool agent_compose = false;  // REPLY screen is for agent, not notify
+enum ReplyMode : uint8_t {
+    REPLY_MODE_NONE = 0,
+    REPLY_MODE_NOTIFY,
+    REPLY_MODE_AGENT,
+    REPLY_MODE_WIFI,
+};
+static ReplyMode reply_mode = REPLY_MODE_NONE;
 static int agent_scroll = -1;       // visual row; -1 = pin to latest
 static int agent_scroll_total = 0;  // last known wrapped row count
 static int agent_sess_sel = 0;      // selected row on the agent SESSIONS list
@@ -2468,7 +2473,7 @@ static void ui_open_net(uint8_t origin = UINAV_WIFI);
 
 static void ui_open_wifi() {
     wifi_sel = 0;
-    wifi_compose = false;
+    reply_mode = REPLY_MODE_NONE;
     hw_ui_show_wifi(wifi_sel);
     ui_note_input();
 }
@@ -2571,8 +2576,7 @@ static void ui_wifi_show_profiles() {
 static void ui_wifi_open_password(const char *ssid) {
     if (!ssid || !ssid[0]) return;
     snprintf(wifi_pending_ssid, sizeof(wifi_pending_ssid), "%s", ssid);
-    wifi_compose = true;
-    agent_compose = false;
+    reply_mode = REPLY_MODE_WIFI;
     notify_card_id = 0;
     snprintf(reply_title, sizeof(reply_title), "PASS %s", ssid);
     reply_buf[0] = '\0';
@@ -2889,7 +2893,14 @@ static bool reply_buf_append(const char *utf8) {
 }
 
 static void ui_reply_paint() {
-    hw_ui_show_reply(reply_title, reply_buf, hw_kb_caps(), hw_kb_symbol(),
+    const char *mode = "COMPOSE";
+    switch (reply_mode) {
+    case REPLY_MODE_NOTIFY: mode = "NOTIFY REPLY";  break;
+    case REPLY_MODE_AGENT:  mode = "AGENT REPLY";   break;
+    case REPLY_MODE_WIFI:   mode = "WIFI PASSWORD"; break;
+    default: break;
+    }
+    hw_ui_show_reply(mode, reply_title, reply_buf, hw_kb_caps(), hw_kb_symbol(),
                      hw_kb_layout_name());
 }
 
@@ -2897,7 +2908,7 @@ static void ui_reply_paint() {
 static void ui_go_home() {
     notify_card_id = 0;
     reply_buf[0] = '\0';
-    agent_compose = false;
+    reply_mode = REPLY_MODE_NONE;
     hw_kb_reset_mods();
     ui_go_clock(NULL);
     ui_note_input();
@@ -2951,8 +2962,7 @@ static void ui_go_back() {
 
 // first_utf8: optional first character (UTF-8); NULL/empty = empty draft.
 static void ui_open_reply(uint32_t id, const char *title, const char *first_utf8) {
-    agent_compose = false;
-    wifi_compose = false;
+    reply_mode = REPLY_MODE_NOTIFY;
     notify_card_id = id;
     snprintf(reply_title, sizeof(reply_title), "%s", title ? title : "");
     reply_buf[0] = '\0';
@@ -2967,8 +2977,7 @@ static void ui_open_reply(uint32_t id, const char *title, const char *first_utf8
 }
 
 static void ui_open_agent_compose(const char *first_utf8) {
-    agent_compose = true;
-    wifi_compose = false;
+    reply_mode = REPLY_MODE_AGENT;
     notify_card_id = 0;
     snprintf(reply_title, sizeof(reply_title), "-> %s", agents_name(agent_focus));
     reply_buf[0] = '\0';
@@ -2997,28 +3006,34 @@ static bool utf8_is_printable(const char *u) {
 
 static void ui_reply_submit() {
     if (!reply_buf[0]) return;
-    if (wifi_compose) {
+    switch (reply_mode) {
+    case REPLY_MODE_WIFI: {
         /* Save password for pending SSID and connect. */
         char ssid[33];
         snprintf(ssid, sizeof(ssid), "%s", wifi_pending_ssid);
         wifi_nets_upsert(ssid, reply_buf);
         wifi_persist_profiles();
         reply_buf[0] = '\0';
-        wifi_compose = false;
+        reply_mode = REPLY_MODE_NONE;
         wifi_pending_ssid[0] = '\0';
         hw_haptic_notify(0);
         ui_wifi_connect_ssid(ssid);
         return;
     }
-    if (agent_compose) {
+    case REPLY_MODE_AGENT: {
         const char *aid = agents_id(agent_focus);
         if (agents_send(aid, reply_buf)) {
             hw_haptic_notify(0);
             hw_sound_notify(0);
         }
         reply_buf[0] = '\0';
-        agent_compose = false;
+        reply_mode = REPLY_MODE_NONE;
         ui_open_agent_chat(agent_focus);
+        return;
+    }
+    case REPLY_MODE_NOTIFY:
+        break;
+    default:
         return;
     }
     if (!notify_card_id) return;
@@ -3036,6 +3051,7 @@ static void ui_reply_submit() {
     }
     notify_card_id = 0;
     reply_buf[0] = '\0';
+    reply_mode = REPLY_MODE_NONE;
     ui_go_clock("sent");
 }
 
@@ -3373,7 +3389,7 @@ static void ui_open_agent_chat(int idx) {
     if (idx < 0) idx = 0;
     if (idx >= agents_count()) idx = agents_count() - 1;
     agent_focus = idx;
-    agent_compose = false;
+    reply_mode = REPLY_MODE_NONE;
     agent_scroll = -1;  // pin to latest when entering the room
     agents_thread_goto_tail(idx);  // load the session's history from the store
     ui_agent_chat_refresh();
@@ -4124,16 +4140,17 @@ static void ui_on_click() {
         // Encoder click = send if draft non-empty, else cancel
         if (reply_buf[0]) {
             ui_reply_submit();
-        } else if (wifi_compose) {
-            wifi_compose = false;
+        } else if (reply_mode == REPLY_MODE_WIFI) {
+            reply_mode = REPLY_MODE_NONE;
             wifi_pending_ssid[0] = '\0';
             reply_buf[0] = '\0';
             ui_open_wifi();
-        } else if (agent_compose) {
-            agent_compose = false;
+        } else if (reply_mode == REPLY_MODE_AGENT) {
+            reply_mode = REPLY_MODE_NONE;
             reply_buf[0] = '\0';
             ui_open_agent_chat(agent_focus);
         } else {
+            reply_mode = REPLY_MODE_NONE;
             notify_card_id = 0;
             reply_buf[0] = '\0';
             ui_go_clock(NULL);

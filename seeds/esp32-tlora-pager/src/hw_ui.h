@@ -303,9 +303,11 @@ int micron_render_last_dirty();
 // caller can clamp its scroll. `scroll` is clamped internally to [0, max].
 size_t hw_ui_render_page(const char *src, size_t len, int scroll);
 
-// Free-text reply composer. buffer is UTF-8 draft.
+// Free-text reply composer. mode labels the active routing target; buffer is
+// the UTF-8 draft.
 // caps/sym badges + layout_name ("ABC"/"PHON"/"RU") in header.
-void hw_ui_show_reply(const char *title,
+void hw_ui_show_reply(const char *mode,
+                      const char *title,
                       const char *buffer,
                       bool caps,
                       bool symbol,

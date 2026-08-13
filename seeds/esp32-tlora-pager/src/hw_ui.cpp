@@ -2323,7 +2323,8 @@ void hw_ui_show_net(const char *const *labels,
                     COL_DIM, COL_BG, 1);
 }
 
-void hw_ui_show_reply(const char *title,
+void hw_ui_show_reply(const char *mode,
+                      const char *title,
                       const char *buffer,
                       bool caps,
                       bool symbol,
@@ -2334,7 +2335,8 @@ void hw_ui_show_reply(const char *title,
     HwSpiBusGuard bus;
     tft_fill(COL_BG);
     tft_fill_rect(0, 0, PANEL_W, 22, COL_ACCENT);
-    tft_draw_text(MARGIN, 4, "REPLY", COL_BG, COL_ACCENT, 2);
+    tft_draw_text(MARGIN, 4, mode && mode[0] ? mode : "COMPOSE",
+                  COL_BG, COL_ACCENT, 2);
     // Badge: layout (ABC/PHON/RU) + CAPS + 123 while ALT held.
     char mods[28];
     const char *lay = (layout_name && layout_name[0]) ? layout_name : "ABC";
