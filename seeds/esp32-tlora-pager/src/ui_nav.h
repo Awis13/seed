@@ -17,7 +17,6 @@ enum UiNavScreen : uint8_t {
     UINAV_NOTIFY,
     UINAV_CARD_ACT,
     UINAV_MENU,
-    UINAV_AGENTS,
     UINAV_AGENT_CHAT,
     UINAV_AGENT_ACT,
     UINAV_AGENT_SESSIONS,
@@ -62,7 +61,6 @@ static inline uint8_t ui_nav_back_target(uint8_t screen, bool has_rooms,
     case UINAV_NOTIFY:         return UINAV_MSGLIST;
     case UINAV_CARD_ACT:       return UINAV_NOTIFY;
     case UINAV_MENU:           return UINAV_CLOCK;
-    case UINAV_AGENTS:         return UINAV_MENU;
     case UINAV_AGENT_CHAT:     return has_rooms ? UINAV_AGENT_SESSIONS : UINAV_MSGLIST;
     case UINAV_AGENT_ACT:      return UINAV_AGENT_CHAT;
     case UINAV_AGENT_SESSIONS: return sessions_origin;

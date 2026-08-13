@@ -38,7 +38,6 @@ int main(void) {
     assert(ui_nav_back_target(UINAV_NOTIFY, false)        == UINAV_MSGLIST);
     assert(ui_nav_back_target(UINAV_CARD_ACT, false)      == UINAV_NOTIFY);
     assert(ui_nav_back_target(UINAV_MENU, false)          == UINAV_CLOCK);
-    assert(ui_nav_back_target(UINAV_AGENTS, false)        == UINAV_MENU);
     assert(ui_nav_back_target(UINAV_AGENT_ACT, false)     == UINAV_AGENT_CHAT);
     assert(ui_nav_back_target(UINAV_AGENT_SESSIONS, false) == UINAV_MSGLIST);
     assert(ui_nav_back_target(UINAV_MSGLIST, false)       == UINAV_MENU);

@@ -68,7 +68,6 @@ static_assert((int)UINAV_CLOCK          == (int)HW_UI_CLOCK,          "ui_nav en
 static_assert((int)UINAV_NOTIFY         == (int)HW_UI_NOTIFY,         "ui_nav enum drift");
 static_assert((int)UINAV_CARD_ACT       == (int)HW_UI_CARD_ACT,      "ui_nav enum drift");
 static_assert((int)UINAV_MENU           == (int)HW_UI_MENU,           "ui_nav enum drift");
-static_assert((int)UINAV_AGENTS         == (int)HW_UI_AGENTS,         "ui_nav enum drift");
 static_assert((int)UINAV_AGENT_CHAT     == (int)HW_UI_AGENT_CHAT,     "ui_nav enum drift");
 static_assert((int)UINAV_AGENT_ACT      == (int)HW_UI_AGENT_ACT,      "ui_nav enum drift");
 static_assert((int)UINAV_AGENT_SESSIONS == (int)HW_UI_AGENT_SESSIONS, "ui_nav enum drift");
@@ -1852,7 +1851,6 @@ enum {
 enum { WIFI_LIST_SCAN = 0, WIFI_LIST_PROFILES = 1 };
 static int menu_sel = 0;
 static int card_act_sel = 0;
-static int agents_sel = 0;
 static int agent_act_sel = 0;
 // The in-chat sheet drops the DELETE row for a seeded conversation (claude /
 // hermes): those doors are re-created from firmware every boot, so a delete
@@ -1960,74 +1958,14 @@ static char ag_chat_lines[AGENT_THREAD_MAX][AGENT_TEXT_LEN];
 static bool ag_chat_from_me[AGENT_THREAD_MAX];
 static uint32_t ag_chat_ts[AGENT_THREAD_MAX];
 static const char *ag_chat_ptrs[AGENT_THREAD_MAX];
-// Session-list screen rows: N sessions + "NEW SESSION" + "BACK".
-// ag_sess_msgs[i] < 0 ⇒ no message-count badge on that row.
-/* Inbox snapshot. Built under agents_lock() and drawn from — never a live
- * pointer into the conversation table, which the off-loop drain mints into and
- * evicts from while the panel is painting. */
-static char        ag_inbox_labels[CONV_MAX][CONV_LABEL_LEN];
-static const char *ag_inbox_ptrs[CONV_MAX];
-static char        ag_inbox_glyphs[CONV_MAX];
-static int         ag_inbox_unread[CONV_MAX];
-static char        ag_inbox_ids[CONV_MAX][CONV_ID_LEN];  /* what each row displayed */
-static uint8_t     ag_inbox_slot[CONV_MAX];     /* row -> conversation index */
-static bool        ag_inbox_rooms[CONV_MAX];    /* row opens rooms, not a chat */
-static int         ag_inbox_n = 0;              /* conversation rows (BACK extra) */
-
-/* Snapshot the conversation table into the row arrays, newest first. */
-static_assert(CONV_MAX <= INBOX_MAX_ROWS,
-              "the inbox model must be able to order every conversation slot");
-
 /* The store's "is the user reading this?" test. The chat screen being up on
  * this conversation is the only thing that counts as reading it. */
 static bool ui_conv_on_screen(int idx) {
     return hw_ui_screen() == HW_UI_AGENT_CHAT && agent_focus == idx;
 }
 
-static void ui_inbox_build() {
-    InboxConvView v[CONV_MAX];
-    InboxRow rows[CONV_MAX];
-    int n = 0;
-    agents_lock();
-    int total = agents_count();
-    for (int i = 0; i < total && n < CONV_MAX; i++) {
-        v[n].slot = (uint8_t)i;
-        v[n].id = agents_id(i);
-        v[n].label = agents_name(i);
-        v[n].transport = agents_transport(i);
-        v[n].last_use = agents_last_use(i);
-        v[n].unread = agents_unread(i);
-        v[n].has_rooms = agents_has_rooms(i) ? 1 : 0;
-        n++;
-    }
-    int rn = inbox_build_rows(v, n, rows, CONV_MAX);
-    for (int i = 0; i < rn; i++) {
-        snprintf(ag_inbox_labels[i], sizeof(ag_inbox_labels[i]), "%s", rows[i].label);
-        ag_inbox_ptrs[i] = ag_inbox_labels[i];
-        ag_inbox_glyphs[i] = rows[i].glyph;
-        ag_inbox_unread[i] = (int)rows[i].unread;
-        ag_inbox_slot[i] = rows[i].slot;
-        ag_inbox_rooms[i] = rows[i].has_rooms != 0;
-        snprintf(ag_inbox_ids[i], sizeof(ag_inbox_ids[i]), "%s", rows[i].id);
-    }
-    agents_unlock();
-    ag_inbox_n = rn;
-}
-
-/* Repaint from a REBUILT snapshot: the rows changed, so the renderer's
- * selection memo has to be dropped or it decides nothing needs drawing. */
-static void ui_inbox_refresh(int selected) {
-    ui_inbox_build();
-    hw_ui_inbox_invalidate();
-    hw_ui_show_inbox(ag_inbox_ptrs, ag_inbox_glyphs, ag_inbox_unread,
-                     ag_inbox_n, selected, agents_bridge_ok());
-}
-
-static void ui_inbox_render(int selected) {
-    hw_ui_show_inbox(ag_inbox_ptrs, ag_inbox_glyphs, ag_inbox_unread,
-                     ag_inbox_n, selected, agents_bridge_ok());
-}
-
+// Session-list screen rows: N sessions + "NEW SESSION" + "BACK".
+// ag_sess_msgs[i] < 0 ⇒ no message-count badge on that row.
 static char ag_sess_titles[AGENT_SESSIONS_MAX + 2][AGENT_SESSION_LEN + 2];
 static int  ag_sess_msgs[AGENT_SESSIONS_MAX + 2];
 static bool ag_sess_active[AGENT_SESSIONS_MAX + 2];
@@ -4072,37 +4010,6 @@ static void ui_on_click() {
             hw_ui_show_layout(layout_sel, (int)hw_kb_layout());
         }
         break;
-    case HW_UI_AGENTS:
-        if (agents_sel >= ag_inbox_n) {          /* the trailing BACK row */
-            ui_open_menu();
-        } else {
-            /* THE SLOT MAY HAVE CHANGED HANDS since the list was drawn: the
-             * off-loop drain mints while the inbox sits open, and minting on a
-             * full table recycles a slot. Opening without checking would put
-             * the user in a stranger's thread under the name they picked. The
-             * check is one string compare against the id the row displayed;
-             * rebuilding the list on every scroll tick would cost a lock and a
-             * repaint per knob step instead. */
-            int slot = ag_inbox_slot[agents_sel];
-            InboxRow probe;
-            memset(&probe, 0, sizeof(probe));
-            snprintf(probe.id, sizeof(probe.id), "%s", ag_inbox_ids[agents_sel]);
-            agents_lock();
-            bool same = inbox_row_matches(&probe, agents_id(slot));
-            agents_unlock();
-            if (!same) {
-                /* Show what is actually there now rather than opening it —
-                 * and force the repaint, or the stale name stays on screen and
-                 * the next click opens the stranger under it. */
-                ui_inbox_refresh(agents_sel);
-                break;
-            }
-            // Land straight in the conversation's active (last-used) room, even
-            // when it has several — one tap to read/type. The room list stays
-            // reachable with BACKSPACE from inside the chat (see ui_go_back).
-            ui_open_agent_chat(slot);
-        }
-        break;
     case HW_UI_AGENT_SESSIONS: {
         int n = ag_sess_vis_n;   // visible (non-dead) rows drawn by the refresh
         if (agent_sess_sel < n) {  // existing visible session → open its chat
@@ -4267,15 +4174,6 @@ static void ui_on_steps(int steps) {
         while (card_act_sel >= CARD_ACT_COUNT) card_act_sel -= CARD_ACT_COUNT;
         hw_ui_show_card_act(card_act_sel,
                             reply_title[0] ? reply_title : NULL);
-        break;
-    }
-    case HW_UI_AGENTS: {
-        int n = ag_inbox_n + 1;          /* conversations + BACK */
-        if (n < 1) n = 1;
-        agents_sel += steps;
-        while (agents_sel < 0) agents_sel += n;
-        while (agents_sel >= n) agents_sel -= n;
-        ui_inbox_render(agents_sel);
         break;
     }
     case HW_UI_AGENT_SESSIONS: {
@@ -4782,19 +4680,6 @@ void loop() {
         }
     }
 
-    // Inbox open when something arrives: the rows themselves changed — a new
-    // conversation may have been minted, an unread mark raised, the order
-    // moved — so the list is rebuilt and repainted. Without this the inbox
-    // shows the state it had when it was opened until the user leaves and
-    // comes back.
-    if (display_force && hw_ui_screen() == HW_UI_AGENTS) {
-        display_force = false;
-        bool real_in = g_agents_real_inbound;
-        g_agents_real_inbound = false;
-        ui_inbox_refresh(agents_sel);
-        if (real_in) ui_note_wake();
-    }
-
     // Agent thread inbound (display_force) — refresh open chat room live.
     if (display_force && hw_ui_screen() == HW_UI_AGENT_CHAT) {
         display_force = false;
@@ -4837,8 +4722,8 @@ void loop() {
             if (is_pending_chat) {
                 /* The bounded drain above handled it or deliberately left it
                  * visible for retry. Never misrender a failed chat as severity. */
-            } else if (on_clock || scr == HW_UI_MENU || scr == HW_UI_AGENTS ||
-                       scr == HW_UI_MSGLIST || scr == HW_UI_INFO) {
+            } else if (on_clock || scr == HW_UI_MENU || scr == HW_UI_MSGLIST ||
+                       scr == HW_UI_INFO) {
                 // Real message from any service: severity colours (info/warn/crit).
                 notify_card_id = arrived_id;
                 snprintf(reply_title, sizeof(reply_title), "%s", v.title);

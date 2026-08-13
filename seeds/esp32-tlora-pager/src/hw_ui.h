@@ -62,7 +62,6 @@ enum HwUiScreen : uint8_t {
     HW_UI_NOTIFY,
     HW_UI_CARD_ACT,  // Ack / Reply / Back after click-Enter on a card
     HW_UI_MENU,
-    HW_UI_AGENTS,      // Claude / Hermes list
     HW_UI_AGENT_CHAT,  // one agent thread
     HW_UI_AGENT_ACT,   // CLEAR / BACK inside a chat room
     HW_UI_AGENT_SESSIONS,  // session list inside one agent
@@ -196,22 +195,6 @@ void hw_ui_show_wifi_list(const char *header,
 
 // Multi-line WiFi/WG status (click = back).
 void hw_ui_show_wifi_info(const char *const *lines, int n_lines);
-
-// The inbox: every conversation, newest first, plus a trailing BACK row.
-// labels[i] is the display name, glyphs[i] the one-letter transport tag
-// ('A' agent / 'M' mesh / 'L' lxmf) and unread[i] the arrival count (0 = none,
-// drawn as a * marker). `count` counts the CONVERSATION rows only; the renderer
-// adds BACK after them, so the caller's selected index runs 0..count inclusive.
-// Forget what was drawn, so the next show_inbox repaints even if `selected` is
-// unchanged. Needed whenever the ROWS changed rather than the selection.
-void hw_ui_inbox_invalidate(void);
-
-void hw_ui_show_inbox(const char *const *labels,
-                      const char *glyphs,
-                      const int *unread,
-                      int count,
-                      int selected,
-                      bool bridge_ok);
 
 // Session list inside one agent: N existing sessions + "NEW SESSION" + "BACK".
 // titles[i] short UTF-8, msgs[i] = message count (negative = no badge),
