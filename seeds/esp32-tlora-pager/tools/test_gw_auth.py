@@ -12,8 +12,13 @@ gitignore = (ROOT / ".gitignore").read_text(encoding="utf-8")
 assert '#define GW_TOKEN_PATH "/gw_token.txt"' in main
 assert "static void gw_token_load()" in main
 load = main[main.index("static void gw_token_load()") :]
-load = load[: load.index("}") + 1]
-assert "read_spiffs_file(GW_TOKEN_PATH)" in load
+# Slice to the next top-level definition (the function now has nested braces
+# for the NVS-first branch, so a first-"}" cut would truncate the body).
+load = load[: load.index("\nstatic ", 1)]
+# C2: NVS is the source of truth after the boot migration (survives a SPIFFS
+# format); the file remains the pre-migration fallback.
+assert 'secret_store_get("gw_tok"' in load, "gw token must load NVS-first"
+assert "read_spiffs_file(GW_TOKEN_PATH)" in load, "the SPIFFS file stays the fallback"
 assert "stored.trim()" in load
 assert 'snprintf(gw_token, sizeof(gw_token), "%s", stored.c_str());' in load
 assert "gw_token_load();" in main[main.index("void setup()") :], (

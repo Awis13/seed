@@ -50,6 +50,7 @@
 #include <Preferences.h>          // NVS-backed panic counter that survives poweron
 #include <HTTPClient.h>
 #include "boot_diag_decide.h"     // pure, host-tested NVS panic-counter decision
+#include "secret_store.h"         // format-safe per-device secrets in NVS (C1/C2)
 #include "board_pins.h"
 #include "hw_ui.h"
 #include "hw_input.h"
@@ -637,16 +638,32 @@ static bool clock_local_time(struct tm &out) {
 // ===== Auth =====
 
 static void token_load() {
-    auth_token = read_spiffs_file(TOKEN_FILE);
+    // NVS-first: the auth (OTA) token must be STABLE across a SPIFFS format.
+    // The old path re-read only the file and esp_random()-minted a new token
+    // whenever the file was gone — every format rotated it and locked out WiFi
+    // flashing. NVS is the source of truth after migration; the file is only a
+    // pre-migration fallback.
+    uint8_t buf[SECRET_VALUE_MAX];
+    size_t n = secret_store_get("auth_tok", buf, sizeof(buf));
+    if (n > 0) {
+        auth_token = String();
+        auth_token.reserve(n);
+        for (size_t i = 0; i < n; i++) auth_token += (char)buf[i];
+    } else {
+        auth_token = read_spiffs_file(TOKEN_FILE);
+    }
     auth_token.trim();
 
     if (auth_token.length() == 0) {
-        char buf[33];
+        char hex[33];
         for (int i = 0; i < 16; i++) {
-            snprintf(buf + i * 2, 3, "%02x", (uint8_t)esp_random());
+            snprintf(hex + i * 2, 3, "%02x", (uint8_t)esp_random());
         }
-        buf[32] = '\0';
-        auth_token = String(buf);
+        hex[32] = '\0';
+        auth_token = String(hex);
+        // Persist to NVS (survives a format) AND the file (back-compat).
+        secret_store_put("auth_tok", (const uint8_t *)auth_token.c_str(),
+                         auth_token.length());
         write_spiffs_file(TOKEN_FILE, auth_token);
     }
 }
@@ -2061,7 +2078,18 @@ static void mesh_gw_load() {
 }
 
 static void gw_token_load() {
-    String stored = read_spiffs_file(GW_TOKEN_PATH);
+    // NVS-first (source of truth after migration); the SPIFFS file is only a
+    // pre-migration fallback. An absent token is legitimate (none provisioned),
+    // and leaves gw_token empty exactly as before.
+    String stored;
+    uint8_t buf[SECRET_VALUE_MAX];
+    size_t n = secret_store_get("gw_tok", buf, sizeof(buf));
+    if (n > 0) {
+        stored.reserve(n);
+        for (size_t i = 0; i < n; i++) stored += (char)buf[i];
+    } else {
+        stored = read_spiffs_file(GW_TOKEN_PATH);
+    }
     stored.trim();
     snprintf(gw_token, sizeof(gw_token), "%s", stored.c_str());
 }
@@ -4032,6 +4060,13 @@ void setup() {
     // STA associates.
     hw_ui_begin();
     storage_begin();  // SPIFFS mount → announced format → degraded continue
+    // Capture this device's real secrets into NVS, byte-for-byte, the moment
+    // storage is up and BEFORE any consumer (auth/gw/rns/mesh) loads one. NVS
+    // survives a SPIFFS format, so this is what keeps the live identity, RNS
+    // address and OTA token from changing after a data-partition wipe. Idempotent
+    // (a sentinel makes later boots a no-op); only run when the mount succeeded,
+    // so a failed mount cannot set the sentinel over files it never read.
+    if (storage_ok) secret_store_migrate_from_spiffs(SPIFFS);
     // Reclaim AW9364 from the boot pulse in hw_ui; load /backlight.json.
     backlight_begin();
     hw_input_begin();

@@ -2040,13 +2040,32 @@ static bool rns_is_hex(const String &s) {
     return true;
 }
 
-/* Load /rns_identity.id, or mint one when the file does not exist. The branch
- * is decided by SPIFFS.exists(), never by content: read_spiffs_file() returns
- * "" both for an absent file and for a failed open/read, so deciding on the
- * string would regenerate — and overwrite — a key we merely failed to read. */
+/* Load the RNS identity, or mint one when none exists. NVS is the source of
+ * truth after the boot migration (it survives a SPIFFS format, so the RNS
+ * ADDRESS — derived from these key bytes — survives too); the /rns_identity.id
+ * file is only a pre-migration fallback. The presence branch is decided by an
+ * explicit "found it" flag, never by the decoded string being empty: an absent
+ * source and a failed read both look like "", and deciding on that would
+ * regenerate — and overwrite — a key we merely failed to read. */
 static void rns_identity_bring_up() {
-    if (SPIFFS.exists(RNS_ID_PATH)) {
-        String hex = read_spiffs_file(RNS_ID_PATH);
+    String hex;
+    bool found = false;
+
+    /* 1) NVS first. The migration copied the file's bytes VERBATIM, so the NVS
+     *    value is the same hex text the file held (128 chars, no newline). */
+    uint8_t buf[SECRET_VALUE_MAX];
+    size_t n = secret_store_get("rns_id", buf, sizeof(buf));
+    if (n > 0) {
+        hex.reserve(n);
+        for (size_t i = 0; i < n; i++) hex += (char)buf[i];
+        found = true;
+    } else if (SPIFFS.exists(RNS_ID_PATH)) {
+        /* 2) Pre-migration fallback: the file itself. */
+        hex = read_spiffs_file(RNS_ID_PATH);
+        found = true;
+    }
+
+    if (found) {
         hex.trim();
         if (hex.length() == 0) {
             rns_error = "stored identity is present but unreadable";
@@ -2075,7 +2094,12 @@ static void rns_identity_bring_up() {
     } else {
         RNS::Identity fresh;              /* default ctor generates a keypair */
         String out = fresh.get_private_key().toHex().c_str();
-        if (!write_spiffs_file_atomic(RNS_ID_PATH, RNS_ID_TMP, out)) {
+        /* Persist to NVS (survives a format, the source of truth) AND the file
+         * (status/back-compat). NVS is what keeps the address stable next time. */
+        bool nvs_ok = secret_store_put("rns_id", (const uint8_t *)out.c_str(),
+                                       out.length());
+        bool file_ok = write_spiffs_file_atomic(RNS_ID_PATH, RNS_ID_TMP, out);
+        if (!nvs_ok && !file_ok) {
             /* The key is live in RAM but will not survive a reboot; say so
              * rather than pretending the identity is persistent. */
             rns_error = "identity generated but could not be saved";

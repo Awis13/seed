@@ -1,7 +1,9 @@
-// Seed BaseChatMesh client: load SPIFFS identity, RX private DM, sparse TX.
+// Seed BaseChatMesh client: load identity (NVS-first, mint if absent), RX
+// private DM, sparse TX.
 #include "mc_client.h"
 #include "mc_target.h"
 #include "contact_record.h"
+#include "../mesh_secret_bridge.h"   // NVS get/put for the mesh identity (no heavy headers)
 
 #include <Mesh.h>
 #include <SPIFFS.h>
@@ -55,6 +57,15 @@ static void mlog(const char *fmt, ...) {
   va_end(ap);
   Serial.printf("[mesh] %s\n", buf);
   if (cb_log) cb_log(buf);
+}
+
+static void bytes_to_hex(const uint8_t *in, size_t n, char *out) {
+  static const char H[] = "0123456789abcdef";
+  for (size_t i = 0; i < n; i++) {
+    out[i * 2] = H[(in[i] >> 4) & 0xF];
+    out[i * 2 + 1] = H[in[i] & 0xF];
+  }
+  out[n * 2] = '\0';
 }
 
 static bool hex_to_bytes(const char *hex, uint8_t *out, size_t n) {
@@ -251,6 +262,68 @@ public:
            mesh::PacketManager &mgr, SimpleMeshTables &tables)
       : BaseChatMesh(radio, mesh_ms_clock, rng, rtc, mgr, tables) {}
 
+  // The mesh identity is a 96-byte MeshCore blob: pub(32) followed by prv(64),
+  // exactly the layout LocalIdentity::writeTo(Stream&) puts in /mesh_identity.id
+  // and the boot migration mirrors VERBATIM into the NVS key "mesh_id". Both
+  // stores therefore hold the same bytes; this is the single serialization the
+  // load and the persist below agree on, so a round-trip never moves the key.
+  static const size_t MESH_ID_BLOB = 96;   // PUB_KEY_SIZE(32) + PRV_KEY_SIZE(64)
+
+  // Write self_id to NVS (always) and, when write_file, to /mesh_identity.id.
+  // NVS is the format-safe source of truth; the file is kept for the status
+  // reader (meshcore.cpp) and pre-migration back-compat.
+  void persistMeshIdentity(bool write_file) {
+    uint8_t blob[MESH_ID_BLOB];
+    memcpy(blob, self_id.pub_key, 32);          // pub first (file/Stream layout)
+    uint8_t tmp[MESH_ID_BLOB];
+    size_t w = self_id.writeTo(tmp, sizeof(tmp));  // buffer overload gives prv(64)+pub(32)
+    if (w < 64) { mlog("identity serialize fail"); return; }
+    memcpy(blob + 32, tmp, 64);                 // prv follows
+    if (!mesh_secret_put("mesh_id", blob, MESH_ID_BLOB))
+      mlog("identity NVS write fail");
+    if (write_file) {
+      File f = SPIFFS.open(MESH_ID_PATH, "w");
+      if (f) { self_id.writeTo(f); f.close(); }  // Stream overload: pub+prv
+      else mlog("identity file write fail");
+    }
+  }
+
+  // NVS-first identity bring-up with SPIFFS fallback and mint-if-absent. RNS
+  // already self-generates; mesh now does too, using the same MeshCore keygen
+  // (LocalIdentity(RNG*)) the vendor lib uses, seeded from radio noise in
+  // mesh_client_begin() before start() runs.
+  bool bringUpIdentity() {
+    // 1) NVS: the source of truth after the boot migration.
+    uint8_t blob[MESH_ID_BLOB];
+    size_t n = mesh_secret_get("mesh_id", blob, sizeof(blob));
+    if (n == MESH_ID_BLOB) {
+      char pub_hex[65], prv_hex[129];
+      bytes_to_hex(blob, 32, pub_hex);
+      bytes_to_hex(blob + 32, 64, prv_hex);
+      self_id = mesh::LocalIdentity(prv_hex, pub_hex);
+      mlog("identity from NVS");
+      return true;
+    }
+    // 2) Pre-migration fallback: the SPIFFS file. Mirror it into NVS for next boot.
+    if (SPIFFS.exists(MESH_ID_PATH)) {
+      File f = SPIFFS.open(MESH_ID_PATH, "r");
+      if (f && self_id.readFrom(f)) {          // Stream overload: reads pub+prv
+        f.close();
+        persistMeshIdentity(false);            // file already exists; NVS only
+        mlog("identity from SPIFFS (mirrored to NVS)");
+        return true;
+      }
+      if (f) f.close();
+      mlog("identity read fail");
+      return false;   // present but unreadable: do not overwrite by minting
+    }
+    // 3) Nothing anywhere: mint a fresh keypair and persist it.
+    self_id = mesh::LocalIdentity(getRNG());
+    persistMeshIdentity(true);                  // NVS + file
+    mlog("minted mesh identity");
+    return true;
+  }
+
   bool start() {
     Mesh::begin();
     // SPIFFS already mounted by seed main — do not SPIFFS.begin(true) here
@@ -284,20 +357,8 @@ public:
       }
     }
 
-    // Identity: /mesh_identity.id is pub(32)+prv(64)
-    if (!SPIFFS.exists(MESH_ID_PATH)) {
-      mlog("no %s", MESH_ID_PATH);
-      return false;
-    }
-    {
-      File f = SPIFFS.open(MESH_ID_PATH, "r");
-      if (!f || !self_id.readFrom(f)) {
-        mlog("identity read fail");
-        if (f) f.close();
-        return false;
-      }
-      f.close();
-    }
+    // Identity: NVS-first, SPIFFS fallback, mint if absent (see bringUpIdentity).
+    if (!bringUpIdentity()) return false;
 
     // Sync RTC from NTP if available
     time_t now = time(nullptr);

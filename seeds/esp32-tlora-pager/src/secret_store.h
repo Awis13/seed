@@ -127,8 +127,16 @@ struct SecretMigrateOps {
  * single write (idempotent). Otherwise, for each mapping row: read the file,
  * and if secret_should_copy() says so AND the bytes fit, copy them VERBATIM into
  * NVS; an existing key is never overwritten and an oversize/absent file is
- * skipped. Finally set the sentinel so a later call is a no-op. Returns the
- * number of secrets copied, or -1 if the ops are malformed.
+ * skipped.
+ *
+ * The sentinel is set ONLY when every copy that SHOULD have happened did. If a
+ * put of a present, copyable secret FAILS (a transient NVS write error), the
+ * sentinel is left unset so the next boot retries that key rather than skipping
+ * it forever — the secrets that already landed are guarded by nvs_has, so the
+ * retry touches only what is still missing. A skip for an oversize or absent
+ * file is NOT a failure (it is a permanent condition, and blocking the sentinel
+ * on it would retry every boot with no hope of success), so it does not hold the
+ * sentinel back. Returns the number of secrets copied, or -1 if ops are malformed.
  */
 static inline int secret_migrate_run(const SecretMigrateOps *ops) {
     if (!ops || !ops->has || !ops->read_file || !ops->put) return -1;
@@ -137,6 +145,7 @@ static inline int secret_migrate_run(const SecretMigrateOps *ops) {
     size_t n = 0;
     const SecretMap *map = secret_map(&n);
     int copied = 0;
+    bool copy_failed = false;
     for (size_t i = 0; i < n; i++) {
         uint8_t buf[SECRET_VALUE_MAX];
         bool present = false;
@@ -146,9 +155,13 @@ static inline int secret_migrate_run(const SecretMigrateOps *ops) {
         if (!secret_should_copy(false, nvs_has, present)) continue;
         if (!secret_value_fits(len)) continue;   /* oversize: guard, never cut */
         if (ops->put(ops->ctx, map[i].nvs_key, buf, len)) copied++;
+        else copy_failed = true;                 /* transient: retry next boot */
     }
-    const uint8_t one = 1;
-    ops->put(ops->ctx, SECRET_SENTINEL_KEY, &one, 1);
+    /* Do not seal the migration if a copyable secret failed to write. */
+    if (!copy_failed) {
+        const uint8_t one = 1;
+        ops->put(ops->ctx, SECRET_SENTINEL_KEY, &one, 1);
+    }
     return copied;
 }
 

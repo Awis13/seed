@@ -67,6 +67,7 @@ static bool lxmf_ingest_wire(const uint8_t *wire, size_t len);
 
 struct MeshPairInfo {
     bool     has_identity;
+    bool     want_identity;    /* no identity anywhere: mint one on radio bring-up */
     bool     has_meta;
     bool     radio_ready;      /* BaseChatMesh up — probe can TX */
     char     name[16];
@@ -415,16 +416,24 @@ static void mesh_cb_log(const char *msg) {
 static bool mesh_load_identity() {
     g_mesh.has_identity = false;
     g_mesh.public_key_hex[0] = '\0';
-    if (!SPIFFS.exists(MESH_ID_PATH)) return false;
-    File f = SPIFFS.open(MESH_ID_PATH, "r");
-    if (!f) return false;
+    /* NVS is the source of truth after the boot migration (it survives a SPIFFS
+     * format); the /mesh_identity.id file is only a pre-migration fallback. Both
+     * hold the same 96-byte pub(32)+prv(64) blob, so the public-key prefix is
+     * read identically from either. This is a STATUS read; the crypto identity
+     * is loaded (and minted, when absent) in mc_client.cpp, which owns the RNG. */
     uint8_t blob[MESH_ID_BLOB_LEN];
-    size_t n = f.read(blob, sizeof(blob));
-    f.close();
+    size_t n = secret_store_get("mesh_id", blob, sizeof(blob));
     if (n != MESH_ID_BLOB_LEN) {
-        event_add("mesh identity size %u (want %u)",
-                  (unsigned)n, (unsigned)MESH_ID_BLOB_LEN);
-        return false;
+        if (!SPIFFS.exists(MESH_ID_PATH)) return false;
+        File f = SPIFFS.open(MESH_ID_PATH, "r");
+        if (!f) return false;
+        n = f.read(blob, sizeof(blob));
+        f.close();
+        if (n != MESH_ID_BLOB_LEN) {
+            event_add("mesh identity size %u (want %u)",
+                      (unsigned)n, (unsigned)MESH_ID_BLOB_LEN);
+            return false;
+        }
     }
     mesh_hex_of(blob, MESH_PUB_LEN, g_mesh.public_key_hex, sizeof(g_mesh.public_key_hex));
     snprintf(g_mesh.name, sizeof(g_mesh.name), "%.8s", g_mesh.public_key_hex);
@@ -904,8 +913,10 @@ static int mesh_status_lines(char lines[][40], int max_lines) {
 }
 
 static void skill_meshcore_poll() {
-    /* Deferred radio start (~5s after boot): seed UI/WiFi already running. */
-    if (g_mesh.has_identity && !g_mesh.radio_ready &&
+    /* Deferred radio start (~5s after boot): seed UI/WiFi already running.
+     * want_identity brings the radio up even with no keys yet, so mc_client.cpp
+     * can mint an identity from radio noise on first boot / after a wipe. */
+    if ((g_mesh.has_identity || g_mesh.want_identity) && !g_mesh.radio_ready &&
         strcmp(g_mesh.radio_state, "radio_fail") != 0 &&
         millis() > 5000UL) {
         static bool tried = false;
@@ -913,6 +924,11 @@ static void skill_meshcore_poll() {
             tried = true;
             if (mesh_client_begin()) {
                 g_mesh.radio_ready = true;
+                /* A mint may have just happened inside begin(): re-read the now
+                 * present NVS identity so status (public key, name) is populated
+                 * and has_identity gates the keepalive below. */
+                if (!g_mesh.has_identity) mesh_load_identity();
+                g_mesh.want_identity = false;
                 snprintf(g_mesh.radio_state, sizeof(g_mesh.radio_state), "rx_on");
                 event_add("mesh radio RX/TX up");
             } else {
@@ -1131,8 +1147,13 @@ static void skill_meshcore_init() {
         event_add("mesh pair %s probe %lus (radio deferred)",
                   g_mesh.name, (unsigned long)g_mesh.probe_interval_s);
     } else {
-        snprintf(g_mesh.radio_state, sizeof(g_mesh.radio_state), "no_keys");
-        event_add("mesh: no identity on SPIFFS");
+        /* No identity anywhere (fresh board, or one whose SPIFFS was wiped before
+         * the NVS store existed). RNS already self-generates; mesh now does too:
+         * bring the radio up so mc_client.cpp can mint a keypair from radio noise
+         * and persist it to NVS. */
+        g_mesh.want_identity = true;
+        snprintf(g_mesh.radio_state, sizeof(g_mesh.radio_state), "radio_deferred");
+        event_add("mesh: no identity, will mint on radio bring-up");
     }
     skill_register(&meshcore_skill);
     Serial.printf("[meshcore] paired=%d name=%s probe=%lus radio=%s\n",

@@ -19,7 +19,9 @@
  *     mapped secret, driven end to end through the fake store;
  *   - an existing NVS key is never overwritten;
  *   - an oversize file is rejected, not truncated;
- *   - the sentinel makes a second run a pure no-op (idempotent).
+ *   - the sentinel makes a second run a pure no-op (idempotent);
+ *   - a transient put failure WITHHOLDS the sentinel and the next run retries
+ *     only the missing key (the C1-review self-heal guard).
  */
 
 #include <assert.h>
@@ -54,6 +56,11 @@ struct FakeWorld {
     FakeFile  files[FAKE_FILE_MAX];
     int       n_files;
     int       put_calls;     /* observability for the no-op assertions */
+    /* Injected transient write failure: while fail_key matches and fail_times>0,
+     * fake_put refuses the write (and consumes one fail_times) to model a flaky
+     * NVS. Lets the test prove the sentinel is withheld and the retry recovers. */
+    const char *fail_key;
+    int         fail_times;
 };
 
 static FakeEntry *fake_find(FakeWorld *w, const char *key) {
@@ -86,6 +93,10 @@ static bool fake_put(void *ctx, const char *key, const uint8_t *buf,
                      size_t len) {
     FakeWorld *w = (FakeWorld *)ctx;
     w->put_calls++;
+    if (w->fail_key && w->fail_times > 0 && strcmp(key, w->fail_key) == 0) {
+        w->fail_times--;
+        return false;                 /* transient write failure */
+    }
     if (len > SECRET_VALUE_MAX) return false;
     FakeEntry *e = fake_find(w, key);
     if (!e) {
@@ -359,6 +370,62 @@ static void test_sentinel_short_circuits(void) {
         assert(!fake_has(&w, m[i].nvs_key));
 }
 
+/* --- 7b. a failed copy withholds the sentinel; the next run retries --------- */
+
+static void test_put_failure_withholds_sentinel(void) {
+    FakeWorld w;
+    memset(&w, 0, sizeof(w));
+
+    size_t n = 0;
+    const SecretMap *m = secret_map(&n);
+
+    /* Every secret has a file present. */
+    static uint8_t data[5][40];
+    const size_t sizes[5] = {40, 40, 40, 40, 40};
+    for (size_t i = 0; i < n; i++) {
+        make_payload((int)i + 20, data[i], sizes[i]);
+        w.files[w.n_files].path    = m[i].spiffs_path;
+        w.files[w.n_files].data    = data[i];
+        w.files[w.n_files].len     = sizes[i];
+        w.files[w.n_files].present = true;
+        w.n_files++;
+    }
+
+    /* The third secret's write fails ONCE (a transient NVS error). */
+    w.fail_key   = m[2].nvs_key;
+    w.fail_times = 1;
+
+    SecretMigrateOps ops;
+    ops_bind(&ops, &w);
+
+    int copied = secret_migrate_run(&ops);
+    assert(copied == 4);                        /* four landed, one failed */
+    /* The failed key did NOT land, and the sentinel was WITHHELD so the run is
+     * not sealed — this is the pin: without the guard the sentinel would be set
+     * and the key lost forever. */
+    assert(!fake_has(&w, m[2].nvs_key));
+    assert(!fake_has(&w, SECRET_SENTINEL_KEY));
+    /* The four that succeeded are present. */
+    for (size_t i = 0; i < n; i++)
+        if (i != 2) assert(fake_has(&w, m[i].nvs_key));
+
+    /* Re-run: the flaky write now succeeds. Only the missing key is copied
+     * (the four already there are guarded by nvs_has), and the sentinel is set. */
+    int again = secret_migrate_run(&ops);
+    assert(again == 1);
+    assert(fake_has(&w, m[2].nvs_key));
+    assert(fake_has(&w, SECRET_SENTINEL_KEY));
+    /* Byte-exact even on the retry path. */
+    FakeEntry *e = fake_find(&w, m[2].nvs_key);
+    assert(e != NULL && e->len == sizes[2]);
+    assert(memcmp(e->val, data[2], sizes[2]) == 0);
+
+    /* A third run is now a pure no-op. */
+    int before = w.put_calls;
+    assert(secret_migrate_run(&ops) == 0);
+    assert(w.put_calls == before);
+}
+
 /* --- 8. malformed ops are refused, not crashed ------------------------------ */
 
 static void test_ops_guard(void) {
@@ -377,6 +444,7 @@ int main(void) {
     test_missing_file_skipped();
     test_oversize_rejected();
     test_sentinel_short_circuits();
+    test_put_failure_withholds_sentinel();
     test_ops_guard();
     printf("secret store tests: OK\n");
     return 0;

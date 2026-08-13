@@ -12,6 +12,7 @@
  */
 
 #include "secret_store.h"
+#include "mesh_secret_bridge.h"
 
 #include <Preferences.h>
 #include <FS.h>
@@ -93,6 +94,17 @@ bool real_put(void *ctx, const char *key, const uint8_t *buf, size_t len) {
 }
 
 }  // namespace
+
+// ---- mesh_secret_bridge.h: narrow NVS window for the mc_client crypto TU -----
+// Thin pass-throughs so mc_client.cpp need not include Preferences/secret_store.h.
+
+size_t mesh_secret_get(const char *name, uint8_t *buf, size_t cap) {
+    return secret_store_get(name, buf, cap);
+}
+
+bool mesh_secret_put(const char *name, const uint8_t *buf, size_t len) {
+    return secret_store_put(name, buf, len);
+}
 
 bool secret_store_migrate_from_spiffs(fs::FS &fs) {
     SecretRealCtx c;
