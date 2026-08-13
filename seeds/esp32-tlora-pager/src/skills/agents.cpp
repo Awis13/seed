@@ -343,8 +343,8 @@ static bool agents_on_inbound(const char *agent_id, const char *text,
                               const char *origin_key = nullptr,
                               const NotifyEventId *origin_event = nullptr);
 
-/* A genuine arrival (a mesh chat frame, HTTP /agents/inbound, a GPS answer)
- * pushed a line into a room. loop() consumes it together with display_force:
+/* A genuine arrival (a transport chat, a notification-backed agent reply, or
+ * a GPS answer) pushed a line into a room. loop() consumes it with display_force:
  * if the room is open on screen, the repaint wakes the panel once. Synthetic
  * error lines never set this. Set BEFORE display_force so the loop cannot
  * consume the repaint without seeing the arrival. */
@@ -2037,7 +2037,7 @@ bool transport_send(const struct Conversation *conv, const char *text) {
 /* Public: send a line as the user, into the conversation's ACTIVE room.
  * Path: local thread/history → transport_send(), which picks the wire from the
  * conversation record. Downlink replies arrive on the same wire (or WiFi
- * /agents/inbound). One chat loop. */
+ * /agents/inbound, admitted through the notification door). One chat loop. */
 static bool agents_send(const char *agent_id, const char *text) {
     int idx = agents_find(agent_id);
     if (idx < 0 || !text || !text[0]) return false;
@@ -2064,10 +2064,11 @@ static bool agents_send(const char *agent_id, const char *text) {
     return true;
 }
 
-/* Inject an agent reply into the active session of the agent (long texts split).
- * real_inbound: true only for genuine arrivals (HTTP /agents/inbound, GPS
- * answer) — they may wake the panel when the room is open on screen. Synthetic
- * lines (mesh_chat_tx_fail) pass false and never restart the idle countdown. */
+/* Canonical thread sink for an accepted inbound line. Notification-backed
+ * replies reach this only from the off-loop door worker, which attaches their
+ * durable event origin before ACKing the backing card. No HTTP route appends a
+ * second copy directly. real_inbound is true for genuine arrivals and GPS
+ * answers; synthetic error lines pass false and do not restart idle. */
 static bool agents_on_inbound(const char *agent_id, const char *text,
                               bool real_inbound, uint32_t origin_id,
                               const char *origin_key,
@@ -2780,7 +2781,8 @@ static const char *agents_describe() {
         "Pocket chat with Claude / Hermes.\n"
         "Uplink: WiFi bridge /v1/chat, else MeshCore C1|agent|…|u|… private DM\n"
         "  (agent = claude|hermes).\n"
-        "Downlink: same C1 side=a (or WiFi /agents/inbound) — one loop.\n"
+        "Downlink: same C1 side=a (or WiFi /agents/inbound); the backing card\n"
+        "is ACKed after the reply is durably appended to the thread.\n"
         "A \"where are you?\" / \"где ты\" message is answered locally with the\n"
         "GNSS fix (POST /gps/fix semantics) and never hits the bridge.\n\n"
         "History: append-only JSONL on SD (fallback SPIFFS) at\n"
@@ -2792,7 +2794,7 @@ static const char *agents_describe() {
 static const SkillEndpoint agents_endpoints[] = {
     {"GET",  "/agents",         "List agents, bridge, sessions, history counts"},
     {"POST", "/agents/send",    "Send {agent, text, session?} into a thread (+ bridge)"},
-    {"POST", "/agents/inbound", "Inject agent reply {agent, text} into thread"},
+    {"POST", "/agents/inbound", "Queue agent reply {agent, text} for its thread"},
     {"POST", "/agents/clear",   "Clear active session {agent} or {\"all\":true}"},
     {"POST", "/agents/bridge",  "Set bridge base URL (raw body), empty clears"},
     {"POST", "/agents/session", "Select session {agent, session}"},
@@ -2922,11 +2924,21 @@ static void agents_register_routes(AsyncWebServer &server) {
         const char *text  = input["text"]  | "";
         if (agents_find(agent) < 0) { notify_send_error(req, 400, "unknown conversation"); return; }
         if (!text[0]) { notify_send_error(req, 400, "text required"); return; }
-        agents_on_inbound(agent, text, true);
-        event_add("agent %s >> %s", agent, text);
+        /* One receiver: HTTP agent replies enter as a backing card. C3's
+         * off-loop door worker is the sole path that appends the body to the
+         * thread, then ACKs/hides this card by its event identity. Calling
+         * agents_on_inbound here as well would store the same reply twice. */
+        uint32_t card_id = inbox_deliver_card(CONV_AGENT, nullptr,
+                                              INBOX_SEV_INFO, agent,
+                                              "CHAT", text);
+        if (!card_id) {
+            notify_send_error(req, 503, "inbound queue full");
+            return;
+        }
         JsonDocument doc;
         doc["ok"] = true;
         doc["agent"] = agent;
+        doc["notification_id"] = card_id;
         notify_send_json(req, 200, doc);
     }, NULL, handle_body_collect);
 

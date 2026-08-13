@@ -91,8 +91,18 @@ assert "g_agents_real_inbound = false;" in consume, (
 
 # --- real_inbound classification of every agents_on_inbound producer ---------
 assert "static volatile bool g_agents_real_inbound = false;" in agents
-assert 'agents_on_inbound(agent, text, true);' in agents, (
-    "HTTP /agents/inbound is a genuine arrival: real_inbound = true"
+inbound_http = agents[agents.index('server.on(AsyncURIMatcher::exact("/agents/inbound")'):]
+inbound_http = inbound_http[:inbound_http.index('server.on(AsyncURIMatcher::exact("/agents/bridge")')]
+assert "inbox_deliver_card(CONV_AGENT" in inbound_http, (
+    "HTTP agent replies must enter through their backing card"
+)
+assert "agents_on_inbound(" not in inbound_http, (
+    "the HTTP route must not append a second copy beside the backing card"
+)
+door_worker = agents[agents.index("if (item.kind == 3)"):]
+door_worker = door_worker[:door_worker.index("if (idx < 0) continue;")]
+assert "agents_on_inbound(" in door_worker and "item.door_event" in door_worker, (
+    "the off-loop card worker must be the canonical thread receiver"
 )
 assert "agents_on_inbound(g_convs[idx].id, line, true);" in agents, (
     "a GPS answer landing (possibly minutes later) is an arrival for the user"
