@@ -106,6 +106,7 @@
 
 #include "../micron/notify_record.h"
 #include "../transport.h"   /* the one card door: inbox_deliver_card + its plan */
+#include "../notify_wire.h" /* pure P/M notify-wire parse — the cross-transport key */
 
 /* Forward decl: the off-loop archive enqueue is defined in skills/history.cpp,
  * which is #included AFTER this file in the unity build (main.cpp). Notify's
@@ -234,6 +235,13 @@ static_assert(NR_SOURCE_CAP == NOTIFY_SOURCE_LEN, "notify_rec source cap drift")
 static_assert(NR_TITLE_CAP  == NOTIFY_TITLE_LEN,  "notify_rec title cap drift");
 static_assert(NR_BODY_CAP   == NOTIFY_BODY_LEN,   "notify_rec body cap drift");
 static_assert(NR_KEY_CAP    == NOTIFY_KEY_LEN,    "notify_rec key cap drift");
+
+/* The pure wire parser (notify_wire.h) fills the same fields off the P/M frames;
+ * pin its caps to the notify widths so a wire value that fits the parser fits the
+ * card and cannot be silently re-truncated on ingest. */
+static_assert(NW_SOURCE_CAP == NOTIFY_SOURCE_LEN, "notify_wire source cap drift");
+static_assert(NW_TITLE_CAP  == NOTIFY_TITLE_LEN,  "notify_wire title cap drift");
+static_assert(NW_KEY_CAP    == NOTIFY_KEY_LEN,    "notify_wire key cap drift");
 
 /* The store itself is sliced onto the host too, because the restore loop under
    it is where a refused entry can leak a slot and only a real slot array shows
@@ -1234,91 +1242,35 @@ static uint32_t notify_ingest(const char *level_s,
     return notify_raise(e, NULL, NULL);
 }
 
-/*
- * Could this be a client key rather than the tail of a body?
- *
- * The alphabet is the one every key this pager is sent already uses —
- * "pingani-a1b2", "hermes-chat", "k1c.print" — and it deliberately excludes the
- * space, which is what keeps ordinary prose from qualifying. See
- * notify_ingest_p1() for why a guess is needed here at all.
- */
-static bool notify_key_plausible(const char *s) {
-    if (!s || !s[0]) return false;
-    size_t n = strlen(s);
-    if (n >= NOTIFY_KEY_LEN) return false;
-    for (size_t i = 0; i < n; i++) {
-        char c = s[i];
-        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-            (c >= '0' && c <= '9') ||
-            c == '-' || c == '_' || c == '.' || c == ':')
-            continue;
-        return false;
-    }
-    return true;
-}
-
-/* Wire format from home-rig MeshCore gateway:
- *   P1|<info|warn|crit>|<source>|<title>|<body>
- *   P1|<info|warn|crit>|<source>|<title>|<body>|<key>
+/* Wire format from the home MeshCore gateway (see src/notify_wire.h for the full
+ * spec the gateway must match byte-for-byte):
+ *   P1|<info|warn|crit>|<source>|<title>|<body>[|<key>]   legacy, key by heuristic
+ *   P2|<info|warn|crit>|<source>|<title>|<body>|<key>     explicit trailing key
  * body may contain '|'. Returns notify id or 0.
  *
- * The trailing key is the client id, and it is what a reply typed on the card
- * needs in order to be routed back to whoever asked — a card without one has
- * nobody upstream, on this transport as much as on the WiFi one.
- *
- * Recovering it means guessing, because the body in front of it is unescaped
- * and may hold separators of its own. The guess is the last '|' of the
- * remainder, taken only when what follows it could be a key at all
- * (notify_key_plausible). A five-field frame whose body happens to end in
- * "|something-like-this" is therefore read as six and loses that tail off the
- * body. That is the whole cost of the ambiguity, and it is paid in a few
- * characters of one message rather than in the routing of every reply.
- */
+ * The key is the client id, and it is what a reply typed on the card needs in
+ * order to be routed back to whoever asked — and it is what makes THIS card dedup
+ * against the same card arriving over M-series or LXMF. On the legacy P1 wire the
+ * key is an optional trailing field recovered by guessing (notify_wire_key_plausible),
+ * because the body in front of it is unescaped and may hold separators of its own;
+ * that guess is the fragility the explicit P2 tag removes, where the trailing '|'
+ * always ends the body and begins the key. The parse itself is the pure, host-tested
+ * notify_wire_parse_p(); this is only the copy-and-raise wrapper. */
 static uint32_t notify_ingest_p1(const char *wire) {
-    if (!wire || strncmp(wire, "P1|", 3) != 0) return 0;
-    const char *p = wire + 3;
-    char level[8] = {0}, source[NOTIFY_SOURCE_LEN] = {0};
-    char title[NOTIFY_TITLE_LEN] = {0};
-    const char *body = "";
+    NotifyPFrame f;
+    if (!notify_wire_parse_p(wire, &f)) return 0;
 
-    const char *a = strchr(p, '|');
-    if (!a) return 0;
-    size_t n = (size_t)(a - p);
-    if (n >= sizeof(level)) n = sizeof(level) - 1;
-    memcpy(level, p, n);
-    p = a + 1;
+    /* body points into `wire`; copy it NUL-terminated so notify_ingest ->
+       notify_copy_text can bound and UTF-8-trim it. */
+    char body[NOTIFY_BODY_LEN];
+    size_t bl = f.body_len;
+    if (bl > sizeof(body) - 1) bl = sizeof(body) - 1;
+    /* Back off a cut that landed inside a UTF-8 sequence before copy_text sees it. */
+    while (bl > 0 && ((unsigned char)f.body[bl] & 0xC0) == 0x80) bl--;
+    memcpy(body, f.body, bl);
+    body[bl] = '\0';
 
-    a = strchr(p, '|');
-    if (!a) return 0;
-    n = (size_t)(a - p);
-    if (n >= sizeof(source)) n = sizeof(source) - 1;
-    memcpy(source, p, n);
-    p = a + 1;
-
-    a = strchr(p, '|');
-    if (!a) return 0;
-    n = (size_t)(a - p);
-    if (n >= sizeof(title)) n = sizeof(title) - 1;
-    memcpy(title, p, n);
-    body = a + 1;
-
-    /* Split the optional trailing key off the body. The body copy only happens
-       on that path; a five-field frame keeps pointing straight into `wire`. */
-    char body_buf[NOTIFY_BODY_LEN] = {0};
-    char key[NOTIFY_KEY_LEN] = {0};
-    const char *last = strrchr(body, '|');
-    if (last && notify_key_plausible(last + 1)) {
-        size_t bn = (size_t)(last - body);
-        if (bn >= sizeof(body_buf)) bn = sizeof(body_buf) - 1;
-        /* Back off a cut that landed inside a UTF-8 sequence: notify_copy_text()
-           can only keep the boundary honest on text it is handed whole. */
-        while (bn > 0 && ((unsigned char)body[bn] & 0xC0) == 0x80) bn--;
-        memcpy(body_buf, body, bn);
-        snprintf(key, sizeof(key), "%s", last + 1);
-        body = body_buf;
-    }
-
-    return notify_ingest(level, source, title, body, key[0] ? key : NULL);
+    return notify_ingest(f.level, f.source, f.title, body, f.key[0] ? f.key : NULL);
 }
 
 /* --- Endpoints --- */

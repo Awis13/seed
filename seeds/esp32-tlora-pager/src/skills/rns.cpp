@@ -265,6 +265,7 @@
 #include "../lxmf_codec.h"
 #include "../lxmf_route.h"
 #include "../lxmf_reply.h"
+#include "../card_ack.h"    /* pure A1|key delivery-ack: decision + wire + dedup ring */
 
 /* The two wire constants rns/pktfilter.h mirrors, checked against the library's
  * own enums here — this is the only translation unit that sees both. A value
@@ -1303,6 +1304,93 @@ bool rns_send_lxmf_reply(const uint8_t *dest, const char *text,
 
     g_rns_lxmf_tx++;
     return true;
+}
+
+/* ---- LXMF per-card delivery ACK (ticket CARD-DELIVERY / C2) --------------- *
+ *
+ * A KEYED card admitted off an LXMF message (rns_lxmf_route, and the same door
+ * for an LXMF wire tunnelled over MeshCore L1) owes the gateway a delivery
+ * confirmation the WiFi lane gets for free from its 200. lxmf_card_ack_stage()
+ * records the card's key AND the sender's 16-byte lxmf.delivery hash — the ACK
+ * goes back to whoever sent the card, over LXMF. lxmf_card_ack_poll() emits it
+ * from the LOOP TASK (after rns_stack.loop(), never in the drain) by handing
+ * "A1|key" to rns_send_lxmf_reply(), which builds/signs/enqueues onto the shared
+ * outbox ladder — RAM + crypto only, no stack call, exactly where the announce
+ * sign and a keyboard reply already run.
+ *
+ * A tiny FIFO for the same reason as the mesh lane: a store-and-forward flush is
+ * a burst. Dedup (g_lxmf_ack_seen) stops an ack storm and is marked on the
+ * successful ENQUEUE; a send that could not be queued (rns not ready / outbox
+ * full) is left pending and retried next pass. Bounded and static. The stage runs
+ * on the loop task (lxmf_ingest_wire's task); guarded by a spinlock for symmetry
+ * with the rest of this file's producers. */
+#define LXMF_ACK_Q_MAX 6
+struct LxmfAckItem {
+    char    key[NW_KEY_CAP];
+    uint8_t dest[LXMF_HASH_LEN];
+};
+static LxmfAckItem   g_lxmf_ack_q[LXMF_ACK_Q_MAX];
+static uint8_t       g_lxmf_ack_qn = 0;
+static CardAckSeen   g_lxmf_ack_seen = {};
+static portMUX_TYPE  g_lxmf_ack_mux = portMUX_INITIALIZER_UNLOCKED;
+
+static void lxmf_card_ack_stage(const char *key, const uint8_t *dest) {
+    if (card_ack_decide(CONV_LXMF, key) != CARD_ACK_LXMF) return;
+    if (!dest) return;
+    portENTER_CRITICAL(&g_lxmf_ack_mux);
+    bool skip = card_ack_seen_has(&g_lxmf_ack_seen, key);   /* already acked */
+    for (int i = 0; !skip && i < g_lxmf_ack_qn; i++)
+        if (strcmp(g_lxmf_ack_q[i].key, key) == 0) skip = true;  /* already queued */
+    if (!skip && g_lxmf_ack_qn < LXMF_ACK_Q_MAX) {
+        snprintf(g_lxmf_ack_q[g_lxmf_ack_qn].key, NW_KEY_CAP, "%s", key);
+        memcpy(g_lxmf_ack_q[g_lxmf_ack_qn].dest, dest, LXMF_HASH_LEN);
+        g_lxmf_ack_qn++;
+    }
+    portEXIT_CRITICAL(&g_lxmf_ack_mux);
+}
+
+/* Drained on the LOOP TASK from skill_rns_poll, after the stack has run. One ack
+ * per pass; a peek-then-pop so a send that is refused stays queued for a retry. */
+static void lxmf_card_ack_poll() {
+    if (g_lxmf_ack_qn == 0) return;
+
+    char    key[NW_KEY_CAP];
+    uint8_t dest[LXMF_HASH_LEN];
+    portENTER_CRITICAL(&g_lxmf_ack_mux);
+    snprintf(key, sizeof(key), "%s", g_lxmf_ack_q[0].key);
+    memcpy(dest, g_lxmf_ack_q[0].dest, LXMF_HASH_LEN);
+    portEXIT_CRITICAL(&g_lxmf_ack_mux);
+    if (!key[0]) { /* corrupt head: drop it */
+        portENTER_CRITICAL(&g_lxmf_ack_mux);
+        for (int i = 1; i < g_lxmf_ack_qn; i++) g_lxmf_ack_q[i - 1] = g_lxmf_ack_q[i];
+        if (g_lxmf_ack_qn) g_lxmf_ack_qn--;
+        portEXIT_CRITICAL(&g_lxmf_ack_mux);
+        return;
+    }
+
+    char frame[CARD_ACK_FRAME_CAP];
+    if (!card_ack_encode(key, frame, sizeof(frame))) {
+        /* unencodable key: drop it rather than spin */
+        portENTER_CRITICAL(&g_lxmf_ack_mux);
+        for (int i = 1; i < g_lxmf_ack_qn; i++) g_lxmf_ack_q[i - 1] = g_lxmf_ack_q[i];
+        if (g_lxmf_ack_qn) g_lxmf_ack_qn--;
+        portEXIT_CRITICAL(&g_lxmf_ack_mux);
+        return;
+    }
+
+    const char *why = nullptr;
+    if (!rns_send_lxmf_reply(dest, frame, &why)) {
+        /* rns not ready / outbox full: keep it pending, retry next pass. */
+        return;
+    }
+    /* Enqueued onto the ladder: pop it and remember it so a re-delivery is not
+     * re-acked. */
+    portENTER_CRITICAL(&g_lxmf_ack_mux);
+    for (int i = 1; i < g_lxmf_ack_qn; i++) g_lxmf_ack_q[i - 1] = g_lxmf_ack_q[i];
+    if (g_lxmf_ack_qn) g_lxmf_ack_qn--;
+    card_ack_seen_add(&g_lxmf_ack_seen, key);
+    portEXIT_CRITICAL(&g_lxmf_ack_mux);
+    event_add("card ack lxmf A1: %s", key);
 }
 
 /* ---- announce state ----
@@ -3122,8 +3210,13 @@ static bool lxmf_ingest_wire(const uint8_t *wire, size_t len) {
     if (strcmp(route.level, "warn") == 0)      sev = INBOX_SEV_WARN;
     else if (strcmp(route.level, "crit") == 0) sev = INBOX_SEV_CRIT;
     if (inbox_deliver_card(CONV_LXMF, route.key, sev, route.source,
-                           title[0] ? title : "lxmf", g_rns_card_body) != 0)
+                           title[0] ? title : "lxmf", g_rns_card_body) != 0) {
         g_rns_lxmf_cards++;
+        /* Admitted and keyed: stage a delivery ACK back to the sender over LXMF
+         * (C2). Keyless cards get none — card_ack_decide returns NONE for them. */
+        if (route.key[0])
+            lxmf_card_ack_stage(route.key, g_rns_lxmf_msg.source_hash);
+    }
     return true;
 }
 
@@ -3631,6 +3724,10 @@ static void skill_rns_poll() {
      * rns_stack.loop(), so a step taken ahead of it reads last tick's path
      * table and every rung of the ladder costs an extra RNS_TICK_MS. */
     rns_send_poll();
+    /* Emit any staged A1|key delivery acks over LXMF (C2). After the stack and
+     * the send poll: the enqueue rides the same outbox ladder rns_send_poll
+     * drives, so a card admitted this pass is acked on the next. */
+    lxmf_card_ack_poll();
     /* Loop task, right after the stack has run: everything GET /rns/status is
      * not allowed to read live is republished here. */
     rns_status_publish();
