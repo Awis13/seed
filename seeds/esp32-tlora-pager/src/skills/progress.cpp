@@ -463,7 +463,7 @@ static void progress_poll() {
 /*
  * The winning job as one line for the clock face's note row, plus the
  * percentage the bar under it is drawn from. Formatting only — this skill never
- * touches TFT_eSPI, the same arrangement ir_status_line() had before the arc
+ * draws the panel, the same arrangement ir_status_line() had before the arc
  * grew an arbiter.
  *
  * Reads the loop-owned snapshot, so it must be called from the loop task, which

@@ -1423,7 +1423,7 @@ static const char *notify_describe() {
            "the earlier message instead of queueing a second one, so a job that\n"
            "reports progress leaves one entry rather than fifty.\n\n"
            "Lengths are capped and longer values are truncated, not rejected:\n"
-           "title 40, body 96, source 16, id 24, and each option label 15 —\n"
+           "title 60, body 240, source 16, id 24, and each option label 15 —\n"
            "bytes, which is characters for ASCII and fewer for anything else.\n"
            "The cut lands on a character boundary, so a multi-byte one is\n"
            "dropped whole rather than left half-written in the JSON.\n\n"
