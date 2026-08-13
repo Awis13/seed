@@ -138,6 +138,17 @@ class AgentChannelTests(unittest.TestCase):
 
 
 class DeliveryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_c1_mid_is_forwarded_as_bridge_idempotency_key(self):
+        daemon = load_daemon()
+        daemon.cfg = {"agent_bridge": {"url": "http://bridge"}}
+        with mock.patch.object(daemon, "_http_json_post", return_value=(202, "ok")) as post:
+            await daemon.handle_c1_uplink(
+                "pager", "C1|hermes|tx-1234|1|1|u|hello"
+            )
+        payload = post.call_args.args[1]
+        self.assertEqual(payload["id"], "tx-1234")
+        self.assertEqual(payload["text"], "hello")
+
     async def test_reject_moves_item_to_durable_dead_letter(self):
         daemon = load_daemon()
         with tempfile.TemporaryDirectory() as directory:

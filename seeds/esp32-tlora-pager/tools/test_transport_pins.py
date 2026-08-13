@@ -79,12 +79,12 @@ assert "agents_gps_intercept(idx, cleaned)" in send, (
 assert "agents_push_line(idx, true, cleaned)" in send, (
     "the message must still land in the room before it is handed to a transport"
 )
-assert "transport_send(&g_convs[idx], cleaned)" in send, (
+assert "transport_send(&g_convs[idx], cleaned, delivery_key)" in send, (
     "agents_send must hand off to the one outbound seam"
 )
 
 # --- 2. dispatch goes through the pure planner -------------------------------
-tsend = fn_body(agents, "bool transport_send(const struct Conversation *conv, const char *text)")
+tsend = fn_body(agents, "bool transport_send(const struct Conversation *conv, const char *text,")
 assert "transport_plan(&tgt" in tsend, (
     "transport_send must dispatch through the pure planner, not a private switch"
 )
@@ -113,7 +113,7 @@ assert re.search(r'\*why\s*=\s*"[^"]+"', mesh), (
 )
 # Nothing anywhere in the mesh backend may reach for the gateway send.
 assert "mesh_client_send_to_gateway" not in fn_body(
-    agents, "bool transport_send(const struct Conversation *conv, const char *text)"
+    agents, "bool transport_send(const struct Conversation *conv, const char *text,"
 ), "transport_send must not fall back to the gateway"
 
 # --- 4. a card is raised in exactly one place --------------------------------

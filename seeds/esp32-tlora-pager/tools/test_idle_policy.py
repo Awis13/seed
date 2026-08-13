@@ -93,12 +93,16 @@ assert "g_agents_real_inbound = false;" in consume, (
 assert "static volatile bool g_agents_real_inbound = false;" in agents
 inbound_http = agents[agents.index('server.on(AsyncURIMatcher::exact("/agents/inbound")'):]
 inbound_http = inbound_http[:inbound_http.index('server.on(AsyncURIMatcher::exact("/agents/bridge")')]
-assert "inbox_deliver_card(CONV_AGENT" in inbound_http, (
+assert "inbox_deliver_card(" in inbound_http and "CONV_AGENT" in inbound_http, (
     "HTTP agent replies must enter through their backing card"
 )
 assert "agents_on_inbound(" not in inbound_http, (
     "the HTTP route must not append a second copy beside the backing card"
 )
+assert 'const char *key   = input["id"]' in inbound_http
+assert "agents_inbound_key_duplicate(key)" in inbound_http
+assert "key[0] ? key : nullptr" in inbound_http
+assert "agents_inbound_key_commit(key)" in inbound_http
 door_worker = agents[agents.index("if (item.kind == 3)"):]
 door_worker = door_worker[:door_worker.index("if (idx < 0) continue;")]
 assert "agents_on_inbound(" in door_worker and "item.door_event" in door_worker, (
@@ -126,6 +130,10 @@ assert "g_agents_real_inbound = true;" in c1, (
     "a chat line arriving over LoRa must wake the open room like WiFi does"
 )
 assert c1.index("g_agents_real_inbound = true;") < c1.index("display_force = true;")
+assert "agents_inbound_key_duplicate(delivery_key)" in c1, (
+    "a looped-back user line or replayed agent delivery must not append twice"
+)
+assert "agents_inbound_key_commit(delivery_key)" in c1
 
 # --- mesh TX failure line: per-agent, only on that room's success->fail edge --
 assert "static bool g_mesh_chat_tx_failed[AGENTS_N]" in mesh, (

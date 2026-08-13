@@ -24,6 +24,10 @@ assert "mesh_client_send_to_gateway" not in uplink, (
 )
 assert "delay(350)" not in uplink, "multi-part chat must not freeze the UI"
 assert "g_mesh_chat_tx.active = true" in uplink
+assert "agents_delivery_key_valid(delivery_key)" in uplink
+assert 'snprintf(mid, sizeof(mid), "%s", delivery_key)' in uplink, (
+    "WiFi timeout fallback must reuse the same idempotency key as C1 mid"
+)
 assert "expected_ack_crc = 0" in client
 assert 'agents_on_inbound(agent, "(mesh delivery failed - resend)", false)' in mesh
 manual_ping = main[main.index("// ---- Mesh path: sparse private probe"):

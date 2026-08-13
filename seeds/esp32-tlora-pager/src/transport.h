@@ -208,7 +208,8 @@ static inline void conv_route_resolve(bool seeded,
  * true when the message was accepted by a backend; a backend that cannot take
  * it puts one short line in the room rather than failing silently.
  */
-bool transport_send(const struct Conversation *conv, const char *text);
+bool transport_send(const struct Conversation *conv, const char *text,
+                    const char *delivery_key = nullptr);
 
 /*
  * Raise ONE notification card, whichever transport it arrived on

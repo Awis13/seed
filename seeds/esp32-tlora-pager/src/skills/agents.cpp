@@ -65,6 +65,7 @@
 #include "../transport.h"          // the backend contract: transport_send + the inbox doors
 #include "../rns/outbox.h"         // the OTHER half of that seam: rns_send_envelope + rns_peer_addr
 #include "../agent_transport.h"    // C2: pure rung selection over the C1 reachability verdict
+#include "../card_ack.h"          // bounded recent-key ring + shared key grammar
 
 /* Conversation slots. A slot used to carry its own AGENT_VIEW_MAX viewport, so
  * the table cost 12.6 KB per conversation and could not grow without spending
@@ -211,6 +212,45 @@ static char g_bridge[AGENT_BRIDGE_LEN] = "";
 static char g_session[AGENT_SESSION_LEN] = "pager";
 static FS *g_store = nullptr;        // &SD (primary) or &SPIFFS (fallback)
 static bool g_store_is_sd = false;
+static portMUX_TYPE g_agent_key_spin = portMUX_INITIALIZER_UNLOCKED;
+static uint16_t g_agent_key_next = 1;
+static CardAckSeen g_agent_sent_keys = {};
+static CardAckSeen g_agent_inbound_keys = {};
+
+static bool agents_delivery_key_valid(const char *key) {
+    return key && key[0] && notify_wire_key_plausible(key);
+}
+
+static void agents_delivery_key_next(char out[NW_KEY_CAP]) {
+    portENTER_CRITICAL(&g_agent_key_spin);
+    uint16_t seq = g_agent_key_next++;
+    if (g_agent_key_next == 0) g_agent_key_next = 1;
+    portEXIT_CRITICAL(&g_agent_key_spin);
+    snprintf(out, NW_KEY_CAP, "tx-%04x", (unsigned)seq);
+}
+
+static bool agents_inbound_key_duplicate(const char *key) {
+    if (!agents_delivery_key_valid(key)) return false; /* keyless is distinct */
+    portENTER_CRITICAL(&g_agent_key_spin);
+    bool duplicate = card_ack_seen_has(&g_agent_sent_keys, key) ||
+                     card_ack_seen_has(&g_agent_inbound_keys, key);
+    portEXIT_CRITICAL(&g_agent_key_spin);
+    return duplicate;
+}
+
+static void agents_inbound_key_commit(const char *key) {
+    if (!agents_delivery_key_valid(key)) return;
+    portENTER_CRITICAL(&g_agent_key_spin);
+    card_ack_seen_add(&g_agent_inbound_keys, key);
+    portEXIT_CRITICAL(&g_agent_key_spin);
+}
+
+static void agents_sent_key_commit(const char *key) {
+    if (!agents_delivery_key_valid(key)) return;
+    portENTER_CRITICAL(&g_agent_key_spin);
+    card_ack_seen_add(&g_agent_sent_keys, key);
+    portEXIT_CRITICAL(&g_agent_key_spin);
+}
 
 /* Recursive mutex: agents_push_line() locks itself (mesh task calls it without
  * a lock) while send/inbound/view also take the same lock (nested). File IO
@@ -1567,7 +1607,7 @@ static bool agents_bridge_save(const char *url) {
 /* Best-effort POST to the bridge. Runs on the loop/web task — short timeout.
    Returns true if the bridge accepted the message (2xx). */
 static bool agents_bridge_post(const char *agent_id, const char *session,
-                               const char *text) {
+                               const char *text, const char *delivery_key) {
     if (!g_bridge[0] || !agent_id || !session || !text || !text[0]) return false;
     if (WiFi.status() != WL_CONNECTED) return false;
 
@@ -1581,6 +1621,7 @@ static bool agents_bridge_post(const char *agent_id, const char *session,
     doc["session"] = session;
     doc["text"] = text;
     doc["from"] = "tlora-pager";
+    if (agents_delivery_key_valid(delivery_key)) doc["id"] = delivery_key;
     String body;
     serializeJson(doc, body);
 
@@ -1641,7 +1682,8 @@ static bool agents_normalize_inbound(const char *text, char *out, size_t out_n) 
 }
 
 /* Optional mesh uplink (registered by meshcore skill). Same framing as downlink. */
-typedef bool (*AgentsMeshUplinkFn)(const char *agent_id, const char *text);
+typedef bool (*AgentsMeshUplinkFn)(const char *agent_id, const char *text,
+                                   const char *delivery_key);
 static AgentsMeshUplinkFn g_agents_mesh_uplink = nullptr;
 
 static void agents_set_mesh_uplink(AgentsMeshUplinkFn fn) {
@@ -1861,7 +1903,7 @@ static bool agents_rns_rung_ok(const char *agent_id, const char **why) {
  * configured address, so offering it to every agent would put `hermes` traffic
  * on a link the user configured for something else. */
 static bool transport_send_agent(int idx, const char *conv_id, const char *session,
-                                 const char *text) {
+                                 const char *text, const char *delivery_key) {
     /* LXMF-ORIGIN ROOMS ANSWER AS LXMF, and BEFORE the seed.pager uplink below.
      * If this room last received an LXMF message, its reply goes back to THAT
      * sender over lxmf.delivery, not to the configured seed.pager peer — which
@@ -1907,7 +1949,7 @@ static bool transport_send_agent(int idx, const char *conv_id, const char *sessi
      * rung below it (WiFi -> RNS -> MeshCore) so a transient higher-rung fault
      * does not drop the card. */
     if (rung == AGENT_RUNG_WIFI) {
-        if (agents_bridge_post(conv_id, session, text)) {
+        if (agents_bridge_post(conv_id, session, text, delivery_key)) {
             event_add("agent %s bridge uplink", conv_id);
             return true;
         }
@@ -1923,7 +1965,7 @@ static bool transport_send_agent(int idx, const char *conv_id, const char *sessi
         rung = mesh_avail ? AGENT_RUNG_MESHCORE : AGENT_RUNG_NONE;
     }
     if (rung == AGENT_RUNG_MESHCORE && g_agents_mesh_uplink) {
-        if (g_agents_mesh_uplink(conv_id, text)) {
+        if (g_agents_mesh_uplink(conv_id, text, delivery_key)) {
             event_add("agent %s mesh uplink", conv_id);
             return true;
         }
@@ -1991,7 +2033,8 @@ static bool transport_send_mesh(const uint8_t *addr, uint8_t addr_len,
  * chat path. The active room is read off the conversation so no caller has to
  * pass — or pick — one.
  */
-bool transport_send(const struct Conversation *conv, const char *text) {
+bool transport_send(const struct Conversation *conv, const char *text,
+                    const char *delivery_key) {
     if (!conv || !text || !text[0]) return false;
     int idx = agents_find(conv->id);
     if (idx < 0) return false;
@@ -2014,7 +2057,8 @@ bool transport_send(const struct Conversation *conv, const char *text) {
     } else if (backend == TRANSPORT_BACKEND_AGENT) {
         /* Owns its own in-room reporting (the bridge/RNS ladder's error lines). */
         return transport_send_agent(idx, conv->id,
-                                    conv->sessions[conv->active_idx], text);
+                                    conv->sessions[conv->active_idx], text,
+                                    delivery_key);
     } else if (backend == TRANSPORT_BACKEND_LXMF) {
         ok = transport_send_lxmf(addr, text, &why);
         if (ok) event_add("conv %s lxmf reply", conv->id);
@@ -2056,7 +2100,10 @@ static bool agents_send(const char *agent_id, const char *text) {
     agents_unlock();
     display_force = true;
 
-    transport_send(&g_convs[idx], cleaned);
+    char delivery_key[NW_KEY_CAP];
+    agents_delivery_key_next(delivery_key);
+    agents_sent_key_commit(delivery_key);
+    transport_send(&g_convs[idx], cleaned, delivery_key);
     /* The room already carries the outcome (the backend puts one line in it on
      * failure), and the caller's contract has always been "accepted into the
      * thread", not "delivered" — GET /agents and the transport status routes
@@ -2922,23 +2969,30 @@ static void agents_register_routes(AsyncWebServer &server) {
         free(body);
         const char *agent = input["agent"] | "";
         const char *text  = input["text"]  | "";
+        const char *key   = input["id"]    | "";
         if (agents_find(agent) < 0) { notify_send_error(req, 400, "unknown conversation"); return; }
         if (!text[0]) { notify_send_error(req, 400, "text required"); return; }
+        if (key[0] && !agents_delivery_key_valid(key)) {
+            notify_send_error(req, 400, "invalid id"); return;
+        }
+        bool duplicate = agents_inbound_key_duplicate(key);
         /* One receiver: HTTP agent replies enter as a backing card. C3's
          * off-loop door worker is the sole path that appends the body to the
          * thread, then ACKs/hides this card by its event identity. Calling
          * agents_on_inbound here as well would store the same reply twice. */
-        uint32_t card_id = inbox_deliver_card(CONV_AGENT, nullptr,
-                                              INBOX_SEV_INFO, agent,
-                                              "CHAT", text);
-        if (!card_id) {
+        uint32_t card_id = duplicate ? 0 : inbox_deliver_card(
+            CONV_AGENT, key[0] ? key : nullptr, INBOX_SEV_INFO,
+            agent, "CHAT", text);
+        if (!duplicate && !card_id) {
             notify_send_error(req, 503, "inbound queue full");
             return;
         }
+        if (card_id) agents_inbound_key_commit(key);
         JsonDocument doc;
         doc["ok"] = true;
         doc["agent"] = agent;
-        doc["notification_id"] = card_id;
+        doc["duplicate"] = duplicate;
+        if (card_id) doc["notification_id"] = card_id;
         notify_send_json(req, 200, doc);
     }, NULL, handle_body_collect);
 
@@ -3094,6 +3148,8 @@ static void skill_agents_init() {
     snprintf(g_session, sizeof(g_session), "pager-%04x",
              (unsigned)(mac & 0xFFFF));
     agents_mux = xSemaphoreCreateRecursiveMutex();
+    g_agent_key_next = (uint16_t)esp_random();
+    if (g_agent_key_next == 0) g_agent_key_next = 1;
     agents_bridge_load();
     agents_store_init();
 
