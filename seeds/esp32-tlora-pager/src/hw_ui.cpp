@@ -989,7 +989,8 @@ void hw_ui_show_notify(const char *level,
                        const char *source,
                        const char *title,
                        const char *body,
-                       int unread) {
+                       int unread,
+                       const char *delivery) {
     if (!panel_ok) return;
     screen = HW_UI_NOTIFY;
 
@@ -1005,7 +1006,9 @@ void hw_ui_show_notify(const char *level,
     snprintf(head, sizeof(head), "%s", level && level[0] ? level : "info");
     for (char *p = head; *p; p++) if (*p >= 'a' && *p <= 'z') *p -= 32;
     tft_draw_text(MARGIN, 4, head, COL_BG, accent, 2);
-    if (unread > 0) {
+    if (delivery && delivery[0]) {
+        tft_draw_text_r(PANEL_W - MARGIN, 4, delivery, COL_BG, accent, 2);
+    } else if (unread > 0) {
         char badge[16];
         snprintf(badge, sizeof(badge), "%d UNREAD", unread);
         tft_draw_text_r(PANEL_W - MARGIN, 4, badge, COL_BG, accent, 2);

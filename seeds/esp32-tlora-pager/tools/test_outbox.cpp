@@ -14,6 +14,7 @@ int main() {
                           "wire-2", "world") == 2);
     assert(outbox_oldest_pending(&store)->id == first);
     assert(outbox_set_state(&store, first, OUTBOX_STATE_SENT));
+    assert(outbox_latest_target(&store, OUTBOX_KIND_REPLY, "card-1")->id == first);
     assert(outbox_oldest_pending(&store)->id == 2);
 
     for (int i = 0; i < OUTBOX_SLOTS - 2; ++i) {
@@ -28,6 +29,8 @@ int main() {
     assert(outbox_find_id(&store, first) < 0);
     assert(outbox_find_id(&store, replacement) >= 0);
     assert(outbox_enqueue(&store, OUTBOX_KIND_REPLY, "full", "", "k", "x") == 0);
+    assert(outbox_retry_delay_ms(1) == 5000);
+    assert(outbox_retry_delay_ms(9) == 900000);
 
     uint8_t snapshot[OUTBOX_SNAPSHOT_MAX];
     size_t encoded = outbox_encode(&store, snapshot, sizeof(snapshot));

@@ -138,7 +138,8 @@ void hw_ui_show_notify(const char *level,
                        const char *source,
                        const char *title,
                        const char *body,
-                       int unread);
+                       int unread,
+                       const char *delivery = nullptr);
 
 // Agent chat door: big name + teaser. Click opens the room (not a full msg card).
 void hw_ui_show_agent_invite(const char *agent_name,

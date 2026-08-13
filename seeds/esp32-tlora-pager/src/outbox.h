@@ -11,6 +11,7 @@
 #define OUTBOX_KEY_LEN 25
 #define OUTBOX_TEXT_LEN 512
 #define OUTBOX_SNAPSHOT_MAX 5200
+#define OUTBOX_ATTEMPTS_MAX 7
 
 enum OutboxKind : uint8_t {
     OUTBOX_KIND_REPLY = 1,
@@ -105,6 +106,44 @@ static inline bool outbox_set_state(OutboxStore *store, uint32_t id,
         return false;
     store->items[slot].state = state;
     return true;
+}
+
+static inline bool outbox_remove(OutboxStore *store, uint32_t id) {
+    int slot = outbox_find_id(store, id);
+    if (slot < 0) return false;
+    memset(&store->items[slot], 0, sizeof(store->items[slot]));
+    return true;
+}
+
+static inline const OutboxItem *outbox_latest_target(const OutboxStore *store,
+                                                     uint8_t kind,
+                                                     const char *target) {
+    const OutboxItem *best = nullptr;
+    if (!store || !target || !target[0]) return nullptr;
+    for (int i = 0; i < OUTBOX_SLOTS; ++i) {
+        const OutboxItem *item = &store->items[i];
+        if (!item->id || item->kind != kind || strcmp(item->target, target) != 0)
+            continue;
+        if (!best || item->id > best->id) best = item;
+    }
+    return best;
+}
+
+static inline uint32_t outbox_retry_delay_ms(uint8_t attempts) {
+    static const uint32_t delays[] = {5000, 15000, 60000, 300000, 900000};
+    if (!attempts) return 0;
+    size_t i = (size_t)attempts - 1;
+    if (i >= sizeof(delays) / sizeof(delays[0]))
+        i = sizeof(delays) / sizeof(delays[0]) - 1;
+    return delays[i];
+}
+
+static inline void outbox_nudge_pending(OutboxStore *store) {
+    if (!store) return;
+    for (int i = 0; i < OUTBOX_SLOTS; ++i) {
+        if (store->items[i].id && store->items[i].state == OUTBOX_STATE_QUEUED)
+            store->items[i].next_try_ms = 0;
+    }
 }
 
 static inline OutboxItem *outbox_oldest_pending(OutboxStore *store) {

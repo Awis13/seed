@@ -1682,7 +1682,10 @@ static void conn_mgr_service() {
 
     ConnMgrActions a = conn_mgr_step(&g_conn_mgr, &in);
 
-    if (a.on_attach) event_add("conn: network attached");
+    if (a.on_attach) {
+        outbox_nudge_pending(&g_outbox);
+        event_add("conn: network attached");
+    }
     if (a.on_lost) event_add("conn: network lost");
 
     // Stage a flush beacon on a genuine attach (rate-limited against flaps). The
@@ -2299,30 +2302,19 @@ static void gw_token_load() {
 // nothing else.
 #define REPLY_UP_FRAME_MAX  150   // one MeshCore DM, same budget as C1 uplink
 
-// Staged by Enter, drained by loop(). ui_reply_submit() runs on the loop task
-// already — it is reached from the keyboard drain — so this is not about task
-// safety but about the clock: an HTTP POST with a 5 s timeout inside the key
-// handler freezes the panel between the keystroke and the "sent" face. Raising
-// a flag lets the card paint and return to the clock first, and the blocking
-// work happens further down the same loop pass with nothing left on screen
-// waiting for it. One slot, because it is drained on the pass that fills it and
-// a second Enter cannot arrive inside one iteration.
-static volatile bool reply_up_pending = false;
-static char reply_up_key[NOTIFY_KEY_LEN];
-static char reply_up_text[NOTIFY_REPLY_LEN];
-
-static void reply_upstream_queue(const char *key, const char *text) {
-    if (!key || !key[0] || !text || !text[0]) return;
-    snprintf(reply_up_key, sizeof(reply_up_key), "%s", key);
-    snprintf(reply_up_text, sizeof(reply_up_text), "%s", text);
-    reply_up_pending = true;
+static bool reply_upstream_queue(const char *key, const char *text) {
+    uint32_t id = outbox_enqueue(&g_outbox, OUTBOX_KIND_REPLY, key, "", key, text);
+    if (!id) return false;
+    if (outbox_persist()) return true;
+    outbox_remove(&g_outbox, id);
+    return false;
 }
 
-// POST {gw}/reply {"key":…,"reply":…}. True only on 2xx — anything else is a
-// gateway that did not take it, and the mesh path is what that is for.
-static bool reply_upstream_http(const char *key, const char *text) {
-    if (WiFi.status() != WL_CONNECTED) return false;
-    if (!mesh_gw_url[0]) return false;
+enum ReplyHttpResult : uint8_t { REPLY_HTTP_FAIL, REPLY_HTTP_OK, REPLY_HTTP_AUTH };
+
+static ReplyHttpResult reply_upstream_http(const char *key, const char *text) {
+    if (WiFi.status() != WL_CONNECTED) return REPLY_HTTP_FAIL;
+    if (!mesh_gw_url[0]) return REPLY_HTTP_FAIL;
 
     size_t bl = strlen(mesh_gw_url);
     while (bl > 0 && mesh_gw_url[bl - 1] == '/') bl--;
@@ -2340,14 +2332,15 @@ static bool reply_upstream_http(const char *key, const char *text) {
     // not the whole 5 s read window, or the panel freezes for the difference.
     http.setConnectTimeout(1000);
     http.setTimeout(5000);
-    if (!http.begin(url)) return false;
+    if (!http.begin(url)) return REPLY_HTTP_FAIL;
     http.addHeader("Content-Type", "application/json");
     if (gw_token[0]) {
         http.addHeader("Authorization", String("Bearer ") + gw_token);
     }
     int code = http.POST(body);
     http.end();
-    return code >= 200 && code < 300;
+    if (code == 401 || code == 403) return REPLY_HTTP_AUTH;
+    return (code >= 200 && code < 300) ? REPLY_HTTP_OK : REPLY_HTTP_FAIL;
 }
 
 // One private DM: R1|key|reply, cut to the frame budget on a codepoint
@@ -2379,29 +2372,70 @@ static bool reply_upstream_mesh(const char *key, const char *text) {
 }
 
 static void reply_upstream_poll() {
-    if (!reply_up_pending) return;
+    OutboxItem *item = outbox_oldest_pending(&g_outbox);
+    if (!item || item->kind != OUTBOX_KIND_REPLY) return;
+    uint32_t now = millis();
+    if (item->next_try_ms && (int32_t)(now - item->next_try_ms) < 0) return;
 
-    char key[NOTIFY_KEY_LEN];
-    char text[NOTIFY_REPLY_LEN];
-    snprintf(key, sizeof(key), "%s", reply_up_key);
-    snprintf(text, sizeof(text), "%s", reply_up_text);
-    if (!key[0] || !text[0]) return;
-
-    if (reply_upstream_http(key, text)) {
-        reply_up_pending = false;
-        event_add("reply upstream wifi ok: %s", key);
+    item->state = OUTBOX_STATE_SENDING;
+    ReplyHttpResult http = reply_upstream_http(item->target, item->text);
+    if (http == REPLY_HTTP_OK) {
+        item->state = OUTBOX_STATE_SENT;
+        outbox_persist();
+        event_add("reply upstream wifi ok: %s", item->target);
+        return;
+    }
+    if (http == REPLY_HTTP_AUTH) {
+        item->state = OUTBOX_STATE_AUTH;
+        outbox_persist();
+        event_add("reply upstream auth: %s", item->target);
         return;
     }
     // C1/probe/R1 share one MeshCore ACK slot. Keep this reply pending until
     // the current private frame completes instead of overwriting its CRC.
-    if (mesh_client_ack_pending()) return;
-    if (reply_upstream_mesh(key, text)) {
-        reply_up_pending = false;
-        event_add("reply upstream mesh R1: %s", key);
+    if (mesh_client_ack_pending()) {
+        item->state = OUTBOX_STATE_QUEUED;
         return;
     }
-    reply_up_pending = false;
-    event_add("reply upstream unreachable: %s (kept on device)", key);
+    if (reply_upstream_mesh(item->target, item->text)) {
+        item->state = OUTBOX_STATE_SENT;
+        outbox_persist();
+        event_add("reply upstream mesh R1: %s", item->target);
+        return;
+    }
+    item->attempts++;
+    if (item->attempts >= OUTBOX_ATTEMPTS_MAX) {
+        item->state = OUTBOX_STATE_FAIL;
+        item->next_try_ms = 0;
+    } else {
+        item->state = OUTBOX_STATE_QUEUED;
+        item->next_try_ms = now + outbox_retry_delay_ms(item->attempts);
+    }
+    outbox_persist();
+    event_add("reply upstream retry %u: %s", (unsigned)item->attempts,
+              item->target);
+}
+
+static const char *outbox_reply_status(const char *key) {
+    const OutboxItem *item = outbox_latest_target(&g_outbox, OUTBOX_KIND_REPLY, key);
+    if (!item) return nullptr;
+    switch (item->state) {
+    case OUTBOX_STATE_QUEUED:
+    case OUTBOX_STATE_SENDING: return "QUEUED";
+    case OUTBOX_STATE_SENT:    return "SENT";
+    case OUTBOX_STATE_AUTH:    return "AUTH";
+    case OUTBOX_STATE_FAIL:    return "FAIL";
+    default:                   return nullptr;
+    }
+}
+
+static char outbox_reply_mark(const char *key) {
+    const OutboxItem *item = outbox_latest_target(&g_outbox, OUTBOX_KIND_REPLY, key);
+    if (!item) return '\0';
+    if (item->state == OUTBOX_STATE_QUEUED || item->state == OUTBOX_STATE_SENDING)
+        return '~';
+    if (item->state == OUTBOX_STATE_SENT) return '+';
+    return '!';
 }
 
 // POST {gw}/flush {"id":…} — the attach flush beacon (CARD-DELIVERY / C3). Runs
@@ -3061,6 +3095,7 @@ static void ui_reply_submit() {
         return;
     }
     if (!notify_card_id) return;
+    bool queued = false;
     if (notify_set_reply(notify_card_id, reply_buf)) {
         hw_haptic_notify(0);
         hw_sound_notify(0);
@@ -3070,13 +3105,15 @@ static void ui_reply_submit() {
         // serves. A card with no client id has nowhere to go — that is the whole
         // condition, and it leaves the reply stored exactly as before.
         NotifyView v;
-        if (notify_view_by_id(notify_card_id, v, NULL, NULL) && v.key[0])
-            reply_upstream_queue(v.key, v.reply);
+        if (notify_view_by_id(notify_card_id, v, NULL, NULL) && v.key[0]) {
+            queued = reply_upstream_queue(v.key, v.reply);
+            event_add("reply outbox %s: %s", queued ? "queued" : "full", v.key);
+        }
     }
     notify_card_id = 0;
     reply_buf[0] = '\0';
     reply_mode = REPLY_MODE_NONE;
-    ui_go_clock("sent");
+    ui_go_clock(queued ? "queued" : "saved");
 }
 
 static void ui_on_key(const char *u) {
@@ -3567,7 +3604,8 @@ static void ui_open_msglist() {
         cards[nc].id = v.id;
         cards[nc].epoch = v.created_epoch;
         cards[nc].title = card_titles[nc];
-        cards[nc].sev = msglist_sev_letter(v.level);
+        char delivery = outbox_reply_mark(v.key);
+        cards[nc].sev = delivery ? delivery : msglist_sev_letter(v.level);
         cards[nc].unread = v.unread ? 1 : 0;
         nc++;
     }
@@ -3918,7 +3956,7 @@ static void ui_open_notify_id(uint32_t id) {
     notify_card_id = id;
     snprintf(reply_title, sizeof(reply_title), "%s", v.title);
     hw_ui_show_notify(notify_level_name(v.level), v.source, v.title,
-                      v.body, notify_unread_count());
+                      v.body, notify_unread_count(), outbox_reply_status(v.key));
     ui_note_input();
 }
 
@@ -4768,7 +4806,8 @@ void loop() {
                 notify_card_id = arrived_id;
                 snprintf(reply_title, sizeof(reply_title), "%s", v.title);
                 hw_ui_show_notify(notify_level_name(v.level), v.source, v.title,
-                                  v.body, notify_unread_count());
+                                  v.body, notify_unread_count(),
+                                  outbox_reply_status(v.key));
                 ui_note_wake();
             } else {
                 // In reply compose / sheets — badge only, don't yank the user.
