@@ -1873,14 +1873,15 @@ enum {
 };
 // MeshCore menu: 0=STATUS 1=PING 2=BACK
 enum { MESH_ACT_STATUS = 0, MESH_ACT_PING = 1, MESH_ACT_BACK = 2, MESH_LIST_COUNT = 3 };
-// WiFi menu: 0=STATUS 1=SCAN 2=PROFILES 3=TOGGLE 4=BACK
+// WiFi menu: STATUS / SCAN / PROFILES / HIDDEN SSID / TOGGLE / BACK
 enum {
     WIFI_ACT_STATUS = 0,
     WIFI_ACT_SCAN = 1,
     WIFI_ACT_PROFILES = 2,
-    WIFI_ACT_TOGGLE = 3,
-    WIFI_ACT_BACK = 4,
-    WIFI_LIST_COUNT = 5
+    WIFI_ACT_HIDDEN = 3,
+    WIFI_ACT_TOGGLE = 4,
+    WIFI_ACT_BACK = 5,
+    WIFI_LIST_COUNT = 6
 };
 // WiFi list mode (scan results vs saved profiles)
 enum { WIFI_LIST_SCAN = 0, WIFI_LIST_PROFILES = 1 };
@@ -1982,7 +1983,8 @@ enum ReplyMode : uint8_t {
     REPLY_MODE_NONE = 0,
     REPLY_MODE_NOTIFY,
     REPLY_MODE_AGENT,
-    REPLY_MODE_WIFI,
+    REPLY_MODE_WIFI_SSID,
+    REPLY_MODE_WIFI_PASSWORD,
 };
 static ReplyMode reply_mode = REPLY_MODE_NONE;
 static int agent_scroll = -1;       // visual row; -1 = pin to latest
@@ -2718,9 +2720,20 @@ static void ui_wifi_show_profiles() {
 static void ui_wifi_open_password(const char *ssid) {
     if (!ssid || !ssid[0]) return;
     snprintf(wifi_pending_ssid, sizeof(wifi_pending_ssid), "%s", ssid);
-    reply_mode = REPLY_MODE_WIFI;
+    reply_mode = REPLY_MODE_WIFI_PASSWORD;
     notify_card_id = 0;
     snprintf(reply_title, sizeof(reply_title), "PASS %s", ssid);
+    reply_buf[0] = '\0';
+    hw_kb_reset_mods();
+    ui_reply_paint();
+    ui_note_input();
+}
+
+static void ui_wifi_open_hidden_ssid() {
+    wifi_pending_ssid[0] = '\0';
+    reply_mode = REPLY_MODE_WIFI_SSID;
+    notify_card_id = 0;
+    snprintf(reply_title, sizeof(reply_title), "NETWORK NAME (32 BYTES)");
     reply_buf[0] = '\0';
     hw_kb_reset_mods();
     ui_reply_paint();
@@ -3039,7 +3052,8 @@ static void ui_reply_paint() {
     switch (reply_mode) {
     case REPLY_MODE_NOTIFY: mode = "NOTIFY REPLY";  break;
     case REPLY_MODE_AGENT:  mode = "AGENT REPLY";   break;
-    case REPLY_MODE_WIFI:   mode = "WIFI PASSWORD"; break;
+    case REPLY_MODE_WIFI_SSID: mode = "WIFI SSID"; break;
+    case REPLY_MODE_WIFI_PASSWORD: mode = "WIFI PASSWORD"; break;
     default: break;
     }
     hw_ui_show_reply(mode, reply_title, reply_buf, hw_kb_caps(), hw_kb_symbol(),
@@ -3147,9 +3161,21 @@ static bool utf8_is_printable(const char *u) {
 }
 
 static void ui_reply_submit() {
-    if (!reply_buf[0]) return;
+    if (!reply_buf[0] && reply_mode != REPLY_MODE_WIFI_PASSWORD) return;
     switch (reply_mode) {
-    case REPLY_MODE_WIFI: {
+    case REPLY_MODE_WIFI_SSID: {
+        bool content = false;
+        size_t bytes = strlen(reply_buf);
+        if (bytes > 32 || !utf8_text_is_printable(reply_buf, &content) || !content) {
+            hw_haptic_notify(1);
+            return;
+        }
+        char ssid[33];
+        snprintf(ssid, sizeof(ssid), "%s", reply_buf);
+        ui_wifi_open_password(ssid);
+        return;
+    }
+    case REPLY_MODE_WIFI_PASSWORD: {
         /* Save password for pending SSID and connect. */
         char ssid[33];
         snprintf(ssid, sizeof(ssid), "%s", wifi_pending_ssid);
@@ -4117,6 +4143,8 @@ static void ui_on_click() {
             ui_wifi_do_scan();
         } else if (wifi_sel == WIFI_ACT_PROFILES) {
             ui_wifi_show_profiles();
+        } else if (wifi_sel == WIFI_ACT_HIDDEN) {
+            ui_wifi_open_hidden_ssid();
         } else if (wifi_sel == WIFI_ACT_TOGGLE) {
             ui_wifi_toggle();
         }
@@ -4294,7 +4322,8 @@ static void ui_on_click() {
         // Encoder click = send if draft non-empty, else cancel
         if (reply_buf[0]) {
             ui_reply_submit();
-        } else if (reply_mode == REPLY_MODE_WIFI) {
+        } else if (reply_mode == REPLY_MODE_WIFI_SSID ||
+                   reply_mode == REPLY_MODE_WIFI_PASSWORD) {
             reply_mode = REPLY_MODE_NONE;
             wifi_pending_ssid[0] = '\0';
             reply_buf[0] = '\0';

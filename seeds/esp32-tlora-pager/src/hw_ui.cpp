@@ -1136,12 +1136,12 @@ static const char *const MENU_ITEMS[MENU_N] = {
 };
 
 // WiFi submenu
-static const int WIFI_MENU_N = 5;
-static const int WIFI_MENU_ROW0_Y = 48;
-static const int WIFI_MENU_ROW_H = 32;
-static const int WIFI_MENU_BAR_H = 28;
+static const int WIFI_MENU_N = 6;
+static const int WIFI_MENU_ROW0_Y = 38;
+static const int WIFI_MENU_ROW_H = 29;
+static const int WIFI_MENU_BAR_H = 25;
 static const char *const WIFI_MENU_ITEMS[WIFI_MENU_N] = {
-    "STATUS", "SCAN", "PROFILES", "TOGGLE WIFI", "BACK"
+    "STATUS", "SCAN", "PROFILES", "HIDDEN SSID", "TOGGLE WIFI", "BACK"
 };
 
 // MeshCore submenu
