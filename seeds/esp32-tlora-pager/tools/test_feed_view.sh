@@ -50,7 +50,7 @@ assert "#define HW_UI_MSGLIST_MAX 20" in hw_h
 assert "const char *const *times" in hw_h
 assert "msglist_draw_row(const char *const *titles,\n                             const char *const *times" in hw_cpp
 assert "tft_draw_text_r(PANEL_W - MARGIN - 4" in hw_cpp
-assert "memcpy(out, raw, used);" in hw_cpp
+assert "utf8_text_copy(out, out_n, raw, 28, true);" in hw_cpp
 assert "static uint32_t msglist_unread_mask" in hw_cpp
 assert "i < HW_UI_MSGLIST_MAX" in hw_cpp
 for workspace in (

@@ -11,6 +11,7 @@
 #include "box_glyphs.h"            // box-drawing + block glyphs for micron pages
 #include "conv_store.h"             // CONV_LABEL_LEN: the inbox row label width
 #include "feed_view.h"              // FEED_LABEL_LEN for UTF-8-safe feed titles
+#include "utf8_text.h"              // shared code-point-safe display truncation
 #include "net_view.h"               // NetLevel + net_level_glyph: network status screen
 #include "boot_logo.h"             // PURE b33pr boot-splash decrypt logic
 #include "psram_alloc.h"           // psram_calloc_pref: micron grids in PSRAM
@@ -1977,24 +1978,7 @@ static uint32_t msglist_mask_of(const bool *unread, int count) {
 }
 
 static void msglist_copy_title(const char *raw, char *out, size_t out_n) {
-    if (!out || out_n == 0) return;
-    if (!raw) raw = "";
-    size_t used = 0;
-    int glyphs = 0;
-    while (raw[used] && glyphs < 25) {
-        uint32_t cp = 0;
-        int n = utf8_next(raw + used, &cp);
-        if (n <= 0 || used + (size_t)n >= out_n) break;
-        used += (size_t)n;
-        glyphs++;
-    }
-    bool clipped = raw[used] != '\0';
-    memcpy(out, raw, used);
-    if (clipped && used + 3 < out_n) {
-        memcpy(out + used, "...", 3);
-        used += 3;
-    }
-    out[used] = '\0';
+    utf8_text_copy(out, out_n, raw, 28, true);
 }
 
 // Row:  [*| ][W]  Title…                  HH:MM

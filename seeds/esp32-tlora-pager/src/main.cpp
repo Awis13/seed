@@ -63,6 +63,7 @@
 #include "ui_nav.h"               // pure, host-tested back-navigation policy
 #include "notify_chat_class.h"    // pure, host-tested: incoming chat vs notification card
 #include "outbox.h"               // durable canonical outbound message store
+#include "utf8_text.h"            // code-point-safe display labels
 
 // Bind the host-testable UiNavScreen ids to HwUiScreen so the two never drift.
 static_assert((int)UINAV_CLOCK          == (int)HW_UI_CLOCK,          "ui_nav enum drift");
@@ -1891,7 +1892,7 @@ static int wifi_sel = 0;
 static int wifi_list_sel = 0;
 static int wifi_list_mode = WIFI_LIST_SCAN;
 static int wifi_list_count = 0;
-static char wifi_list_titles[HW_UI_WIFI_LIST_MAX][36];
+static char wifi_list_titles[HW_UI_WIFI_LIST_MAX][48];
 static uint8_t net_origin = UINAV_WIFI;
 static char wifi_list_ssids[HW_UI_WIFI_LIST_MAX][33];
 static char wifi_pending_ssid[33] = "";
@@ -2636,12 +2637,12 @@ static void ui_wifi_do_scan() {
                 break;
             }
         }
-        snprintf(wifi_list_titles[wifi_list_count],
-                 sizeof(wifi_list_titles[0]),
-                 "%s%c %ddBm",
-                 wifi_list_ssids[wifi_list_count],
-                 known ? '*' : ' ',
+        char raw_title[48];
+        snprintf(raw_title, sizeof(raw_title), "%s%c %ddBm",
+                 wifi_list_ssids[wifi_list_count], known ? '*' : ' ',
                  (int)WiFi.RSSI(i));
+        utf8_text_copy(wifi_list_titles[wifi_list_count],
+                       sizeof(wifi_list_titles[0]), raw_title, SIZE_MAX, false);
         wifi_list_count++;
     }
     WiFi.scanDelete();
@@ -2659,11 +2660,11 @@ static void ui_wifi_show_profiles() {
     for (int i = 0; i < wifi_net_count && wifi_list_count < HW_UI_WIFI_LIST_MAX; i++) {
         snprintf(wifi_list_ssids[wifi_list_count],
                  sizeof(wifi_list_ssids[0]), "%s", wifi_nets[i].ssid);
-        snprintf(wifi_list_titles[wifi_list_count],
-                 sizeof(wifi_list_titles[0]),
-                 "%c %s",
-                 (i == wifi_net_idx) ? '*' : ' ',
-                 wifi_nets[i].ssid);
+        char raw_title[48];
+        snprintf(raw_title, sizeof(raw_title), "%c %s",
+                 (i == wifi_net_idx) ? '*' : ' ', wifi_nets[i].ssid);
+        utf8_text_copy(wifi_list_titles[wifi_list_count],
+                       sizeof(wifi_list_titles[0]), raw_title, SIZE_MAX, false);
         wifi_list_count++;
     }
     ui_wifi_paint_list();

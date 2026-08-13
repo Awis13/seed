@@ -306,7 +306,7 @@ static void test_bounds(void) {
     assert(feed_build_rows(&utf, 1, NULL, 0, out, FEED_ORDER_MAX) == 1);
     size_t pos = 0;
     while (out[0].label[pos]) {
-        size_t width = feed_utf8_char_bytes(out[0].label + pos);
+        size_t width = utf8_text_decode(out[0].label + pos, NULL);
         assert(width == 2);
         pos += width;
     }

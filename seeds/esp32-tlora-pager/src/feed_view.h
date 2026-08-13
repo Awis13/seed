@@ -36,6 +36,7 @@
 #include <string.h>
 
 #include "inbox_view.h"   /* inbox_transport_glyph, INBOX_UNREAD_MARK, CONV_ID_LEN */
+#include "utf8_text.h"
 
 /* Where a row came from. Persisted nowhere — a pure view tag. */
 enum FeedOrigin {
@@ -43,10 +44,9 @@ enum FeedOrigin {
     FEED_CONV = 1,   /* a chat conversation; handle is a table slot + conv id */
 };
 
-/* Display label width for a feed row. Card titles are the longer of the two
- * kinds; the renderer truncates well before this, so 40 is generous headroom
- * without carrying a card's full 60. */
-#define FEED_LABEL_LEN   40
+/* A card title is at most 60 source bytes. Keep all of it here; the renderer
+ * applies its own cell limit without ever cutting a UTF-8 code point. */
+#define FEED_LABEL_LEN   61
 
 /* Input caps. Cards come from a 40-deep queue but the caller only ever offers
  * the newest handful; conversations are bounded by the table. The internal sort
@@ -104,32 +104,6 @@ struct FeedSortItem {
     uint8_t  idx;      /* index into the matching input array                    */
 };
 
-static inline size_t feed_utf8_char_bytes(const char *s) {
-    if (!s || !s[0]) return 0;
-    const unsigned char *p = (const unsigned char *)s;
-    if (p[0] < 0x80) return 1;
-    if ((p[0] & 0xE0) == 0xC0 && p[1] && (p[1] & 0xC0) == 0x80) return 2;
-    if ((p[0] & 0xF0) == 0xE0 && p[1] && p[2] &&
-        (p[1] & 0xC0) == 0x80 && (p[2] & 0xC0) == 0x80) return 3;
-    if ((p[0] & 0xF8) == 0xF0 && p[1] && p[2] && p[3] &&
-        (p[1] & 0xC0) == 0x80 && (p[2] & 0xC0) == 0x80 &&
-        (p[3] & 0xC0) == 0x80) return 4;
-    return 1;
-}
-
-static inline void feed_copy_label(char *out, size_t out_n, const char *src) {
-    if (!out || out_n == 0) return;
-    if (!src) src = "";
-    size_t used = 0;
-    while (src[used]) {
-        size_t n = feed_utf8_char_bytes(src + used);
-        if (n == 0 || used + n >= out_n) break;
-        memcpy(out + used, src + used, n);
-        used += n;
-    }
-    out[used] = '\0';
-}
-
 static inline void feed_emit_card(const FeedCardView &c, FeedRow &r) {
     r.origin = FEED_CARD;
     r.epoch = c.epoch;
@@ -140,7 +114,7 @@ static inline void feed_emit_card(const FeedCardView &c, FeedRow &r) {
     r.mark = c.unread ? INBOX_UNREAD_MARK : ' ';
     r.has_rooms = 0;
     r.id[0] = '\0';
-    feed_copy_label(r.label, sizeof(r.label), c.title);
+    utf8_text_copy(r.label, sizeof(r.label), c.title, SIZE_MAX, false);
 }
 
 static inline void feed_emit_conv(const FeedConvView &c, FeedRow &r) {
@@ -156,7 +130,7 @@ static inline void feed_emit_conv(const FeedConvView &c, FeedRow &r) {
     if (c.id)
         for (; c.id[k] && k + 1 < sizeof(r.id); k++) r.id[k] = c.id[k];
     r.id[k] = '\0';
-    feed_copy_label(r.label, sizeof(r.label), c.label);
+    utf8_text_copy(r.label, sizeof(r.label), c.label, SIZE_MAX, false);
 }
 
 /*
