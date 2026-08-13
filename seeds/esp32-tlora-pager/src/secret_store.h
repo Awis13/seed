@@ -183,6 +183,12 @@ size_t secret_store_get(const char *name, uint8_t *buf, size_t cap);
 /* Store len bytes under `name`. Refuses an oversize value (returns false). */
 bool secret_store_put(const char *name, const uint8_t *buf, size_t len);
 
+/* Erase the secret `name` from NVS. True when the key is absent afterwards:
+ * deleting a key that was never stored is a successful no-op, not an error.
+ * A real delete, not a zero-length putBytes sentinel — an empty value would
+ * still read as "key present" to secret_store_has() and the migrate guard. */
+bool secret_store_del(const char *name);
+
 /* One-time SPIFFS->NVS migration for the five mapped secrets. Idempotent: a
  * second call after the sentinel is set does nothing. Returns true if it copied
  * at least one secret this call. */
