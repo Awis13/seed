@@ -1599,6 +1599,75 @@ static void handle_wifi_networks_post(AsyncWebServerRequest *request) {
 #include "skills/gps.cpp"    // after notify: reuses notify_send_json; uses hw_ui_expand_ok
 #include "skills/rns.cpp"    // Reticulum bring-up; uses write_spiffs_file_atomic
 
+// ===== Connection coordinator =====
+// Pure policy in src/conn_mgr.h; this is the thin device half that reads the
+// real transport accessors, runs one coordinator step, and dispatches the
+// returned actions to the EXISTING recover entrypoints (never re-implementing
+// them). Placed here, after every skill translation unit is included, so the
+// per-transport statics (wg_is_up, g_rns_*, g_mesh, ...) are in scope.
+//
+// Called once per loop() pass, throttled to CONN_MGR_TICK_MS. On the happy path
+// (every wanted layer up) conn_mgr_step() returns all-false and this writes
+// nothing — no behaviour change when the network is healthy.
+#include "conn_mgr.h"
+static ConnMgrState g_conn_mgr;
+
+static void conn_mgr_service() {
+    static uint32_t last = 0;
+    uint32_t now = millis();
+    if (last != 0 && (now - last) < CONN_MGR_TICK_MS) return;
+    last = now ? now : 1;
+
+    ConnMgrInputs in;
+    memset(&in, 0, sizeof(in));
+    in.now_ms = now;
+    in.wifi_wanted = !wifi_user_off && (wifi_net_count > 0 || wifi_ssid[0]);
+    in.wifi_connected = (WiFi.status() == WL_CONNECTED);
+    in.time_valid = (time(NULL) > TIME_VALID_EPOCH);
+    in.wg_wanted = g_wg_want && g_wg_cfg_ok;
+    in.wg_up = wg_is_up();
+    in.rns_wanted = g_rns_cfg_enabled && g_rns_cfg_ok;
+    in.rns_up = (g_rns_cs.load() == RNS_CS_CONNECTED);
+    in.mesh_wanted = g_mesh.has_identity && g_mesh.radio_ready &&
+                     g_mesh.heltec_pk_hex[0] != '\0';
+    in.mesh_up = (g_mesh.fail_streak < MESH_FAIL_DOWN);
+
+    ConnMgrActions a = conn_mgr_step(&g_conn_mgr, &in);
+
+    if (a.on_attach) event_add("conn: network attached");
+    if (a.on_lost) event_add("conn: network lost");
+
+    // WG bring-up / restart: hand it to wg.cpp's own deferred restart path
+    // (stop -> gap -> start on the loop task). g_wg_restart_req is exactly the
+    // signal the /wg/restart route raises, so this reuses that machinery.
+    if ((a.start_wg || a.restart_wg) && g_wg_want && g_wg_cfg_ok) {
+        g_wg_restart_req = true;
+        event_add("conn: %s wireguard", a.start_wg ? "start" : "restart");
+    }
+
+    // RNS: rearm the connect retry at its minimum backoff so the interface's
+    // own loop() picks it up on the next tick. No socket work here.
+    if (a.nudge_rns) {
+        g_rns_backoff_ms = RNS_TCP_BACKOFF_MIN_MS;
+        g_rns_next_try_ms = millis();
+        event_add("conn: nudge rns reconnect");
+    }
+
+    // mesh: clear the last-probe stamp so skill_meshcore_poll() fires a probe.
+    if (a.nudge_mesh) {
+        g_mesh.last_probe_ms = 0;
+        event_add("conn: nudge mesh probe");
+    }
+
+    // WiFi wedge escape: restart the STA ladder from its fastest rung. The
+    // threshold is past the ladder's own 20 min top rung, so this only fires if
+    // the ladder itself is stuck.
+    if (a.nudge_wifi) {
+        wifi_reconnect_request();
+        event_add("conn: nudge wifi ladder");
+    }
+}
+
 /* Defined with the other UI helpers below; the store needs it as soon as it
  * starts counting unread, which is from the first message it stores. */
 static bool ui_conv_on_screen(int idx);
@@ -4121,6 +4190,11 @@ void loop() {
     // Deferred STA sequence raised by HTTP handlers (mode → disconnect →
     // begin, millis() settle gaps) — the AsyncTCP task never touches WiFi.
     wifi_reconnect_poll();
+
+    // Connection coordinator: observes the WiFi attach/lost edge, sequences
+    // bring-up (clock -> WG -> RNS), debounces WG flaps, and backs up each
+    // transport's own recovery if it wedges. No-op while everything is healthy.
+    conn_mgr_service();
 
     // WiFi reconnect — one non-blocking attempt per ladder rung while offline
     // (the driver's own auto-reconnect stays off: its retries underneath the
