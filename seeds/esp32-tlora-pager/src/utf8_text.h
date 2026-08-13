@@ -49,6 +49,23 @@ static inline size_t utf8_text_cells(const char *text) {
     return cells;
 }
 
+/* Labels may use any valid UTF-8 scalar, but never terminal/control bytes.
+ * `has_content` distinguishes a real label from one made only of spaces. */
+static inline bool utf8_text_is_printable(const char *text, bool *has_content) {
+    if (has_content) *has_content = false;
+    if (!text) return false;
+    bool any = false;
+    for (size_t pos = 0; text[pos];) {
+        uint32_t cp = 0;
+        size_t n = utf8_text_decode(text + pos, &cp);
+        if (!n || cp < 0x20 || (cp >= 0x7F && cp <= 0x9F)) return false;
+        if (cp != 0x20) any = true;
+        pos += n;
+    }
+    if (has_content) *has_content = any;
+    return true;
+}
+
 /* Copy whole code points, replacing malformed bytes with '?'. When ellipsis
  * is requested, max_cells includes the three cells occupied by "...". */
 static inline bool utf8_text_copy(char *out, size_t out_n, const char *text,

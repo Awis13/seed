@@ -30,7 +30,7 @@
  * again under a label that is already live updates that job rather than opening
  * a second one, so a task reporting every few seconds leaves one bar rather
  * than fifty. It is also what is drawn, which is why it is bounded at 16
- * characters of printable ASCII and why an over-long one is REFUSED rather than
+ * bytes of printable UTF-8 and why an over-long one is REFUSED rather than
  * truncated: truncation would silently make "download-backups" and
  * "download-photos" the same key, and the caller would never learn that its two
  * jobs had become one.
@@ -127,6 +127,8 @@
  * every comment inside fully closed: the slicer copies from the marker without
  * understanding what it copies. */
 /* host-test:begin core — sliced out by tools/test_progress.sh */
+#include "../utf8_text.h"
+
 #define PROGRESS_MAX            4
 #define PROGRESS_LABEL_LEN     17    /* 16 characters plus the terminator */
 #define PROGRESS_TTL_DEFAULT_S 30
@@ -161,11 +163,9 @@ static void progress_copy_label(char *dst, const char *src) {
 /*
  * Is this label usable, and if not, why not.
  *
- * The ASCII rule is not tidiness. The panel's compiled TFT_eSPI fonts cover
- * 32..126 and nothing else: a Cyrillic or accented label would be drawn as
- * garbage, on a device with no console, with no error raised anywhere. This
- * firmware has been bitten by exactly that once already, so the refusal happens
- * at the endpoint where somebody is still holding the curl command.
+ * The panel accepts the same printable UTF-8 that its text renderer decodes.
+ * Controls and malformed sequences are refused at the endpoint so neither the
+ * display nor the label-as-key comparison sees ambiguous bytes.
  */
 static bool progress_label_check(const char *label, const char **err) {
     const char *sink = NULL;
@@ -176,13 +176,9 @@ static bool progress_label_check(const char *label, const char **err) {
     if (n >= PROGRESS_LABEL_LEN) { *err = "label is too long: 16 characters at most"; return false; }
 
     bool any = false;
-    for (size_t i = 0; i < n; i++) {
-        unsigned char c = (unsigned char)label[i];
-        if (c < 0x20 || c > 0x7E) {
-            *err = "label must be printable ASCII (32..126): the panel has no other glyphs";
-            return false;
-        }
-        if (c != ' ') any = true;
+    if (!utf8_text_is_printable(label, &any)) {
+        *err = "label must be valid printable UTF-8 without control characters";
+        return false;
     }
     /* A label of nothing but spaces is an empty label with extra steps: it
        cannot be read on the bar and it is a key nobody can type twice. */
@@ -511,11 +507,10 @@ static const char *progress_describe() {
            "key**: posting again with the same label updates that job rather\n"
            "than opening a second one, exactly the way `id` works on\n"
            "POST /notify. Four jobs are held at once.\n\n"
-           "`label` is 1-16 characters of printable ASCII (32-126) and is\n"
+           "`label` is 1-16 bytes of valid printable UTF-8 and is\n"
            "REFUSED, not truncated, when it is longer — truncation would make\n"
-           "two different labels the same key without telling anyone. Non-ASCII\n"
-           "is refused because the panel's fonts have no glyphs for it and it\n"
-           "would be drawn as garbage with no error anywhere.\n\n"
+           "two different labels the same key without telling anyone. Control\n"
+           "characters and malformed UTF-8 are refused.\n\n"
            "`percent` is 0-100 and anything else is a 400.\n\n"
            "`ttl_s` is 1-3600, default 30, and it is set per push rather than\n"
            "being a constant: it means \"expect my next update within this many\n"

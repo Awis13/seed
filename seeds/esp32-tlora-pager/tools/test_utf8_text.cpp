@@ -25,6 +25,13 @@ int main(void) {
     assert(utf8_text_copy(tight, sizeof(tight), "ЖЖЖ", 8, false));
     assert(strcmp(tight, "ЖЖ") == 0);
 
+    bool content = false;
+    assert(utf8_text_is_printable("Готово", &content) && content);
+    assert(utf8_text_is_printable(" café ", &content) && content);
+    assert(utf8_text_is_printable("   ", &content) && !content);
+    assert(!utf8_text_is_printable("line\nbreak", &content));
+    assert(!utf8_text_is_printable(invalid, &content));
+
     puts("utf8 text tests: OK");
     return 0;
 }

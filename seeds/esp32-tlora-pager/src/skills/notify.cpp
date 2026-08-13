@@ -412,6 +412,8 @@ static bool notify_level_parse(const char *s, uint8_t &out) {
  * This and the two option helpers under it are compiled on the host by
  * tools/test_notify_options.sh; the marker rules from the types region apply.
  */
+#include "../utf8_text.h"
+
 /* host-test:begin text — sliced out by tools/test_notify_options.sh */
 static void notify_copy_text(char *dst, size_t size, const char *src) {
     snprintf(dst, size, "%s", src);
@@ -436,11 +438,8 @@ static void notify_copy_text(char *dst, size_t size, const char *src) {
 /*
  * Is this option label usable, and if not, why not.
  *
- * The ASCII rule is not tidiness, and it is the same rule progress.cpp keeps
- * for the same reason: the panel's compiled TFT_eSPI fonts cover 32..126 and
- * nothing else, so a Cyrillic or accented label is drawn as garbage on a device
- * with no console and with no error raised anywhere. It is refused here, at the
- * endpoint, while somebody is still holding the curl command.
+ * Labels use the same printable UTF-8 accepted by the renderer. Controls and
+ * malformed sequences are refused while the caller can still correct them.
  *
  * Length is not checked: an over-long label is truncated by notify_copy_text()
  * like every other string this skill accepts. A label is a chip on a screen —
@@ -459,13 +458,9 @@ static bool notify_option_check(const char *label, const char **err) {
     if (!label || !label[0]) { *err = "an option label must not be empty"; return false; }
 
     bool any = false;
-    for (size_t i = 0; label[i]; i++) {
-        unsigned char c = (unsigned char)label[i];
-        if (c < 0x20 || c > 0x7E) {
-            *err = "an option label must be printable ASCII (32..126): the panel has no other glyphs";
-            return false;
-        }
-        if (c != ' ') any = true;
+    if (!utf8_text_is_printable(label, &any)) {
+        *err = "an option label must be valid printable UTF-8 without control characters";
+        return false;
     }
     /* All spaces is an empty label with extra steps: an unreadable chip that
        still occupies a position the knob can land on. */
@@ -1445,9 +1440,8 @@ static const char *notify_describe() {
            "produ`. The panel then puts it in capitals and cuts it again to\n"
            "whatever share of the row it gets, which depends on how many\n"
            "options there are: what is stored is what the API serves back, not\n"
-           "what appears on screen. Labels are printable ASCII only (32..126):\n"
-           "anything else is refused with a reason, because the panel has no\n"
-           "glyphs for it and would draw a message nobody can read.\n\n"
+           "what appears on screen. Labels must be valid printable UTF-8;\n"
+           "controls and malformed sequences are refused with a reason.\n\n"
            "Posting again under the same `id` key clears any answer along with\n"
            "the message it belonged to. A re-post is a new question, and\n"
            "carrying the old reply onto it would be worse than losing it.\n"
