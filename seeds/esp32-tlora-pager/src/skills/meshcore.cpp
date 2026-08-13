@@ -1,17 +1,21 @@
 /*
  * skills/meshcore.cpp — MeshCore private-link transport into notify
  *
- * Home Heltec gateway (daemon :8325) sends:
- *   P1|level|source|title|body[|key]
- * as a MeshCore private DM (never Public). `key` is the card's client id and is
- * optional; see notify_ingest_p1() for how it is told apart from a body that is
- * allowed to contain separators of its own.
+ * Home Heltec gateway (daemon :8325) sends, as a MeshCore private DM (never
+ * Public); the AUTHORITATIVE wire spec lives in src/notify_wire.h:
+ *   P1|level|source|title|body[|key]           legacy, key OPTIONAL (heuristic)
+ *   P2|level|source|title|body|key             explicit trailing card key
+ *   M1|mid|i|n|level|source|title|chunk        legacy multipart, KEYLESS
+ *   M2|mid|i|n|level|source|title|chunk|key     multipart with stable card key
+ * `key` is the card's stable client id: it dedups this card against the SAME card
+ * arriving over another transport (M/P/LXMF), and routes a typed reply upstream.
+ * On the v1 wires it is recovered by a heuristic (P1) or absent (M1); the v2 tags
+ * make it explicit — the trailing '|' always ends the arbitrary body/chunk and
+ * begins the key. See notify_wire_parse_p / notify_wire_parse_m.
  *
  * The pager answers on the same link with one frame:
  *   R1|key|reply
  * built in main.cpp (reply_upstream_mesh) when WiFi cannot reach the gateway.
- * M1 carries no key: its last field is an arbitrary chunk, so a key sitting
- * between the title and the chunk could not be told from the chunk itself.
  *
  * Pair identity (Ed25519) lives on SPIFFS:
  *   /mesh_identity.id  — pub(32)+prv(64) MeshCore LocalIdentity blob
@@ -33,6 +37,7 @@
 #include "mesh/mc_client.h"
 #include "mesh/utf8_chunk.h"
 #include "../l1_frame.h"    /* pure L1 frame parse + byte reassembler (host-tested) */
+#include "../notify_wire.h" /* pure P/M notify-wire parse — the cross-transport key */
 
 /* THE SHARED LXMF ROUTER lives in skills/rns.cpp, which main.cpp #includes AFTER
  * this file into the same translation unit. Forward-declare it so the MeshCore
@@ -473,10 +478,12 @@ static bool mesh_load_meta() {
     return true;
 }
 
-/* ---- Multi-part reassembly (M1 notify / C1 chat) ----------------------------
- * Wire (gateway meshcore_daemon.encode_mesh_frames):
- *   P1|level|source|title|body
- *   M1|mid|i|n|level|source|title|chunk
+/* ---- Multi-part reassembly (M1/M2 notify / C1 chat) -------------------------
+ * Wire (gateway meshcore_daemon.encode_mesh_frames; full spec in notify_wire.h):
+ *   P1|level|source|title|body[|key]            (single frame, key by heuristic)
+ *   P2|level|source|title|body|key              (single frame, explicit key)
+ *   M1|mid|i|n|level|source|title|chunk          (multipart, keyless)
+ *   M2|mid|i|n|level|source|title|chunk|key      (multipart, explicit card key)
  *   C1|agent|mid|i|n|side|chunk   side=a|u
  * Truncate is per-frame; append is here until i==n, then push to inbox/thread.
  */
@@ -492,6 +499,7 @@ struct MeshReasm {
     char     level[8];
     char     source[NOTIFY_SOURCE_LEN];
     char     title[NOTIFY_TITLE_LEN];
+    char     key[NOTIFY_KEY_LEN];   /* M2 stable card key ("" = keyless, M1) */
     char     side;           /* 'a' or 'u' for C1 */
     uint8_t  n_parts;
     uint8_t  got_mask;       /* bit i-1 set when part i received (max 8 parts in mask;
@@ -635,56 +643,38 @@ static uint32_t mesh_on_private_text(const uint8_t *from_pubkey,
     if (!text || !text[0]) return 0;
     uint32_t id = 0;
 
-    if (strncmp(text, "P1|", 3) == 0) {
+    if (strncmp(text, "P1|", 3) == 0 || strncmp(text, "P2|", 3) == 0) {
+        /* P1 legacy (key by heuristic) / P2 explicit trailing key — one parser. */
         id = notify_ingest_p1(text);
-    } else if (strncmp(text, "M1|", 3) == 0) {
-        /* M1|mid|i|n|level|source|title|chunk */
-        char mid[8] = {0}, level[8] = {0}, source[NOTIFY_SOURCE_LEN] = {0};
-        char title[NOTIFY_TITLE_LEN] = {0};
-        int part_i = 0, n_parts = 0;
-        const char *p = text + 3;
-        const char *a = strchr(p, '|');
-        if (!a) return 0;
-        size_t n = (size_t)(a - p);
-        if (n >= sizeof(mid)) n = sizeof(mid) - 1;
-        memcpy(mid, p, n);
-        p = a + 1;
-        part_i = atoi(p);
-        a = strchr(p, '|');
-        if (!a) return 0;
-        p = a + 1;
-        n_parts = atoi(p);
-        a = strchr(p, '|');
-        if (!a) return 0;
-        p = a + 1;
-        a = strchr(p, '|');
-        if (!a) return 0;
-        n = (size_t)(a - p);
-        if (n >= sizeof(level)) n = sizeof(level) - 1;
-        memcpy(level, p, n);
-        p = a + 1;
-        a = strchr(p, '|');
-        if (!a) return 0;
-        n = (size_t)(a - p);
-        if (n >= sizeof(source)) n = sizeof(source) - 1;
-        memcpy(source, p, n);
-        p = a + 1;
-        a = strchr(p, '|');
-        if (!a) return 0;
-        n = (size_t)(a - p);
-        if (n >= sizeof(title)) n = sizeof(title) - 1;
-        memcpy(title, p, n);
-        const char *chunk = a + 1;
+    } else if (strncmp(text, "M1|", 3) == 0 || strncmp(text, "M2|", 3) == 0) {
+        /* M1|mid|i|n|level|source|title|chunk         (legacy, keyless)
+         * M2|mid|i|n|level|source|title|chunk|key      (explicit stable card key)
+         * The per-frame FIELD parse is the pure, host-tested notify_wire_parse_m();
+         * only the TTL/slot reassembly lives here. */
+        NotifyMFrame f;
+        if (!notify_wire_parse_m(text, &f)) return 0;
 
-        MeshReasm *r = mesh_reasm_get('M', mid);
+        /* Copy the chunk NUL-terminated for the byte reassembler; a single frame's
+         * chunk is one radio packet (< NOTIFY_BODY_LEN), reassembly bounds again. */
+        char chunk[NOTIFY_BODY_LEN];
+        size_t cl = f.chunk_len;
+        if (cl > sizeof(chunk) - 1) cl = sizeof(chunk) - 1;
+        memcpy(chunk, f.chunk, cl);
+        chunk[cl] = '\0';
+
+        MeshReasm *r = mesh_reasm_get('M', f.mid);
         if (r->got_count == 0) {
-            snprintf(r->level, sizeof(r->level), "%s", level);
-            snprintf(r->source, sizeof(r->source), "%s", source);
-            snprintf(r->title, sizeof(r->title), "%s", title);
+            snprintf(r->level, sizeof(r->level), "%s", f.level);
+            snprintf(r->source, sizeof(r->source), "%s", f.source);
+            snprintf(r->title, sizeof(r->title), "%s", f.title);
+            /* The gateway repeats the same key on every M2 fragment; keep the one
+             * from the first fragment we see. M1 leaves it empty (keyless). */
+            snprintf(r->key, sizeof(r->key), "%s", f.key);
         }
-        mesh_reasm_append(r, (uint8_t)part_i, (uint8_t)n_parts, chunk);
+        mesh_reasm_append(r, (uint8_t)f.part, (uint8_t)f.n_parts, chunk);
         if (r->got_count >= r->n_parts && r->n_parts > 0) {
-            id = notify_ingest(r->level, r->source, r->title, r->buf, NULL);
+            id = notify_ingest(r->level, r->source, r->title, r->buf,
+                               r->key[0] ? r->key : NULL);
             r->used = false;
         }
     } else if (strncmp(text, "C1|", 3) == 0) {
@@ -1003,7 +993,8 @@ static const SkillEndpoint meshcore_endpoints[] = {
 static const char *meshcore_describe() {
     return "## Skill: meshcore\n\n"
            "Private MeshCore link to home Heltec gateway.\n"
-           "Notify: `P1|level|source|title|body[|key]` → same cards as WiFi `/notify`.\n"
+           "Notify: `P1|level|source|title|body[|key]` (P2 makes the key explicit;\n"
+           "M1/M2 the multipart forms) → same cards as WiFi `/notify`.\n"
            "Reply: card reply goes up as `R1|key|reply` when WiFi is down.\n"
            "Clock `M`: sparse private keepalive `MC|k` (default every 15 min),\n"
            "MeshCore ACK via stored path/repeaters — never Public flood.\n"
