@@ -74,7 +74,7 @@ enum HwUiScreen : uint8_t {
     HW_UI_MESH_PING,   // live gateway ping / path probe
     HW_UI_WIFI,        // WiFi menu: STATUS / SCAN / PROFILES
     HW_UI_WIFI_LIST,   // scan results or saved profiles list
-    HW_UI_WIFI_INFO,   // multi-line WiFi/WG status
+    HW_UI_WIFI_PROGRESS,  // multi-line scan/connect progress
     HW_UI_PAGE,        // micron page view (system-layer store, wheel-paged)
     HW_UI_CONTACTS,    // grouped Contacts: AI / LXMF / mesh, pick to open a chat
     HW_UI_NET,         // sectioned network status: WiFi / Reticulum / mesh / tunnel
@@ -99,7 +99,7 @@ enum HwMeshUi : int8_t {
     MESH_UI_DOWN = 4,
 };
 
-// WireGuard chrome (small "W" left of M). Same state shape as HwMeshUi.
+// WireGuard status used by the sectioned Network screen.
 enum HwWgUi : int8_t {
     WG_UI_OFF = 0,
     WG_UI_WAIT = 1,
@@ -113,7 +113,6 @@ enum HwWgUi : int8_t {
 // mesh_ui: sparse MeshCore reachability chrome (see HwMeshUi).
 // mesh_age_s: seconds since last private-path alive (ACK / inbound DM);
 //             <0 = never — drawn as M-- next to the glyph.
-// wg_ui: WireGuard tunnel chrome (see HwWgUi); 0 hides.
 void hw_ui_clock_tick(const char *version,
                       const char *batt,
                       const char *ip_or_status,
@@ -126,8 +125,7 @@ void hw_ui_clock_tick(const char *version,
                       const char *date_str,
                       bool crit_unread,
                       int mesh_ui,
-                      int mesh_age_s,
-                      int wg_ui = 0);
+                      int mesh_age_s);
 
 // 80ms breathing hairline under the header when crit is unread. Clock only.
 void hw_ui_clock_rule_tick(bool crit_unread);
@@ -175,11 +173,8 @@ void hw_ui_show_mesh_ping(const char *phase,
                           const char *const *lines,
                           int n_lines);
 
-// Final dual-path glance: two big icons (WiFi / Mesh) + OK/NO + short strength
-// lines under each. sub1/sub2 optional (NULL = omit). At-a-glance who is up.
-void hw_ui_show_mesh_ping_result(bool wifi_ok, const char *wifi_sub1,
-                                 const char *wifi_sub2,
-                                 bool mesh_ok, const char *mesh_sub1,
+// Final MeshCore path glance: a big mesh icon + OK/NO + short strength lines.
+void hw_ui_show_mesh_ping_result(bool mesh_ok, const char *mesh_sub1,
                                  const char *mesh_sub2);
 
 // WiFi menu: STATUS / SCAN / PROFILES / BACK. selected 0..3
@@ -193,8 +188,8 @@ void hw_ui_show_wifi_list(const char *header,
                           int n,
                           int selected);
 
-// Multi-line WiFi/WG status (click = back).
-void hw_ui_show_wifi_info(const char *const *lines, int n_lines);
+// Multi-line WiFi scan/connect progress (click = back).
+void hw_ui_show_wifi_progress(const char *const *lines, int n_lines);
 
 // Session list inside one agent: N existing sessions + "NEW SESSION" + "BACK".
 // titles[i] short UTF-8, msgs[i] = message count (negative = no badge),
@@ -271,13 +266,11 @@ void hw_ui_show_net(const char *const *labels,
                     int count,
                     int top);
 
-// Device info (version, IP, host, token, free heap).
+// Device info (version, host, token, free heap). Network details live in NET.
 void hw_ui_show_info(const char *version,
                      const char *host,
-                     const char *ip,
                      const char *token,
-                     uint32_t free_heap,
-                     int unread);
+                     uint32_t free_heap);
 
 void hw_ui_invalidate_clock();
 

@@ -960,58 +960,6 @@ static void mesh_status_json(JsonDocument &doc) {
                       : "need /mesh_identity.id on SPIFFS";
 }
 
-/* Fill short status lines for MESHCORE → STATUS screen (caller owns buffers). */
-static int mesh_status_lines(char lines[][40], int max_lines) {
-    int n = 0;
-    auto push = [&](const char *s) {
-        if (n >= max_lines) return;
-        snprintf(lines[n], 40, "%s", s);
-        n++;
-    };
-    char buf[40];
-    if (g_mesh.has_identity) {
-        snprintf(buf, sizeof(buf), "NODE %s", g_mesh.name);
-        push(buf);
-        snprintf(buf, sizeof(buf), "PK %.12s…", g_mesh.public_key_hex);
-        push(buf);
-    } else {
-        push("NO IDENTITY");
-        push("flash SPIFFS keys");
-    }
-    if (g_mesh.heltec_pk_hex[0]) {
-        snprintf(buf, sizeof(buf), "GW %.8s…", g_mesh.heltec_pk_hex);
-        push(buf);
-    }
-    snprintf(buf, sizeof(buf), "RF %.3f SF%u", (double)g_mesh.freq, (unsigned)g_mesh.sf);
-    push(buf);
-    snprintf(buf, sizeof(buf), "RADIO %s", g_mesh.radio_state);
-    push(buf);
-    {
-        const char *lk = "?";
-        switch (mesh_ui_state()) {
-            case MESH_UI_OFF: lk = "off"; break;
-            case MESH_UI_WAIT: lk = "wait"; break;
-            case MESH_UI_OK: lk = "OK"; break;
-            case MESH_UI_STALE: lk = "stale"; break;
-            case MESH_UI_DOWN: lk = "DOWN"; break;
-        }
-        snprintf(buf, sizeof(buf), "LINK %s", lk);
-        push(buf);
-    }
-    snprintf(buf, sizeof(buf), "PROBE every %lus",
-             (unsigned long)g_mesh.probe_interval_s);
-    push(buf);
-    if (g_mesh.last_rtt_ms)
-        snprintf(buf, sizeof(buf), "RTT %lu ms", (unsigned long)g_mesh.last_rtt_ms);
-    else
-        snprintf(buf, sizeof(buf), "RTT --");
-    push(buf);
-    snprintf(buf, sizeof(buf), "DM RX %lu", (unsigned long)g_mesh.dm_rx_count);
-    push(buf);
-    push("private DM only");
-    return n;
-}
-
 static void skill_meshcore_poll() {
     /* Deferred radio start (~5s after boot): seed UI/WiFi already running.
      * want_identity brings the radio up even with no keys yet, so mc_client.cpp

@@ -31,7 +31,7 @@ int main(void) {
     assert(ui_nav_backspace_goes_back(UINAV_AGENT_CHAT));
     assert(ui_nav_backspace_goes_back(UINAV_NOTIFY));
     assert(ui_nav_backspace_goes_back(UINAV_CARD_ACT));
-    assert(ui_nav_backspace_goes_back(UINAV_WIFI_INFO));
+    assert(ui_nav_backspace_goes_back(UINAV_WIFI_PROGRESS));
     assert(ui_nav_backspace_goes_back(UINAV_PAGE));
 
     // Back targets mirror the BACK rows in ui_on_click(), by value.
@@ -48,7 +48,7 @@ int main(void) {
     assert(ui_nav_back_target(UINAV_MESH_PING, false)     == UINAV_MESHCORE);
     assert(ui_nav_back_target(UINAV_WIFI, false)          == UINAV_MENU);
     assert(ui_nav_back_target(UINAV_WIFI_LIST, false)     == UINAV_WIFI);
-    assert(ui_nav_back_target(UINAV_WIFI_INFO, false)     == UINAV_WIFI);
+    assert(ui_nav_back_target(UINAV_WIFI_PROGRESS, false) == UINAV_WIFI);
     assert(ui_nav_back_target(UINAV_PAGE, false)          == UINAV_CLOCK);
     // Contacts backs out to the menu it was opened from, and BACKSPACE navigates
     // (it is a list, not a text-entry field).
@@ -56,9 +56,10 @@ int main(void) {
     assert(ui_nav_backspace_goes_back(UINAV_CONTACTS));
     assert(!ui_nav_is_text_entry(UINAV_CONTACTS));
 
-    // Network status backs out to the WiFi menu it was opened from, and BACKSPACE
-    // navigates (it is a read-only status list, not a text-entry field).
+    // Network status backs out to the menu that opened it.
     assert(ui_nav_back_target(UINAV_NET, false)           == UINAV_WIFI);
+    assert(ui_nav_back_target(UINAV_NET, false, UINAV_MSGLIST, UINAV_MESHCORE)
+           == UINAV_MESHCORE);
     assert(ui_nav_backspace_goes_back(UINAV_NET));
     assert(!ui_nav_is_text_entry(UINAV_NET));
 

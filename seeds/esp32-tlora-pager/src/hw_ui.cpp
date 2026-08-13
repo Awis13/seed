@@ -622,7 +622,6 @@ static char fld_note[56]  = "";
 static int  clock_badge   = -1;
 static int  clock_mesh_ui = -1;
 static int  clock_mesh_age_bucket = -2;  // -2 dirty; -1 never; else minutes (or hours*1000)
-static int  clock_wg_ui = -1;
 static bool clock_dirty   = true;
 
 // Selection caches for partial repaint.
@@ -786,7 +785,6 @@ void hw_ui_invalidate_clock() {
     clock_badge = -1;
     clock_mesh_ui = -1;
     clock_mesh_age_bucket = -2;
-    clock_wg_ui = -1;
     clock_bar_drawn = -1;
 }
 
@@ -830,13 +828,12 @@ void hw_ui_clock_tick(const char *version,
                       const char *date_str,
                       bool crit_unread,
                       int mesh_ui,
-                      int mesh_age_s,
-                      int wg_ui) {
+                      int mesh_age_s) {
     if (!panel_ok || screen != HW_UI_CLOCK) return;
     (void)crit_unread;
     HwSpiBusGuard bus;  // one tick = one logical paint operation
 
-    // Header: version | badge | W | M+age | BAT | IP
+    // Header: version | badge | M+age | BAT | IP
     draw_field(fld_ver, sizeof(fld_ver), version ? version : "",
                MARGIN, HDR_Y, 2, COL_DIM, 'L', 80);
     draw_field(fld_batt, sizeof(fld_batt), batt ? batt : "",
@@ -856,20 +853,6 @@ void hw_ui_clock_tick(const char *version,
             if (badge > 9) snprintf(b, sizeof(b), "9+");
             else snprintf(b, sizeof(b), "%d", badge);
             tft_draw_text(bx + 8, HDR_Y, b, COL_ACCENT, COL_BG, 2);
-        }
-    }
-
-    // WireGuard "W" just left of MeshCore slot.
-    if (clock_dirty || wg_ui != clock_wg_ui) {
-        clock_wg_ui = wg_ui;
-        const int wx = PANEL_W / 2 - 140;
-        tft_fill_rect(wx - 2, HDR_Y, 20, 16, COL_BG);
-        if (wg_ui > WG_UI_OFF) {
-            uint16_t col = COL_DIM;
-            if (wg_ui == WG_UI_OK) col = COL_INFO;
-            else if (wg_ui == WG_UI_STALE) col = COL_WARN;
-            else if (wg_ui == WG_UI_DOWN) col = COL_CRIT;
-            tft_draw_text((uint16_t)wx, HDR_Y, "W", col, COL_BG, 2);
         }
     }
 
@@ -1441,20 +1424,7 @@ void hw_ui_show_mesh_ping(const char *phase,
     tft_draw_text(MARGIN, PANEL_H - 16, "click = back", COL_DIM, COL_BG, 1);
 }
 
-// ---- dual-path ping result (glance: WiFi | Mesh) ---------------------------
-// Simple geometric icons so the eye hits OK/NO before reading text.
-
-static void ping_draw_wifi_icon(int cx, int cy, uint16_t col) {
-    /* Arc bars + stem — readable at a glance on 480×222. */
-    for (int b = 0; b < 3; b++) {
-        int w = 10 + b * 14;
-        int y = cy - 22 + b * 10;
-        tft_fill_rect((uint16_t)(cx - w / 2), (uint16_t)y,
-                      (uint16_t)w, 4, col);
-    }
-    tft_fill_rect((uint16_t)(cx - 3), (uint16_t)(cy + 10), 6, 10, col);
-    tft_fill_rect((uint16_t)(cx - 8), (uint16_t)(cy + 18), 16, 4, col);
-}
+// ---- MeshCore ping result --------------------------------------------------
 
 static void ping_draw_mesh_icon(int cx, int cy, uint16_t col) {
     /* Three nodes + links — MeshCore private path, not WiFi. */
@@ -1507,31 +1477,21 @@ static void ping_draw_path_column(int cx, bool ok,
     }
 }
 
-void hw_ui_show_mesh_ping_result(bool wifi_ok, const char *wifi_sub1,
-                                 const char *wifi_sub2,
-                                 bool mesh_ok, const char *mesh_sub1,
+void hw_ui_show_mesh_ping_result(bool mesh_ok, const char *mesh_sub1,
                                  const char *mesh_sub2) {
     if (!panel_ok) return;
     screen = HW_UI_MESH_PING;
 
     HwSpiBusGuard bus;
     tft_fill(COL_BG);
-    uint16_t accent = (wifi_ok || mesh_ok) ? COL_INFO : COL_CRIT;
-    if (wifi_ok && mesh_ok) accent = COL_INFO;
-    else if (wifi_ok || mesh_ok) accent = COL_WARN;
+    uint16_t accent = mesh_ok ? COL_INFO : COL_CRIT;
 
     tft_fill_rect(0, 0, PANEL_W, 22, accent);
     tft_draw_text(MARGIN, 4, "MESH PING", COL_BG, accent, 2);
-    const char *tag = (wifi_ok && mesh_ok) ? "BOTH"
-                    : (wifi_ok ? "WIFI" : (mesh_ok ? "MESH" : "NONE"));
+    const char *tag = mesh_ok ? "OK" : "NO";
     tft_draw_text_r(PANEL_W - MARGIN, 4, tag, COL_BG, accent, 2);
 
-    /* vertical divider */
-    tft_fill_rect(PANEL_W / 2 - 1, 28, 2, PANEL_H - 48, COL_RULE);
-
-    ping_draw_path_column(PANEL_W / 4, wifi_ok, "WiFi",
-                          ping_draw_wifi_icon, wifi_sub1, wifi_sub2);
-    ping_draw_path_column(3 * PANEL_W / 4, mesh_ok, "Mesh",
+    ping_draw_path_column(PANEL_W / 2, mesh_ok, "Mesh",
                           ping_draw_mesh_icon, mesh_sub1, mesh_sub2);
 
     tft_draw_text(MARGIN, PANEL_H - 16, "click = back", COL_DIM, COL_BG, 1);
@@ -1569,8 +1529,8 @@ void hw_ui_show_wifi(int selected) {
     tft_fill(COL_BG);
     tft_fill_rect(0, 0, PANEL_W, 22, COL_ACCENT);
     tft_draw_text(MARGIN, 4, "WIFI", COL_BG, COL_ACCENT, 2);
-    tft_draw_text_r(PANEL_W - MARGIN, 6, "STA+WG", COL_BG, COL_ACCENT, 1);
-    tft_draw_text(MARGIN, 32, "networks + tunnel", COL_DIM, COL_BG, 1);
+    tft_draw_text_r(PANEL_W - MARGIN, 6, "STA", COL_BG, COL_ACCENT, 1);
+    tft_draw_text(MARGIN, 32, "networks", COL_DIM, COL_BG, 1);
     for (int i = 0; i < WIFI_MENU_N; i++) wifi_menu_draw_row(i, i == selected);
     wifi_sel_drawn = selected;
 }
@@ -1631,16 +1591,16 @@ void hw_ui_show_wifi_list(const char *header,
     wifi_list_n_drawn = n;
 }
 
-void hw_ui_show_wifi_info(const char *const *lines, int n_lines) {
+void hw_ui_show_wifi_progress(const char *const *lines, int n_lines) {
     if (!panel_ok) return;
-    screen = HW_UI_WIFI_INFO;
+    screen = HW_UI_WIFI_PROGRESS;
     if (n_lines < 0) n_lines = 0;
     if (n_lines > 12) n_lines = 12;
 
     HwSpiBusGuard bus;
     tft_fill(COL_BG);
     tft_fill_rect(0, 0, PANEL_W, 22, COL_ACCENT);
-    tft_draw_text(MARGIN, 4, "WIFI STATUS", COL_BG, COL_ACCENT, 2);
+    tft_draw_text(MARGIN, 4, "WIFI", COL_BG, COL_ACCENT, 2);
 
     uint16_t y = 32;
     for (int i = 0; i < n_lines; i++) {
@@ -2465,10 +2425,8 @@ void hw_ui_show_reply(const char *title,
 
 void hw_ui_show_info(const char *version,
                      const char *host,
-                     const char *ip,
                      const char *token,
-                     uint32_t free_heap,
-                     int unread) {
+                     uint32_t free_heap) {
     if (!panel_ok) return;
     screen = HW_UI_INFO;
 
@@ -2483,11 +2441,7 @@ void hw_ui_show_info(const char *version,
     tft_draw_text(MARGIN, y, line, COL_TIME, COL_BG, 2); y += 28;
     snprintf(line, sizeof(line), "HOST  %s", host ? host : "?");
     tft_draw_text(MARGIN, y, line, COL_TIME, COL_BG, 2); y += 28;
-    snprintf(line, sizeof(line), "IP    %s", ip && ip[0] ? ip : "offline");
-    tft_draw_text(MARGIN, y, line, COL_TIME, COL_BG, 2); y += 28;
     snprintf(line, sizeof(line), "HEAP  %u", (unsigned)free_heap);
-    tft_draw_text(MARGIN, y, line, COL_DIM, COL_BG, 2); y += 28;
-    snprintf(line, sizeof(line), "INBOX %d unread", unread);
     tft_draw_text(MARGIN, y, line, COL_DIM, COL_BG, 2); y += 28;
     tft_draw_text(MARGIN, y, "TOKEN", COL_DIM, COL_BG, 1); y += 16;
     tft_draw_text(MARGIN, y, token && token[0] ? token : "(none)", COL_TIME, COL_BG, 1);

@@ -80,7 +80,7 @@ static_assert((int)UINAV_MESHCORE       == (int)HW_UI_MESHCORE,       "ui_nav en
 static_assert((int)UINAV_MESH_PING      == (int)HW_UI_MESH_PING,      "ui_nav enum drift");
 static_assert((int)UINAV_WIFI           == (int)HW_UI_WIFI,           "ui_nav enum drift");
 static_assert((int)UINAV_WIFI_LIST      == (int)HW_UI_WIFI_LIST,      "ui_nav enum drift");
-static_assert((int)UINAV_WIFI_INFO      == (int)HW_UI_WIFI_INFO,      "ui_nav enum drift");
+static_assert((int)UINAV_WIFI_PROGRESS  == (int)HW_UI_WIFI_PROGRESS,  "ui_nav enum drift");
 static_assert((int)UINAV_PAGE           == (int)HW_UI_PAGE,           "ui_nav enum drift");
 static_assert((int)UINAV_CONTACTS       == (int)HW_UI_CONTACTS,       "ui_nav enum drift");
 static_assert((int)UINAV_NET            == (int)HW_UI_NET,            "ui_nav enum drift");
@@ -1783,8 +1783,7 @@ static void ui_clock_paint(const char *note) {
                      ok, hh, mm, ss, date,
                      notify_crit_unread(),
                      mesh_ui_state(),
-                     mesh_alive_age_s(),
-                     wg_ui_state());
+                     mesh_alive_age_s());
     hw_ui_clock_bar(bar_pct);
 }
 
@@ -1866,6 +1865,7 @@ static int wifi_list_sel = 0;
 static int wifi_list_mode = WIFI_LIST_SCAN;
 static int wifi_list_count = 0;
 static char wifi_list_titles[HW_UI_WIFI_LIST_MAX][36];
+static uint8_t net_origin = UINAV_WIFI;
 static char wifi_list_ssids[HW_UI_WIFI_LIST_MAX][33];
 static bool wifi_compose = false;           // REPLY screen = enter WiFi password
 static char wifi_pending_ssid[33] = "";
@@ -2464,7 +2464,7 @@ static void ui_open_meshcore() {
 }
 
 static void ui_reply_paint();  // defined later (WiFi password reuses reply face)
-static void ui_open_net();     // sectioned network status; defined with Contacts below
+static void ui_open_net(uint8_t origin = UINAV_WIFI);
 
 static void ui_open_wifi() {
     wifi_sel = 0;
@@ -2504,14 +2504,14 @@ static void ui_wifi_toggle() {
             Serial.println("[wifi] user toggled ON — no saved profile");
         }
     }
-    ui_open_net();
+    ui_open_net(UINAV_WIFI);
     ui_note_input();
 }
 
 static void ui_wifi_do_scan() {
     /* Blocking scan — paint "SCAN…" first so the panel is not frozen blank. */
     static const char *wait_lines[] = { "scanning…", "hold on" };
-    hw_ui_show_wifi_info(wait_lines, 2);
+    hw_ui_show_wifi_progress(wait_lines, 2);
     delay(50);
 
     if (wifi_user_off) {
@@ -2594,7 +2594,7 @@ static void ui_wifi_connect_ssid(const char *ssid) {
             snprintf(lines[1], sizeof(lines[1]), "%s", ssid);
             ptrs[0] = lines[0];
             ptrs[1] = lines[1];
-            hw_ui_show_wifi_info(ptrs, 2);
+            hw_ui_show_wifi_progress(ptrs, 2);
             delay(30);
             wifi_user_off = false;
             WiFi.mode(WIFI_STA);
@@ -2606,7 +2606,7 @@ static void ui_wifi_connect_ssid(const char *ssid) {
             snprintf(lines[1], sizeof(lines[1]), "%s", ssid);
             snprintf(lines[2], sizeof(lines[2]), "async - UI stays live");
             ptrs[2] = lines[2];
-            hw_ui_show_wifi_info(ptrs, 3);
+            hw_ui_show_wifi_progress(ptrs, 3);
             event_add("wifi menu async connect %s", ssid);
             ui_note_input();
             return;
@@ -2616,23 +2616,9 @@ static void ui_wifi_connect_ssid(const char *ssid) {
     ui_wifi_open_password(ssid);
 }
 
-// MESHCORE → STATUS: pair keys + RF policy (from SPIFFS /mesh_*).
-static void ui_mesh_show_status() {
-    static char lines[HW_UI_MESH_PING_LINES][40];
-    static const char *ptrs[HW_UI_MESH_PING_LINES];
-    char raw[HW_UI_MESH_PING_LINES][40];
-    int n = mesh_status_lines(raw, HW_UI_MESH_PING_LINES);
-    for (int i = 0; i < n; i++) {
-        snprintf(lines[i], sizeof(lines[i]), "%s", raw[i]);
-        ptrs[i] = lines[i];
-    }
-    const char *phase = g_mesh.has_identity ? "PAIR" : "NOKEY";
-    hw_ui_show_mesh_ping(phase, ptrs, n);
-    ui_note_input();
-}
-
-// MESHCORE → PING GATEWAY: dual-path glance (WiFi HTTP + Mesh private DM).
-// Final face = two big icons (who is up) + strength under each.
+// MESHCORE → PING GATEWAY: WiFi reachability probe + Mesh private DM.
+// The final face focuses on MeshCore; WiFi detail lives in Network. The
+// existing HTTP probe remains unchanged.
 //
 // Non-blocking: opening the PING face arms a small state machine that loop()
 // advances one bounded step per pass via ui_mesh_ping_poll(). The WiFi HTTP
@@ -2839,10 +2825,8 @@ static void ui_mesh_ping_step_wait() {
             snprintf(mesh_s2, sizeof(mesh_s2), "never");
     }
 
-    hw_ui_show_mesh_ping_result(mesh_ping_wifi_ok, mesh_ping_wifi_s1,
-                                mesh_ping_wifi_s2,
-                                mesh_ok, mesh_s1, mesh_s2);
-    if (mesh_ping_wifi_ok || mesh_ok) hw_haptic_notify(0);
+    hw_ui_show_mesh_ping_result(mesh_ok, mesh_s1, mesh_s2);
+    if (mesh_ok) hw_haptic_notify(0);
     else hw_haptic_notify(1);
     ui_note_input();
     mesh_ping_state = MESH_PING_IDLE;
@@ -2960,7 +2944,8 @@ static void ui_go_back() {
     HwUiScreen scr = hw_ui_screen();
     if (!ui_nav_backspace_goes_back((uint8_t)scr)) return;
     bool has_rooms = (scr == HW_UI_AGENT_CHAT) && agents_has_rooms(agent_focus);
-    ui_go_to_screen(ui_nav_back_target((uint8_t)scr, has_rooms, agent_origin));
+    ui_go_to_screen(ui_nav_back_target((uint8_t)scr, has_rooms, agent_origin,
+                                       net_origin));
     hw_haptic_notify(0);
 }
 
@@ -3493,11 +3478,8 @@ static void ui_agent_act_confirm() {
 static void ui_open_info() {
     char ver[16];
     snprintf(ver, sizeof(ver), "v%s", SEED_VERSION);
-    String ip = (WiFi.status() == WL_CONNECTED)
-        ? WiFi.localIP().toString() : String("");
-    hw_ui_show_info(ver, node_name.c_str(), ip.c_str(),
-                    auth_token.c_str(), ESP.getFreeHeap(),
-                    notify_unread_count());
+    hw_ui_show_info(ver, node_name.c_str(), auth_token.c_str(),
+                    ESP.getFreeHeap());
     ui_note_input();
 }
 
@@ -3802,13 +3784,14 @@ static void ui_net_render() {
 // these value buffers only need to outlive the build call. g_mesh / g_rns_* /
 // WiFi are read directly on the loop task exactly as conn_mgr_service() and
 // ui_clock_paint() do — those globals are loop-task owned, so no extra lock.
-static void ui_open_net() {
+static void ui_open_net(uint8_t origin) {
     static char wifi_ssid_s[NET_VALUE_LEN];
     static char wifi_ip_s[NET_VALUE_LEN];
     static char rns_addr_s[NET_VALUE_LEN];
     static char mesh_key_s[NET_VALUE_LEN];
     static char mesh_rf_s[NET_VALUE_LEN];
 
+    net_origin = origin;
     NetStatus s;
     memset(&s, 0, sizeof(s));
 
@@ -3855,6 +3838,15 @@ static void ui_open_net() {
 
     net_count = net_build_rows(&s, net_rows, NET_ROWS_MAX);
     net_top = 0;
+    if (origin == UINAV_MESHCORE) {
+        for (int i = 0; i < net_count; i++) {
+            if (net_rows[i].kind == NET_ROW_HEADER &&
+                net_rows[i].section == NET_SEC_MESH) {
+                net_top = i;
+                break;
+            }
+        }
+    }
     ui_net_render();
 }
 
@@ -3958,7 +3950,7 @@ static void ui_on_click() {
         if (wifi_sel == WIFI_ACT_BACK) {
             ui_open_menu();
         } else if (wifi_sel == WIFI_ACT_STATUS) {
-            ui_open_net();
+            ui_open_net(UINAV_WIFI);
         } else if (wifi_sel == WIFI_ACT_SCAN) {
             ui_wifi_do_scan();
         } else if (wifi_sel == WIFI_ACT_PROFILES) {
@@ -3974,7 +3966,7 @@ static void ui_on_click() {
             ui_wifi_connect_ssid(wifi_list_ssids[wifi_list_sel]);
         }
         break;
-    case HW_UI_WIFI_INFO:
+    case HW_UI_WIFI_PROGRESS:
         ui_open_wifi();
         break;
     case HW_UI_SETTINGS:
@@ -3996,7 +3988,7 @@ static void ui_on_click() {
         if (mesh_sel == MESH_ACT_BACK) {
             ui_open_menu();
         } else if (mesh_sel == MESH_ACT_STATUS) {
-            ui_mesh_show_status();
+            ui_open_net(UINAV_MESHCORE);
         } else {
             ui_mesh_ping_gateway();
         }
@@ -4113,8 +4105,7 @@ static void ui_on_click() {
         ui_contacts_open_selected();
         break;
     case HW_UI_NET:
-        // Read-only status screen: click returns to the WiFi menu it opened from.
-        ui_open_wifi();
+        ui_go_to_screen(net_origin);
         break;
     case HW_UI_PAGE:
         // Click toggles the two input modes: OPEN the page for in-page scrolling,

@@ -82,7 +82,7 @@ PAINT_ENTRIES = [
     "void hw_ui_show_mesh_ping_result(",
     "void hw_ui_show_wifi(",
     "void hw_ui_show_wifi_list(",
-    "void hw_ui_show_wifi_info(",
+    "void hw_ui_show_wifi_progress(",
     "void hw_ui_show_agent_sessions(",
     "int hw_ui_show_agent_chat(",
     "void hw_ui_show_agent_act(",
