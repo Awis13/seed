@@ -48,8 +48,9 @@ bool hw_kb_take_layout_changed();
 // symbol layer and must type that character — silent lives in Settings.
 bool hw_kb_take_silent_toggle();
 
-// Keyboard lock (pocket / bag). Held encoder click toggles it; CAPS unlocks.
-// While locked all other keys are ignored.
+// Keyboard lock (pocket / bag), controlled by held USER in main.
+// While locked all keyboard keys are ignored.
+// ALT+CAPS layout cycle is also blocked while locked.
 bool hw_kb_locked();
 void hw_kb_set_locked(bool on);
 // True once after lock state flips (for haptic / note).

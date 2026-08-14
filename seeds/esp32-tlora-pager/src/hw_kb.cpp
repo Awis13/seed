@@ -325,7 +325,7 @@ void hw_kb_set_locked(bool on) {
         symbol = false;
         alt_held = false;
     }
-    Serial.printf("[kb] %s\n", on ? "LOCKED (CAPS or hold click)" : "unlocked");
+    Serial.printf("[kb] %s\n", on ? "LOCKED (hold USER to unlock)" : "unlocked");
 }
 
 bool hw_kb_take_lock_changed() {
@@ -362,12 +362,8 @@ bool hw_kb_read(char *out, size_t out_sz) {
         return false;
     }
     if (k == KEY_CAPS) {
-        if (pressed && kb_locked) {
-            hw_kb_set_locked(false);
-            return false;
-        }
         if (!pressed) {
-            if (kb_locked) return false;
+            if (kb_locked) return false;  // pocket: keys must not unlock
             if (alt_held) {
                 hw_kb_cycle_layout();
             } else {

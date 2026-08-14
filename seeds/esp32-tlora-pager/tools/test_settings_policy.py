@@ -29,7 +29,8 @@ assert "INPUT_LONG_MS          1000" in input_cpp
 assert "!long_fired && (t - key_down_at) < INPUT_CLICK_MAX_MS" in input_cpp
 assert "pending_click = false;" in input_cpp
 assert "kb_toggle_lock" not in kb and "CAPS_LONG_MS" not in kb
-assert "if (pressed && kb_locked)" in kb, "short CAPS must unlock; it is not a lock key"
-assert "LOCKED  CAPS or hold click" in main
+assert "if (kb_locked) return false;  // pocket: keys must not unlock" in kb
+assert "if (pressed && kb_locked)" not in kb
+assert "LOCKED  hold USER unlock" in main
 
 print("settings policy tests: OK")

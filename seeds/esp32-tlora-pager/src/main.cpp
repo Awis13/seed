@@ -90,7 +90,7 @@ static_assert((int)UINAV_CONTACTS       == (int)HW_UI_CONTACTS,       "ui_nav en
 static_assert((int)UINAV_NET            == (int)HW_UI_NET,            "ui_nav enum drift");
 
 // ===== Configuration =====
-#define SEED_VERSION        "0.9.109"
+#define SEED_VERSION        "0.9.110"
 // Core clock: datasheet puts 240 vs 80 ~11.5mA apart on WAITI. Periph bus holds
 // at 80 for every PLL-fed core clock; go lower and RMT/I2S retimes. Same floor
 // as tembed idle policy (no light sleep — notify latency is the job).
@@ -1848,7 +1848,7 @@ static void ui_clock_paint(const char *note) {
     }
     if (hw_kb_locked()) {
         /* LOCK takes the note row so pocket mode is obvious. */
-        snprintf(row2, sizeof(row2), "LOCKED  CAPS or hold click");
+        snprintf(row2, sizeof(row2), "LOCKED  hold USER unlock");
     }
     if (settings_silent && row2[0] == '\0')
         snprintf(row2, sizeof(row2), "SILENT");
