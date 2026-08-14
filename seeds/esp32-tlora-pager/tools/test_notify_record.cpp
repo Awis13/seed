@@ -153,7 +153,7 @@ static void test_event_identity_and_reservation(void) {
     assert(strcmp(notify_rec_archive_event_key(
                       "opencode-pager", 99, &no_event, true,
                       fail_safe, sizeof(fail_safe)), "#99") == 0);
-    assert(!notify_rec_key_replaces("hermes-chat"));
+    assert(notify_rec_key_replaces("hermes-chat"));
     assert(notify_rec_key_replaces("raid-tank"));
 }
 

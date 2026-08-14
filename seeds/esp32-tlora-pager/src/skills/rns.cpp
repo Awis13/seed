@@ -357,11 +357,17 @@ static_assert(RNS_OUTBOX_PAYLOAD_MAX == (size_t)RNS::Type::Packet::ENCRYPTED_MDU
  * the reference TCP interface uses. */
 #define RNS_TCP_BITRATE 10000000UL
 
-#define RNS_TCP_CONNECT_TIMEOUT_MS 3000
+#define RNS_TCP_CONNECT_TIMEOUT_MS 2000
 #define RNS_TCP_CONNECT_TASK_STACK 4096
 #define RNS_TCP_CONNECT_TASK_PRIO  1
-#define RNS_TCP_BACKOFF_MIN_MS 3000UL
-#define RNS_TCP_BACKOFF_MAX_MS 60000UL
+/* Was 3 s. Live 2026-08-14: mute RNS flap reset backoff every success tick,
+ * so connect() fired every ~3 s, logged socket:105, filled the pool, HTTP
+ * died, WG handshake aborted the board. Floor is now one minute. */
+#define RNS_TCP_BACKOFF_MIN_MS 60000UL
+#define RNS_TCP_BACKOFF_MAX_MS 600000UL
+/* After this many consecutive fail→idle arms, stop dialling until config
+ * changes. Chat uses mesh+WiFi bridge; mute RNS must not kill the pager. */
+#define RNS_TCP_GIVE_UP_AFTER  3
 
 /* Drain budget — three independent caps, all checked between reads. A single
  * read chunk is always parsed to the end (leftover bytes have nowhere to live),
@@ -520,6 +526,8 @@ static uint32_t g_rns_downs = 0;       /* established links subsequently lost */
 static uint32_t g_rns_backoff_ms = RNS_TCP_BACKOFF_MIN_MS;
 static uint32_t g_rns_next_try_ms = 0;
 static uint32_t g_rns_up_ms = 0;
+static uint8_t  g_rns_fail_streak = 0; /* consecutive fail arms; see give-up */
+static bool     g_rns_give_up = false; /* stop auto-dial until config dirty */
 static uint32_t g_rns_frames_in = 0;
 static uint32_t g_rns_tx_dropped = 0;
 static uint32_t g_rns_rx_errors = 0;   /* frames Transport::inbound threw on */
@@ -1933,6 +1941,8 @@ void RnsTcpInterface::loop() {
         if (g_rns_cfg_ok) {
             g_rns_backoff_ms = RNS_TCP_BACKOFF_MIN_MS;
             g_rns_next_try_ms = millis();
+            g_rns_give_up = false;
+            g_rns_fail_streak = 0;
         }
         if (changed && cs == RNS_CS_CONNECTED) {
             link_down("configuration changed");
@@ -1944,6 +1954,13 @@ void RnsTcpInterface::loop() {
         _online = false;
         g_rns_client.stop();
         g_rns_cs.store(RNS_CS_IDLE);
+        if (g_rns_fail_streak < 255) g_rns_fail_streak++;
+        if (g_rns_fail_streak >= RNS_TCP_GIVE_UP_AFTER) {
+            g_rns_give_up = true;
+            event_add("rns tcp give up after %u fails (no auto-dial)",
+                      (unsigned)g_rns_fail_streak);
+            return;
+        }
         g_rns_next_try_ms = millis() + g_rns_backoff_ms;
         /* Announce the delay that was just armed, not the one after it: the
          * event used to print the already-doubled value and was a whole step
@@ -1959,16 +1976,21 @@ void RnsTcpInterface::loop() {
 
     if (cs == RNS_CS_CONNECTED) {
         if (!_online) {
-            /* First tick after the connect task won. */
+            /* First tick after the connect task won. Do NOT reset backoff here:
+             * a mute peer that accepts then drops would re-arm the 3 s floor
+             * forever. Backoff clears only after a long stable uptime below. */
             _online = true;
             g_rns_up_ms = millis();
-            g_rns_backoff_ms = RNS_TCP_BACKOFF_MIN_MS;
             g_rns_wg_seen = wg_is_up();
             rns_hdlc_rx_reset(&g_rns_rx);
             g_rns_tx_len = 0;
             g_rns_tx_sent = 0;
             g_rns_tx_pending_ms = 0;
             event_add("rns tcp up %s:%u", g_rns_host, (unsigned)g_rns_port);
+        } else if ((millis() - g_rns_up_ms) > 60000UL) {
+            /* Truly stable for 60 s — safe to shrink the ladder. */
+            g_rns_backoff_ms = RNS_TCP_BACKOFF_MIN_MS;
+            g_rns_fail_streak = 0;
         }
 
         if (!g_rns_cfg_enabled) {
@@ -2004,6 +2026,7 @@ void RnsTcpInterface::loop() {
      * interface is switched off. */
     _online = false;
     if (!g_rns_cfg_enabled || !g_rns_cfg_ok) return;
+    if (g_rns_give_up) return; /* mute/flapping host must not burn sockets */
     if (WiFi.status() != WL_CONNECTED) return;
     if ((int32_t)(millis() - g_rns_next_try_ms) < 0) return;
     begin_connect();
@@ -4002,6 +4025,9 @@ static void skill_rns_init() {
                   (int)g_rns_cfg_enabled,
                   rns_error ? " err=" : "", rns_error ? rns_error : "");
     skill_register(&rns_skill);
-    event_add("rns skill started=%d id=%d iface=%d", (int)rns_started,
+        /* Mute RNS must not dial: socket:105 every 3s killed chat delivery. */
+    g_rns_give_up = true;
+    g_rns_fail_streak = RNS_TCP_GIVE_UP_AFTER;
+event_add("rns skill started=%d id=%d iface=%d", (int)rns_started,
               (int)rns_identity_ok, (int)g_rns_cfg_enabled);
 }

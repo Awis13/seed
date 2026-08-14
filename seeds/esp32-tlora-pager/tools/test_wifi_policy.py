@@ -54,8 +54,11 @@ assert "wifi_begin_active_profile()" in retry
 toggle = main[main.index("static void ui_wifi_toggle()") :]
 toggle = toggle[: toggle.index("static void ui_wifi_do_scan()")]
 assert "if (!wifi_user_off)" in toggle
-assert "WiFi.mode(WIFI_OFF)" in toggle
-assert "WiFi.disconnect(true, false)" in toggle
+assert "wifi_off_request()" in toggle, "OFF must be deferred; inline WIFI_OFF reboots"
+assert "WiFi.disconnect(true, false)" not in toggle
+assert "WiFi.mode(WIFI_OFF)" not in toggle
+assert "WIFI_OFF_STOP_WG" in main
+assert "static void wifi_off_poll()" in main
 
 for marker, end_marker in (
     ("static void handle_wifi_scan", "static void handle_wifi_networks_post"),
@@ -63,7 +66,7 @@ for marker, end_marker in (
 ):
     scan = main[main.index(marker):main.index(end_marker)]
     assert "wifi_user_off = false" not in scan, "scan must preserve manual Wi-Fi OFF"
-    assert "WiFi.mode(WIFI_OFF)" in scan, "scan must restore RF-off state"
+    assert "wifi_off_request()" in scan, "scan must restore RF-off via the settle machine"
 
 confirm = main[main.index("// Auto-confirm after 60s") :]
 confirm = confirm[: confirm.index("// WiFi reconnect")]
@@ -91,6 +94,17 @@ assert "agents_bridge_post(conv_id, session, text, delivery_key)" in send, (
 )
 assert "g_agents_mesh_uplink(conv_id, text, delivery_key)" in send, (
     "the mesh uplink remains the fallback rung"
+)
+
+wg = (ROOT / "src" / "skills" / "wg.cpp").read_text(encoding="utf-8")
+assert "g_wg_json_ok" in wg, "WG config must stay in RAM so a restart does not fopen SPIFFS"
+probe = wg[wg.index("http.setConnectTimeout"):]
+assert "wg_stop_now()" not in probe, (
+    "a failed WG health probe must not stop the tunnel — that reboot-looped"
+)
+
+assert "g_wg_restart_req = true" not in main, (
+    "the coordinator must not stop+start WireGuard on the loop task"
 )
 
 print("Wi-Fi/mesh boot policy tests: OK")

@@ -114,15 +114,29 @@ static bool wg_derive_public_key(const char *private_key_b64) {
     return true;
 }
 
+/* Keep /wg.json in RAM. After socket exhaustion, SPIFFS fopen aborts
+ * (lock_init_generic) — serial 2026-08-14: probe fail → stop → start → crash. */
+#define WG_JSON_CAP 768
+static char g_wg_json[WG_JSON_CAP];
+static bool g_wg_json_ok = false;
+
 static bool wg_load_config(JsonDocument &doc) {
+    if (g_wg_json_ok)
+        return deserializeJson(doc, g_wg_json) == DeserializationError::Ok;
     String json = read_spiffs_file(WG_CONFIG_FILE);
-    if (json.length() == 0) return false;
-    return deserializeJson(doc, json) == DeserializationError::Ok;
+    if (json.length() == 0 || json.length() >= WG_JSON_CAP) return false;
+    memcpy(g_wg_json, json.c_str(), json.length() + 1);
+    g_wg_json_ok = true;
+    return deserializeJson(doc, g_wg_json) == DeserializationError::Ok;
 }
 
 static bool wg_save_config(const JsonDocument &doc) {
     String json;
     serializeJson(doc, json);
+    if (json.length() > 0 && json.length() < WG_JSON_CAP) {
+        memcpy(g_wg_json, json.c_str(), json.length() + 1);
+        g_wg_json_ok = true;
+    }
     return write_spiffs_file(WG_CONFIG_FILE, json);
 }
 
@@ -212,10 +226,7 @@ static bool wg_start_now() {
         return false;
     }
 
-    if (g_wg_running) {
-        g_wg.end();
-        g_wg_running = false;
-    }
+    if (g_wg_running) return true;
 
     Serial.printf("[wg] start %s -> %s\n", address, g_wg_endpoint_used);
     g_wg_last_try_ms = millis();
@@ -286,7 +297,8 @@ static void wg_status_json(JsonDocument &doc) {
     doc["endpoint"] = g_wg_endpoint_used;
     doc["fail_streak"] = g_wg_fail_streak;
     doc["has_private_key"] = loaded && ((cfg["private_key"] | "")[0] != '\0');
-    doc["cfg_bytes"] = (int)read_spiffs_file(WG_CONFIG_FILE).length();
+    /* RAM only — re-reading SPIFFS under low DRAM aborts in lock_init. */
+    doc["cfg_bytes"] = g_wg_json_ok ? (int)strlen(g_wg_json) : 0;
     if (g_wg_running && g_wg_up_ms)
         doc["up_age_s"] = (unsigned long)((millis() - g_wg_up_ms) / 1000UL);
     else
@@ -617,45 +629,20 @@ static void skill_wg_poll() {
     if (now - last < WG_TICK_MS) return;
     last = now;
 
-    if (!g_wg_want || !g_wg_cfg_ok) return;
-
-    bool wifi = (WiFi.status() == WL_CONNECTED);
-    if (!wifi) {
+    /* WiFi lost → stop tunnel (library timer must not keep handshaking). */
+    if (WiFi.status() != WL_CONNECTED) {
         if (g_wg_running) wg_stop_now();
         return;
     }
 
-    if (!g_wg_running) {
-        /* Retry start every 15s while wanted. */
-        if (g_wg_last_try_ms == 0 || (now - g_wg_last_try_ms) > 15000UL)
-            wg_start_now();
-        return;
-    }
-
-    /* Soft liveness: periodic ping of gateway over WG (HTTP cheap). */
-    static uint32_t last_probe = 0;
-    if (now - last_probe < WG_HANDSHAKE_PROBE_MS) return;
-    last_probe = now;
-
-    HTTPClient http;
-    String url = String("http://") + wg_gateway_ip() + ":8325/health";
-    /* Loop task: a dead tunnel must cost ~1 s to notice, not the read window. */
-    http.setConnectTimeout(1000);
-    http.setTimeout(3000);
-    if (!http.begin(url)) return;
-    int code = http.GET();
-    http.end();
-    if (code > 0 && code < 500) {
-        g_wg_last_ok_ms = millis();
-        g_wg_fail_streak = 0;
-    } else {
-        g_wg_fail_streak++;
-        if (g_wg_fail_streak >= 3) {
-            event_add("wg probe fail x%u — restart", (unsigned)g_wg_fail_streak);
-            wg_stop_now();
-            /* next tick will restart */
-        }
-    }
+    /* EMERGENCY 0.9.106: do NOT auto-start WireGuard.
+     * Live crash: NetworkClient "socket: 105" ×15 → wireguardif_tmr
+     * handshake → lock_init_generic → abort() → reboot loop.
+     * Days-stable builds either had no WG load or sockets free.
+     * Tunnel only via explicit POST /wg/start (g_wg_start_req above).
+     * Mesh + LAN WiFi keep chat alive at home. */
+    (void)g_wg_want;
+    (void)g_wg_cfg_ok;
 }
 
 static const Skill wg_skill = {

@@ -48,9 +48,14 @@
 #include "wireguard.h"
 #include "crypto.h"
 #include "esp_log.h"
+#include "esp_heap_caps.h"
 /* tcpip_adapter removed in ESP-IDF 5 / Arduino-ESP32 3.x — use lwIP netif. */
 
 #include "esp32-hal-log.h"
+
+/* Handshake under DRAM pressure: random/crypto + ESP_LOG can abort in
+ * lock_init_generic on the tcpip thread (live serial 2026-08-14). */
+#define WG_HANDSHAKE_MIN_INTERNAL 16384u
 
 #define WIREGUARDIF_TIMER_MSECS 400
 
@@ -879,7 +884,11 @@ static void wireguardif_tmr(void *arg) {
 				wireguardif_send_keepalive(device, peer);
 			}
 			if (should_send_initiation(peer)) {
-				wireguard_start_handshake(device->netif, peer);
+				/* Skip rather than abort when sockets/DRAM are exhausted. */
+				if (heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)
+				    >= WG_HANDSHAKE_MIN_INTERNAL) {
+					wireguard_start_handshake(device->netif, peer);
+				}
 			}
 
 			if ((peer->curr_keypair.valid) || (peer->prev_keypair.valid)) {

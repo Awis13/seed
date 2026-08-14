@@ -2563,8 +2563,9 @@ assert "return false;" in send, (
     "a total ladder failure must reach the durable outbox caller"
 )
 assert "outbox_enqueue(&g_outbox, OUTBOX_KIND_AGENT" in agent_send
-assert 'agents_push_line(idx, false, "(~ queued)")' in agent_send
-assert 'agents_push_line(idx, false, "(! outbox full)")' in agent_send
+assert 'agents_push_line(idx, false, "(~ queued)")' not in agent_send
+assert 'agents_push_line(idx, false, "(! outbox full)")' not in agent_send
+assert "agents_mark_last_pending(idx, AGENT_DELIV_FAIL)" in agent_send
 # 11g. AND IT MUST NOT PRINT THE OLD LIE. The room said "(bridge: claude not
 # wired yet)"-shaped things for a path that was dead; a bare bridge complaint
 # for `claude` is now wrong by construction.

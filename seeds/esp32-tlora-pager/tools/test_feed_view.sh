@@ -10,10 +10,8 @@ ${CXX:-c++} -std=c++17 -Wall -Wextra -Werror \
   "$HERE/test_feed_view.cpp" -o "$OUT"
 "$OUT"
 
-# Wiring pin (Bug2a, TLORA-UI-FIX C3): the value-level filter test above proves
-# WHAT the filter decides; this slice proves main.cpp's card scan actually MAKES
-# that call. Goes RED if the `if (notify_is_chat(v)) continue;` line is removed
-# from ui_open_msglist. Same source-slice technique as test_idle_policy.py.
+# Wiring pin: a routed Hermes/Claude door stays in the feed next to its
+# conversation. Goes RED if the old C3 hide-the-door filter comes back.
 python3 - "$HERE/../src/main.cpp" <<'PYEOF'
 import sys
 from pathlib import Path
@@ -29,9 +27,9 @@ scan = scan[: scan.index("feed_build_rows(")]
 assert "if (!notify_view(i, v)) break;" in scan, (
     "the card scan changed shape; re-anchor this slice"
 )
-assert "if (notify_is_chat(v)) continue;" in scan, (
-    "Bug2a: the feed card scan must skip chat door cards via the C2 "
-    "classifier, or a chat shows twice (conversation row + door card)"
+assert "if (notify_is_chat(v)) continue;" not in scan, (
+    "door cards must stay in the feed; hiding them after routing "
+    "swallows the Hermes/Claude notification"
 )
 # View-level only: the scan must not delete or mutate the stored card. (The
 # delivery-time ack pinned below lives in the loop() arrival branch, OUTSIDE
@@ -61,13 +59,24 @@ for workspace in (
     assert workspace in open_fn, f"loop-stack feed workspace returned: {workspace}"
 assert "static FeedSortItem it[FEED_ORDER_MAX];" in feed_h
 assert "agents_head_time(r.epoch, times[msglist_count]" in open_fn
+assert "if (notify_rec_is_chat_door_key(v.key)) continue;" in open_fn, (
+    "chat doorbells must not occupy a Messages row — the conversation is the row"
+)
+assert "notify_chat_candidate(v).conversation >= 0) continue;" in open_fn
 
-# The counterpart of hiding the door card: arrival must use the shared plan and
-# ACK only after the thread accepts the normalized line.
+# The counterpart of hiding the door card: *-chat is a doorbell/teaser.
+# Full body lands via /agents/inbound or MeshCore C1 — never the 48 B teaser.
 chat_arr = main[main.index("static bool notify_reconcile_pending_chats(") :]
 chat_arr = chat_arr[: chat_arr.index("static void notify_take_chat_completions(")]
 assert "agents_chat_door_enqueue(" in chat_arr
-assert "agents_on_inbound(" not in chat_arr and "notify_ack" not in chat_arr
+assert "agents_on_inbound(" not in chat_arr
+assert "if (notify_rec_is_chat_door_key(view.key))" in chat_arr, (
+    "*-chat doorbells must not be copied into the thread"
+)
+assert "agents_thread_has_prefix(" in chat_arr, (
+    "a hermes-chat door must not copy if inbound already wrote the reply"
+)
+assert "notify_ack_id(view.id)" in chat_arr
 completion = main[main.index("static void notify_take_chat_completions(") :]
 completion = completion[: completion.index("static void agents_head_time(")]
 assert "done.accepted" in completion and "notify_ack_identity(" in completion, (

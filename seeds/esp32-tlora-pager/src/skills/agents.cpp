@@ -105,8 +105,62 @@
  * and the LOCK ORDER note below): only the *bus* is chunked, never the mux. */
 #define AGENT_SCAN_BUS_CHUNK  4096u
 
+/* RAM-only delivery tick on a from_me line. Not persisted in JSONL. */
+#define AGENT_DELIV_NONE  0  /* history / unknown — painted as '>' */
+#define AGENT_DELIV_PEND  1  /* accepted, waiting for ACK / 2xx — '~' */
+#define AGENT_DELIV_OK    2  /* mesh ACK or WiFi/LXMF/RNS 2xx — '*' */
+#define AGENT_DELIV_FAIL  3  /* radio/HTTP gave up — '!' */
+
+/* WiFi inbound + MeshCore C1 of the same reply share no delivery key
+ * (HTTP often arrives without id; C1 keys on mid). Collapse by body. */
+#define AGENT_IN_DEDUP_MS  15000
+static uint32_t g_in_hash[CONV_MAX];
+static uint16_t g_in_len[CONV_MAX];
+static uint32_t g_in_ms[CONV_MAX];
+
+static uint32_t agents_fnv1a(const char *s, size_t n) {
+    uint32_t h = 2166136261u;
+    for (size_t i = 0; i < n; i++) {
+        h ^= (unsigned char)s[i];
+        h *= 16777619u;
+    }
+    return h;
+}
+
+static char g_in_head[CONV_MAX][41];
+
+/* Caller holds agents_mux. True = this exact body landed moments ago. */
+static bool agents_inbound_recent(int idx, const char *text) {
+    if (idx < 0 || idx >= CONV_MAX || !text) return false;
+    size_t n = strlen(text);
+    if (n > 0xFFFFu) n = 0xFFFFu;
+    uint32_t h = agents_fnv1a(text, n);
+    uint32_t now = millis();
+    if (g_in_hash[idx] == h && g_in_len[idx] == (uint16_t)n &&
+        (uint32_t)(now - g_in_ms[idx]) < AGENT_IN_DEDUP_MS)
+        return true;
+    /* Same reply, different length: 241 B door vs full inbound. Keep the
+     * longer one — drop a teaser that arrives after the full body. */
+    size_t head_n = strlen(g_in_head[idx]);
+    if (head_n >= 16 && n >= 16 &&
+        (uint32_t)(now - g_in_ms[idx]) < AGENT_IN_DEDUP_MS) {
+        size_t c = head_n < 40 ? head_n : 40;
+        if (c > n) c = n;
+        if (strncmp(g_in_head[idx], text, c) == 0 && n <= g_in_len[idx])
+            return true;
+    }
+    g_in_hash[idx] = h;
+    g_in_len[idx] = (uint16_t)n;
+    g_in_ms[idx] = now;
+    size_t hn = n < 40 ? n : 40;
+    memcpy(g_in_head[idx], text, hn);
+    g_in_head[idx][hn] = '\0';
+    return false;
+}
+
 struct AgentLine {
     bool from_me;
+    uint8_t delivery;       // AGENT_DELIV_*; 0 after a disk reload
     uint32_t ts;            // unix seconds (the JSONL "ts"); 0 = unknown
     char text[AGENT_TEXT_LEN];
 };
@@ -325,7 +379,7 @@ fs::FS &mesh_contacts_fs();
  * conv_peer_id (a peer's address -> its conversation id) is pure and lives in
  * ../conv_store.h now, so no forward decl of it is needed here. */
 static void agents_view_append(ConvWindow &w, bool from_me, uint32_t ts,
-                               const char *text);
+                               const char *text, uint8_t delivery);
 static int agents_find(const char *id);
 static int agents_session_add(int idx, const char *name);
 
@@ -348,7 +402,9 @@ uint32_t agents_thread_line_ts(int idx, int i);  // ts of view[i] (0 unknown)
 void   agents_thread_goto_tail(int idx);         // rewind to latest (sync)
 void   agents_thread_goto_page(int idx, uint32_t end_line);  // load older page
 int    agents_thread_view(int idx, char out[][AGENT_TEXT_LEN], bool *from_me,
-                          uint32_t *ts_out, int max_lines);
+                          uint32_t *ts_out, int max_lines,
+                          uint8_t *delivery = nullptr);
+void   agents_mark_last_pending(int idx, uint8_t status);
 
 /* CONTACTS SCREEN enumeration (foundation for the grouped Contacts view).
  * The AI bucket of that screen is the seeded doors, and any bucket's row is
@@ -609,7 +665,7 @@ static bool agents_store_append(int idx, bool from_me, const char *text,
         if (notify_event_id_valid(origin_event)) {
             persisted = agents_store_append_verified(
                 path, (const uint8_t *)g_agents_append_record, record_n);
-        } else if (agents_store_ready()) {
+        } else if (agents_store_ready() && fs_internal_heap_ok()) {
             File f = g_store->open(path.c_str(), "a");
             if (f) {
                 f.write((const uint8_t *)g_agents_append_record, record_n);
@@ -628,7 +684,8 @@ static bool agents_store_append(int idx, bool from_me, const char *text,
     snprintf(a.last.text, sizeof(a.last.text), "%s", text ? text : "");
     a.last_use = ++g_conv_clock;
     if (!from_me && !agents_is_on_screen(idx) && a.unread < 0xFFFF) a.unread++;
-    if (g_win.owner == idx) agents_view_append(g_win, from_me, ts, text);
+    if (g_win.owner == idx) agents_view_append(g_win, from_me, ts, text,
+        from_me ? (uint8_t)AGENT_DELIV_PEND : (uint8_t)AGENT_DELIV_NONE);
     a.lines++;
     a.session_lines[a.active_idx]++;
     if (g_win.owner == idx && agents_store_ready())
@@ -637,16 +694,18 @@ static bool agents_store_append(int idx, bool from_me, const char *text,
 }
 
 static void agents_view_append(ConvWindow &w, bool from_me, uint32_t ts,
-                               const char *text) {
+                               const char *text, uint8_t delivery) {
     if (w.vn >= AGENT_VIEW_MAX) {
         memmove(&w.view[0], &w.view[1], (AGENT_VIEW_MAX - 1) * sizeof(AgentLine));
         w.view[AGENT_VIEW_MAX - 1].from_me = from_me;
+        w.view[AGENT_VIEW_MAX - 1].delivery = delivery;
         w.view[AGENT_VIEW_MAX - 1].ts = ts;
         snprintf(w.view[AGENT_VIEW_MAX - 1].text, sizeof(w.view[0].text),
                  "%s", text ? text : "");
         w.win_start++;
     } else {
         w.view[w.vn].from_me = from_me;
+        w.view[w.vn].delivery = delivery;
         w.view[w.vn].ts = ts;
         snprintf(w.view[w.vn].text, sizeof(w.view[0].text), "%s", text ? text : "");
         w.vn++;
@@ -713,9 +772,13 @@ struct AgentJScanner {
     }
 };
 
+/* Reuse one document per parse call site: a long JSONL scan used to allocate a
+ * fresh JsonDocument per line and fragment internal DRAM until the next FS::open
+ * aborted in lock_init_generic. Loop-task + agents_mux only — not re-entrant. */
 static bool agents_jsonl_parse(char *buf, bool &from_me, uint32_t &ts,
                                char *text, size_t text_n) {
-    JsonDocument doc;
+    static JsonDocument doc;
+    doc.clear();
     if (deserializeJson(doc, buf) != DeserializationError::Ok) return false;
     from_me = doc["from_me"] | false;
     ts = doc["ts"] | 0u;
@@ -729,13 +792,25 @@ static bool agents_jsonl_origin_matches(char *buf, uint32_t origin_id,
                                         const NotifyEventId *origin_event) {
     if (!buf || origin_id == 0 || !origin_key ||
         !notify_event_id_valid(origin_event)) return false;
-    JsonDocument doc;
+    static JsonDocument doc;
+    doc.clear();
     if (deserializeJson(doc, buf) != DeserializationError::Ok) return false;
     const char *stored_key = doc["origin_key"] | "";
     const char *stored_event = doc["origin_event"] | "";
     return notify_event_origin_matches(doc["origin_id"] | 0u, stored_key,
                                        stored_event, origin_id, origin_key,
                                        origin_event);
+}
+
+/* Last-line fallback when disk open is unsafe (low internal heap). */
+static void agents_seed_window_from_last(int idx) {
+    Conversation &a = g_convs[idx];
+    if (g_win.owner != idx) agents_window_take(idx);
+    if (g_win.vn == 0 && a.last.text[0]) {
+        agents_view_append(g_win, a.last.from_me, a.last.ts, a.last.text,
+                           AGENT_DELIV_NONE);
+        if (a.lines == 0) a.lines = 1;
+    }
 }
 
 /* Scan an already-open JSONL file line by line while BOUNDING the SPI-bus
@@ -788,6 +863,12 @@ static void agents_sync_view(int idx) {
      * empties the window, which turns the delta-sync below into a full rebuild
      * — the same work the old per-conversation code did on every room switch. */
     if (g_win.owner != idx) agents_window_take(idx);
+    /* FS::open → fopen → lock_init aborts when internal DRAM is exhausted
+     * (live backtrace 0.9.94: open chat from notify → goto_tail → here). */
+    if (!fs_internal_heap_ok()) {
+        agents_seed_window_from_last(idx);
+        return;
+    }
     String path = agents_log_path(a.id, a.sessions[a.active_idx]);
     /* Open + size/seek under one short bus burst; the line scan below bounds
      * its own bus hold (mux held throughout — see agents_scan_chunked). */
@@ -798,10 +879,15 @@ static void agents_sync_view(int idx) {
         HwSpiBusGuard bus;
         if (!g_store->exists(path.c_str())) {
             agents_window_take(idx);
+            agents_seed_window_from_last(idx);
             return;
         }
         f = g_store->open(path.c_str(), "r");
-        if (!f) { agents_window_take(idx); return; }
+        if (!f) {
+            agents_window_take(idx);
+            agents_seed_window_from_last(idx);
+            return;
+        }
         size_t sz = f.size();
         if (sz < g_win.file_sync)    // file shrank between calls → full rebuild
             agents_window_take(idx);
@@ -809,6 +895,7 @@ static void agents_sync_view(int idx) {
         do_scan = (g_win.file_sync < sz && f.seek(g_win.file_sync));
     }
     if (do_scan) {
+        /* Stack: 1088 + 512 under 16 KB loop — ok. Static JsonDocument in parse. */
         char lbuf[AGENT_JSONL_MAX];
         char text[AGENT_TEXT_LEN];
         AgentJScanner sc(f);
@@ -816,7 +903,7 @@ static void agents_sync_view(int idx) {
             bool from_me;
             uint32_t ts;
             if (line[0] && agents_jsonl_parse(line, from_me, ts, text, sizeof(text))) {
-                agents_view_append(g_win, from_me, ts, text);
+                agents_view_append(g_win, from_me, ts, text, AGENT_DELIV_NONE);
                 a.lines++;
                 /* The newest line read is also the picker's cached line. */
                 a.last.from_me = from_me;
@@ -828,6 +915,7 @@ static void agents_sync_view(int idx) {
     g_win.file_sync = final_size;
     a.session_lines[a.active_idx] = a.lines;
     { HwSpiBusGuard bus; f.close(); }
+    if (g_win.vn == 0) agents_seed_window_from_last(idx);
 }
 
 /*
@@ -1335,6 +1423,10 @@ static void agents_load_page(int idx, uint32_t end_line) {
     g_win.owner = idx;                  /* paging is an explicit focus */
     if (end_line > a.lines) end_line = a.lines;
     uint32_t keep_from = (end_line > AGENT_VIEW_MAX) ? (end_line - AGENT_VIEW_MAX) : 0;
+    if (!fs_internal_heap_ok()) {
+        agents_seed_window_from_last(idx);
+        return;
+    }
     String path = agents_log_path(a.id, a.sessions[a.active_idx]);
     /* Page scan runs from byte 0; bound its bus hold in chunks (mux held). */
     File f;
@@ -1351,7 +1443,7 @@ static void agents_load_page(int idx, uint32_t end_line) {
         uint32_t ts;
         if (line[0] && line_idx >= keep_from && line_idx < end_line &&
             agents_jsonl_parse(line, from_me, ts, text, sizeof(text))) {
-            agents_view_append(g_win, from_me, ts, text);
+            agents_view_append(g_win, from_me, ts, text, AGENT_DELIV_NONE);
         }
         line_idx++;
     });
@@ -1469,6 +1561,12 @@ static bool agents_push_line_with_origin(int idx, bool from_me, const char *text
         agents_unlock();
         return false;
     }
+    /* last.text is one 511 B chunk. A long Hermes reply over WiFi then C1
+     * would miss that compare and land twice. Hash the whole body instead. */
+    if (!from_me && agents_inbound_recent(idx, text)) {
+        agents_unlock();
+        return true;
+    }
 
     const char *p = text;
     bool persisted_any = false;
@@ -1494,7 +1592,7 @@ static bool agents_push_line_with_origin(int idx, bool from_me, const char *text
             if (n > cap) n = cap;
         }
 
-        char chunk[AGENT_TEXT_LEN];
+        static char chunk[AGENT_TEXT_LEN];
         if (n >= (int)sizeof(chunk)) n = (int)sizeof(chunk) - 1;
         memcpy(chunk, p, (size_t)n);
         chunk[n] = '\0';
@@ -1530,7 +1628,7 @@ static bool agents_push_line(int idx, bool from_me, const char *text) {
  * goto_tail would have run, on the same task. A blank thread is not an
  * acceptable alternative. */
 int agents_thread_view(int idx, char out[][AGENT_TEXT_LEN], bool *from_me,
-                       uint32_t *ts_out, int max_lines) {
+                       uint32_t *ts_out, int max_lines, uint8_t *delivery) {
     if (idx < 0 || idx >= g_conv_n || max_lines <= 0) return 0;
     int n = 0;
     agents_lock();
@@ -1540,9 +1638,29 @@ int agents_thread_view(int idx, char out[][AGENT_TEXT_LEN], bool *from_me,
         snprintf(out[i], AGENT_TEXT_LEN, "%s", g_win.view[i].text);
         if (from_me) from_me[i] = g_win.view[i].from_me;
         if (ts_out)  ts_out[i] = g_win.view[i].ts;
+        if (delivery) delivery[i] = g_win.view[i].delivery;
     }
     agents_unlock();
     return n;
+}
+
+/* Flip the newest still-pending from_me line. Mesh ACK and a WiFi 2xx both
+ * land here; a miss (line already scrolled out of the RAM window) is silent. */
+void agents_mark_last_pending(int idx, uint8_t status) {
+    if (idx < 0 || idx >= g_conv_n) return;
+    if (status != AGENT_DELIV_OK && status != AGENT_DELIV_FAIL) return;
+    agents_lock();
+    if (g_win.owner == idx) {
+        for (int i = g_win.vn - 1; i >= 0; i--) {
+            if (g_win.view[i].from_me &&
+                g_win.view[i].delivery == AGENT_DELIV_PEND) {
+                g_win.view[i].delivery = status;
+                display_force = true;
+                break;
+            }
+        }
+    }
+    agents_unlock();
 }
 
 /* List-model accessors (main.cpp builds its inbox snapshot from these under
@@ -1562,6 +1680,35 @@ uint32_t agents_last_use(int idx) {
  * across the two stores. 0 when the thread has no dated message yet. */
 uint32_t agents_last_ts(int idx) {
     return (idx >= 0 && idx < g_conv_n) ? g_convs[idx].last.ts : 0;
+}
+
+/* True when the newest stored line is exactly `text`. Used so a door card
+ * with the same body is ACK'd, not appended a second time. */
+static bool agents_last_text_is(int idx, const char *text) {
+    if (idx < 0 || idx >= g_conv_n || !text || !text[0]) return false;
+    return strcmp(g_convs[idx].last.text, text) == 0;
+}
+
+/* True if this conversation already holds this reply (or its opening).
+ * The hermes-chat door is a 241 B prefix of the inbound body. */
+static bool agents_thread_has_prefix(int idx, const char *text) {
+    if (idx < 0 || idx >= g_conv_n || !text || !text[0]) return false;
+    size_t n = strlen(text);
+    if (n > 40) n = 40;
+    if (g_in_head[idx][0] && strncmp(g_in_head[idx], text, n) == 0)
+        return true;
+    if (g_convs[idx].last.text[0] &&
+        strncmp(g_convs[idx].last.text, text, n) == 0)
+        return true;
+    if (g_win.owner == idx) {
+        for (int i = 0; i < g_win.vn; i++) {
+            if (g_win.view[i].from_me) continue;
+            if (g_win.view[i].text[0] &&
+                strncmp(g_win.view[i].text, text, n) == 0)
+                return true;
+        }
+    }
+    return false;
 }
 /* Rooms are an agent concept: a seeded conversation has them and its row opens
  * the room picker, a minted peer has none and its row opens the chat. */
@@ -1626,7 +1773,9 @@ static bool agents_bridge_post(const char *agent_id, const char *session,
     serializeJson(doc, body);
 
     HTTPClient http;
-    http.setTimeout(4000);
+    /* Loop/keyboard path: under task WDT; dead bridge must not hang UI. */
+    http.setConnectTimeout(500);
+    http.setTimeout(1200);
     if (!http.begin(url)) return false;
     http.addHeader("Content-Type", "application/json");
     if (auth_token.length() > 0) {
@@ -1673,12 +1822,45 @@ static void agents_clean_text(const char *in, char *out, size_t out_n) {
     out[j] = '\0';
 }
 
+/* Case-insensitive ASCII starts-with / contains (ASCII needles only). */
+static bool agents_ci_starts(const char *s, const char *pref) {
+    if (!s || !pref) return false;
+    for (; *pref; ++pref, ++s) {
+        char a = *s, b = *pref;
+        if (a >= 'A' && a <= 'Z') a = (char)(a + 32);
+        if (b >= 'A' && b <= 'Z') b = (char)(b + 32);
+        if (a != b) return false;
+    }
+    return true;
+}
+static bool agents_ci_has(const char *s, const char *needle) {
+    if (!s || !needle || !needle[0]) return false;
+    size_t n = strlen(needle);
+    for (const char *q = s; *q; q++) {
+        size_t i = 0;
+        for (; i < n; i++) {
+            char a = q[i], b = needle[i];
+            if (!a) return false;
+            if (a >= 'A' && a <= 'Z') a = (char)(a + 32);
+            if (b >= 'A' && b <= 'Z') b = (char)(b + 32);
+            if (a != b) break;
+        }
+        if (i == n) return true;
+    }
+    return false;
+}
+
 /* Normalize one incoming line exactly as the thread store will. Keeping this
  * seam separate lets the notification router validate before it acknowledges
  * the backing card, so an empty/control-only body remains visible. */
 static bool agents_normalize_inbound(const char *text, char *out, size_t out_n) {
     agents_clean_text(text, out, out_n);
-    return out && out_n > 0 && out[0] != '\0';
+    if (!out || out_n == 0 || !out[0]) return false;
+    /* Drop only chrome the device itself used to inject — never Hermes prose. */
+    if (agents_ci_starts(out, "(~ queued)") || agents_ci_starts(out, "(+ sent)") ||
+        agents_ci_starts(out, "mesh delivery failed"))
+        return false;
+    return true;
 }
 
 /* Optional mesh uplink (registered by meshcore skill). Same framing as downlink. */
@@ -1729,17 +1911,6 @@ static void agents_set_mesh_peer_send(AgentsMeshPeerSendFn fn) {
 #define AGENT_GPS_FRESH_S 60    /* mirror gps.cpp GPS_FRESH_S */
 
 static bool g_agents_gps_pending[CONV_MAX];
-
-/* Case-insensitive substring (lowercase only ASCII; needles are ASCII/Cyrillic). */
-static bool agents_ci_has(const char *hay, const char *needle) {
-    char lower[AGENT_TEXT_LEN];
-    size_t n = strlen(hay ? hay : "");
-    if (n >= sizeof(lower)) n = sizeof(lower) - 1;
-    for (size_t i = 0; i < n; i++)
-        lower[i] = (hay[i] >= 'A' && hay[i] <= 'Z') ? (char)(hay[i] + 32) : hay[i];
-    lower[n] = '\0';
-    return strstr(lower, needle) != NULL;
-}
 
 static bool agents_wants_gps(const char *text) {
     if (!text || !text[0]) return false;
@@ -1915,6 +2086,7 @@ static bool transport_send_agent(int idx, const char *conv_id, const char *sessi
             const char *lx_why = nullptr;
             if (rns_send_lxmf_reply(lxmf_dest, text, &lx_why)) {
                 event_add("agent %s lxmf reply", conv_id);
+                agents_mark_last_pending(idx, AGENT_DELIV_OK);
                 return true;
             }
             return false;
@@ -1945,6 +2117,7 @@ static bool transport_send_agent(int idx, const char *conv_id, const char *sessi
     if (rung == AGENT_RUNG_WIFI) {
         if (agents_bridge_post(conv_id, session, text, delivery_key)) {
             event_add("agent %s bridge uplink", conv_id);
+            agents_mark_last_pending(idx, AGENT_DELIV_OK);
             return true;
         }
         rung = rns_avail  ? AGENT_RUNG_RNS
@@ -1954,6 +2127,7 @@ static bool transport_send_agent(int idx, const char *conv_id, const char *sessi
     if (rung == AGENT_RUNG_RNS) {
         if (agents_rns_uplink(conv_id, session, text, &rns_why)) {
             event_add("agent %s rns uplink", conv_id);
+            agents_mark_last_pending(idx, AGENT_DELIV_OK);
             return true;
         }
         rung = mesh_avail ? AGENT_RUNG_MESHCORE : AGENT_RUNG_NONE;
@@ -2042,13 +2216,13 @@ bool transport_send(const struct Conversation *conv, const char *text,
     }
 
     if (!ok) {
-        /* One short line in the room, same shape the agent ladder uses: a
-         * seven-row screen cannot afford two, and a silent failure is how a
-         * message the user believes they sent disappears. */
-        char line[64];
-        snprintf(line, sizeof(line), "(send: %s)", why ? why : "not sent");
-        agents_push_line(idx, false, line);
+        /* Delivery mark only — chat lines like "(send: …)" flooded the room
+         * and forced repaints until the device wedged. */
+        (void)why;
+        agents_mark_last_pending(idx, AGENT_DELIV_FAIL);
         display_force = true;
+    } else if (backend == TRANSPORT_BACKEND_LXMF) {
+        agents_mark_last_pending(idx, AGENT_DELIV_OK);
     }
     return ok;
 }
@@ -2085,19 +2259,15 @@ static bool agents_send(const char *agent_id, const char *text) {
                                          g_convs[idx].sessions[g_convs[idx].active_idx],
                                          delivery_key, cleaned);
         if (out_id && outbox_persist()) {
-            agents_push_line(idx, false, "(~ queued)");
+            /* Stay pending (~) — do not inject "(~ queued)" chat spam. */
             display_force = true;
             return true;
         }
         if (out_id) outbox_remove(&g_outbox, out_id);
-        agents_push_line(idx, false, "(! outbox full)");
+        agents_mark_last_pending(idx, AGENT_DELIV_FAIL);
         display_force = true;
         return false;
     }
-    /* The room already carries the outcome (the backend puts one line in it on
-     * failure), and the caller's contract has always been "accepted into the
-     * thread", not "delivered" — GET /agents and the transport status routes
-     * are where delivery is reported. */
     return true;
 }
 
@@ -2112,10 +2282,15 @@ static bool agents_on_inbound(const char *agent_id, const char *text,
                               const NotifyEventId *origin_event) {
     int idx = agents_find(agent_id);
     if (idx < 0 || !text || !text[0]) return false;
-    char cleaned[2048];
-    if (!agents_normalize_inbound(text, cleaned, sizeof(cleaned))) return false;
-    if (!agents_push_line_with_origin(idx, false, cleaned,
-                                      origin_id, origin_key, origin_event)) return false;
+    /* Static under the recursive mux: the 8 KB route task cannot hold 3.5K,
+     * and GPS (loop) plus inbound (route) must not share it unlocked. */
+    agents_lock();
+    static char cleaned[3500];
+    bool ok = agents_normalize_inbound(text, cleaned, sizeof(cleaned)) &&
+              agents_push_line_with_origin(idx, false, cleaned,
+                                           origin_id, origin_key, origin_event);
+    agents_unlock();
+    if (!ok) return false;
     if (real_inbound) g_agents_real_inbound = true;
     display_force = true;
     return true;
@@ -2213,7 +2388,7 @@ bool inbox_deliver_msg(uint8_t via, const char *peer_id, const char *label,
  * bounded (agents_clean_text) — the third untrusted-input barrier after the mac
  * and the transport receiver. */
 struct AgentRouteItem {
-    uint8_t kind;                       /* 0 chat, 1 roster, 2 peer, 3 notify door */
+    uint8_t kind;                       /* 0 chat, 1 roster, 2 peer, 3 notify door, 4 wifi inbound */
     bool newest;                        /* empty name => newest-active room */
     char session[AGENT_SESSION_LEN];    /* kind 0/1: room; kind 2: sender display name */
     char text[AGENT_TEXT_LEN];          /* kind 0/2: cleaned message; kind 1: roster payload */
@@ -2223,11 +2398,12 @@ struct AgentRouteItem {
     uint8_t peer[CONV_REPLY_MAX];
     uint8_t peer_len;
     uint8_t via;                        /* kind 2: CONV_MESH or CONV_LXMF */
-    char door_conv[CONV_ID_LEN];        /* kind 3: stable conversation identity */
+    char door_conv[CONV_ID_LEN];        /* kind 3: stable conversation identity; kind 4: agent id */
     char door_source[NOTIFY_SOURCE_LEN];/* kind 3: re-resolve mapping in worker */
     uint32_t door_id;                   /* kind 3: backing notification */
     char door_key[NOTIFY_KEY_LEN];
     NotifyEventId door_event;
+    char *heap_text;                    /* kind 4: malloc'd full inbound, freed by drain */
 };
 
 struct AgentDoorCompletion {
@@ -2357,6 +2533,14 @@ static void agents_route_task(void *arg) {
             agents_route_peer(item);
             continue;
         }
+        if (item.kind == 4) {              /* WiFi /agents/inbound — full body */
+            if (item.heap_text) {
+                if (item.door_conv[0] && item.heap_text[0])
+                    agents_on_inbound(item.door_conv, item.heap_text, true);
+                free(item.heap_text);
+            }
+            continue;
+        }
         if (item.kind == 3) {              /* notification chat door */
             AgentDoorCompletion done;
             memset(&done, 0, sizeof(done));
@@ -2462,6 +2646,33 @@ static bool agents_chat_door_enqueue(int idx, const char *conversation,
 
 static bool agents_chat_door_take_completion(AgentDoorCompletion &out) {
     return g_door_done_q && xQueueReceive(g_door_done_q, &out, 0) == pdTRUE;
+}
+
+/* WiFi thread inject. A notify card is 241 B — too small for a real reply.
+ * Heap-copy the body and persist it off-loop so the HTTP task does no SD. */
+#define AGENT_INBOUND_HEAP_MAX 3500
+
+static bool agents_inbound_enqueue(const char *agent, const char *text) {
+    if (!g_route_q || !agent || !agent[0] || !text || !text[0]) return false;
+    if (agents_find(agent) < 0) return false;
+    size_t n = strlen(text);
+    if (n > AGENT_INBOUND_HEAP_MAX - 1) n = AGENT_INBOUND_HEAP_MAX - 1;
+    while (n > 0 && ((unsigned char)text[n] & 0xC0) == 0x80) n--;
+    if (n == 0) return false;
+    char *copy = (char *)malloc(n + 1);
+    if (!copy) return false;
+    memcpy(copy, text, n);
+    copy[n] = '\0';
+    AgentRouteItem item;
+    memset(&item, 0, sizeof(item));
+    item.kind = 4;
+    snprintf(item.door_conv, sizeof(item.door_conv), "%s", agent);
+    item.heap_text = copy;
+    if (xQueueSend(g_route_q, &item, 0) != pdTRUE) {
+        free(copy);
+        return false;
+    }
+    return true;
 }
 
 /* Transport entry point (declared in ../agents_chat_route.h). Land `text` into
@@ -2966,23 +3177,17 @@ static void agents_register_routes(AsyncWebServer &server) {
             notify_send_error(req, 400, "invalid id"); return;
         }
         bool duplicate = agents_inbound_key_duplicate(key);
-        /* One receiver: HTTP agent replies enter as a backing card. C3's
-         * off-loop door worker is the sole path that appends the body to the
-         * thread, then ACKs/hides this card by its event identity. Calling
-         * agents_on_inbound here as well would store the same reply twice. */
-        uint32_t card_id = duplicate ? 0 : inbox_deliver_card(
-            CONV_AGENT, key[0] ? key : nullptr, INBOX_SEV_INFO,
-            agent, "CHAT", text);
-        if (!duplicate && !card_id) {
+        /* Full body into the thread off-loop. A notify card is 241 B and the
+         * hermes-chat door is a 48 B teaser — neither is the chat line. */
+        if (!duplicate && !agents_inbound_enqueue(agent, text)) {
             notify_send_error(req, 503, "inbound queue full");
             return;
         }
-        if (card_id) agents_inbound_key_commit(key);
+        if (!duplicate && key[0]) agents_inbound_key_commit(key);
         JsonDocument doc;
         doc["ok"] = true;
         doc["agent"] = agent;
         doc["duplicate"] = duplicate;
-        if (card_id) doc["notification_id"] = card_id;
         notify_send_json(req, 200, doc);
     }, NULL, handle_body_collect);
 

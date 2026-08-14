@@ -1282,8 +1282,8 @@ static_assert(INBOX_SEV_CRIT == NOTIFY_CRIT, "inbox/notify severity must agree")
 static uint32_t notify_raise(Notification &e, const NotifyOptions *opts,
                              uint32_t *replaced_out) {
     if (!notify_event_take(e.event_id)) memset(&e.event_id, 0, sizeof(e.event_id));
-    e.event_distinct = notify_rec_is_chat_door_key(e.key) ||
-        (notify_event_distinct_fn && notify_event_distinct_fn(e.source, e.key));
+    e.event_distinct = notify_event_distinct_fn &&
+        notify_event_distinct_fn(e.source, e.key);
     time_t now = time(NULL);
     e.created_epoch = (now > TIME_VALID_EPOCH) ? now : 0;
     e.created_ms = millis();

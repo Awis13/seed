@@ -135,7 +135,7 @@ static void mesh_load_probe_interval() {
     g_mesh.probe_interval_s = (uint32_t)v;
 }
 
-/* Per-agent success->fail edge: the synthetic "(mesh delivery failed - resend)"
+/* Per-agent success->fail edge: delivery-fail mark (no chat spam line)
  * chat line is injected once per outage per agent room. Repeated failures while
  * that room already got the line stay silent (its user has been told); the flag
  * clears on the next chat ACK for that agent, and ANY proof the link is alive
@@ -373,7 +373,9 @@ static void mesh_chat_tx_fail(const char *reason) {
     if (g_mesh_chat_tx_failed[aidx]) return;  /* room already told: silent */
     /* Set only together with the injected line, so silence never == success. */
     g_mesh_chat_tx_failed[aidx] = true;
-    agents_on_inbound(agent, "(mesh delivery failed - resend)", false);
+    /* Mark only — a chat line here spammed the room on every ACK timeout. */
+    agents_mark_last_pending(aidx, AGENT_DELIV_FAIL);
+    display_force = true;
 }
 
 static void mesh_chat_tx_poll() {
@@ -394,6 +396,10 @@ static void mesh_chat_tx_poll() {
             if (g_mesh_chat_tx.next >= g_mesh_chat_tx.count) {
                 event_add("mesh chat delivered %u parts",
                           (unsigned)g_mesh_chat_tx.count);
+                {
+                    int done = agents_find(g_mesh_chat_tx.agent);
+                    if (done >= 0) agents_mark_last_pending(done, AGENT_DELIV_OK);
+                }
                 memset(&g_mesh_chat_tx, 0, sizeof(g_mesh_chat_tx));
                 return;
             }
@@ -826,19 +832,45 @@ static uint32_t mesh_on_private_text(const uint8_t *from_pubkey,
             if (idx >= 0 && agents_transport(idx) != CONV_AGENT) idx = -1;
             if (idx >= 0) {
                 bool from_me = (r->side == 'u');
-                if (agents_push_line(idx, from_me, r->buf)) {
-                    agents_inbound_key_commit(delivery_key);
-                    /* Genuine mesh chat arrival: same wake as the WiFi door path.
-                     * Set before display_force (loop consumes them together). */
-                    g_agents_real_inbound = true;
-                    display_force = true;
-                    id = 1;  /* non-zero = handled */
+                if (from_me) {
+                    /* Own uplink echo: history only, no door. */
+                    if (agents_push_line(idx, true, r->buf)) {
+                        agents_inbound_key_commit(delivery_key);
+                        id = 1;
+                    }
                 } else {
-                    /* Preserve the message as a retryable visible card when the
-                     * conversation store cannot durably append it. */
-                    id = notify_ingest("info", r->agent, "CHAT", r->buf,
-                                       delivery_key);
-                    if (id) agents_inbound_key_commit(delivery_key);
+                    /* Full body goes in the thread once. The door is only a
+                     * wake/teaser — reconcile must not copy it back in. */
+                    static char cleaned[2048];
+                    const char *body = r->buf;
+                    if (agents_normalize_inbound(r->buf, cleaned, sizeof(cleaned)))
+                        body = cleaned;
+                    if (!agents_push_line(idx, false, body)) {
+                        id = notify_ingest("info", r->agent, "CHAT", r->buf,
+                                           delivery_key);
+                        if (id) agents_inbound_key_commit(delivery_key);
+                    } else {
+                        agents_inbound_key_commit(delivery_key);
+                        g_agents_real_inbound = true;
+                        display_force = true;  /* open room: radio ACK ≠ repaint */
+                        id = 1;
+                        /* Open room: the thread is enough. Closed: one
+                         * replaceable doorbell so the clock can wake. */
+                        if (!agents_is_on_screen(idx)) {
+                            char door[24], teaser[52];
+                            size_t n = 0;
+                            while (r->buf[n] && n < 48) n++;
+                            while (n > 0 && ((unsigned char)r->buf[n] & 0xC0) == 0x80)
+                                n--;
+                            memcpy(teaser, r->buf, n);
+                            teaser[n] = '\0';
+                            snprintf(door, sizeof(door), "%s-chat", r->agent);
+                            uint32_t did = notify_ingest("info", r->agent, r->agent,
+                                                         teaser[0] ? teaser : r->agent,
+                                                         door);
+                            if (did) id = did;
+                        }
+                    }
                 }
             } else {
                 /* unknown agent → notify card */

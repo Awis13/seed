@@ -367,8 +367,11 @@ static inline int notify_rec_is_chat_door_key(const char *key) {
     return n > 5 && strcmp(key + n - 5, "-chat") == 0;
 }
 
+/* A keyed card replaces the previous one with the same key. Chat doors
+ * (`hermes-chat`) are one doorbell, not a stack of inbox rows — the thread
+ * holds the messages. */
 static inline int notify_rec_key_replaces(const char *key) {
-    return key && key[0] && !notify_rec_is_chat_door_key(key);
+    return key && key[0];
 }
 
 #define NOTIFY_ARCHIVE_EVENTKEY_CAP 33

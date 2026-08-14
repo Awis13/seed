@@ -90,7 +90,7 @@ static_assert((int)UINAV_CONTACTS       == (int)HW_UI_CONTACTS,       "ui_nav en
 static_assert((int)UINAV_NET            == (int)HW_UI_NET,            "ui_nav enum drift");
 
 // ===== Configuration =====
-#define SEED_VERSION        "0.9.80"
+#define SEED_VERSION        "0.9.108"
 // Core clock: datasheet puts 240 vs 80 ~11.5mA apart on WAITI. Periph bus holds
 // at 80 for every PLL-fed core clock; go lower and RMT/I2S retimes. Same floor
 // as tembed idle policy (no light sleep — notify latency is the job).
@@ -571,6 +571,8 @@ static String get_mac_suffix() {
 }
 
 static String read_spiffs_file(const char *path) {
+    /* fopen aborts under low internal DRAM (lock_init_generic) — never open. */
+    if (!fs_internal_heap_ok()) return "";
     File f = SPIFFS.open(path, FILE_READ);
     if (!f) return "";
     String content = f.readString();
@@ -583,6 +585,7 @@ static bool write_spiffs_file(const char *path, const String &content) {
     // encoder ISR read flash while SPIFFS had the cache disabled. This board has
     // no encoder ISR yet, so the write stands alone - the hazard returns the
     // day an ISR is added here.
+    if (!fs_internal_heap_ok()) return false;
     File f = SPIFFS.open(path, FILE_WRITE);
     if (!f) return false;
     f.print(content);
@@ -889,11 +892,36 @@ enum {
 static volatile int wifi_reconnect_state = WIFI_RECONNECT_IDLE;
 static unsigned long wifi_reconnect_step_ms = 0;
 
+/* Manual TOGGLE WIFI used to call disconnect(wifioff)+mode(OFF) on the same
+ * click as the net screen, while WireGuard and AsyncTCP still owned the STA
+ * netif. That tears lwIP down under live sockets and reboots the S3. Same
+ * settle machine as reconnect, in reverse: stop WG, drop the association,
+ * then power the RF off. */
+enum {
+    WIFI_OFF_IDLE = 0,
+    WIFI_OFF_STOP_WG,
+    WIFI_OFF_DISC,
+    WIFI_OFF_MODE
+};
+#define WIFI_OFF_WG_SETTLE_MS   100UL
+#define WIFI_OFF_DISC_SETTLE_MS 200UL
+static volatile int wifi_off_state = WIFI_OFF_IDLE;
+static unsigned long wifi_off_step_ms = 0;
+
+static void wifi_off_request() {
+    wifi_reconnect_state = WIFI_RECONNECT_IDLE;
+    if (wifi_off_state == WIFI_OFF_IDLE)
+        wifi_off_state = WIFI_OFF_STOP_WG;
+}
+
+static void wifi_off_poll();
+
 static void wifi_reconnect_request() {
     /* User intent (config apply / manual connect) starts a fresh ladder:
      * without this, a saturated step would leave the next background retry
      * 20 minutes away if this attempt fails on the wrong profile. */
     wifi_retry_step = 0;
+    wifi_off_state = WIFI_OFF_IDLE;
     wifi_reconnect_state = WIFI_RECONNECT_MODE;
 }
 
@@ -1584,10 +1612,7 @@ static void handle_wifi_scan(AsyncWebServerRequest *request) {
         o["secure"] = (WiFi.encryptionType(i) != WIFI_AUTH_OPEN);
     }
     WiFi.scanDelete();
-    if (wifi_user_off) {
-        WiFi.disconnect(true, false);
-        WiFi.mode(WIFI_OFF);
-    }
+    if (wifi_user_off) wifi_off_request();
     String response;
     serializeJson(doc, response);
     request->send(200, "application/json", response);
@@ -1730,13 +1755,11 @@ static void conn_mgr_service() {
     if (attach_beacon_decide(&g_attach_beacon, a.on_attach, now))
         event_add("conn: flush beacon staged");
 
-    // WG bring-up / restart: hand it to wg.cpp's own deferred restart path
-    // (stop -> gap -> start on the loop task). g_wg_restart_req is exactly the
-    // signal the /wg/restart route raises, so this reuses that machinery.
-    if ((a.start_wg || a.restart_wg) && g_wg_want && g_wg_cfg_ok) {
-        g_wg_restart_req = true;
-        event_add("conn: %s wireguard", a.start_wg ? "start" : "restart");
-    }
+    // WireGuard starts itself from skill_wg_poll, like it did before the
+    // coordinator existed. Mapping start/restart onto g_wg_restart_req
+    // STOPs the tunnel and begin()s again on this task — that froze the menu.
+    (void)a.start_wg;
+    (void)a.restart_wg;
 
     // RNS: rearm the connect retry at its minimum backoff so the interface's
     // own loop() picks it up on the next tick. No socket work here.
@@ -1825,7 +1848,7 @@ static void ui_clock_paint(const char *note) {
     }
     if (hw_kb_locked()) {
         /* LOCK takes the note row so pocket mode is obvious. */
-        snprintf(row2, sizeof(row2), "LOCKED  hold USER unlock");
+        snprintf(row2, sizeof(row2), "LOCKED  CAPS or hold click");
     }
     if (settings_silent && row2[0] == '\0')
         snprintf(row2, sizeof(row2), "SILENT");
@@ -1966,42 +1989,11 @@ static char gw_token[GW_TOKEN_MAX + 1] = "";
 // the pure two-speed cadence in reachability.h; a black-holed gateway costs
 // ~1 s (connect cap) at most and only at the probe cadence, never per send.
 static void reachability_service(uint32_t now) {
-    // No WiFi link means home is not reachable OVER WIFI — record DOWN without a
-    // request. This is cheap and keeps the verdict fresh (and DOWN, not stale
-    // UNKNOWN) while the link is gone; when WiFi returns the fast down-cadence
-    // re-probes for real.
-    if (WiFi.status() != WL_CONNECTED) {
-        reach_record(&g_reach, now, false);
-        return;
-    }
-    if (!reach_should_probe(&g_reach, now, REACH_UP_INTERVAL_MS,
-                            REACH_DOWN_INTERVAL_MS, REACH_STALE_MS))
-        return;
-    if (!mesh_gw_url[0]) {   // no gateway configured: nothing to prove
-        reach_record(&g_reach, now, false);
-        return;
-    }
-
-    // Bounded GET, mirroring ui_mesh_ping_step_http(): 1 s connect cap so a
-    // black-holed gateway does not eat the full read window, a short read
-    // window, and ANY HTTP status counts as "route proven" (a 401/403 is the
-    // gateway refusing the token, not a dead WiFi path). Buffer is static: this
-    // runs on the loop task, whose stack is shallow.
-    static char url[128];
-    snprintf(url, sizeof(url), "%s/ping?t=%lu", mesh_gw_url, (unsigned long)now);
-    bool up = false;
-    HTTPClient http;
-    http.setConnectTimeout(1000);
-    http.setTimeout(2000);
-    if (http.begin(url)) {
-        if (gw_token[0]) {
-            http.addHeader("Authorization", String("Bearer ") + gw_token);
-        }
-        int code = http.GET();
-        http.end();
-        up = (code > 0);   // any status => reachable; <=0 is timeout/conn-fail
-    }
-    reach_record(&g_reach, now, up);
+    /* NO HTTP probe. Live serial 2026-08-14: REACH_DOWN_INTERVAL_MS=3s meant
+     * NetworkClient.connect every 3 s → socket:105 forever → HTTP server dead
+     * → Hermes POST /agents/inbound fails → chat has no replies → reboot.
+     * Verdict is WiFi link only; the send ladder still has mesh fallback. */
+    reach_record(&g_reach, now, WiFi.status() == WL_CONNECTED);
 }
 
 // Accessor for the send ladder (C2): the cached route-home verdict, no I/O.
@@ -2034,6 +2026,7 @@ static uint8_t agent_origin = UINAV_MSGLIST;
 // full history lives on SD, so no whole-thread RAM snapshot is held.
 static char ag_chat_lines[AGENT_THREAD_MAX][AGENT_TEXT_LEN];
 static bool ag_chat_from_me[AGENT_THREAD_MAX];
+static uint8_t ag_chat_deliv[AGENT_THREAD_MAX];
 static uint32_t ag_chat_ts[AGENT_THREAD_MAX];
 static const char *ag_chat_ptrs[AGENT_THREAD_MAX];
 /* The store's "is the user reading this?" test. The chat screen being up on
@@ -2461,10 +2454,9 @@ static ReplyHttpResult reply_upstream_http(const char *key, const char *text) {
     serializeJson(doc, body);
 
     HTTPClient http;
-    // Runs on the loop task: a black-holed gateway must cost ~1 s to connect,
-    // not the whole 5 s read window, or the panel freezes for the difference.
-    http.setConnectTimeout(1000);
-    http.setTimeout(5000);
+    // Runs on the loop task: must stay under the task WDT (~5 s).
+    http.setConnectTimeout(500);
+    http.setTimeout(1200);
     if (!http.begin(url)) return REPLY_HTTP_FAIL;
     http.addHeader("Content-Type", "application/json");
     if (gw_token[0]) {
@@ -2558,12 +2550,16 @@ static void outbox_agent_poll(OutboxItem *item) {
         outbox_persist();
         return;
     }
+    /* Loop task: never HTTP-post here (was 4 s freeze + chat spam). Mesh
+     * uplink is queue-or-fail only. WiFi retries when the user resends. */
     item->state = OUTBOX_STATE_SENDING;
-    if (transport_send_agent(idx, item->target, item->session, item->text,
-                             item->delivery_key)) {
+    bool ok = false;
+    if (g_agents_mesh_uplink)
+        ok = g_agents_mesh_uplink(item->target, item->text, item->delivery_key);
+    if (ok) {
         item->state = OUTBOX_STATE_SENT;
         outbox_persist();
-        agents_push_line(idx, false, "(+ sent)");
+        agents_mark_last_pending(idx, AGENT_DELIV_OK);
         display_force = true;
         return;
     }
@@ -2571,7 +2567,7 @@ static void outbox_agent_poll(OutboxItem *item) {
     if (item->attempts >= OUTBOX_ATTEMPTS_MAX) {
         item->state = OUTBOX_STATE_FAIL;
         item->next_try_ms = 0;
-        agents_push_line(idx, false, "(! delivery failed)");
+        agents_mark_last_pending(idx, AGENT_DELIV_FAIL);
         display_force = true;
     } else {
         item->state = OUTBOX_STATE_QUEUED;
@@ -2623,8 +2619,8 @@ static bool flush_beacon_http() {
     if (!attach_beacon_body(node_name.c_str(), body, sizeof(body))) return false;
 
     HTTPClient http;
-    http.setConnectTimeout(1000);
-    http.setTimeout(5000);
+    http.setConnectTimeout(500);
+    http.setTimeout(1200);
     if (!http.begin(url)) return false;
     http.addHeader("Content-Type", "application/json");
     if (gw_token[0]) {
@@ -2716,17 +2712,44 @@ static void ui_wifi_paint_list() {
     ui_note_input();
 }
 
+static void wifi_off_poll() {
+    if (wifi_off_state == WIFI_OFF_IDLE) return;
+    if (!wifi_user_off) {
+        wifi_off_state = WIFI_OFF_IDLE;
+        return;
+    }
+    switch (wifi_off_state) {
+    case WIFI_OFF_STOP_WG:
+        g_wg_stop_req = true;
+        wifi_off_step_ms = millis();
+        wifi_off_state = WIFI_OFF_DISC;
+        break;
+    case WIFI_OFF_DISC:
+        if (millis() - wifi_off_step_ms < WIFI_OFF_WG_SETTLE_MS) return;
+        WiFi.disconnect(false, false);
+        wifi_off_step_ms = millis();
+        wifi_off_state = WIFI_OFF_MODE;
+        break;
+    case WIFI_OFF_MODE:
+        if (millis() - wifi_off_step_ms < WIFI_OFF_DISC_SETTLE_MS) return;
+        WiFi.mode(WIFI_OFF);
+        wifi_off_state = WIFI_OFF_IDLE;
+        Serial.println("[wifi] RF off (mesh only)");
+        break;
+    }
+}
+
 // WiFi on/off switch for mesh-only testing in the garden: STA ON (reconnect via
 // saved profiles) or STA OFF (disconnect, leave mesh/WG path alone).
 static void ui_wifi_toggle() {
     if (!wifi_user_off) {
         wifi_user_off = true;
-        WiFi.disconnect(true, false);
-        WiFi.mode(WIFI_OFF);
+        wifi_off_request();
         event_add("wifi off (mesh only)");
         Serial.println("[wifi] user toggled OFF");
     } else {
         wifi_user_off = false;
+        wifi_off_state = WIFI_OFF_IDLE;
         WiFi.mode(WIFI_STA);
         if (wifi_net_count > 0 || wifi_ssid[0]) {
             wifi_retry_step = 0;  /* user intent = fresh ladder */
@@ -2778,10 +2801,7 @@ static void ui_wifi_do_scan() {
         wifi_list_count++;
     }
     WiFi.scanDelete();
-    if (wifi_user_off) {
-        WiFi.disconnect(true, false);
-        WiFi.mode(WIFI_OFF);
-    }
+    if (wifi_user_off) wifi_off_request();
     ui_wifi_paint_list();
 }
 
@@ -2943,9 +2963,9 @@ static void ui_mesh_ping_step_http() {
         hw_ui_show_mesh_ping("WIFI", mesh_ping_ptrs, mesh_ping_nlines);
 
         HTTPClient http;
-        // A black-holed gateway must cost ~1 s here, not the full read window.
-        http.setConnectTimeout(1000);
-        http.setTimeout(4000);
+        // Loop task / PING face: stay under task WDT.
+        http.setConnectTimeout(500);
+        http.setTimeout(1200);
         if (http.begin(url)) {
             if (gw_token[0]) {
                 http.addHeader("Authorization", String("Bearer ") + gw_token);
@@ -3419,8 +3439,11 @@ static void ui_open_menu() {
 }
 
 static bool notify_event_distinct_cb(const char *source, const char *key) {
+    if (notify_rec_is_chat_door_key(key)) return false;
     NotifyChatResolution resolution = agents_notify_chat_resolve_snapshot(source, key);
-    return resolution.conversation >= 0;
+    /* A known conversation is one thread. Stacking a card per replica
+     * is what filled the inbox with Hermes. */
+    return resolution.conversation < 0;
 }
 
 static char notify_chat_normalized[NOTIFY_BODY_LEN];
@@ -3464,8 +3487,13 @@ static void notify_reconcile_restored_chats() {
         if (!notify_view(i, view)) break;
         if (!view.unread || count >= NOTIFY_MAX) continue;
         NotifyChatResolution resolution = notify_chat_candidate(view);
-        if (resolution.conversation < 0 || !notify_chat_normalized[0] ||
-            !notify_event_id_valid(&view.event_id)) continue;
+        if (resolution.conversation < 0 || !notify_chat_normalized[0]) continue;
+        /* Boot: doorbells stay out of the JSONL (inbound already persisted). */
+        if (notify_rec_is_chat_door_key(view.key)) {
+            notify_ack_id(view.id);
+            continue;
+        }
+        if (!notify_event_id_valid(&view.event_id)) continue;
         items[count].id = view.id;
         items[count].order.card_epoch = view.created_epoch;
         items[count].order.restore_rank = (uint8_t)i;
@@ -3487,6 +3515,14 @@ static void notify_reconcile_restored_chats() {
         NotifyChatResolution resolution = notify_chat_candidate(view);
         int ax = resolution.conversation;
         if (ax < 0 || ax >= CONV_MAX || !notify_chat_normalized[0]) continue;
+        if (notify_rec_is_chat_door_key(view.key)) {
+            notify_ack_id(view.id);
+            continue;
+        }
+        if (agents_last_text_is(ax, notify_chat_normalized)) {
+            notify_ack_id(view.id);
+            continue;
+        }
         NotifyChatThreadState thread = {
             agents_has_origin(ax, view.id, view.key,
                               &view.event_id)
@@ -3533,10 +3569,21 @@ static bool notify_reconcile_pending_chats(HwUiScreen scr) {
     int count = 0;
     for (int i = 0; i < NOTIFY_MAX; i++) {
         if (!notify_view(i, view)) break;
-        if (!view.unread || count >= NOTIFY_MAX ||
-            !notify_event_id_valid(&view.event_id)) continue;
+        if (!view.unread || count >= NOTIFY_MAX) continue;
         NotifyChatResolution resolution = notify_chat_candidate(view);
         if (resolution.conversation < 0 || !notify_chat_normalized[0]) continue;
+        /* *-chat: wait 2 s for /agents/inbound. If inbound landed, skip.
+         * If it missed (HTTP died), copy the card so the room is not empty. */
+        if (notify_rec_is_chat_door_key(view.key)) {
+            if (agents_thread_has_prefix(resolution.conversation,
+                                         notify_chat_normalized))
+                continue;
+            if (view.age_s < 2) {
+                retry_needed = true;
+                continue;
+            }
+        }
+        if (!notify_event_id_valid(&view.event_id)) continue;
         items[count].id = view.id;
         items[count].order.card_epoch = view.created_epoch;
         items[count].order.restore_rank = (uint8_t)i;
@@ -3558,6 +3605,13 @@ static bool notify_reconcile_pending_chats(HwUiScreen scr) {
         NotifyChatResolution resolution = notify_chat_candidate(view);
         int ax = resolution.conversation;
         if (ax < 0 || ax >= CONV_MAX || !notify_chat_normalized[0]) continue;
+        if (notify_rec_is_chat_door_key(view.key) &&
+            agents_thread_has_prefix(ax, notify_chat_normalized))
+            continue;
+        if (agents_last_text_is(ax, notify_chat_normalized)) {
+            notify_ack_id(view.id);
+            continue;
+        }
         if (attempted >= DRAIN_BATCH) { retry_needed = true; continue; }
         if (queued[ax] || notify_chat_inflight_find(resolution.id) >= 0) {
             retry_needed = true;
@@ -3613,7 +3667,7 @@ static void ui_agent_chat_refresh() {
     int n = 0;
     agents_lock();
     n = agents_thread_view(agent_focus, ag_chat_lines, ag_chat_from_me,
-                           ag_chat_ts, AGENT_THREAD_MAX);
+                           ag_chat_ts, AGENT_THREAD_MAX, ag_chat_deliv);
     agents_unlock();
     for (int i = 0; i < n; i++) ag_chat_ptrs[i] = ag_chat_lines[i];
 
@@ -3636,9 +3690,24 @@ static void ui_agent_chat_refresh() {
         snprintf(foot, sizeof(foot), "wheel=scroll  type=msg");
 
     int total = 0;
-    agent_scroll = hw_ui_show_agent_chat(head, ag_chat_ptrs, ag_chat_from_me,
-                                         n, agent_scroll, &total, foot);
+    int shown = hw_ui_show_agent_chat(head, ag_chat_ptrs, ag_chat_from_me,
+                                      n, agent_scroll, &total, foot,
+                                      ag_chat_deliv);
     agent_scroll_total = total;
+    // Keep -1 as the follow-tail sentinel. The renderer converts it to
+    // max_scroll for paint; writing that back would lose "pinned to latest"
+    // and a new reply would land off-screen.
+    if (agent_scroll >= 0) agent_scroll = shown;
+}
+
+static void notify_ack_open_chat(int conv_idx) {
+    static NotifyView view;
+    for (int i = 0; i < NOTIFY_MAX; i++) {
+        if (!notify_view(i, view)) break;
+        if (!view.unread) continue;
+        if (notify_chat_candidate(view).conversation == conv_idx)
+            notify_ack_id(view.id);
+    }
 }
 
 static void ui_open_agent_chat(int idx) {
@@ -3648,6 +3717,7 @@ static void ui_open_agent_chat(int idx) {
     reply_mode = REPLY_MODE_NONE;
     agent_scroll = -1;  // pin to latest when entering the room
     agents_thread_goto_tail(idx);  // load the session's history from the store
+    notify_ack_open_chat(idx);     // doorbells are read once the room is open
     ui_agent_chat_refresh();
 }
 
@@ -3732,7 +3802,12 @@ static void ui_open_agent_act() {
 static void ui_agent_act_confirm() {
     int act = agent_act_row_action(agent_act_sel);
     if (act == AGENT_ACT_CLEAR) {
-        agents_clear(agents_id(agent_focus));
+        const char *aid = agents_id(agent_focus);
+        agents_clear(aid);
+        /* Hermes /new is the session reset the user always types after clear.
+         * One wheel click: wipe local history and start a fresh agent turn. */
+        if (agents_transport(agent_focus) == CONV_AGENT)
+            agents_send(aid, "/new");
         hw_haptic_notify(0);
         ui_open_agent_chat(agent_focus);
     } else if (act == AGENT_ACT_DELETE) {
@@ -3785,16 +3860,10 @@ static void ui_open_msglist() {
     int nc = 0;
     for (int i = 0; i < NOTIFY_MAX && nc < FEED_MAX_CARDS; i++) {
         if (!notify_view(i, v)) break;
-        // A successfully routed chat door must not sit beside its conversation
-        // row. notify_is_chat uses the same resolver/normalizer as live and boot
-        // routing, and requires the archived ACK: unresolved, invalid and
-        // ambiguous unread doors stay visible instead of disappearing silently.
-        // Lock-free on purpose: notify_is_chat -> agents_find needs no
-        // agents_lock here because agents_delete only runs on this same loop
-        // task (ui_agent_act_confirm); the residual race is a conversation
-        // minted between this scan and the merge below, which shows both rows
-        // for ONE repaint and heals on the next.
-        if (notify_is_chat(v)) continue;
+        // Chat lives on the conversation row. A doorbell is a wake, not
+        // another inbox line — otherwise Hermes fills the whole list.
+        if (notify_rec_is_chat_door_key(v.key)) continue;
+        if (notify_chat_candidate(v).conversation >= 0) continue;
         snprintf(card_titles[nc], sizeof(card_titles[0]), "%s", v.title);
         cards[nc].id = v.id;
         cards[nc].epoch = v.created_epoch;
@@ -4725,6 +4794,9 @@ static void setup_routes() {
 // ===== Main =====
 
 void setup() {
+    // GPIO46 is a boot-mode strap. Park it low before anything else so a
+    // previous LEDC/HIGH cannot sample as the invalid 0+1 combination.
+    hw_kb_park_backlight();
     // No power-hold line is driven here. The board runs from USB during bring-up.
     Serial.begin(115200);
     delay(500);
@@ -4801,6 +4873,7 @@ void loop() {
     // Deferred STA sequence raised by HTTP handlers (mode → disconnect →
     // begin, millis() settle gaps) — the AsyncTCP task never touches WiFi.
     wifi_reconnect_poll();
+    wifi_off_poll();
 
     // Connection coordinator: observes the WiFi attach/lost edge, sequences
     // bring-up (clock -> WG -> RNS), debounces WG flaps, and backs up each
@@ -4992,11 +5065,8 @@ void loop() {
         display_force = false;
         bool real_in = g_agents_real_inbound;
         g_agents_real_inbound = false;
-        // Stay pinned to latest if user was following the bottom.
-        if (agent_scroll < 0 ||
-            agent_scroll >= agent_scroll_total - 2) {
-            agent_scroll = -1;
-        }
+        // A reply into the open room always jumps to the latest line.
+        if (real_in) agent_scroll = -1;
         ui_agent_chat_refresh();
         // A genuine arrival (mesh C1 or WiFi) in the open room wakes the
         // panel once; a repaint alone (e.g. synthetic error line) does not.
@@ -5027,8 +5097,23 @@ void loop() {
                                    notify_chat_normalized[0] &&
                                    notify_event_id_valid(&v.event_id);
             if (is_pending_chat) {
-                /* The bounded drain above handled it or deliberately left it
-                 * visible for retry. Never misrender a failed chat as severity. */
+                /* Body is already queued into the thread. The door card is the
+                 * notification: pop the CHAT invite, do not swallow it. */
+                bool in_this_chat = (scr == HW_UI_AGENT_CHAT &&
+                                     agent_focus == resolution.conversation);
+                bool can_pop = on_clock || scr == HW_UI_MENU ||
+                               scr == HW_UI_MSGLIST || scr == HW_UI_INFO ||
+                               scr == HW_UI_WIFI || scr == HW_UI_WIFI_LIST ||
+                               scr == HW_UI_NET || scr == HW_UI_SETTINGS;
+                if (!in_this_chat && can_pop) {
+                    notify_card_id = arrived_id;
+                    const char *nm = (resolution.conversation >= 0)
+                        ? agents_name(resolution.conversation) : v.source;
+                    const char *teaser = notify_chat_normalized[0]
+                        ? notify_chat_normalized : v.body;
+                    hw_ui_show_agent_invite(nm, teaser, notify_unread_count());
+                    ui_note_wake();
+                }
             } else if (on_clock || scr == HW_UI_MENU || scr == HW_UI_MSGLIST ||
                        scr == HW_UI_INFO) {
                 // Real message from any service: severity colours (info/warn/crit).

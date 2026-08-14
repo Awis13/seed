@@ -23,9 +23,14 @@ assert "if (delivery && delivery[0])" in hw
 
 agents = (ROOT / "src/skills/agents.cpp").read_text(encoding="utf-8")
 assert "outbox_enqueue(&g_outbox, OUTBOX_KIND_AGENT" in agents
-assert 'agents_push_line(idx, false, "(~ queued)")' in agents
-assert "transport_send_agent(idx, item->target, item->session" in main
-assert 'agents_push_line(idx, false, "(+ sent)")' in main
-assert 'agents_push_line(idx, false, "(! delivery failed)")' in main
+# Delivery state is the ~/* /! mark — chat spam lines wedged the device.
+assert 'agents_push_line(idx, false, "(~ queued)")' not in agents
+assert 'agents_push_line(idx, false, "(+ sent)")' not in main
+assert 'agents_push_line(idx, false, "(! delivery failed)")' not in main
+assert "g_agents_mesh_uplink" in main, (
+    "agent outbox poll must only try mesh from the loop (no HTTP block)"
+)
+assert "agents_mark_last_pending(idx, AGENT_DELIV_OK)" in main
+assert "agents_mark_last_pending(idx, AGENT_DELIV_FAIL)" in main
 
 print("outbox flow tests: OK")

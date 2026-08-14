@@ -29,7 +29,8 @@ assert 'snprintf(mid, sizeof(mid), "%s", delivery_key)' in uplink, (
     "WiFi timeout fallback must reuse the same idempotency key as C1 mid"
 )
 assert "expected_ack_crc = 0" in client
-assert 'agents_on_inbound(agent, "(mesh delivery failed - resend)", false)' in mesh
+assert "agents_mark_last_pending(aidx, AGENT_DELIV_FAIL)" in mesh
+assert '"(mesh delivery failed - resend)"' not in mesh
 manual_ping = main[main.index("// ---- Mesh path: sparse private probe"):
                    main.index("static void kb_layout_save", main.index("// ---- Mesh path: sparse private probe"))]
 assert "!g_mesh_chat_tx.active && !mesh_client_ack_pending()" in manual_ping

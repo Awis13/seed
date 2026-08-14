@@ -14,15 +14,10 @@
  * (treated as oldest, stable among peers); the top-N cap keeping the newest;
  * and the bounds / NULL / truncation cases.
  *
- * Also covered (TLORA-UI-FIX C3, Bug2a): the door-card filter at the card scan.
- * A chat that arrived through a "chat door" used to appear TWICE — its
- * conversation row AND the door notification card. The scan in main.cpp
- * (ui_open_msglist) now skips every card the C2 classifier
- * (src/notify_chat_class.h, notify_chat_resolve) resolves as a chat, so a
- * conversation is exactly ONE feed row. Section 9 models that scan by VALUE
- * with the REAL classifier and the REAL merge; the wiring — that main.cpp's
- * scan actually makes that exact call — is pinned by test_feed_view.sh's
- * source-slice check, which goes RED if the filter line is removed.
+ * Also covered: a routed chat door stays a feed card beside its conversation.
+ * The card is the notification; the conversation is the thread. Section 9
+ * models that scan by VALUE. test_feed_view.sh goes RED if the old hide-the-
+ * door filter (`if (notify_is_chat(v)) continue;`) comes back.
  */
 
 #include <assert.h>
@@ -32,7 +27,6 @@
 #include <string.h>
 
 #include "../src/feed_view.h"
-#include "../src/notify_chat_class.h"
 
 static FeedCardView card(uint32_t id, uint32_t epoch, const char *title,
                          char sev, uint8_t unread) {
@@ -321,85 +315,37 @@ static void test_bounds(void) {
     assert(feed_build_rows(&c, 0, &v, 0, out, FEED_ORDER_MAX) == 0);
 }
 
-/* --- 10. Bug2a: a chat's door card is filtered out of the card scan ---------
- *
- * Models the ui_open_msglist card scan by value: each raw card carries the
- * source and key the store holds; the scan offers a card to the feed ONLY if
- * the C2 classifier does not call it a chat. Uses the REAL classifier
- * (notify_chat_resolve) and the REAL merge (feed_build_rows) — only the store
- * iteration is fixture. The conversation registry stands in for agents_find(),
- * exactly as in test_notify_chat_class.cpp. */
+/* --- 10. A routed chat door stays a feed card beside its thread ------------- */
 
-static const char *g_scan_convs[] = { "hermes", "claude" };
-
-static int scan_conv_find(const char *id, void * /*ctx*/) {
-    if (!id || !id[0]) return -1;
-    for (size_t i = 0; i < sizeof(g_scan_convs) / sizeof(g_scan_convs[0]); i++)
-        if (strcmp(id, g_scan_convs[i]) == 0) return (int)i;
-    return -1;
-}
-
-/* A stored card as the scan sees it before reducing to FeedCardView. */
-struct ScanCard {
-    const char *source;
-    const char *key;
-    const char *body;
-    FeedCardView view;
-};
-
-static void test_door_card_filtered_from_scan(void) {
-    ScanCard raw[6] = {
-        /* legacy "-chat" door key, conversation "hermes" exists -> chat,
-         * must NOT become a feed row (the conversation row represents it) */
-        { "",       "hermes-chat", "hi", card(201, 950, "hermes says hi", 'I', 0) },
-        /* agent source names an existing conversation -> chat, filtered too */
-        { "claude", "",            "hi", card(202, 940, "claude says hi", 'I', 0) },
-        /* A mapped but still-unread door is not proven routed: keep visible. */
-        { "hermes", "", "different", card(205, 945, "ambiguous door", 'I', 1) },
-        /* Invalid content likewise stays visible even if a stale record is read. */
-        { "hermes", "", "", card(206, 935, "empty door", 'I', 0) },
-        /* "-chat" door whose conversation does NOT exist -> NOT chat: it stays
-         * a plain visible card instead of vanishing with no thread behind it */
-        { "",       "ghost-chat",  "hi", card(203, 930, "orphan door",    'I', 0) },
-        /* genuine notification (HA source, no conversation) -> stays a card */
-        { "ha",     "ha",          "hot", card(204, 920, "boiler alarm",   'C', 1) },
+static void test_door_card_stays_beside_thread(void) {
+    FeedCardView cards[6] = {
+        card(201, 950, "hermes says hi", 'I', 0),
+        card(202, 940, "claude says hi", 'I', 0),
+        card(205, 945, "ambiguous door", 'I', 1),
+        card(206, 935, "empty door", 'I', 0),
+        card(203, 930, "orphan door",    'I', 0),
+        card(204, 920, "boiler alarm",   'C', 1),
     };
+    int nc = 6;
 
-    /* The scan: skip what the classifier calls chat (the main.cpp filter). */
-    FeedCardView cards[6];
-    int nc = 0;
-    for (int i = 0; i < 6; i++) {
-        NotifyChatResolution resolved = notify_chat_resolve(
-            raw[i].source, raw[i].key, scan_conv_find, NULL);
-        if (!raw[i].view.unread && raw[i].body[0] &&
-            resolved.conversation >= 0)
-            continue;
-        cards[nc++] = raw[i].view;
-    }
-
-    /* The conversation the doors point at is in the store and in the feed. */
     FeedConvView convs[1] = {
         conv(0, "hermes", "HERMES", 950, CONV_AGENT, 1, 0),
     };
     FeedRow out[FEED_ORDER_MAX];
     int n = feed_build_rows(cards, nc, convs, 1, out, FEED_ORDER_MAX);
 
-    /* Only the two routed doors disappear. Ambiguous, invalid, orphan and real
-     * notification cards remain beside the single conversation row. */
-    assert(n == 5);
-    for (int i = 0; i < n; i++) {
-        assert(out[i].card_id != 201 && out[i].card_id != 202);
-        assert(strcmp(out[i].label, "hermes says hi") != 0);
-        assert(strcmp(out[i].label, "claude says hi") != 0);
-    }
-    /* the conversation row survives, and is that chat's ONE line */
-    assert(out[0].origin == FEED_CONV && out[0].slot == 0);
-    assert(strcmp(out[0].id, "hermes") == 0);
-    assert(out[1].origin == FEED_CARD && out[1].card_id == 205);
-    assert(out[2].origin == FEED_CARD && out[2].card_id == 206);
-    assert(out[3].origin == FEED_CARD && out[3].card_id == 203);
-    assert(out[4].origin == FEED_CARD && out[4].card_id == 204);
-    assert(out[4].glyph == 'C' && out[4].mark == INBOX_UNREAD_MARK);
+    /* Routed doors sit beside the thread: card 201 ties epoch 950 with the
+     * hermes conversation, cards-before-convs. */
+    assert(n == 7);
+    assert(out[0].origin == FEED_CARD && out[0].card_id == 201);
+    assert(out[1].origin == FEED_CONV && out[1].slot == 0);
+    assert(strcmp(out[1].id, "hermes") == 0);
+    assert(out[2].origin == FEED_CARD && out[2].card_id == 205);
+    assert(out[3].origin == FEED_CARD && out[3].card_id == 202);
+    assert(out[4].origin == FEED_CARD && out[4].card_id == 206);
+    assert(out[5].origin == FEED_CARD && out[5].card_id == 203);
+    assert(out[6].origin == FEED_CARD && out[6].card_id == 204);
+    assert(out[6].glyph == 'C' && out[6].mark == INBOX_UNREAD_MARK);
 }
 
 int main(void) {
@@ -412,7 +358,7 @@ int main(void) {
     test_full_feed_exceeds_legacy_eight();
     test_single_source();
     test_bounds();
-    test_door_card_filtered_from_scan();
+    test_door_card_stays_beside_thread();
     printf("feed view tests: OK\n");
     return 0;
 }

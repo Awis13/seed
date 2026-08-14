@@ -13,7 +13,8 @@ assert "settings_silent = !settings_silent;" in main
 assert "if (!settings_silent) hw_sound_notify(lvl);" in main
 assert "hw_haptic_notify(lvl);" in main
 assert "hw_kb_take_silent_toggle()" in main
-assert "pressed && alt_held && row == 1 && col == 1" in kb
+assert "pressed && alt_held && row == 1 && col == 1" not in kb
+assert "'/', '+'" in kb
 assert '"SILENT %s", silent ? "ON" : "OFF"' in ui
 assert 'snprintf(row2, sizeof(row2), "SILENT");' in main
 assert 'doc["autolock_s"] = settings_autolock_s;' in main
@@ -28,5 +29,7 @@ assert "INPUT_LONG_MS          1000" in input_cpp
 assert "!long_fired && (t - key_down_at) < INPUT_CLICK_MAX_MS" in input_cpp
 assert "pending_click = false;" in input_cpp
 assert "kb_toggle_lock" not in kb and "CAPS_LONG_MS" not in kb
+assert "if (pressed && kb_locked)" in kb, "short CAPS must unlock; it is not a lock key"
+assert "LOCKED  CAPS or hold click" in main
 
 print("settings policy tests: OK")
