@@ -90,7 +90,7 @@ static_assert((int)UINAV_CONTACTS       == (int)HW_UI_CONTACTS,       "ui_nav en
 static_assert((int)UINAV_NET            == (int)HW_UI_NET,            "ui_nav enum drift");
 
 // ===== Configuration =====
-#define SEED_VERSION        "0.9.110"
+#define SEED_VERSION        "0.9.111"
 // Core clock: datasheet puts 240 vs 80 ~11.5mA apart on WAITI. Periph bus holds
 // at 80 for every PLL-fed core clock; go lower and RMT/I2S retimes. Same floor
 // as tembed idle policy (no light sleep — notify latency is the job).
@@ -521,11 +521,11 @@ static bool wifi_user_off = false;
  * radio. WIFI_RETRY_MS stays the steady-state cap (and the last rung). */
 #define WIFI_RETRY_MS 1200000UL
 static const unsigned long WIFI_RETRY_LADDER_MS[] = {
-    30000UL,        /* 30 s — AP likely just came back */
-    60000UL,        /* 1 min */
+    5000UL,         /* 5 s — walk back into the AP, try now */
+    15000UL,        /* 15 s */
+    30000UL,        /* 30 s */
     120000UL,       /* 2 min */
     300000UL,       /* 5 min */
-    600000UL,       /* 10 min */
     WIFI_RETRY_MS,  /* 20 min steady state */
 };
 #define WIFI_RETRY_LADDER_STEPS \
@@ -1990,10 +1990,14 @@ static char gw_token[GW_TOKEN_MAX + 1] = "";
 // ~1 s (connect cap) at most and only at the probe cadence, never per send.
 static void reachability_service(uint32_t now) {
     /* NO HTTP probe. Live serial 2026-08-14: REACH_DOWN_INTERVAL_MS=3s meant
-     * NetworkClient.connect every 3 s → socket:105 forever → HTTP server dead
-     * → Hermes POST /agents/inbound fails → chat has no replies → reboot.
-     * Verdict is WiFi link only; the send ladder still has mesh fallback. */
-    reach_record(&g_reach, now, WiFi.status() == WL_CONNECTED);
+     * NetworkClient.connect every 3 s → socket:105 forever → HTTP server dead.
+     * Association is NOT a route home: treating WL_CONNECTED as REACH_UP made
+     * the send ladder POST the bridge on a zombie STA and stall the UI (~1.7s)
+     * instead of falling to mesh. Record DOWN when the link is gone; while
+     * associated, leave the cache alone so it stays UNKNOWN/DOWN and the
+     * ladder skips WiFi. */
+    if (WiFi.status() != WL_CONNECTED)
+        reach_record(&g_reach, now, false);
 }
 
 // Accessor for the send ladder (C2): the cached route-home verdict, no I/O.
@@ -4904,7 +4908,6 @@ void loop() {
         event_add("wifi retry %s, next in %lus (step %d)", wifi_ssid,
                   wifi_retry_interval_ms() / 1000UL, wifi_retry_step);
         WiFi.disconnect(false, false);
-        delay(50);
         wifi_begin_active_profile();
     }
     if (now_connected != was_connected) {
