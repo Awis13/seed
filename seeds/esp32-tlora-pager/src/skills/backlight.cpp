@@ -203,13 +203,34 @@ static bool backlight_blanked() { return bl_shown == 0 && bl_wanted != 0; }
  * current face after tft_wake(), before the backlight rises. */
 static void ui_blank_wake_repaint();
 
+/* Keyboard backlight (GPIO46) follows the panel: a dark screen with a lit
+ * keypad is a pocket flashlight. Saved across one blank/wake so a user who
+ * turned the keys off stays off. */
+static uint8_t kb_bl_saved = 0;
+static bool kb_bl_parked = false;
+
+static void kb_bl_follow_blank() {
+    if (!kb_bl_parked) {
+        kb_bl_saved = hw_kb_get_backlight();
+        kb_bl_parked = true;
+    }
+    hw_kb_set_backlight(0);
+}
+
+static void kb_bl_follow_wake() {
+    if (!kb_bl_parked) return;
+    hw_kb_set_backlight(kb_bl_saved);
+    kb_bl_parked = false;
+}
+
 static void backlight_poll() {
     if (!bl_ready) return;
     uint8_t shown = bl_shown;
     if (shown != bl_applied) {
         if (shown == 0) {
-            /* Blank: backlight to 0 first, then sleep the ST7796 controller
+            /* Blank: both lights to 0 first, then sleep the ST7796
                (vendor setBrightness(0) auto-sleeps the panel the same way). */
+            kb_bl_follow_blank();
             bl_drive(0);
             tft_sleep();
         } else if (bl_applied == 0) {
@@ -219,6 +240,7 @@ static void backlight_poll() {
             tft_wake();
             ui_blank_wake_repaint();
             bl_drive(shown);
+            kb_bl_follow_wake();
         } else {
             bl_drive(shown);
         }

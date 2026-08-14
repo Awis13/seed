@@ -90,7 +90,7 @@ static_assert((int)UINAV_CONTACTS       == (int)HW_UI_CONTACTS,       "ui_nav en
 static_assert((int)UINAV_NET            == (int)HW_UI_NET,            "ui_nav enum drift");
 
 // ===== Configuration =====
-#define SEED_VERSION        "0.9.111"
+#define SEED_VERSION        "0.9.112"
 // Core clock: datasheet puts 240 vs 80 ~11.5mA apart on WAITI. Periph bus holds
 // at 80 for every PLL-fed core clock; go lower and RMT/I2S retimes. Same floor
 // as tembed idle policy (no light sleep — notify latency is the job).
@@ -4828,6 +4828,7 @@ void setup() {
     hw_haptic_begin();  // after Wire is up (hw_ui_begin)
     hw_sound_begin();
     hw_kb_begin();
+    if (backlight_wanted() == 0) hw_kb_set_backlight(0);
     kb_layout_load(); // SPIFFS /kb_layout.txt → EN / RU PHON / RU
     settings_load();  // SPIFFS /settings.json; missing keys keep defaults
     mesh_gw_load();   // SPIFFS /mesh_gw.txt → home Heltec daemon URL
