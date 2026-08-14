@@ -70,9 +70,12 @@
  * Identity::validate_announce (no ECC accelerator on the ESP32-S3, no Ed25519
  * in mbedTLS). That cost cannot be reduced, so it is not paid: a filter
  * registered on Transport's inbound hook drops every announce that is not a
- * PATH_RESPONSE, ~350 lines of Transport::inbound() before the verification.
- * See the prefilter block further down for what the hook does and does not
- * permit.
+ * PATH_RESPONSE for an allow-listed dest, ~350 lines of Transport::inbound()
+ * before the verification. The allow-list is the configured peer plus this
+ * node's own IN destination hashes. An empty list (no outbound peer, dests
+ * not yet built) drops every PATH_RESPONSE so the uncapped heap path table
+ * cannot grow. See the prefilter block further down for what the hook does
+ * and does not permit.
  *
  * THE TICK IS NOW ON, and it brings four library behaviours with it that no
  * caller can switch off. They are accepted, not worked around:
@@ -276,6 +279,9 @@ static_assert(RNS_PKT_TYPE_ANNOUNCE == (uint8_t)RNS::Type::Packet::ANNOUNCE,
 static_assert(RNS_PKT_CONTEXT_PATH_RESPONSE ==
                   (uint8_t)RNS::Type::Packet::PATH_RESPONSE,
               "rns/pktfilter.h PATH_RESPONSE does not match RNS::Type::Packet");
+static_assert(RNS_DEST_HASH_LEN ==
+                  (size_t)RNS::Type::Reticulum::DESTINATION_LENGTH,
+              "rns/pktfilter.h dest hash length does not match RNS");
 
 /* And the third wire constant, for the same reason: rns/inbox.h sizes its one
  * buffer at the largest plaintext a single encrypted packet can carry, and the
@@ -592,16 +598,20 @@ static uint32_t g_drain_us_max = 0;
  * instead of an Ed25519 verification that measured 221 ms on this board.
  *
  * The decision itself is rns_filter_keep_packet() in rns/pktfilter.h — a pure
- * function of packet type and context, host-tested by tools/test_rns_filter.sh.
- * What lives here is only the plumbing, and every line of it is constrained:
+ * function of type, context, dest hash and the allow-list, host-tested by
+ * tools/test_rns_filter.sh. What lives here is only the plumbing, and every
+ * line of it is constrained:
  *
  *   - The hook is a BARE FUNCTION POINTER (Transport::Callbacks::filter_packet
  *     is `bool(*)(const Packet&)`), so there is nowhere to put state except file
- *     scope. Hence the two statics below rather than anything captured.
+ *     scope. Hence the two counters and the allow-list below rather than
+ *     anything captured.
  *   - It runs inside the drain, on the loop task, once per inbound packet, so it
  *     must be O(1), allocate nothing and have no side effect beyond those two
- *     counters. Packet::packet_type() and Packet::context() are inline reads of
- *     the packet object's own fields; neither copies, allocates or throws.
+ *     counters. Packet::packet_type(), Packet::context() and
+ *     Packet::destination_hash() are inline reads of the packet object's own
+ *     fields; none copies, allocates or throws. destination_hash() is already
+ *     populated: Transport::inbound unpacks the packet BEFORE this callback.
  *   - The hook is FAIL-OPEN, but only for one kind of throw. Transport.cpp
  *     initialises `accept = true` and wraps the call in
  *     `catch (const std::exception&)`, so a std::exception out of here leaves
@@ -621,14 +631,72 @@ static uint32_t g_drain_us_max = 0;
  *
  * The counters are announce-specific on purpose: every non-announce packet is
  * kept unconditionally, so counting those would only measure traffic. kept +
- * dropped is the number of announces that reached the filter. */
+ * dropped is the number of announces that reached the filter.
+ *
+ * The allow-list is written only on the loop task (dest bring-up and
+ * rns_cfg_load) and read only from this callback (inbound drain, also the loop
+ * task). No mutex. It is never filled from inbound traffic. */
 static uint32_t g_rns_ann_dropped = 0;
 static uint32_t g_rns_ann_kept = 0;
+static uint8_t g_path_allow[4][RNS_DEST_HASH_LEN];
+static uint8_t g_path_allow_n = 0;
+
+static void rns_path_allow_add(const uint8_t *h, size_t n) {
+    if (h == nullptr || n != RNS_DEST_HASH_LEN) return;
+    if (g_path_allow_n >= 4) return;
+    for (uint8_t i = 0; i < g_path_allow_n; i++) {
+        if (memcmp(g_path_allow[i], h, RNS_DEST_HASH_LEN) == 0) return;
+    }
+    memcpy(g_path_allow[g_path_allow_n], h, RNS_DEST_HASH_LEN);
+    g_path_allow_n++;
+}
+
+static int rns_path_allow_nibble(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+/* Convert the already-validated 32-hex peer string (rns_addr_valid) to 16
+ * raw bytes. Not a new parser: the same charset and length rns_hex_n uses. */
+static void rns_path_allow_add_hex(const char *hex) {
+    uint8_t raw[RNS_DEST_HASH_LEN];
+    if (!rns_addr_valid(hex)) return;
+    for (size_t i = 0; i < RNS_DEST_HASH_LEN; i++) {
+        int hi = rns_path_allow_nibble(hex[i * 2]);
+        int lo = rns_path_allow_nibble(hex[i * 2 + 1]);
+        if (hi < 0 || lo < 0) return;
+        raw[i] = (uint8_t)((hi << 4) | lo);
+    }
+    rns_path_allow_add(raw, RNS_DEST_HASH_LEN);
+}
+
+static void rns_path_allow_add_dest(const RNS::Destination &dest) {
+    const RNS::Bytes &h = dest.hash();
+    if (h.size() == RNS_DEST_HASH_LEN && h.data() != nullptr)
+        rns_path_allow_add(h.data(), h.size());
+}
+
+/* Rebuild from the dests that exist plus the peer hex just applied. A cleared
+ * or replaced peer must not leave a stale dest in the table: that is how an
+ * empty peer goes back to dropping every PATH_RESPONSE we did not ask for. */
+static void rns_path_allow_reload(const char *peer_hex) {
+    g_path_allow_n = 0;
+    if (rns_dest_ok) rns_path_allow_add_dest(rns_destination);
+    if (rns_lxmf_dest_ok) rns_path_allow_add_dest(rns_lxmf_destination);
+    rns_path_allow_add_hex(peer_hex);
+}
 
 static bool rns_packet_filter(const RNS::Packet &packet) {
     uint8_t type = (uint8_t)packet.packet_type();
     uint8_t context = (uint8_t)packet.context();
-    bool keep = rns_filter_keep_packet(type, context);
+    const RNS::Bytes &dh = packet.destination_hash();  /* reference, not copy */
+    bool keep = rns_filter_keep_packet(
+        type, context,
+        dh.data(), dh.size(),
+        g_path_allow[0],   /* decays to uint8_t* */
+        g_path_allow_n);
     if (type == RNS_PKT_TYPE_ANNOUNCE) {
         if (keep) {
             g_rns_ann_kept++;
@@ -1588,6 +1656,10 @@ static bool rns_cfg_load() {
     portENTER_CRITICAL(&g_rns_tx_mux);
     memcpy(g_rns_peer, peer, sizeof(g_rns_peer));
     portEXIT_CRITICAL(&g_rns_tx_mux);
+
+    /* Peer applied (or cleared). Rebuild so a new peer replaces the old one
+     * and an empty peer drops every PATH_RESPONSE we did not ask for. */
+    rns_path_allow_reload(peer);
 
     /* The peer is NOT in this comparison. See g_rns_peer: the return value is
      * "drop the live link and redial", and a new peer address is no reason to. */
@@ -3888,6 +3960,7 @@ static void skill_rns_init() {
              * is exactly what rns_dest_ok means. Nothing that can throw is
              * allowed between the constructor and here. */
             rns_dest_ok = true;
+            rns_path_allow_add_dest(rns_destination);
         } catch (const std::exception &e) {
             rns_error = "exception creating the destination";
             Serial.printf("[rns] destination failed: %s\n", e.what());
@@ -3948,6 +4021,7 @@ static void skill_rns_init() {
             rns_lxmf_destination.accepts_links(false);
             rns_lxmf_destination.set_packet_callback(rns_lxmf_data_callback);
             rns_lxmf_dest_ok = true;
+            rns_path_allow_add_dest(rns_lxmf_destination);
         } catch (const std::exception &e) {
             rns_error = "exception creating the lxmf destination";
             Serial.printf("[rns] lxmf destination failed: %s\n", e.what());
