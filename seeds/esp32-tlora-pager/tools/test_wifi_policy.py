@@ -98,10 +98,20 @@ assert "g_agents_mesh_uplink(conv_id, text, delivery_key)" in send, (
 
 wg = (ROOT / "src" / "skills" / "wg.cpp").read_text(encoding="utf-8")
 assert "g_wg_json_ok" in wg, "WG config must stay in RAM so a restart does not fopen SPIFFS"
-probe = wg[wg.index("http.setConnectTimeout"):]
-assert "wg_stop_now()" not in probe, (
-    "a failed WG health probe must not stop the tunnel — that reboot-looped"
+# The liveness probe that this rule guarded is gone: 0.9.106 pulled the whole
+# HTTP health check out of the WG poll after live serial showed the probe's own
+# sockets ("socket: 105") driving the handshake timer into abort(). Same intent,
+# stronger form — the poll must do no network I/O at all, and the tunnel may
+# only be stopped by WiFi loss or an explicit request flag.
+poll = wg[wg.index("static void skill_wg_poll()"):]
+assert "http.setConnectTimeout" not in poll and "HTTPClient" not in poll, (
+    "the WG poll must not probe over HTTP — its sockets reboot-looped the device"
 )
+assert "if (g_wg_running) wg_stop_now();" in poll, (
+    "WiFi loss must still stop the tunnel so the library timer stops handshaking"
+)
+for guard in ("if (g_wg_stop_req)", "if (g_wg_restart_req)"):
+    assert guard in poll, f"{guard} must own its wg_stop_now(), nothing else may"
 
 assert "g_wg_restart_req = true" not in main, (
     "the coordinator must not stop+start WireGuard on the loop task"

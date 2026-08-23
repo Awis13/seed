@@ -164,17 +164,27 @@ assert "void gps_request_fix(void)" in gps
 assert "gps_wake_requested" in gps[gps.index("static void gps_tick()") :]
 
 # --- 4. Connect timeouts on every loop-task HTTPClient site ------------------
+# The rule is a CEILING, not one magic number: a black-holed gateway must not
+# cost the loop task more than ~1 s. 0.9.108 tightened every site from 1000 to
+# 500 ms while chasing the socket exhaustion, which honours the rule harder.
+def connect_timeouts_ms(src):
+    return [int(m) for m in re.findall(r"http\.setConnectTimeout\((\d+)\)", src)]
+
 reply = main[main.index("static ReplyHttpResult reply_upstream_http") :
              main.index("static bool reply_upstream_mesh")]
-assert "http.setConnectTimeout(1000)" in reply, (
-    "a black-holed gateway must cost ~1 s on the reply path"
-)
-assert "http.setConnectTimeout(1000)" in ping, (
-    "a black-holed gateway must cost ~1 s on the PING path"
-)
+for slice_src, where in ((reply, "reply"), (ping, "PING")):
+    got = connect_timeouts_ms(slice_src)
+    assert got, f"the {where} path must set a connect timeout at all"
+    assert max(got) <= 1000, (
+        f"a black-holed gateway must cost ~1 s at most on the {where} path, got {got}"
+    )
+
+# The WG liveness probe this used to pin is deliberately gone (EMERGENCY
+# 0.9.106): its own sockets drove wireguardif_tmr into abort() and reboot-looped
+# the device. No probe is the stronger form of "the probe must not block".
 probe = wg[wg.index("static void skill_wg_poll()") :]
-assert "http.setConnectTimeout(1000)" in probe, (
-    "a dead tunnel must cost ~1 s on the liveness probe"
+assert not connect_timeouts_ms(probe), (
+    "the WG poll must own no HTTP probe — that is what reboot-looped the device"
 )
 
 # --- 4b. /wg/restart: deferred, no delay on the AsyncTCP task ----------------
@@ -702,8 +712,17 @@ assert "rns_announce_edge_latch(" in annsched_test and \
     "decision alone"
 )
 # The floor is only meaningful relative to the reconnect ladder it defends
-# against, so pin that the ladder is still the thing it was sized for.
-assert "#define RNS_TCP_BACKOFF_MIN_MS 3000UL" in rns
+# against, so pin that the ladder is still the thing it was sized for. The floor
+# was written against a 3 s dial; 0.9.107 raised the min to 60 s after live
+# serial showed the 3 s flap burning the socket pool ("socket: 105" every 3 s)
+# until the HTTP server died. A LONGER dial only makes the announce floor safer,
+# so assert the direction rather than the number a past build happened to use.
+_backoff = re.search(r"#define RNS_TCP_BACKOFF_MIN_MS (\d+)UL", rns)
+assert _backoff, "the reconnect ladder must still declare its minimum dial"
+assert int(_backoff.group(1)) >= 3000, (
+    "the reconnect dial must never go below the 3 s the announce floor was "
+    f"sized against, got {_backoff.group(1)} ms"
+)
 assert "g_rns_backoff_ms = RNS_TCP_BACKOFF_MIN_MS;" in loop_body, (
     "the backoff reset on a successful connect is what makes the flap period "
     "constant; if this moves, resize RNS_ANNOUNCE_RECONNECT_MIN_MS"

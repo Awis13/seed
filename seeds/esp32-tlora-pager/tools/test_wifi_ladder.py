@@ -96,7 +96,10 @@ assert "wifi_last_attempt_ms = millis();" in owner
 
 # 6. Association is not REACH_UP. Recording WL_CONNECTED as a proven route
 #    made the send ladder block on a dead STA instead of falling to mesh.
-reach = main[main.index("static void reachability_service") :]
+#    Anchor on the definition, not the bare name: a forward declaration of
+#    reachability_service() sits ~270 lines above it, and slicing from there
+#    used to grab an unrelated function body and fail on every assertion.
+reach = main[main.index("static void reachability_service(uint32_t now) {") :]
 reach = reach[: reach.index("\n}\n") + 3]
 assert "reach_record(&g_reach, now, false)" in reach
 assert "WL_CONNECTED" in reach
