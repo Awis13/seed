@@ -90,7 +90,7 @@ static_assert((int)UINAV_CONTACTS       == (int)HW_UI_CONTACTS,       "ui_nav en
 static_assert((int)UINAV_NET            == (int)HW_UI_NET,            "ui_nav enum drift");
 
 // ===== Configuration =====
-#define SEED_VERSION        "0.9.114"
+#define SEED_VERSION        "0.9.115"
 // Core clock: datasheet puts 240 vs 80 ~11.5mA apart on WAITI. Periph bus holds
 // at 80 for every PLL-fed core clock; go lower and RMT/I2S retimes. Same floor
 // as tembed idle policy (no light sleep — notify latency is the job).
@@ -3459,9 +3459,16 @@ static void ui_open_menu() {
 static bool notify_event_distinct_cb(const char *source, const char *key) {
     if (notify_rec_is_chat_door_key(key)) return false;
     NotifyChatResolution resolution = agents_notify_chat_resolve_snapshot(source, key);
-    /* A known conversation is one thread. Stacking a card per replica
-     * is what filled the inbox with Hermes. */
-    return resolution.conversation < 0;
+    /* Distinct means "one chat event, never a key update", so it must name the
+     * chat events and nothing else. Reading it as "everything that is not a
+     * conversation" made every ordinary keyed card distinct, which switched OFF
+     * replace-by-key for exactly the cards that live on it: the pills reminder
+     * re-paged hourly and stacked ten unread CRITs instead of updating one, the
+     * store filled to 40/40, and crit_unread then floored the backlight at dim
+     * forever, so the panel stopped blanking. A known conversation is carried by
+     * its thread; the feed filter (notify_is_chat) is what keeps those rows out
+     * of the inbox, not this flag. */
+    return resolution.conversation >= 0;
 }
 
 static char notify_chat_normalized[NOTIFY_BODY_LEN];
