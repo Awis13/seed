@@ -46,6 +46,7 @@
 #include "../l1_frame.h"    /* pure L1 frame parse + byte reassembler (host-tested) */
 #include "../notify_wire.h" /* pure P/M notify-wire parse — the cross-transport key */
 #include "../card_ack.h"    /* pure A1|key delivery-ack: decision + wire + dedup ring */
+#include "../psram_alloc.h" /* psram_calloc_pref: reassembly slots parked in PSRAM */
 
 /* THE SHARED LXMF ROUTER lives in skills/rns.cpp, which main.cpp #includes AFTER
  * this file into the same translation unit. Forward-declare it so the MeshCore
@@ -593,9 +594,15 @@ struct MeshReasm {
     char     buf[MESH_REASM_MAX];
 };
 
-static MeshReasm g_reasm[MESH_REASM_SLOTS];
+/* Parked in PSRAM (~7.8 KB): the M1/C1 reassembly slots are touched only from
+ * the packet path on the loop task (RadioLib hands frames over a flag, there is
+ * no ISR callback in this file) — never an ISR. Allocated on the first slot
+ * lookup; a null makes mesh_reasm_get return NULL and both call sites drop the
+ * multipart frame, because they dereference the slot immediately. */
+static MeshReasm *g_reasm = nullptr;
 
 static void mesh_reasm_gc() {
+    if (!g_reasm) return;
     uint32_t now = millis();
     for (int i = 0; i < MESH_REASM_SLOTS; i++) {
         if (g_reasm[i].used && (now - g_reasm[i].started_ms) > MESH_REASM_TTL_MS)
@@ -605,6 +612,11 @@ static void mesh_reasm_gc() {
 
 static MeshReasm *mesh_reasm_get(char kind, const char *mid,
                                  const char *agent = NULL) {
+    if (!g_reasm) {
+        g_reasm = (MeshReasm *)psram_calloc_pref(sizeof(MeshReasm) *
+                                                 MESH_REASM_SLOTS);
+        if (!g_reasm) return NULL;   // callers treat this as a dropped multipart
+    }
     mesh_reasm_gc();
     for (int i = 0; i < MESH_REASM_SLOTS; i++) {
         if (g_reasm[i].used && g_reasm[i].kind == kind &&
@@ -754,6 +766,7 @@ static uint32_t mesh_on_private_text(const uint8_t *from_pubkey,
         chunk[cl] = '\0';
 
         MeshReasm *r = mesh_reasm_get('M', f.mid);
+        if (!r) return 0;   // slot pool unavailable: drop the part, same as a parse refusal
         if (r->got_count == 0) {
             snprintf(r->level, sizeof(r->level), "%s", f.level);
             snprintf(r->source, sizeof(r->source), "%s", f.source);
@@ -815,6 +828,7 @@ static uint32_t mesh_on_private_text(const uint8_t *from_pubkey,
         }
 
         MeshReasm *r = mesh_reasm_get('C', mid, agent);
+        if (!r) return 0;   // slot pool unavailable: drop the part, same as a parse refusal
         if (r->got_count == 0) {
             snprintf(r->agent, sizeof(r->agent), "%s", agent);
             r->side = side;

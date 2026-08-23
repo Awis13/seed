@@ -90,7 +90,7 @@ static_assert((int)UINAV_CONTACTS       == (int)HW_UI_CONTACTS,       "ui_nav en
 static_assert((int)UINAV_NET            == (int)HW_UI_NET,            "ui_nav enum drift");
 
 // ===== Configuration =====
-#define SEED_VERSION        "0.9.113"
+#define SEED_VERSION        "0.9.114"
 // Core clock: datasheet puts 240 vs 80 ~11.5mA apart on WAITI. Periph bus holds
 // at 80 for every PLL-fed core clock; go lower and RMT/I2S retimes. Same floor
 // as tembed idle policy (no light sleep — notify latency is the job).
@@ -124,11 +124,21 @@ struct EventEntry {
     char message[EVENT_MSG_LEN];
 };
 
-static EventEntry events_buf[MAX_EVENTS];
+/* Parked in PSRAM (~8.4 KB): written by event_add on the loop and AsyncTCP
+ * tasks, read by the events endpoint — task context only, never an ISR.
+ * Allocated on first use rather than in a _begin(): event_add already reports
+ * from inside outbox_load(), before setup() reaches any init we could hang it
+ * on. A null means both pools are exhausted, and then the event is dropped
+ * rather than taking the boot down with it. */
+static EventEntry *events_buf = nullptr;
 static int events_head = 0;
 static int events_count = 0;
 
 static void event_add(const char *fmt, ...) {
+    if (!events_buf) {
+        events_buf = (EventEntry *)psram_calloc_pref(sizeof(EventEntry) * MAX_EVENTS);
+        if (!events_buf) return;
+    }
     va_list ap;
     va_start(ap, fmt);
     EventEntry *e = &events_buf[events_head];
@@ -2028,7 +2038,11 @@ static int agent_sess_sel = 0;      // selected row on the agent SESSIONS list
 static uint8_t agent_origin = UINAV_MSGLIST;
 // Chat window copy: only the current viewport (AGENT_THREAD_MAX lines) — the
 // full history lives on SD, so no whole-thread RAM snapshot is held.
-static char ag_chat_lines[AGENT_THREAD_MAX][AGENT_TEXT_LEN];
+/* Parked in PSRAM (~12 KB, the largest single buffer left in DRAM): filled by
+ * ui_agent_chat_refresh under agents_lock and read by the painter, both on the
+ * UI/loop task — never an ISR. Allocated on first refresh; a null leaves the
+ * chat window empty instead of crashing. */
+static char (*ag_chat_lines)[AGENT_TEXT_LEN] = nullptr;
 static bool ag_chat_from_me[AGENT_THREAD_MAX];
 static uint8_t ag_chat_deliv[AGENT_THREAD_MAX];
 static uint32_t ag_chat_ts[AGENT_THREAD_MAX];
@@ -3669,6 +3683,15 @@ static void agents_head_time(uint32_t ts, char *out, size_t out_n) {
 
 static void ui_agent_chat_refresh() {
     int n = 0;
+    if (!ag_chat_lines)
+        ag_chat_lines = (char (*)[AGENT_TEXT_LEN])psram_calloc_pref(
+            (size_t)AGENT_THREAD_MAX * AGENT_TEXT_LEN);
+    if (!ag_chat_lines) {
+        /* Both pools exhausted. Leave the face as it stands rather than paint a
+         * half-built one: the refresh is idempotent and the next one recovers. */
+        Serial.println("[ui] chat line buffer alloc FAILED - chat not refreshed");
+        return;
+    }
     agents_lock();
     n = agents_thread_view(agent_focus, ag_chat_lines, ag_chat_from_me,
                            ag_chat_ts, AGENT_THREAD_MAX, ag_chat_deliv);
@@ -3939,7 +3962,11 @@ static void ui_open_msglist() {
 // {transport, id, reply} so open-or-create can act on it after the input arrays
 // are gone (src/contacts_view.h). Selection only ever lands on a contact row;
 // header rows are non-selectable dividers.
-static ContactRow contacts_rows[CONTACT_ROWS_MAX];
+/* Parked in PSRAM (~4 KB): rebuilt under agents_lock on the UI/loop task and
+ * read by the renderer on the same task — never an ISR. Allocated on the first
+ * rebuild; every reader is already gated by contacts_count, which stays 0 while
+ * the pointer is null, so a failed alloc shows an empty list. */
+static ContactRow *contacts_rows = nullptr;
 static int contacts_count = 0;
 static int contacts_sel = 0;
 // Flattened view arrays for the renderer (labels point into contacts_rows, which
@@ -4055,8 +4082,13 @@ static void ui_open_contacts() {
         lxmf[n_lxmf].reply_len = lx_reply_len[n_lxmf];
         n_lxmf++;
     }
-    contacts_count = contacts_build_rows(ai, n_ai, lxmf, n_lxmf, mesh, n_mesh,
-                                         contacts_rows, CONTACT_ROWS_MAX);
+    if (!contacts_rows)
+        contacts_rows = (ContactRow *)psram_calloc_pref(sizeof(ContactRow) *
+                                                        CONTACT_ROWS_MAX);
+    contacts_count = contacts_rows
+        ? contacts_build_rows(ai, n_ai, lxmf, n_lxmf, mesh, n_mesh,
+                              contacts_rows, CONTACT_ROWS_MAX)
+        : 0;
     agents_unlock();
 
     // Land the selection on the first contact row (headers are not selectable).
