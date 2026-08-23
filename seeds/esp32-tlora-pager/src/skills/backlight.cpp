@@ -6,7 +6,8 @@
  *   - under 30s idle → level the person set
  *   - past 30s → dimmest preset (4 / "night"), never brighter than set
  *   - past 120s → off (crit unread floors at dim; progress bar exempt)
- * Any input or an arriving notify stamps the idle clock in main.
+ * A key, click, or arriving notify stamps the idle clock in main.
+ * A wheel detent on an already-blank panel does not (pocket bounce).
  *
  * Policy decisions never overwrite the stored setting: turning idle off
  * restores what was asked for within one poll.
@@ -123,6 +124,9 @@ static uint8_t bl_applied = 0;
 static bool bl_ready = false;
 static volatile bool bl_idle_on = BL_IDLE_DEFAULT;
 static volatile uint8_t bl_shown = BL_DEFAULT;
+static unsigned long bl_since_ms = 0;
+static bool bl_on_bar = false;
+static bool bl_crit_unread = false;
 static unsigned long bl_off_at = 0;
 static volatile bool bl_cfg_dirty = false;
 static volatile unsigned long bl_cfg_save_at = 0;
@@ -192,6 +196,9 @@ static void bl_cfg_load() {
 
 static void backlight_idle(unsigned long since_input_ms,
                            const BacklightPanel &panel) {
+    bl_since_ms = since_input_ms;
+    bl_on_bar = panel.on_bar;
+    bl_crit_unread = panel.crit_unread;
     bl_shown = bl_idle_level(bl_idle_policy(bl_idle_on), bl_wanted,
                              since_input_ms, panel);
 }
@@ -297,6 +304,10 @@ static void backlight_state_json(JsonDocument &doc) {
         p["level"] = bl_preset_table[i].level;
     }
     doc["shown"] = bl_shown;
+    doc["blanked"] = backlight_blanked();
+    doc["idle_ms"] = bl_since_ms;
+    doc["on_bar"] = bl_on_bar;
+    doc["crit_unread"] = bl_crit_unread;
     doc["idle"] = bl_idle_on;
     JsonObject policy = doc["idle_policy"].to<JsonObject>();
     policy["dim_after_ms"] = BL_IDLE_DIM_MS;
@@ -323,7 +334,8 @@ static const char *backlight_describe() {
            "### Idle auto-dim\n\n"
            "No input → dim step (level " BL_STR(BL_IDLE_LEVEL) ") after **"
            BL_STR(BL_IDLE_DIM_S) "s**, off after **" BL_STR(BL_IDLE_OFF_S)
-           "s**. Knob, key, or arriving notify wakes. Crit unread floors at\n"
+           "s**. Click, key, or arriving notify wakes; the wheel does not\n"
+           "wake a dark panel (pocket bounce). Crit unread floors at\n"
            "dim (no full blank). Progress bar keeps the panel readable.\n"
            "`{\"idle\":false}` hands brightness back to the manual level.\n\n"
            "| GET/POST | /backlight |\n";

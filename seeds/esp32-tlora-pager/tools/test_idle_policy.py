@@ -233,6 +233,36 @@ assert "static_assert(BL_IDLE_DIM_MS > UI_IDLE_MS" in main, (
     "backlight must still be forbidden from dimming under a live card"
 )
 
+# --- a blanked panel: wheel is not a wake (pocket bounce / detent edge) ------
+steps_fn = main[main.index("static void ui_on_steps(int steps)") :]
+steps_fn = steps_fn[: steps_fn.index("static void setup_routes()")]
+assert "if (backlight_blanked()) return;" in steps_fn, (
+    "a stray detent must not relight a dark panel"
+)
+assert steps_fn.index("if (backlight_blanked()) return;") < steps_fn.index(
+    "ui_note_input();"
+), "the blanked early-return must precede the idle stamp"
+
+# click/key still wake a dark panel (intentional peek)
+click_fn = main[main.index("static void ui_on_click()") :]
+click_fn = click_fn[: click_fn.index("static void ui_on_steps(")]
+assert "if (backlight_blanked())" in click_fn
+assert "ui_note_input();" in click_fn[click_fn.index("if (backlight_blanked())") :]
+
+# leftover encoder counts must decay or a sitting wheel fabricates detents
+inp = (ROOT / "src" / "hw_input.cpp").read_text(encoding="utf-8")
+assert "INPUT_STALE_MS" in inp, "encoder leftover decay window missing"
+assert "enc_last_edge_ms" in inp
+assert "if (enc_accum != 0 && (t - enc_last_edge_ms) >= INPUT_STALE_MS)" in inp
+assert "enc_accum = 0;" in inp
+
+# GET /backlight must publish the idle clock so a live "why is it on" is visible
+bl = (ROOT / "src" / "skills" / "backlight.cpp").read_text(encoding="utf-8")
+assert 'doc["idle_ms"] = bl_since_ms;' in bl
+assert 'doc["blanked"] = backlight_blanked();' in bl
+assert 'doc["on_bar"] = bl_on_bar;' in bl
+assert 'doc["crit_unread"] = bl_crit_unread;' in bl
+
 # --- one chat, one inbox row: opening the room ACKs leftover doorbells ------
 open_chat = main[main.index("static void ui_open_agent_chat(") :]
 open_chat = open_chat[: open_chat.index("static void ui_agent_sessions_refresh")]

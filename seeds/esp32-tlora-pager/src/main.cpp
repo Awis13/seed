@@ -90,7 +90,7 @@ static_assert((int)UINAV_CONTACTS       == (int)HW_UI_CONTACTS,       "ui_nav en
 static_assert((int)UINAV_NET            == (int)HW_UI_NET,            "ui_nav enum drift");
 
 // ===== Configuration =====
-#define SEED_VERSION        "0.9.112"
+#define SEED_VERSION        "0.9.113"
 // Core clock: datasheet puts 240 vs 80 ~11.5mA apart on WAITI. Periph bus holds
 // at 80 for every PLL-fed core clock; go lower and RMT/I2S retimes. Same floor
 // as tembed idle policy (no light sleep — notify latency is the job).
@@ -4503,11 +4503,10 @@ static void ui_on_click() {
 // Handle encoder detents.
 static void ui_on_steps(int steps) {
     if (steps == 0) return;
-    // Blanked: detents only wake (no menu navigation under the dark).
-    if (backlight_blanked()) {
-        ui_note_input();
-        return;
-    }
+    // Blanked: the wheel must not relight the panel. A sitting encoder
+    // (pocket, bag, desk edge) emits stray detents; each one used to restart
+    // the 120 s off-timer and drain the cell. Click or a key still wakes.
+    if (backlight_blanked()) return;
     ui_note_input();
     switch (hw_ui_screen()) {
     case HW_UI_MENU: {
