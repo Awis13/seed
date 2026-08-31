@@ -73,5 +73,28 @@ assert re.search(
     notify,
 ), "POST /notify must keep taking the string id as the card's dedup key"
 
+# 6. Replace clears EVERY card under the key, not the first one the walk meets.
+#    The walk runs oldest-first (notify_order[0] is the newest), so the final
+#    assignment records the newest removed id while preserving unrelated order.
+loop = notify[notify.index("if (notify_rec_key_replaces(e.key) && !e.event_distinct) {"):]
+loop = loop[: loop.index("\n    }\n") + 1]
+assert "for (int i = notify_len - 1; i >= 0; i--)" in loop, (
+    "the replace walk must stay oldest-first, so `replaced` ends up naming the "
+    "newest card dropped -- the one the caller thinks it is updating"
+)
+assert "break;" not in loop, (
+    "replace-by-key must drop every card carrying the key; breaking after the "
+    "first match leaves a duplicate stack that never drains"
+)
+assert "if (notify_len >= NOTIFY_MAX)" in notify[notify.index(loop):], (
+    "replacement must happen before capacity eviction"
+)
+assert "notify_reply[slot][0] = '\\0';" in notify, (
+    "a replacement must reset the text reply"
+)
+assert "if (opts) notify_opt[slot] = *opts;" in notify, (
+    "a replacement must install the new options"
+)
+
 print("notify replace-by-key tests: OK")
 sys.exit(0)

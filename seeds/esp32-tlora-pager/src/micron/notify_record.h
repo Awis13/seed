@@ -374,6 +374,23 @@ static inline int notify_rec_key_replaces(const char *key) {
     return key && key[0];
 }
 
+static inline int notify_rec_delete_shadows_older(const char *key,
+                                                  int event_distinct) {
+    return notify_rec_key_replaces(key) && !event_distinct;
+}
+
+/* Restore walks archive identities newest-first. A newer ordinary keyed card
+ * therefore shadows every older record carrying the same key, including
+ * records archived under per-event identities by older firmware. A distinct
+ * event never shadows earlier chronology, and keyless cards never shadow one
+ * another. */
+static inline int notify_rec_restore_shadowed(const char *older_key,
+                                              const char *newer_key,
+                                              int newer_event_distinct) {
+    return notify_rec_key_replaces(newer_key) && !newer_event_distinct &&
+           older_key && strcmp(older_key, newer_key) == 0;
+}
+
 #define NOTIFY_ARCHIVE_EVENTKEY_CAP 33
 
 static inline const char *notify_rec_archive_event_key(
@@ -421,13 +438,15 @@ static inline const char *notify_rec_archive_event_key(
  * appends a fresh DATA record with a still-higher seq, which supersedes the
  * tombstone (newest-wins again) and the card comes back.
  *
- * A tombstone is a one-byte payload whose first byte is a reserved marker a real
- * notify_rec can never start with: a data record's first byte is NOTIFY_REC_VER
- * (1), so NOTIFY_REC_TOMBSTONE is deliberately a distinct value. It is NOT a
- * notify_rec — it carries no card fields, only the fact of deletion —
- * so notify_rec_decode refuses it (wrong version byte) and the restorer tests
- * notify_rec_is_tombstone() explicitly before ever decoding. */
+ * A tombstone starts with a reserved marker a real notify_rec can never carry:
+ * a data record's first byte is NOTIFY_REC_VER (1), so NOTIFY_REC_TOMBSTONE is
+ * deliberately distinct. The original one-byte form remains valid and deletes
+ * exactly its archive identity. A keyed ordinary-card delete uses the versioned
+ * form below, which also carries the logical key so restore can suppress older
+ * per-event identities left by legacy firmware. */
 #define NOTIFY_REC_TOMBSTONE  0xEEu   /* first payload byte; != NOTIFY_REC_VER (1) */
+#define NOTIFY_REC_TOMBSTONE_KEY_VER 1u
+#define NOTIFY_REC_TOMBSTONE_KEY_HEAD 3u  /* marker, keyed version, key length */
 
 /* Encode a delete tombstone into `out` (cap must be >= 1). Returns the byte
  * count written (1), or 0 if the buffer is too small. */
@@ -437,9 +456,43 @@ static inline size_t notify_rec_tombstone_encode(uint8_t *out, size_t cap) {
     return 1;
 }
 
+/* Encode a logical-key deletion barrier. This is used only for ordinary keyed
+ * cards; distinct events and keyless cards retain identity-only tombstones. */
+static inline size_t notify_rec_key_tombstone_encode(const char *key,
+                                                     uint8_t *out, size_t cap) {
+    if (!key || !out) return 0;
+    size_t n = strnlen(key, NR_KEY_CAP);
+    if (n == 0 || n >= NR_KEY_CAP || cap < NOTIFY_REC_TOMBSTONE_KEY_HEAD + n)
+        return 0;
+    out[0] = (uint8_t)NOTIFY_REC_TOMBSTONE;
+    out[1] = (uint8_t)NOTIFY_REC_TOMBSTONE_KEY_VER;
+    out[2] = (uint8_t)n;
+    memcpy(out + NOTIFY_REC_TOMBSTONE_KEY_HEAD, key, n);
+    return NOTIFY_REC_TOMBSTONE_KEY_HEAD + n;
+}
+
 /* Is this archived payload a delete tombstone rather than a card record? A
  * tombstone is recognised by its reserved first byte, which no notify_rec ever
  * carries — so this can never mistake a real (possibly truncated) card for one. */
 static inline int notify_rec_is_tombstone(const uint8_t *buf, size_t len) {
     return buf && len >= 1 && buf[0] == (uint8_t)NOTIFY_REC_TOMBSTONE;
+}
+
+/* Extract the logical key from a versioned deletion barrier. Old one-byte
+ * tombstones and unknown/malformed future forms remain tombstones, but return
+ * no broad shadow key and therefore preserve their identity-only semantics. */
+static inline int notify_rec_tombstone_key(const uint8_t *buf, size_t len,
+                                           char *out, size_t out_n) {
+    if (!notify_rec_is_tombstone(buf, len) ||
+        len < NOTIFY_REC_TOMBSTONE_KEY_HEAD + 1 ||
+        buf[1] != (uint8_t)NOTIFY_REC_TOMBSTONE_KEY_VER || !out)
+        return 0;
+    size_t n = buf[2];
+    if (n == 0 || n >= NR_KEY_CAP || out_n <= n ||
+        len != NOTIFY_REC_TOMBSTONE_KEY_HEAD + n ||
+        memchr(buf + NOTIFY_REC_TOMBSTONE_KEY_HEAD, '\0', n))
+        return 0;
+    memcpy(out, buf + NOTIFY_REC_TOMBSTONE_KEY_HEAD, n);
+    out[n] = '\0';
+    return 1;
 }

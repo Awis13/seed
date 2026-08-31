@@ -90,7 +90,7 @@ static_assert((int)UINAV_CONTACTS       == (int)HW_UI_CONTACTS,       "ui_nav en
 static_assert((int)UINAV_NET            == (int)HW_UI_NET,            "ui_nav enum drift");
 
 // ===== Configuration =====
-#define SEED_VERSION        "0.9.115"
+#define SEED_VERSION        "0.9.116"
 // Core clock: datasheet puts 240 vs 80 ~11.5mA apart on WAITI. Periph bus holds
 // at 80 for every PLL-fed core clock; go lower and RMT/I2S retimes. Same floor
 // as tembed idle policy (no light sleep — notify latency is the job).
@@ -2240,14 +2240,37 @@ static void notify_restore_from_archive() {
     time_t now = time(NULL);
     unsigned long now_ms = millis();
     int restored = 0;
-    for (int rank = 0; rank < NOTIFY_MAX; rank++) {
+    static char deleted_keys[HISTORY_INDEX_MAX][NR_KEY_CAP];
+    memset(deleted_keys, 0, sizeof(deleted_keys));
+    int deleted_key_count = 0;
+    /* Skipped tombstones, corrupt records, duplicate ids and legacy same-key
+       event identities do not consume ring capacity. Scan the finite index
+       window until it is exhausted or the ring is actually full. */
+    for (int rank = 0;
+         rank < HISTORY_INDEX_MAX && restored < NOTIFY_MAX;
+         rank++) {
         history_record rec;
         if (!history_restore_at(MICRON_NS_NOTIFY, rank, &rec)) break;  // past the last
-        // A deleted card's newest archived record is a tombstone (newest-wins over
-        // its data record): skip the identity so a delete survives the reboot.
-        if (notify_rec_is_tombstone(rec.payload, rec.len)) continue;
+        // Old tombstones skip their exact archive identity. New keyed tombstones
+        // also shadow older legacy identities carrying the same logical key.
+        if (notify_rec_is_tombstone(rec.payload, rec.len)) {
+            char key[NR_KEY_CAP] = {};
+            if (deleted_key_count < HISTORY_INDEX_MAX &&
+                notify_rec_tombstone_key(rec.payload, rec.len,
+                                         key, sizeof(key))) {
+                memcpy(deleted_keys[deleted_key_count++], key, sizeof(key));
+            }
+            continue;
+        }
         notify_rec nr;
         if (!notify_rec_decode(rec.payload, rec.len, &nr)) continue;   // skip a bad body
+        bool deleted = false;
+        for (int i = 0; i < deleted_key_count; i++) {
+            if (strcmp(nr.key, deleted_keys[i]) != 0) continue;
+            deleted = true;
+            break;
+        }
+        if (deleted) continue;
         if (notify_restore_one(&nr, now, now_ms)) restored++;
     }
     notify_restore_finish(restored);   // drop ttls that ran out while powered off
