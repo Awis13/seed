@@ -18,3 +18,4 @@ bool hw_input_click();
 
 // True while center key is held.
 bool hw_input_held();
+bool hw_input_long_press();

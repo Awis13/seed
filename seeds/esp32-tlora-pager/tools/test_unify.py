@@ -63,10 +63,10 @@ assert loop.index("backlight_poll();") < loop.index("uint32_t arrived_id = 0;"),
 assert loop.index("ui_backlight_idle();") < loop.index("backlight_poll();"), (
     "the idle decision must precede the drive that applies it"
 )
-assert "reply_upstream_poll();" in loop, (
+assert "outbox_poll();" in loop, (
     "the reply uplink is not a Skill; it stays pinned after the keyboard drain"
 )
-assert loop.index("hw_kb_read") < loop.index("reply_upstream_poll();"), (
+assert loop.index("hw_kb_read") < loop.index("outbox_poll();"), (
     "an Enter must be carried on the pass that produced it"
 )
 assert loop.count("hw_sound_poll();") == 2, (
@@ -122,7 +122,8 @@ assert len(tmps) == len(set(tmps)), (
 # /notify.tmp is gone (ticket C3): notify persistence moved off the loop-task
 # SPIFFS snapshot onto the off-loop history archive.
 expected = {"/gw_token.tmp", "/gps.tmp", "/backlight.tmp",
-            "/kb_layout.tmp", "/agent_bridge.tmp"}
+            "/kb_layout.tmp", "/agent_bridge.tmp", "/outbox.tmp",
+            "/settings.tmp"}
 assert set(tmps) == expected, f"unexpected tmp set: {sorted(set(tmps))}"
 
 print("unify pattern tests: OK")

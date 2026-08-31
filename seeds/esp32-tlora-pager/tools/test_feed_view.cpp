@@ -13,6 +13,16 @@
  * two identical builds, cards-before-convs); the epoch==0 ordering choice
  * (treated as oldest, stable among peers); the top-N cap keeping the newest;
  * and the bounds / NULL / truncation cases.
+ *
+ * Also covered (TLORA-UI-FIX C3, Bug2a): the door-card filter at the card scan.
+ * A chat that arrived through a "chat door" used to appear TWICE — its
+ * conversation row AND the door notification card. The scan in main.cpp
+ * (ui_open_msglist) now skips every card the C2 classifier
+ * (src/notify_chat_class.h, notify_chat_resolve) resolves as a chat, so a
+ * conversation is exactly ONE feed row. Section 9 models that scan by VALUE
+ * with the REAL classifier and the REAL merge; the wiring — that main.cpp's
+ * scan actually makes that exact call — is pinned by test_feed_view.sh's
+ * source-slice check, which goes RED if the filter line is removed.
  */
 
 #include <assert.h>
@@ -22,6 +32,7 @@
 #include <string.h>
 
 #include "../src/feed_view.h"
+#include "../src/notify_chat_class.h"
 
 static FeedCardView card(uint32_t id, uint32_t epoch, const char *title,
                          char sev, uint8_t unread) {
@@ -207,7 +218,29 @@ static void test_cap_keeps_newest(void) {
     assert(out[2].slot == 2 && out[2].epoch == 300);
 }
 
-/* --- 7. one store empty ----------------------------------------------------- */
+/* --- 7. the display capacity does not cut the merged feed back to eight ---- */
+
+static void test_full_feed_exceeds_legacy_eight(void) {
+    FeedCardView cards[FEED_MAX_CARDS];
+    FeedConvView convs[FEED_MAX_CONVS];
+    FeedRow out[FEED_ORDER_MAX];
+    for (int i = 0; i < FEED_MAX_CARDS; i++)
+        cards[i] = card((uint32_t)(100 + i), (uint32_t)(1000 - i),
+                        "card", 'I', 0);
+    for (int i = 0; i < FEED_MAX_CONVS; i++)
+        convs[i] = conv((uint8_t)i, "peer", "chat",
+                        (uint32_t)(500 - i), CONV_MESH, 0, 0);
+
+    int n = feed_build_rows(cards, FEED_MAX_CARDS, convs, FEED_MAX_CONVS,
+                            out, FEED_ORDER_MAX);
+    assert(FEED_ORDER_MAX > 8);
+    assert(n == FEED_ORDER_MAX);
+    assert(out[0].card_id == 100);
+    assert(out[FEED_MAX_CARDS].origin == FEED_CONV);
+    assert(out[n - 1].slot == FEED_MAX_CONVS - 1);
+}
+
+/* --- 8. one store empty ----------------------------------------------------- */
 
 static void test_single_source(void) {
     FeedCardView cards[2] = {
@@ -231,7 +264,7 @@ static void test_single_source(void) {
     assert(out[0].slot == 1 && out[1].slot == 0);
 }
 
-/* --- 8. bounds and degenerate input ---------------------------------------- */
+/* --- 9. bounds and degenerate input ---------------------------------------- */
 
 static void test_bounds(void) {
     FeedRow out[FEED_ORDER_MAX];
@@ -261,6 +294,24 @@ static void test_bounds(void) {
     assert(feed_build_rows(&big, 1, NULL, 0, out, FEED_ORDER_MAX) == 1);
     assert(strlen(out[0].label) == FEED_LABEL_LEN - 1);
 
+    /* A long multibyte title is cut before a whole code point, never between
+     * UTF-8 bytes. This is the exact input the timestamped renderer receives. */
+    char multibyte[64];
+    for (size_t i = 0; i < sizeof(multibyte) - 2; i += 2) {
+        multibyte[i] = (char)0xD0;
+        multibyte[i + 1] = (char)0xA1;
+    }
+    multibyte[sizeof(multibyte) - 2] = '\0';
+    FeedCardView utf = card(10, 5, multibyte, 'I', 0);
+    assert(feed_build_rows(&utf, 1, NULL, 0, out, FEED_ORDER_MAX) == 1);
+    size_t pos = 0;
+    while (out[0].label[pos]) {
+        size_t width = utf8_text_decode(out[0].label + pos, NULL);
+        assert(width == 2);
+        pos += width;
+    }
+    assert(pos < strlen(multibyte));
+
     /* A card with no title yields an empty label rather than a guess. */
     FeedCardView noname = card(9, 5, NULL, 'I', 0);
     assert(feed_build_rows(&noname, 1, NULL, 0, out, FEED_ORDER_MAX) == 1);
@@ -270,6 +321,87 @@ static void test_bounds(void) {
     assert(feed_build_rows(&c, 0, &v, 0, out, FEED_ORDER_MAX) == 0);
 }
 
+/* --- 10. Bug2a: a chat's door card is filtered out of the card scan ---------
+ *
+ * Models the ui_open_msglist card scan by value: each raw card carries the
+ * source and key the store holds; the scan offers a card to the feed ONLY if
+ * the C2 classifier does not call it a chat. Uses the REAL classifier
+ * (notify_chat_resolve) and the REAL merge (feed_build_rows) — only the store
+ * iteration is fixture. The conversation registry stands in for agents_find(),
+ * exactly as in test_notify_chat_class.cpp. */
+
+static const char *g_scan_convs[] = { "hermes", "claude" };
+
+static int scan_conv_find(const char *id, void * /*ctx*/) {
+    if (!id || !id[0]) return -1;
+    for (size_t i = 0; i < sizeof(g_scan_convs) / sizeof(g_scan_convs[0]); i++)
+        if (strcmp(id, g_scan_convs[i]) == 0) return (int)i;
+    return -1;
+}
+
+/* A stored card as the scan sees it before reducing to FeedCardView. */
+struct ScanCard {
+    const char *source;
+    const char *key;
+    const char *body;
+    FeedCardView view;
+};
+
+static void test_door_card_filtered_from_scan(void) {
+    ScanCard raw[6] = {
+        /* legacy "-chat" door key, conversation "hermes" exists -> chat,
+         * must NOT become a feed row (the conversation row represents it) */
+        { "",       "hermes-chat", "hi", card(201, 950, "hermes says hi", 'I', 0) },
+        /* agent source names an existing conversation -> chat, filtered too */
+        { "claude", "",            "hi", card(202, 940, "claude says hi", 'I', 0) },
+        /* A mapped but still-unread door is not proven routed: keep visible. */
+        { "hermes", "", "different", card(205, 945, "ambiguous door", 'I', 1) },
+        /* Invalid content likewise stays visible even if a stale record is read. */
+        { "hermes", "", "", card(206, 935, "empty door", 'I', 0) },
+        /* "-chat" door whose conversation does NOT exist -> NOT chat: it stays
+         * a plain visible card instead of vanishing with no thread behind it */
+        { "",       "ghost-chat",  "hi", card(203, 930, "orphan door",    'I', 0) },
+        /* genuine notification (HA source, no conversation) -> stays a card */
+        { "ha",     "ha",          "hot", card(204, 920, "boiler alarm",   'C', 1) },
+    };
+
+    /* The scan: skip what the classifier calls chat (the main.cpp filter). */
+    FeedCardView cards[6];
+    int nc = 0;
+    for (int i = 0; i < 6; i++) {
+        NotifyChatResolution resolved = notify_chat_resolve(
+            raw[i].source, raw[i].key, scan_conv_find, NULL);
+        if (!raw[i].view.unread && raw[i].body[0] &&
+            resolved.conversation >= 0)
+            continue;
+        cards[nc++] = raw[i].view;
+    }
+
+    /* The conversation the doors point at is in the store and in the feed. */
+    FeedConvView convs[1] = {
+        conv(0, "hermes", "HERMES", 950, CONV_AGENT, 1, 0),
+    };
+    FeedRow out[FEED_ORDER_MAX];
+    int n = feed_build_rows(cards, nc, convs, 1, out, FEED_ORDER_MAX);
+
+    /* Only the two routed doors disappear. Ambiguous, invalid, orphan and real
+     * notification cards remain beside the single conversation row. */
+    assert(n == 5);
+    for (int i = 0; i < n; i++) {
+        assert(out[i].card_id != 201 && out[i].card_id != 202);
+        assert(strcmp(out[i].label, "hermes says hi") != 0);
+        assert(strcmp(out[i].label, "claude says hi") != 0);
+    }
+    /* the conversation row survives, and is that chat's ONE line */
+    assert(out[0].origin == FEED_CONV && out[0].slot == 0);
+    assert(strcmp(out[0].id, "hermes") == 0);
+    assert(out[1].origin == FEED_CARD && out[1].card_id == 205);
+    assert(out[2].origin == FEED_CARD && out[2].card_id == 206);
+    assert(out[3].origin == FEED_CARD && out[3].card_id == 203);
+    assert(out[4].origin == FEED_CARD && out[4].card_id == 204);
+    assert(out[4].glyph == 'C' && out[4].mark == INBOX_UNREAD_MARK);
+}
+
 int main(void) {
     test_interleaved_newest_first();
     test_tagged_handles();
@@ -277,8 +409,10 @@ int main(void) {
     test_ties_are_stable();
     test_zero_epoch_is_oldest();
     test_cap_keeps_newest();
+    test_full_feed_exceeds_legacy_eight();
     test_single_source();
     test_bounds();
+    test_door_card_filtered_from_scan();
     printf("feed view tests: OK\n");
     return 0;
 }

@@ -16,7 +16,7 @@
  *
  * WHAT IS PURE HERE, AND WHY IT MATTERS. Ordering is a decision; drawing is not.
  * Interleaving two sources by time is the one part a screenshot cannot confirm
- * and a person cannot eyeball once there are eight rows from two origins — so it
+ * and a person cannot eyeball once there are many rows from two origins — so it
  * is done in a function with no Arduino and no panel, and proved in
  * tools/test_feed_view.cpp by VALUE. This mirrors inbox_view.h, whose glyphs,
  * unread mark and CONV_ID_LEN it reuses rather than re-declaring.
@@ -36,6 +36,7 @@
 #include <string.h>
 
 #include "inbox_view.h"   /* inbox_transport_glyph, INBOX_UNREAD_MARK, CONV_ID_LEN */
+#include "utf8_text.h"
 
 /* Where a row came from. Persisted nowhere — a pure view tag. */
 enum FeedOrigin {
@@ -43,10 +44,9 @@ enum FeedOrigin {
     FEED_CONV = 1,   /* a chat conversation; handle is a table slot + conv id */
 };
 
-/* Display label width for a feed row. Card titles are the longer of the two
- * kinds; the renderer truncates well before this, so 40 is generous headroom
- * without carrying a card's full 60. */
-#define FEED_LABEL_LEN   40
+/* A card title is at most 60 source bytes. Keep all of it here; the renderer
+ * applies its own cell limit without ever cutting a UTF-8 code point. */
+#define FEED_LABEL_LEN   61
 
 /* Input caps. Cards come from a 40-deep queue but the caller only ever offers
  * the newest handful; conversations are bounded by the table. The internal sort
@@ -114,10 +114,7 @@ static inline void feed_emit_card(const FeedCardView &c, FeedRow &r) {
     r.mark = c.unread ? INBOX_UNREAD_MARK : ' ';
     r.has_rooms = 0;
     r.id[0] = '\0';
-    size_t j = 0;
-    if (c.title)
-        for (; c.title[j] && j + 1 < sizeof(r.label); j++) r.label[j] = c.title[j];
-    r.label[j] = '\0';
+    utf8_text_copy(r.label, sizeof(r.label), c.title, SIZE_MAX, false);
 }
 
 static inline void feed_emit_conv(const FeedConvView &c, FeedRow &r) {
@@ -133,10 +130,7 @@ static inline void feed_emit_conv(const FeedConvView &c, FeedRow &r) {
     if (c.id)
         for (; c.id[k] && k + 1 < sizeof(r.id); k++) r.id[k] = c.id[k];
     r.id[k] = '\0';
-    size_t j = 0;
-    if (c.label)
-        for (; c.label[j] && j + 1 < sizeof(r.label); j++) r.label[j] = c.label[j];
-    r.label[j] = '\0';
+    utf8_text_copy(r.label, sizeof(r.label), c.label, SIZE_MAX, false);
 }
 
 /*
@@ -166,7 +160,9 @@ static inline int feed_build_rows(const FeedCardView *cards, int nc,
     if (nc > FEED_MAX_CARDS) nc = FEED_MAX_CARDS;
     if (nv > FEED_MAX_CONVS) nv = FEED_MAX_CONVS;
 
-    FeedSortItem it[FEED_ORDER_MAX];
+    /* Firmware calls this on the loop task. Keep the merge workspace out of
+     * its small stack; callers consume the completed rows before the next call. */
+    static FeedSortItem it[FEED_ORDER_MAX];
     int count = 0;
     for (int i = 0; i < nc && count < FEED_ORDER_MAX; i++) {
         it[count].epoch = cards[i].epoch;

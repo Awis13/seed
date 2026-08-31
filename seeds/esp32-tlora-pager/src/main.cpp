@@ -61,13 +61,17 @@
 #include "hw_kb.h"
 #include "psram_alloc.h"          // psram_calloc_pref: park big buffers in PSRAM
 #include "ui_nav.h"               // pure, host-tested back-navigation policy
+#include "notify_chat_class.h"    // pure, host-tested: incoming chat vs notification card
+#include "outbox.h"               // durable canonical outbound message store
+#include "utf8_text.h"            // code-point-safe display labels
+#include "settings_policy.h"      // pure auto-lock timing policy
+#include "wifi_profile_store.h"   // format-safe NVS Wi-Fi profile store
 
 // Bind the host-testable UiNavScreen ids to HwUiScreen so the two never drift.
 static_assert((int)UINAV_CLOCK          == (int)HW_UI_CLOCK,          "ui_nav enum drift");
 static_assert((int)UINAV_NOTIFY         == (int)HW_UI_NOTIFY,         "ui_nav enum drift");
 static_assert((int)UINAV_CARD_ACT       == (int)HW_UI_CARD_ACT,      "ui_nav enum drift");
 static_assert((int)UINAV_MENU           == (int)HW_UI_MENU,           "ui_nav enum drift");
-static_assert((int)UINAV_AGENTS         == (int)HW_UI_AGENTS,         "ui_nav enum drift");
 static_assert((int)UINAV_AGENT_CHAT     == (int)HW_UI_AGENT_CHAT,     "ui_nav enum drift");
 static_assert((int)UINAV_AGENT_ACT      == (int)HW_UI_AGENT_ACT,      "ui_nav enum drift");
 static_assert((int)UINAV_AGENT_SESSIONS == (int)HW_UI_AGENT_SESSIONS, "ui_nav enum drift");
@@ -80,7 +84,7 @@ static_assert((int)UINAV_MESHCORE       == (int)HW_UI_MESHCORE,       "ui_nav en
 static_assert((int)UINAV_MESH_PING      == (int)HW_UI_MESH_PING,      "ui_nav enum drift");
 static_assert((int)UINAV_WIFI           == (int)HW_UI_WIFI,           "ui_nav enum drift");
 static_assert((int)UINAV_WIFI_LIST      == (int)HW_UI_WIFI_LIST,      "ui_nav enum drift");
-static_assert((int)UINAV_WIFI_INFO      == (int)HW_UI_WIFI_INFO,      "ui_nav enum drift");
+static_assert((int)UINAV_WIFI_PROGRESS  == (int)HW_UI_WIFI_PROGRESS,  "ui_nav enum drift");
 static_assert((int)UINAV_PAGE           == (int)HW_UI_PAGE,           "ui_nav enum drift");
 static_assert((int)UINAV_CONTACTS       == (int)HW_UI_CONTACTS,       "ui_nav enum drift");
 static_assert((int)UINAV_NET            == (int)HW_UI_NET,            "ui_nav enum drift");
@@ -535,6 +539,7 @@ static unsigned long wifi_retry_interval_ms() {
 
 /* Multi-profile STA: try each known network in order on boot / reconnect. */
 #define WIFI_MAX_NETS 6
+static_assert(WIFI_MAX_NETS == WIFI_PROFILE_MAX, "Wi-Fi profile cap drift");
 struct WifiNet {
     char ssid[33];
     char pass[65];
@@ -592,6 +597,29 @@ static bool write_spiffs_file_atomic(const char *path, const char *tmp_path,
     if (!write_spiffs_file(tmp_path, content)) return false;
     SPIFFS.remove(path);
     return SPIFFS.rename(tmp_path, path);
+}
+
+#define OUTBOX_FILE "/outbox.bin"
+#define OUTBOX_TMP  "/outbox.tmp"
+static OutboxStore g_outbox;
+static uint8_t g_outbox_snapshot[OUTBOX_SNAPSHOT_MAX];
+
+static bool outbox_persist() {
+    size_t len = outbox_encode(&g_outbox, g_outbox_snapshot,
+                               sizeof(g_outbox_snapshot));
+    if (!len) return false;
+    String body((const char *)g_outbox_snapshot, (unsigned int)len);
+    return write_spiffs_file_atomic(OUTBOX_FILE, OUTBOX_TMP, body);
+}
+
+static void outbox_load() {
+    outbox_init(&g_outbox);
+    String body = read_spiffs_file(OUTBOX_FILE);
+    if (!body.length()) return;
+    if (!outbox_decode(&g_outbox, (const uint8_t *)body.c_str(), body.length())) {
+        outbox_init(&g_outbox);
+        event_add("outbox snapshot invalid");
+    }
 }
 
 // Raised by notify endpoints; loop() paints and clears it. The endpoints never
@@ -734,6 +762,17 @@ static bool wifi_nets_upsert(const char *ssid, const char *pass) {
 }
 
 static bool wifi_persist_profiles() {
+    WifiProfileSet stored = {};
+    stored.count = (uint8_t)wifi_net_count;
+    stored.active = wifi_net_count ? (uint8_t)wifi_net_idx : 0;
+    for (int i = 0; i < wifi_net_count; i++) {
+        snprintf(stored.entries[i].ssid, sizeof(stored.entries[i].ssid),
+                 "%s", wifi_nets[i].ssid);
+        snprintf(stored.entries[i].pass, sizeof(stored.entries[i].pass),
+                 "%s", wifi_nets[i].pass);
+    }
+    bool nvs_ok = wifi_profile_nvs_save(&stored);
+
     JsonDocument doc;
     if (wifi_net_count > 0) {
         doc["ssid"] = wifi_nets[wifi_net_idx].ssid;
@@ -755,16 +794,17 @@ static bool wifi_persist_profiles() {
     // WiFi and the mesh radio bring-up keep both cores busy. A flash write
     // stalls the other core via a tiny fixed-stack IPC task, so skip the
     // write entirely when nothing changed.
-    if (read_spiffs_file(WIFI_CONFIG_FILE) == json) return true;
-    return write_spiffs_file(WIFI_CONFIG_FILE, json);
+    bool file_ok = read_spiffs_file(WIFI_CONFIG_FILE) == json ||
+                   write_spiffs_file(WIFI_CONFIG_FILE, json);
+    return nvs_ok || file_ok;  // legacy file is a failure-safe fallback only
 }
 
-static void wifi_load_config() {
+static bool wifi_load_legacy_config() {
     wifi_nets_clear();
     String json = read_spiffs_file(WIFI_CONFIG_FILE);
-    if (json.length() == 0) return;
+    if (json.length() == 0) return false;
     JsonDocument doc;
-    if (deserializeJson(doc, json) != DeserializationError::Ok) return;
+    if (deserializeJson(doc, json) != DeserializationError::Ok) return false;
 
     if (doc["networks"].is<JsonArray>()) {
         JsonArray arr = doc["networks"].as<JsonArray>();
@@ -797,6 +837,27 @@ static void wifi_load_config() {
     } else if (wifi_net_count > 0) {
         wifi_nets_set_active(0);
     }
+    return wifi_net_count > 0;
+}
+
+static void wifi_load_config() {
+    wifi_nets_clear();
+    WifiProfileSet stored = {};
+    if (wifi_profile_nvs_load(&stored)) {
+        for (uint8_t i = 0; i < stored.count; i++) {
+            snprintf(wifi_nets[i].ssid, sizeof(wifi_nets[i].ssid),
+                     "%s", stored.entries[i].ssid);
+            snprintf(wifi_nets[i].pass, sizeof(wifi_nets[i].pass),
+                     "%s", stored.entries[i].pass);
+        }
+        wifi_net_count = stored.count;
+        if (wifi_net_count) wifi_nets_set_active(stored.active);
+        return;
+    }
+    /* First NVS boot, or both CRC-protected slots damaged: keep the legacy
+       profiles and retry migration. A SPIFFS format cannot affect a valid NVS
+       slot, so this fallback is needed only before migration or after damage. */
+    if (wifi_load_legacy_config()) wifi_persist_profiles();
 }
 
 static bool wifi_save_config(const String &ssid, const String &pass) {
@@ -1658,7 +1719,10 @@ static void conn_mgr_service() {
 
     ConnMgrActions a = conn_mgr_step(&g_conn_mgr, &in);
 
-    if (a.on_attach) event_add("conn: network attached");
+    if (a.on_attach) {
+        outbox_nudge_pending(&g_outbox);
+        event_add("conn: network attached");
+    }
     if (a.on_lost) event_add("conn: network lost");
 
     // Stage a flush beacon on a genuine attach (rate-limited against flaps). The
@@ -1705,11 +1769,13 @@ static void conn_mgr_service() {
 /* Defined with the other UI helpers below; the store needs it as soon as it
  * starts counting unread, which is from the first message it stores. */
 static bool ui_conv_on_screen(int idx);
+static bool notify_event_distinct_cb(const char *source, const char *key);
 
 static void skills_init() {
     skill_notify_init();
     skill_progress_init();
     skill_agents_init();
+    notify_set_event_distinct_fn(notify_event_distinct_cb);
     /* C2: the send ladder picks the WiFi rung only when the route home is PROVEN.
      * Hand it the cached C1 verdict; the probe stays off the send path. */
     agents_set_reachability(gateway_reachable);
@@ -1725,6 +1791,9 @@ static void skills_init() {
 
 // Build one second of the home clock face (tembed look, 480x222).
 // Lives after notify.cpp so it can read unread/crit without a second copy.
+static bool settings_silent = false;
+static uint16_t settings_autolock_s = 0;
+
 static void ui_clock_paint(const char *note) {
     if (!hw_ui_ready()) return;
 
@@ -1756,8 +1825,10 @@ static void ui_clock_paint(const char *note) {
     }
     if (hw_kb_locked()) {
         /* LOCK takes the note row so pocket mode is obvious. */
-        snprintf(row2, sizeof(row2), "LOCKED  long CAPS unlock");
+        snprintf(row2, sizeof(row2), "LOCKED  hold USER unlock");
     }
+    if (settings_silent && row2[0] == '\0')
+        snprintf(row2, sizeof(row2), "SILENT");
     if (note && note[0]) snprintf(row2, sizeof(row2), "%s", note);
 
     // Progress borrows the note row when it is free (same rule as tembed).
@@ -1781,8 +1852,7 @@ static void ui_clock_paint(const char *note) {
                      ok, hh, mm, ss, date,
                      notify_crit_unread(),
                      mesh_ui_state(),
-                     mesh_alive_age_s(),
-                     wg_ui_state());
+                     mesh_alive_age_s());
     hw_ui_clock_bar(bar_pct);
 }
 
@@ -1826,30 +1896,32 @@ enum { CARD_ACT_ACK = 0, CARD_ACT_REPLY, CARD_ACT_DELETE, CARD_ACT_BACK, CARD_AC
 enum { AGENT_ACT_CLEAR = 0, AGENT_ACT_DELETE, AGENT_ACT_BACK, AGENT_ACT_COUNT };
 // Layout picker: 0=ABC 1=PHON 2=RU 3=BACK
 enum { LAYOUT_BACK = 3, LAYOUT_LIST_COUNT = 4 };
-// SETTINGS: 0=LAYOUT 1=BACKLIGHT 2=AUTO-DIM 3=BACK
+// SETTINGS: LAYOUT / BACKLIGHT / AUTO-DIM / SILENT / AUTOLOCK / BACK
 enum {
     SETTINGS_LAYOUT = 0,
     SETTINGS_BACKLIGHT = 1,
     SETTINGS_AUTODIM = 2,
-    SETTINGS_BACK = 3,
-    SETTINGS_LIST_COUNT = 4
+    SETTINGS_SILENT = 3,
+    SETTINGS_AUTOLOCK = 4,
+    SETTINGS_BACK = 5,
+    SETTINGS_LIST_COUNT = 6
 };
 // MeshCore menu: 0=STATUS 1=PING 2=BACK
 enum { MESH_ACT_STATUS = 0, MESH_ACT_PING = 1, MESH_ACT_BACK = 2, MESH_LIST_COUNT = 3 };
-// WiFi menu: 0=STATUS 1=SCAN 2=PROFILES 3=TOGGLE 4=BACK
+// WiFi menu: STATUS / SCAN / PROFILES / HIDDEN SSID / TOGGLE / BACK
 enum {
     WIFI_ACT_STATUS = 0,
     WIFI_ACT_SCAN = 1,
     WIFI_ACT_PROFILES = 2,
-    WIFI_ACT_TOGGLE = 3,
-    WIFI_ACT_BACK = 4,
-    WIFI_LIST_COUNT = 5
+    WIFI_ACT_HIDDEN = 3,
+    WIFI_ACT_TOGGLE = 4,
+    WIFI_ACT_BACK = 5,
+    WIFI_LIST_COUNT = 6
 };
 // WiFi list mode (scan results vs saved profiles)
 enum { WIFI_LIST_SCAN = 0, WIFI_LIST_PROFILES = 1 };
 static int menu_sel = 0;
 static int card_act_sel = 0;
-static int agents_sel = 0;
 static int agent_act_sel = 0;
 // The in-chat sheet drops the DELETE row for a seeded conversation (claude /
 // hermes): those doors are re-created from firmware every boot, so a delete
@@ -1864,9 +1936,9 @@ static int wifi_sel = 0;
 static int wifi_list_sel = 0;
 static int wifi_list_mode = WIFI_LIST_SCAN;
 static int wifi_list_count = 0;
-static char wifi_list_titles[HW_UI_WIFI_LIST_MAX][36];
+static char wifi_list_titles[HW_UI_WIFI_LIST_MAX][48];
+static uint8_t net_origin = UINAV_WIFI;
 static char wifi_list_ssids[HW_UI_WIFI_LIST_MAX][33];
-static bool wifi_compose = false;           // REPLY screen = enter WiFi password
 static char wifi_pending_ssid[33] = "";
 
 // Home MeshCore gateway (Heltec daemon). Overridable via SPIFFS /mesh_gw.txt
@@ -1942,84 +2014,36 @@ static ReachStatus gateway_reachable() {
 }
 
 static int agent_focus = 0;   // which agent chat is open (0..AGENTS_N-1)
-static bool agent_compose = false;  // REPLY screen is for agent, not notify
+enum ReplyMode : uint8_t {
+    REPLY_MODE_NONE = 0,
+    REPLY_MODE_NOTIFY,
+    REPLY_MODE_AGENT,
+    REPLY_MODE_WIFI_SSID,
+    REPLY_MODE_WIFI_PASSWORD,
+};
+static ReplyMode reply_mode = REPLY_MODE_NONE;
 static int agent_scroll = -1;       // visual row; -1 = pin to latest
 static int agent_scroll_total = 0;  // last known wrapped row count
 static int agent_sess_sel = 0;      // selected row on the agent SESSIONS list
+// Where the agent flow was entered from, so the session picker backs out to the
+// list that opened it (the unified feed or the contacts list) rather than always
+// the feed. Set at the forward entry points and left untouched by the internal
+// chat<->picker navigation, so it survives a round trip through a room.
+static uint8_t agent_origin = UINAV_MSGLIST;
 // Chat window copy: only the current viewport (AGENT_THREAD_MAX lines) — the
 // full history lives on SD, so no whole-thread RAM snapshot is held.
 static char ag_chat_lines[AGENT_THREAD_MAX][AGENT_TEXT_LEN];
 static bool ag_chat_from_me[AGENT_THREAD_MAX];
 static uint32_t ag_chat_ts[AGENT_THREAD_MAX];
 static const char *ag_chat_ptrs[AGENT_THREAD_MAX];
-// Session-list screen rows: N sessions + "NEW SESSION" + "BACK".
-// ag_sess_msgs[i] < 0 ⇒ no message-count badge on that row.
-/* Inbox snapshot. Built under agents_lock() and drawn from — never a live
- * pointer into the conversation table, which the off-loop drain mints into and
- * evicts from while the panel is painting. */
-static char        ag_inbox_labels[CONV_MAX][CONV_LABEL_LEN];
-static const char *ag_inbox_ptrs[CONV_MAX];
-static char        ag_inbox_glyphs[CONV_MAX];
-static int         ag_inbox_unread[CONV_MAX];
-static char        ag_inbox_ids[CONV_MAX][CONV_ID_LEN];  /* what each row displayed */
-static uint8_t     ag_inbox_slot[CONV_MAX];     /* row -> conversation index */
-static bool        ag_inbox_rooms[CONV_MAX];    /* row opens rooms, not a chat */
-static int         ag_inbox_n = 0;              /* conversation rows (BACK extra) */
-
-/* Snapshot the conversation table into the row arrays, newest first. */
-static_assert(CONV_MAX <= INBOX_MAX_ROWS,
-              "the inbox model must be able to order every conversation slot");
-
 /* The store's "is the user reading this?" test. The chat screen being up on
  * this conversation is the only thing that counts as reading it. */
 static bool ui_conv_on_screen(int idx) {
     return hw_ui_screen() == HW_UI_AGENT_CHAT && agent_focus == idx;
 }
 
-static void ui_inbox_build() {
-    InboxConvView v[CONV_MAX];
-    InboxRow rows[CONV_MAX];
-    int n = 0;
-    agents_lock();
-    int total = agents_count();
-    for (int i = 0; i < total && n < CONV_MAX; i++) {
-        v[n].slot = (uint8_t)i;
-        v[n].id = agents_id(i);
-        v[n].label = agents_name(i);
-        v[n].transport = agents_transport(i);
-        v[n].last_use = agents_last_use(i);
-        v[n].unread = agents_unread(i);
-        v[n].has_rooms = agents_has_rooms(i) ? 1 : 0;
-        n++;
-    }
-    int rn = inbox_build_rows(v, n, rows, CONV_MAX);
-    for (int i = 0; i < rn; i++) {
-        snprintf(ag_inbox_labels[i], sizeof(ag_inbox_labels[i]), "%s", rows[i].label);
-        ag_inbox_ptrs[i] = ag_inbox_labels[i];
-        ag_inbox_glyphs[i] = rows[i].glyph;
-        ag_inbox_unread[i] = (int)rows[i].unread;
-        ag_inbox_slot[i] = rows[i].slot;
-        ag_inbox_rooms[i] = rows[i].has_rooms != 0;
-        snprintf(ag_inbox_ids[i], sizeof(ag_inbox_ids[i]), "%s", rows[i].id);
-    }
-    agents_unlock();
-    ag_inbox_n = rn;
-}
-
-/* Repaint from a REBUILT snapshot: the rows changed, so the renderer's
- * selection memo has to be dropped or it decides nothing needs drawing. */
-static void ui_inbox_refresh(int selected) {
-    ui_inbox_build();
-    hw_ui_inbox_invalidate();
-    hw_ui_show_inbox(ag_inbox_ptrs, ag_inbox_glyphs, ag_inbox_unread,
-                     ag_inbox_n, selected, agents_bridge_ok());
-}
-
-static void ui_inbox_render(int selected) {
-    hw_ui_show_inbox(ag_inbox_ptrs, ag_inbox_glyphs, ag_inbox_unread,
-                     ag_inbox_n, selected, agents_bridge_ok());
-}
-
+// Session-list screen rows: N sessions + "NEW SESSION" + "BACK".
+// ag_sess_msgs[i] < 0 ⇒ no message-count badge on that row.
 static char ag_sess_titles[AGENT_SESSIONS_MAX + 2][AGENT_SESSION_LEN + 2];
 static int  ag_sess_msgs[AGENT_SESSIONS_MAX + 2];
 static bool ag_sess_active[AGENT_SESSIONS_MAX + 2];
@@ -2044,6 +2068,8 @@ struct MsgHandle {
 };
 static MsgHandle msglist_h[HW_UI_MSGLIST_MAX];
 static int msglist_count = 0;
+static_assert(HW_UI_MSGLIST_MAX == FEED_ORDER_MAX,
+              "the unified feed must expose every merged row");
 // Notify card currently shown (for ack-on-click / reply).
 static uint32_t notify_card_id = 0;
 static char reply_title[NOTIFY_TITLE_LEN];
@@ -2157,6 +2183,48 @@ static bool ui_page_render(int ordinal) {
 // MICRON_NS_NOTIFY records are walked, so a SYSTEM/FOREIGN page can never enter
 // the notify ring. Graceful no-SD: an empty/absent archive yields nothing on the
 // first rank and the ring simply stays empty — notify still works in RAM.
+static void notify_reconcile_restored_chats();
+static bool notify_chat_retry_pending = false;
+static unsigned long notify_chat_retry_at = 0;
+struct NotifyChatInflight {
+    bool active;
+    char conversation[CONV_ID_LEN];
+    NotifyEventId event;
+};
+static NotifyChatInflight notify_chat_inflight[CONV_MAX] = {};
+
+static int notify_chat_inflight_find(const char *conversation) {
+    if (!conversation || !conversation[0]) return -1;
+    for (int i = 0; i < CONV_MAX; i++)
+        if (notify_chat_inflight[i].active &&
+            strcmp(notify_chat_inflight[i].conversation, conversation) == 0)
+            return i;
+    return -1;
+}
+
+static bool notify_chat_inflight_add(const char *conversation,
+                                     const NotifyEventId *event) {
+    if (!conversation || !conversation[0] || !notify_event_id_valid(event) ||
+        notify_chat_inflight_find(conversation) >= 0) return false;
+    size_t conversation_n = strnlen(conversation, CONV_ID_LEN);
+    if (conversation_n >= CONV_ID_LEN) return false;
+    for (int i = 0; i < CONV_MAX; i++) {
+        if (notify_chat_inflight[i].active) continue;
+        notify_chat_inflight[i].active = true;
+        memcpy(notify_chat_inflight[i].conversation,
+               conversation, conversation_n + 1);
+        notify_chat_inflight[i].event = *event;
+        return true;
+    }
+    return false;
+}
+
+static void notify_chat_inflight_remove(const char *conversation,
+                                        const NotifyEventId *event) {
+    int i = notify_chat_inflight_find(conversation);
+    if (i >= 0 && notify_event_id_equal(&notify_chat_inflight[i].event, event))
+        memset(&notify_chat_inflight[i], 0, sizeof(notify_chat_inflight[i]));
+}
 static void notify_restore_from_archive() {
     time_t now = time(NULL);
     unsigned long now_ms = millis();
@@ -2172,6 +2240,7 @@ static void notify_restore_from_archive() {
         if (notify_restore_one(&nr, now, now_ms)) restored++;
     }
     notify_restore_finish(restored);   // drop ttls that ran out while powered off
+    notify_reconcile_restored_chats();
 }
 
 // UTF-8 draft: keep room for ~40 Cyrillic codepoints (2–3 bytes each).
@@ -2183,11 +2252,47 @@ static unsigned long ui_last_input_ms = 0;
 #define UI_IDLE_REPLY_MS  60000
 #define KB_LAYOUT_PATH    "/kb_layout.txt"
 #define KB_LAYOUT_TMP     "/kb_layout.tmp"
+#define SETTINGS_PATH     "/settings.json"
+#define SETTINGS_TMP      "/settings.tmp"
 
 static_assert(BL_IDLE_DIM_MS > UI_IDLE_MS,
               "backlight must not dim while a message card can still be on screen");
 
 static void ui_note_input() { ui_last_input_ms = millis(); }
+
+static void settings_save() {
+    JsonDocument doc;
+    doc["silent"] = settings_silent;
+    doc["autolock_s"] = settings_autolock_s;
+    String body;
+    serializeJson(doc, body);
+    write_spiffs_file_atomic(SETTINGS_PATH, SETTINGS_TMP, body);
+}
+
+static void settings_load() {
+    String body = read_spiffs_file(SETTINGS_PATH);
+    if (!body.length()) return;
+    JsonDocument doc;
+    if (deserializeJson(doc, body)) return;
+    if (doc["silent"].is<bool>()) settings_silent = doc["silent"].as<bool>();
+    if (doc["autolock_s"].is<uint16_t>()) {
+        uint16_t value = doc["autolock_s"].as<uint16_t>();
+        if (settings_autolock_valid(value)) settings_autolock_s = value;
+    }
+}
+
+static void settings_toggle_silent() {
+    settings_silent = !settings_silent;
+    settings_save();
+    hw_haptic_notify(1);
+}
+
+static const char *settings_autolock_word() {
+    if (settings_autolock_s == 30) return "30S";
+    if (settings_autolock_s == 60) return "1M";
+    if (settings_autolock_s == 300) return "5M";
+    return "OFF";
+}
 
 // SYSTEM events only (a message arriving): wake the panel and restart the
 // idle/dim countdown once per event; repaints and synthetic errors must not call this.
@@ -2197,7 +2302,8 @@ static void ui_note_wake() { ui_last_input_ms = millis(); }
 static void ui_open_settings() {
     char bl[BL_LABEL_MAX];
     bl_level_label(backlight_wanted(), bl, sizeof(bl));
-    hw_ui_show_settings(settings_sel, bl, bl_idle_word());
+    hw_ui_show_settings(settings_sel, bl, bl_idle_word(), settings_silent,
+                        settings_autolock_word());
     ui_note_input();
 }
 
@@ -2329,30 +2435,19 @@ static void gw_token_persist_poll() {
 // nothing else.
 #define REPLY_UP_FRAME_MAX  150   // one MeshCore DM, same budget as C1 uplink
 
-// Staged by Enter, drained by loop(). ui_reply_submit() runs on the loop task
-// already — it is reached from the keyboard drain — so this is not about task
-// safety but about the clock: an HTTP POST with a 5 s timeout inside the key
-// handler freezes the panel between the keystroke and the "sent" face. Raising
-// a flag lets the card paint and return to the clock first, and the blocking
-// work happens further down the same loop pass with nothing left on screen
-// waiting for it. One slot, because it is drained on the pass that fills it and
-// a second Enter cannot arrive inside one iteration.
-static volatile bool reply_up_pending = false;
-static char reply_up_key[NOTIFY_KEY_LEN];
-static char reply_up_text[NOTIFY_REPLY_LEN];
-
-static void reply_upstream_queue(const char *key, const char *text) {
-    if (!key || !key[0] || !text || !text[0]) return;
-    snprintf(reply_up_key, sizeof(reply_up_key), "%s", key);
-    snprintf(reply_up_text, sizeof(reply_up_text), "%s", text);
-    reply_up_pending = true;
+static bool reply_upstream_queue(const char *key, const char *text) {
+    uint32_t id = outbox_enqueue(&g_outbox, OUTBOX_KIND_REPLY, key, "", key, text);
+    if (!id) return false;
+    if (outbox_persist()) return true;
+    outbox_remove(&g_outbox, id);
+    return false;
 }
 
-// POST {gw}/reply {"key":…,"reply":…}. True only on 2xx — anything else is a
-// gateway that did not take it, and the mesh path is what that is for.
-static bool reply_upstream_http(const char *key, const char *text) {
-    if (WiFi.status() != WL_CONNECTED) return false;
-    if (!mesh_gw_url[0]) return false;
+enum ReplyHttpResult : uint8_t { REPLY_HTTP_FAIL, REPLY_HTTP_OK, REPLY_HTTP_AUTH };
+
+static ReplyHttpResult reply_upstream_http(const char *key, const char *text) {
+    if (WiFi.status() != WL_CONNECTED) return REPLY_HTTP_FAIL;
+    if (!mesh_gw_url[0]) return REPLY_HTTP_FAIL;
 
     size_t bl = strlen(mesh_gw_url);
     while (bl > 0 && mesh_gw_url[bl - 1] == '/') bl--;
@@ -2370,14 +2465,15 @@ static bool reply_upstream_http(const char *key, const char *text) {
     // not the whole 5 s read window, or the panel freezes for the difference.
     http.setConnectTimeout(1000);
     http.setTimeout(5000);
-    if (!http.begin(url)) return false;
+    if (!http.begin(url)) return REPLY_HTTP_FAIL;
     http.addHeader("Content-Type", "application/json");
     if (gw_token[0]) {
         http.addHeader("Authorization", String("Bearer ") + gw_token);
     }
     int code = http.POST(body);
     http.end();
-    return code >= 200 && code < 300;
+    if (code == 401 || code == 403) return REPLY_HTTP_AUTH;
+    return (code >= 200 && code < 300) ? REPLY_HTTP_OK : REPLY_HTTP_FAIL;
 }
 
 // One private DM: R1|key|reply, cut to the frame budget on a codepoint
@@ -2408,30 +2504,109 @@ static bool reply_upstream_mesh(const char *key, const char *text) {
     return mesh_client_send_to_gateway(frame, &ack, &est);
 }
 
-static void reply_upstream_poll() {
-    if (!reply_up_pending) return;
+static void outbox_reply_poll(OutboxItem *item) {
+    if (!item || item->kind != OUTBOX_KIND_REPLY) return;
+    uint32_t now = millis();
+    if (item->next_try_ms && (int32_t)(now - item->next_try_ms) < 0) return;
 
-    char key[NOTIFY_KEY_LEN];
-    char text[NOTIFY_REPLY_LEN];
-    snprintf(key, sizeof(key), "%s", reply_up_key);
-    snprintf(text, sizeof(text), "%s", reply_up_text);
-    if (!key[0] || !text[0]) return;
-
-    if (reply_upstream_http(key, text)) {
-        reply_up_pending = false;
-        event_add("reply upstream wifi ok: %s", key);
+    item->state = OUTBOX_STATE_SENDING;
+    ReplyHttpResult http = reply_upstream_http(item->target, item->text);
+    if (http == REPLY_HTTP_OK) {
+        item->state = OUTBOX_STATE_SENT;
+        outbox_persist();
+        event_add("reply upstream wifi ok: %s", item->target);
+        return;
+    }
+    if (http == REPLY_HTTP_AUTH) {
+        item->state = OUTBOX_STATE_AUTH;
+        outbox_persist();
+        event_add("reply upstream auth: %s", item->target);
         return;
     }
     // C1/probe/R1 share one MeshCore ACK slot. Keep this reply pending until
     // the current private frame completes instead of overwriting its CRC.
-    if (mesh_client_ack_pending()) return;
-    if (reply_upstream_mesh(key, text)) {
-        reply_up_pending = false;
-        event_add("reply upstream mesh R1: %s", key);
+    if (mesh_client_ack_pending()) {
+        item->state = OUTBOX_STATE_QUEUED;
         return;
     }
-    reply_up_pending = false;
-    event_add("reply upstream unreachable: %s (kept on device)", key);
+    if (reply_upstream_mesh(item->target, item->text)) {
+        item->state = OUTBOX_STATE_SENT;
+        outbox_persist();
+        event_add("reply upstream mesh R1: %s", item->target);
+        return;
+    }
+    item->attempts++;
+    if (item->attempts >= OUTBOX_ATTEMPTS_MAX) {
+        item->state = OUTBOX_STATE_FAIL;
+        item->next_try_ms = 0;
+    } else {
+        item->state = OUTBOX_STATE_QUEUED;
+        item->next_try_ms = now + outbox_retry_delay_ms(item->attempts);
+    }
+    outbox_persist();
+    event_add("reply upstream retry %u: %s", (unsigned)item->attempts,
+              item->target);
+}
+
+static void outbox_agent_poll(OutboxItem *item) {
+    if (!item || item->kind != OUTBOX_KIND_AGENT) return;
+    uint32_t now = millis();
+    if (item->next_try_ms && (int32_t)(now - item->next_try_ms) < 0) return;
+    int idx = agents_find(item->target);
+    if (idx < 0 || g_convs[idx].transport != CONV_AGENT) {
+        item->state = OUTBOX_STATE_FAIL;
+        outbox_persist();
+        return;
+    }
+    item->state = OUTBOX_STATE_SENDING;
+    if (transport_send_agent(idx, item->target, item->session, item->text,
+                             item->delivery_key)) {
+        item->state = OUTBOX_STATE_SENT;
+        outbox_persist();
+        agents_push_line(idx, false, "(+ sent)");
+        display_force = true;
+        return;
+    }
+    item->attempts++;
+    if (item->attempts >= OUTBOX_ATTEMPTS_MAX) {
+        item->state = OUTBOX_STATE_FAIL;
+        item->next_try_ms = 0;
+        agents_push_line(idx, false, "(! delivery failed)");
+        display_force = true;
+    } else {
+        item->state = OUTBOX_STATE_QUEUED;
+        item->next_try_ms = now + outbox_retry_delay_ms(item->attempts);
+    }
+    outbox_persist();
+}
+
+static void outbox_poll() {
+    OutboxItem *item = outbox_oldest_pending(&g_outbox);
+    if (!item) return;
+    if (item->kind == OUTBOX_KIND_REPLY) outbox_reply_poll(item);
+    else if (item->kind == OUTBOX_KIND_AGENT) outbox_agent_poll(item);
+}
+
+static const char *outbox_reply_status(const char *key) {
+    const OutboxItem *item = outbox_latest_target(&g_outbox, OUTBOX_KIND_REPLY, key);
+    if (!item) return nullptr;
+    switch (item->state) {
+    case OUTBOX_STATE_QUEUED:
+    case OUTBOX_STATE_SENDING: return "QUEUED";
+    case OUTBOX_STATE_SENT:    return "SENT";
+    case OUTBOX_STATE_AUTH:    return "AUTH";
+    case OUTBOX_STATE_FAIL:    return "FAIL";
+    default:                   return nullptr;
+    }
+}
+
+static char outbox_reply_mark(const char *key) {
+    const OutboxItem *item = outbox_latest_target(&g_outbox, OUTBOX_KIND_REPLY, key);
+    if (!item) return '\0';
+    if (item->state == OUTBOX_STATE_QUEUED || item->state == OUTBOX_STATE_SENDING)
+        return '~';
+    if (item->state == OUTBOX_STATE_SENT) return '+';
+    return '!';
 }
 
 // POST {gw}/flush {"id":…} — the attach flush beacon (CARD-DELIVERY / C3). Runs
@@ -2523,11 +2698,11 @@ static void ui_open_meshcore() {
 }
 
 static void ui_reply_paint();  // defined later (WiFi password reuses reply face)
-static void ui_open_net();     // sectioned network status; defined with Contacts below
+static void ui_open_net(uint8_t origin = UINAV_WIFI);
 
 static void ui_open_wifi() {
     wifi_sel = 0;
-    wifi_compose = false;
+    reply_mode = REPLY_MODE_NONE;
     hw_ui_show_wifi(wifi_sel);
     ui_note_input();
 }
@@ -2563,14 +2738,14 @@ static void ui_wifi_toggle() {
             Serial.println("[wifi] user toggled ON — no saved profile");
         }
     }
-    ui_open_net();
+    ui_open_net(UINAV_WIFI);
     ui_note_input();
 }
 
 static void ui_wifi_do_scan() {
     /* Blocking scan — paint "SCAN…" first so the panel is not frozen blank. */
     static const char *wait_lines[] = { "scanning…", "hold on" };
-    hw_ui_show_wifi_info(wait_lines, 2);
+    hw_ui_show_wifi_progress(wait_lines, 2);
     delay(50);
 
     if (wifi_user_off) {
@@ -2594,12 +2769,12 @@ static void ui_wifi_do_scan() {
                 break;
             }
         }
-        snprintf(wifi_list_titles[wifi_list_count],
-                 sizeof(wifi_list_titles[0]),
-                 "%s%c %ddBm",
-                 wifi_list_ssids[wifi_list_count],
-                 known ? '*' : ' ',
+        char raw_title[48];
+        snprintf(raw_title, sizeof(raw_title), "%s%c %ddBm",
+                 wifi_list_ssids[wifi_list_count], known ? '*' : ' ',
                  (int)WiFi.RSSI(i));
+        utf8_text_copy(wifi_list_titles[wifi_list_count],
+                       sizeof(wifi_list_titles[0]), raw_title, SIZE_MAX, false);
         wifi_list_count++;
     }
     WiFi.scanDelete();
@@ -2617,11 +2792,11 @@ static void ui_wifi_show_profiles() {
     for (int i = 0; i < wifi_net_count && wifi_list_count < HW_UI_WIFI_LIST_MAX; i++) {
         snprintf(wifi_list_ssids[wifi_list_count],
                  sizeof(wifi_list_ssids[0]), "%s", wifi_nets[i].ssid);
-        snprintf(wifi_list_titles[wifi_list_count],
-                 sizeof(wifi_list_titles[0]),
-                 "%c %s",
-                 (i == wifi_net_idx) ? '*' : ' ',
-                 wifi_nets[i].ssid);
+        char raw_title[48];
+        snprintf(raw_title, sizeof(raw_title), "%c %s",
+                 (i == wifi_net_idx) ? '*' : ' ', wifi_nets[i].ssid);
+        utf8_text_copy(wifi_list_titles[wifi_list_count],
+                       sizeof(wifi_list_titles[0]), raw_title, SIZE_MAX, false);
         wifi_list_count++;
     }
     ui_wifi_paint_list();
@@ -2630,10 +2805,20 @@ static void ui_wifi_show_profiles() {
 static void ui_wifi_open_password(const char *ssid) {
     if (!ssid || !ssid[0]) return;
     snprintf(wifi_pending_ssid, sizeof(wifi_pending_ssid), "%s", ssid);
-    wifi_compose = true;
-    agent_compose = false;
+    reply_mode = REPLY_MODE_WIFI_PASSWORD;
     notify_card_id = 0;
     snprintf(reply_title, sizeof(reply_title), "PASS %s", ssid);
+    reply_buf[0] = '\0';
+    hw_kb_reset_mods();
+    ui_reply_paint();
+    ui_note_input();
+}
+
+static void ui_wifi_open_hidden_ssid() {
+    wifi_pending_ssid[0] = '\0';
+    reply_mode = REPLY_MODE_WIFI_SSID;
+    notify_card_id = 0;
+    snprintf(reply_title, sizeof(reply_title), "NETWORK NAME (32 BYTES)");
     reply_buf[0] = '\0';
     hw_kb_reset_mods();
     ui_reply_paint();
@@ -2653,7 +2838,7 @@ static void ui_wifi_connect_ssid(const char *ssid) {
             snprintf(lines[1], sizeof(lines[1]), "%s", ssid);
             ptrs[0] = lines[0];
             ptrs[1] = lines[1];
-            hw_ui_show_wifi_info(ptrs, 2);
+            hw_ui_show_wifi_progress(ptrs, 2);
             delay(30);
             wifi_user_off = false;
             WiFi.mode(WIFI_STA);
@@ -2665,7 +2850,7 @@ static void ui_wifi_connect_ssid(const char *ssid) {
             snprintf(lines[1], sizeof(lines[1]), "%s", ssid);
             snprintf(lines[2], sizeof(lines[2]), "async - UI stays live");
             ptrs[2] = lines[2];
-            hw_ui_show_wifi_info(ptrs, 3);
+            hw_ui_show_wifi_progress(ptrs, 3);
             event_add("wifi menu async connect %s", ssid);
             ui_note_input();
             return;
@@ -2675,23 +2860,9 @@ static void ui_wifi_connect_ssid(const char *ssid) {
     ui_wifi_open_password(ssid);
 }
 
-// MESHCORE → STATUS: pair keys + RF policy (from SPIFFS /mesh_*).
-static void ui_mesh_show_status() {
-    static char lines[HW_UI_MESH_PING_LINES][40];
-    static const char *ptrs[HW_UI_MESH_PING_LINES];
-    char raw[HW_UI_MESH_PING_LINES][40];
-    int n = mesh_status_lines(raw, HW_UI_MESH_PING_LINES);
-    for (int i = 0; i < n; i++) {
-        snprintf(lines[i], sizeof(lines[i]), "%s", raw[i]);
-        ptrs[i] = lines[i];
-    }
-    const char *phase = g_mesh.has_identity ? "PAIR" : "NOKEY";
-    hw_ui_show_mesh_ping(phase, ptrs, n);
-    ui_note_input();
-}
-
-// MESHCORE → PING GATEWAY: dual-path glance (WiFi HTTP + Mesh private DM).
-// Final face = two big icons (who is up) + strength under each.
+// MESHCORE → PING GATEWAY: WiFi reachability probe + Mesh private DM.
+// The final face focuses on MeshCore; WiFi detail lives in Network. The
+// existing HTTP probe remains unchanged.
 //
 // Non-blocking: opening the PING face arms a small state machine that loop()
 // advances one bounded step per pass via ui_mesh_ping_poll(). The WiFi HTTP
@@ -2898,10 +3069,8 @@ static void ui_mesh_ping_step_wait() {
             snprintf(mesh_s2, sizeof(mesh_s2), "never");
     }
 
-    hw_ui_show_mesh_ping_result(mesh_ping_wifi_ok, mesh_ping_wifi_s1,
-                                mesh_ping_wifi_s2,
-                                mesh_ok, mesh_s1, mesh_s2);
-    if (mesh_ping_wifi_ok || mesh_ok) hw_haptic_notify(0);
+    hw_ui_show_mesh_ping_result(mesh_ok, mesh_s1, mesh_s2);
+    if (mesh_ok) hw_haptic_notify(0);
     else hw_haptic_notify(1);
     ui_note_input();
     mesh_ping_state = MESH_PING_IDLE;
@@ -2964,7 +3133,15 @@ static bool reply_buf_append(const char *utf8) {
 }
 
 static void ui_reply_paint() {
-    hw_ui_show_reply(reply_title, reply_buf, hw_kb_caps(), hw_kb_symbol(),
+    const char *mode = "COMPOSE";
+    switch (reply_mode) {
+    case REPLY_MODE_NOTIFY: mode = "NOTIFY REPLY";  break;
+    case REPLY_MODE_AGENT:  mode = "AGENT REPLY";   break;
+    case REPLY_MODE_WIFI_SSID: mode = "WIFI SSID"; break;
+    case REPLY_MODE_WIFI_PASSWORD: mode = "WIFI PASSWORD"; break;
+    default: break;
+    }
+    hw_ui_show_reply(mode, reply_title, reply_buf, hw_kb_caps(), hw_kb_symbol(),
                      hw_kb_layout_name());
 }
 
@@ -2972,7 +3149,7 @@ static void ui_reply_paint() {
 static void ui_go_home() {
     notify_card_id = 0;
     reply_buf[0] = '\0';
-    agent_compose = false;
+    reply_mode = REPLY_MODE_NONE;
     hw_kb_reset_mods();
     ui_go_clock(NULL);
     ui_note_input();
@@ -2987,13 +3164,11 @@ static void ui_agent_sessions_refresh();
 static void ui_open_agent_chat(int idx);
 static void ui_agent_chat_refresh();
 static void ui_open_agent_act();
-static int agents_index_from_source(const char *src);
-static bool notify_is_chat_door(const NotifyView &v);
-static int agents_index_from_door(const NotifyView &v);
-static void ui_show_agent_invite_from_view(const NotifyView &v, uint32_t id);
+static bool notify_is_chat(const NotifyView &v);
 static void ui_enter_agent_from_notify(uint32_t id, const NotifyView &v);
 static void ui_open_menu();
 static void ui_open_info();
+static void ui_open_contacts();
 
 // Navigate to `target` (a UiNavScreen id) by rebuilding its content — the same
 // open helpers the per-screen BACK rows call. Used only for the small set of
@@ -3009,6 +3184,7 @@ static void ui_go_to_screen(uint8_t target) {
     case UINAV_SETTINGS:       ui_open_settings();                break;
     case UINAV_MESHCORE:       ui_open_meshcore();                break;
     case UINAV_WIFI:           ui_open_wifi();                    break;
+    case UINAV_CONTACTS:       ui_open_contacts();               break;
     default:                   ui_go_clock(NULL);                 break;
     }
 }
@@ -3020,14 +3196,14 @@ static void ui_go_back() {
     HwUiScreen scr = hw_ui_screen();
     if (!ui_nav_backspace_goes_back((uint8_t)scr)) return;
     bool has_rooms = (scr == HW_UI_AGENT_CHAT) && agents_has_rooms(agent_focus);
-    ui_go_to_screen(ui_nav_back_target((uint8_t)scr, has_rooms));
+    ui_go_to_screen(ui_nav_back_target((uint8_t)scr, has_rooms, agent_origin,
+                                       net_origin));
     hw_haptic_notify(0);
 }
 
 // first_utf8: optional first character (UTF-8); NULL/empty = empty draft.
 static void ui_open_reply(uint32_t id, const char *title, const char *first_utf8) {
-    agent_compose = false;
-    wifi_compose = false;
+    reply_mode = REPLY_MODE_NOTIFY;
     notify_card_id = id;
     snprintf(reply_title, sizeof(reply_title), "%s", title ? title : "");
     reply_buf[0] = '\0';
@@ -3042,8 +3218,7 @@ static void ui_open_reply(uint32_t id, const char *title, const char *first_utf8
 }
 
 static void ui_open_agent_compose(const char *first_utf8) {
-    agent_compose = true;
-    wifi_compose = false;
+    reply_mode = REPLY_MODE_AGENT;
     notify_card_id = 0;
     snprintf(reply_title, sizeof(reply_title), "-> %s", agents_name(agent_focus));
     reply_buf[0] = '\0';
@@ -3071,47 +3246,69 @@ static bool utf8_is_printable(const char *u) {
 }
 
 static void ui_reply_submit() {
-    if (!reply_buf[0]) return;
-    if (wifi_compose) {
+    if (!reply_buf[0] && reply_mode != REPLY_MODE_WIFI_PASSWORD) return;
+    switch (reply_mode) {
+    case REPLY_MODE_WIFI_SSID: {
+        bool content = false;
+        size_t bytes = strlen(reply_buf);
+        if (bytes > 32 || !utf8_text_is_printable(reply_buf, &content) || !content) {
+            hw_haptic_notify(1);
+            return;
+        }
+        char ssid[33];
+        snprintf(ssid, sizeof(ssid), "%s", reply_buf);
+        ui_wifi_open_password(ssid);
+        return;
+    }
+    case REPLY_MODE_WIFI_PASSWORD: {
         /* Save password for pending SSID and connect. */
         char ssid[33];
         snprintf(ssid, sizeof(ssid), "%s", wifi_pending_ssid);
         wifi_nets_upsert(ssid, reply_buf);
         wifi_persist_profiles();
         reply_buf[0] = '\0';
-        wifi_compose = false;
+        reply_mode = REPLY_MODE_NONE;
         wifi_pending_ssid[0] = '\0';
         hw_haptic_notify(0);
         ui_wifi_connect_ssid(ssid);
         return;
     }
-    if (agent_compose) {
+    case REPLY_MODE_AGENT: {
         const char *aid = agents_id(agent_focus);
         if (agents_send(aid, reply_buf)) {
             hw_haptic_notify(0);
-            hw_sound_notify(0);
+            if (!settings_silent) hw_sound_notify(0);
         }
         reply_buf[0] = '\0';
-        agent_compose = false;
+        reply_mode = REPLY_MODE_NONE;
         ui_open_agent_chat(agent_focus);
         return;
     }
+    case REPLY_MODE_NOTIFY:
+        break;
+    default:
+        return;
+    }
     if (!notify_card_id) return;
+    bool queued = false;
     if (notify_set_reply(notify_card_id, reply_buf)) {
         hw_haptic_notify(0);
-        hw_sound_notify(0);
+        if (!settings_silent) hw_sound_notify(0);
         event_add("reply id=%lu: %s", (unsigned long)notify_card_id, reply_buf);
         // Read the card back rather than sending reply_buf: the store cleaned
         // and truncated it, and what goes upstream must be what GET /notify/one
         // serves. A card with no client id has nowhere to go — that is the whole
         // condition, and it leaves the reply stored exactly as before.
         NotifyView v;
-        if (notify_view_by_id(notify_card_id, v, NULL, NULL) && v.key[0])
-            reply_upstream_queue(v.key, v.reply);
+        if (notify_view_by_id(notify_card_id, v, NULL, NULL) && v.key[0]) {
+            queued = reply_upstream_queue(v.key, v.reply);
+            event_add("reply outbox %s: %s", queued ? "queued" : "full", v.key);
+        }
     }
     notify_card_id = 0;
     reply_buf[0] = '\0';
-    ui_go_clock("sent");
+    reply_mode = REPLY_MODE_NONE;
+    ui_go_clock(queued ? "queued" : "saved");
 }
 
 static void ui_on_key(const char *u) {
@@ -3141,7 +3338,7 @@ static void ui_on_key(const char *u) {
         if (c0 == '\n') {
             NotifyView v;
             if (notify_view_by_id(notify_card_id, v, NULL, NULL) &&
-                notify_is_chat_door(v)) {
+                notify_is_chat(v)) {
                 ui_enter_agent_from_notify(notify_card_id, v);
             } else {
                 ui_open_card_act();
@@ -3150,7 +3347,7 @@ static void ui_on_key(const char *u) {
         }
         NotifyView v;
         if (notify_view_by_id(notify_card_id, v, NULL, NULL)) {
-            if (notify_is_chat_door(v)) {
+            if (notify_is_chat(v)) {
                 ui_enter_agent_from_notify(notify_card_id, v);
                 if (utf8_is_printable(u)) ui_open_agent_compose(u);
                 return;
@@ -3221,38 +3418,186 @@ static void ui_open_menu() {
     ui_note_input();
 }
 
-static int agents_index_from_source(const char *src) {
-    if (!src || !src[0]) return -1;
-    // notify source is short: "claude", "hermes"
-    return agents_find(src);
+static bool notify_event_distinct_cb(const char *source, const char *key) {
+    NotifyChatResolution resolution = agents_notify_chat_resolve_snapshot(source, key);
+    return resolution.conversation >= 0;
 }
 
-/* Chat-door vs real message:
- *   door  = client id ends with "-chat" (bridge posts "hermes-chat",
- *           "claude-chat" etc.)
- *   page  = everything else — full severity card (info/warn/crit colours),
- *           from any service/agent; reply works as before.
- * Chat rooms (AGENTS menu) are separate from the message queue. */
-static bool notify_is_chat_door(const NotifyView &v) {
-    if (!v.key[0]) return false;
-    size_t n = strlen(v.key);
-    return n >= 5 && strcmp(v.key + (n - 5), "-chat") == 0;
+static char notify_chat_normalized[NOTIFY_BODY_LEN];
+
+/* Resolve and normalize together. Every classifier, feed filter and router uses
+ * this one plan, so a card cannot be hidden under one conversation rule and
+ * then routed under another. */
+static NotifyChatResolution notify_chat_candidate(const NotifyView &v) {
+    agents_normalize_inbound(v.body, notify_chat_normalized,
+                             sizeof(notify_chat_normalized));
+    return agents_notify_chat_resolve_snapshot(v.source, v.key);
 }
 
-static int agents_index_from_door(const NotifyView &v) {
-    if (!notify_is_chat_door(v)) return -1;
-    // Prefer source; fall back to key prefix "hermes-chat" → "hermes",
-    // "claude-chat" → "claude"
-    int ax = agents_index_from_source(v.source);
-    if (ax >= 0) return ax;
-    char id[AGENT_ID_LEN];
-    size_t n = strlen(v.key);
-    if (n <= 5) return -1;
-    size_t m = n - 5;
-    if (m >= sizeof(id)) m = sizeof(id) - 1;
-    memcpy(id, v.key, m);
-    id[m] = '\0';
-    return agents_find(id);
+/* A resolved, valid card becomes a chat row only after its backing door is
+ * read. Fresh and ambiguous restored doors remain visible until routing has
+ * succeeded and notify_ack_id has archived that fact. */
+static bool notify_is_chat(const NotifyView &v) {
+    NotifyChatResolution resolution = notify_chat_candidate(v);
+    return !v.unread && resolution.conversation >= 0 &&
+           notify_chat_normalized[0] != '\0';
+}
+
+struct NotifyChatRestoreItem {
+    uint32_t id;
+    NotifyChatRestoreOrder order;
+};
+
+/* Restored cards never pass through loop()'s arrival branch. Snapshot their
+ * order first, then replay oldest-first so one empty thread preserves the
+ * original chronology. Exact durable event identity makes a crash-window
+ * replay an ACK-only operation; absent origin is appended and ACKed only after
+ * the full JSONL record persists. Legacy cards without an identity stay visible
+ * because text, client key and the recyclable ring id are not safe evidence. */
+static void notify_reconcile_restored_chats() {
+    static NotifyView view;
+    static NotifyChatRestoreItem items[NOTIFY_MAX];
+    bool blocked[CONV_MAX] = {};
+    bool retry_needed = false;
+    int count = 0;
+    for (int i = 0; i < NOTIFY_MAX; i++) {
+        if (!notify_view(i, view)) break;
+        if (!view.unread || count >= NOTIFY_MAX) continue;
+        NotifyChatResolution resolution = notify_chat_candidate(view);
+        if (resolution.conversation < 0 || !notify_chat_normalized[0] ||
+            !notify_event_id_valid(&view.event_id)) continue;
+        items[count].id = view.id;
+        items[count].order.card_epoch = view.created_epoch;
+        items[count].order.restore_rank = (uint8_t)i;
+        count++;
+    }
+    for (int i = 1; i < count; i++) {
+        NotifyChatRestoreItem item = items[i];
+        int j = i;
+        while (j > 0 && notify_chat_restore_before(item.order,
+                                                    items[j - 1].order)) {
+            items[j] = items[j - 1];
+            j--;
+        }
+        items[j] = item;
+    }
+    for (int i = 0; i < count; i++) {
+        if (!notify_view_by_id(items[i].id, view, nullptr, nullptr) || !view.unread)
+            continue;
+        NotifyChatResolution resolution = notify_chat_candidate(view);
+        int ax = resolution.conversation;
+        if (ax < 0 || ax >= CONV_MAX || !notify_chat_normalized[0]) continue;
+        NotifyChatThreadState thread = {
+            agents_has_origin(ax, view.id, view.key,
+                              &view.event_id)
+        };
+        NotifyChatAction action = notify_chat_reconcile_plan(
+            &resolution, notify_chat_normalized, view.created_epoch, &thread);
+        bool accepted = (action == NOTIFY_CHAT_ACK_ALREADY_ROUTED);
+        if (action == NOTIFY_CHAT_ROUTE_THEN_ACK && !blocked[ax])
+            accepted = agents_restore_inbound(ax,
+                                               notify_chat_normalized,
+                                               view.id, view.key, &view.event_id);
+        NotifyChatDrainResult result = notify_chat_drain_result(blocked[ax], accepted);
+        if (result == NOTIFY_CHAT_DRAIN_KEEP_FAILED) blocked[ax] = true;
+        if (result != NOTIFY_CHAT_DRAIN_ACK_ROUTED) {
+            retry_needed = true;
+            continue;
+        }
+        notify_ack_id(view.id);
+    }
+    if (retry_needed) {
+        notify_chat_retry_pending = true;
+        notify_chat_retry_at = millis() + 1000;
+    }
+    /* Boot reconciliation is store repair, not a user-visible arrival/input.
+     * notify_ack_id is still used for its archive write-through, but its normal
+     * runtime repaint/ring hints must not leak into the first loop pass. */
+    notify_ring_acked = false;
+    display_force = false;
+}
+
+/* A single arrival latch is only a repaint signal: on each signal, snapshot and
+ * drain every fresh unread chat door oldest-first. This makes a burst lossless
+ * even when producers overwrite notify_arrived_id before loop() runs. A failed
+ * append blocks newer messages for that conversation during this pass, while
+ * other conversations may continue. Exact event origins make retries safe. */
+static bool notify_reconcile_pending_chats(HwUiScreen scr) {
+    (void)scr;
+    static const int DRAIN_BATCH = 4;
+    static NotifyView view;
+    static NotifyChatRestoreItem items[NOTIFY_MAX];
+    bool queued[CONV_MAX] = {};
+    bool retry_needed = false;
+    int attempted = 0;
+    int count = 0;
+    for (int i = 0; i < NOTIFY_MAX; i++) {
+        if (!notify_view(i, view)) break;
+        if (!view.unread || count >= NOTIFY_MAX ||
+            !notify_event_id_valid(&view.event_id)) continue;
+        NotifyChatResolution resolution = notify_chat_candidate(view);
+        if (resolution.conversation < 0 || !notify_chat_normalized[0]) continue;
+        items[count].id = view.id;
+        items[count].order.card_epoch = view.created_epoch;
+        items[count].order.restore_rank = (uint8_t)i;
+        count++;
+    }
+    for (int i = 1; i < count; i++) {
+        NotifyChatRestoreItem item = items[i];
+        int j = i;
+        while (j > 0 && notify_chat_restore_before(item.order,
+                                                    items[j - 1].order)) {
+            items[j] = items[j - 1];
+            j--;
+        }
+        items[j] = item;
+    }
+    for (int i = 0; i < count; i++) {
+        if (!notify_view_by_id(items[i].id, view, nullptr, nullptr) || !view.unread)
+            continue;
+        NotifyChatResolution resolution = notify_chat_candidate(view);
+        int ax = resolution.conversation;
+        if (ax < 0 || ax >= CONV_MAX || !notify_chat_normalized[0]) continue;
+        if (attempted >= DRAIN_BATCH) { retry_needed = true; continue; }
+        if (queued[ax] || notify_chat_inflight_find(resolution.id) >= 0) {
+            retry_needed = true;
+            continue;
+        }
+        attempted++;
+        if (notify_chat_inflight_add(resolution.id, &view.event_id) &&
+            agents_chat_door_enqueue(ax, resolution.id, view.source,
+                                     notify_chat_normalized, view.id,
+                                     view.key, &view.event_id)) {
+            queued[ax] = true;
+        } else {
+            notify_chat_inflight_remove(resolution.id, &view.event_id);
+            retry_needed = true;
+        }
+    }
+    return retry_needed;
+}
+
+static void notify_take_chat_completions(HwUiScreen scr) {
+    AgentDoorCompletion done;
+    while (agents_chat_door_take_completion(done)) {
+        notify_chat_inflight_remove(done.conversation, &done.event);
+        NotifyView view;
+        bool same_card = notify_view_by_id(done.id, view, nullptr, nullptr) &&
+                         notify_event_id_equal(&view.event_id, &done.event);
+        if (done.accepted && same_card &&
+            notify_ack_identity(done.id, &done.event)) {
+            int current_idx = agents_notify_chat_resolve_snapshot(
+                done.conversation, "").conversation;
+            if (scr == HW_UI_AGENT_CHAT && agent_focus == current_idx) {
+                ui_agent_chat_refresh();
+                ui_note_wake();
+            }
+            notify_chat_retry_at = millis();
+        } else {
+            notify_chat_retry_at = millis() + 1000;
+        }
+        notify_chat_retry_pending = true;
+    }
 }
 
 static void agents_head_time(uint32_t ts, char *out, size_t out_n) {
@@ -3300,7 +3645,7 @@ static void ui_open_agent_chat(int idx) {
     if (idx < 0) idx = 0;
     if (idx >= agents_count()) idx = agents_count() - 1;
     agent_focus = idx;
-    agent_compose = false;
+    reply_mode = REPLY_MODE_NONE;
     agent_scroll = -1;  // pin to latest when entering the room
     agents_thread_goto_tail(idx);  // load the session's history from the store
     ui_agent_chat_refresh();
@@ -3405,11 +3750,8 @@ static void ui_agent_act_confirm() {
 static void ui_open_info() {
     char ver[16];
     snprintf(ver, sizeof(ver), "v%s", SEED_VERSION);
-    String ip = (WiFi.status() == WL_CONNECTED)
-        ? WiFi.localIP().toString() : String("");
-    hw_ui_show_info(ver, node_name.c_str(), ip.c_str(),
-                    auth_token.c_str(), ESP.getFreeHeap(),
-                    notify_unread_count());
+    hw_ui_show_info(ver, node_name.c_str(), auth_token.c_str(),
+                    ESP.getFreeHeap());
     ui_note_input();
 }
 
@@ -3428,24 +3770,37 @@ static char msglist_sev_letter(uint8_t level) {
 // handle (card id vs conv slot+id) is cached so a click opens the right thing.
 static void ui_open_msglist() {
     static char titles[HW_UI_MSGLIST_MAX][FEED_LABEL_LEN];
+    static char times[HW_UI_MSGLIST_MAX][6];
     static char glyphs[HW_UI_MSGLIST_MAX];
     static bool is_conv[HW_UI_MSGLIST_MAX];
     static bool unread[HW_UI_MSGLIST_MAX];
     static const char *title_ptrs[HW_UI_MSGLIST_MAX];
+    static const char *time_ptrs[HW_UI_MSGLIST_MAX];
 
     // Cards out of the notify queue (newest first). Titles are copied into a
     // scratch that outlives the merge, so the view can point at them.
-    FeedCardView cards[FEED_MAX_CARDS];
+    static FeedCardView cards[FEED_MAX_CARDS];
     static char card_titles[FEED_MAX_CARDS][NOTIFY_TITLE_LEN];
+    static NotifyView v;
     int nc = 0;
     for (int i = 0; i < NOTIFY_MAX && nc < FEED_MAX_CARDS; i++) {
-        NotifyView v;
         if (!notify_view(i, v)) break;
+        // A successfully routed chat door must not sit beside its conversation
+        // row. notify_is_chat uses the same resolver/normalizer as live and boot
+        // routing, and requires the archived ACK: unresolved, invalid and
+        // ambiguous unread doors stay visible instead of disappearing silently.
+        // Lock-free on purpose: notify_is_chat -> agents_find needs no
+        // agents_lock here because agents_delete only runs on this same loop
+        // task (ui_agent_act_confirm); the residual race is a conversation
+        // minted between this scan and the merge below, which shows both rows
+        // for ONE repaint and heals on the next.
+        if (notify_is_chat(v)) continue;
         snprintf(card_titles[nc], sizeof(card_titles[0]), "%s", v.title);
         cards[nc].id = v.id;
         cards[nc].epoch = v.created_epoch;
         cards[nc].title = card_titles[nc];
-        cards[nc].sev = msglist_sev_letter(v.level);
+        char delivery = outbox_reply_mark(v.key);
+        cards[nc].sev = delivery ? delivery : msglist_sev_letter(v.level);
         cards[nc].unread = v.unread ? 1 : 0;
         nc++;
     }
@@ -3453,8 +3808,8 @@ static void ui_open_msglist() {
     // Conversations out of the live table, then merge — both under the lock,
     // because the view points into the table until feed_build_rows copies each
     // label and id out. After it returns the rows are self-contained.
-    FeedConvView convs[CONV_MAX];
-    FeedRow rows[HW_UI_MSGLIST_MAX];
+    static FeedConvView convs[CONV_MAX];
+    static FeedRow rows[HW_UI_MSGLIST_MAX];
     int rn = 0;
     agents_lock();
     int total = agents_count();
@@ -3477,6 +3832,8 @@ static void ui_open_msglist() {
         const FeedRow &r = rows[i];
         snprintf(titles[msglist_count], sizeof(titles[0]), "%s", r.label);
         title_ptrs[msglist_count] = titles[msglist_count];
+        agents_head_time(r.epoch, times[msglist_count], sizeof(times[0]));
+        time_ptrs[msglist_count] = times[msglist_count];
         glyphs[msglist_count] = r.glyph;
         is_conv[msglist_count] = (r.origin == FEED_CONV);
         unread[msglist_count] = (r.mark != ' ');
@@ -3498,7 +3855,8 @@ static void ui_open_msglist() {
     }
     if (msglist_sel >= msglist_count) msglist_sel = msglist_count > 0 ? msglist_count - 1 : 0;
     if (msglist_sel < 0) msglist_sel = 0;
-    hw_ui_show_msglist(title_ptrs, glyphs, is_conv, unread, msglist_count, msglist_sel);
+    hw_ui_show_msglist(title_ptrs, time_ptrs, glyphs, is_conv, unread,
+                       msglist_count, msglist_sel);
     ui_note_input();
 }
 
@@ -3651,7 +4009,15 @@ static void ui_contacts_open_selected() {
         return;
     }
     hw_haptic_notify(0);
-    ui_open_agent_chat(slot);
+    // A multi-session AI door opens its room picker; a single-session one (a
+    // freshly created conversation always has exactly one) opens the chat
+    // directly, so a first contact tap does not land on an empty picker. The
+    // picker backs out to this contacts list.
+    agent_origin = UINAV_CONTACTS;
+    if (ui_nav_conv_open_target(agents_session_count(slot)) == UINAV_AGENT_SESSIONS)
+        ui_open_agent_sessions(slot);
+    else
+        ui_open_agent_chat(slot);
 }
 
 // ===== Network status screen =====
@@ -3691,13 +4057,14 @@ static void ui_net_render() {
 // these value buffers only need to outlive the build call. g_mesh / g_rns_* /
 // WiFi are read directly on the loop task exactly as conn_mgr_service() and
 // ui_clock_paint() do — those globals are loop-task owned, so no extra lock.
-static void ui_open_net() {
+static void ui_open_net(uint8_t origin) {
     static char wifi_ssid_s[NET_VALUE_LEN];
     static char wifi_ip_s[NET_VALUE_LEN];
     static char rns_addr_s[NET_VALUE_LEN];
     static char mesh_key_s[NET_VALUE_LEN];
     static char mesh_rf_s[NET_VALUE_LEN];
 
+    net_origin = origin;
     NetStatus s;
     memset(&s, 0, sizeof(s));
 
@@ -3744,26 +4111,28 @@ static void ui_open_net() {
 
     net_count = net_build_rows(&s, net_rows, NET_ROWS_MAX);
     net_top = 0;
+    if (origin == UINAV_MESHCORE) {
+        for (int i = 0; i < net_count; i++) {
+            if (net_rows[i].kind == NET_ROW_HEADER &&
+                net_rows[i].section == NET_SEC_MESH) {
+                net_top = i;
+                break;
+            }
+        }
+    }
     ui_net_render();
-}
-
-// Show the agent "door" card (pretty invite). Does not enter the room yet.
-static void ui_show_agent_invite_from_view(const NotifyView &v, uint32_t id) {
-    notify_card_id = id;
-    snprintf(reply_title, sizeof(reply_title), "%s", v.title);
-    int ax = agents_index_from_door(v);
-    const char *aname = (ax >= 0) ? agents_name(ax) : v.source;
-    hw_ui_show_agent_invite(aname, v.body, notify_unread_count());
-    // Reachable from the loop() arrival path: a system wake, not user input.
-    ui_note_wake();
 }
 
 // Enter the chat room from a chat-door notify (ack + open).
 static void ui_enter_agent_from_notify(uint32_t id, const NotifyView &v) {
-    int ax = agents_index_from_door(v);
+    NotifyChatResolution resolution = notify_chat_candidate(v);
+    int ax = resolution.conversation;
     if (ax < 0) return;
     notify_ack_id(id);
     notify_card_id = 0;
+    // A chat-door notify lives in the feed, so a picker reached by backing out of
+    // this chat backs on to the feed.
+    agent_origin = UINAV_MSGLIST;
     ui_open_agent_chat(ax);
 }
 
@@ -3773,15 +4142,16 @@ static void ui_open_notify_id(uint32_t id) {
         ui_open_msglist();
         return;
     }
-    // Only *-chat doors open the invite; real pages keep severity colours.
-    if (notify_is_chat_door(v)) {
-        ui_show_agent_invite_from_view(v, id);
+    // A chat card opens straight into its room (the picker handles multi-session);
+    // real pages keep severity colours.
+    if (notify_is_chat(v)) {
+        ui_enter_agent_from_notify(id, v);
         return;
     }
     notify_card_id = id;
     snprintf(reply_title, sizeof(reply_title), "%s", v.title);
     hw_ui_show_notify(notify_level_name(v.level), v.source, v.title,
-                      v.body, notify_unread_count());
+                      v.body, notify_unread_count(), outbox_reply_status(v.key));
     ui_note_input();
 }
 
@@ -3853,11 +4223,13 @@ static void ui_on_click() {
         if (wifi_sel == WIFI_ACT_BACK) {
             ui_open_menu();
         } else if (wifi_sel == WIFI_ACT_STATUS) {
-            ui_open_net();
+            ui_open_net(UINAV_WIFI);
         } else if (wifi_sel == WIFI_ACT_SCAN) {
             ui_wifi_do_scan();
         } else if (wifi_sel == WIFI_ACT_PROFILES) {
             ui_wifi_show_profiles();
+        } else if (wifi_sel == WIFI_ACT_HIDDEN) {
+            ui_wifi_open_hidden_ssid();
         } else if (wifi_sel == WIFI_ACT_TOGGLE) {
             ui_wifi_toggle();
         }
@@ -3869,7 +4241,7 @@ static void ui_on_click() {
             ui_wifi_connect_ssid(wifi_list_ssids[wifi_list_sel]);
         }
         break;
-    case HW_UI_WIFI_INFO:
+    case HW_UI_WIFI_PROGRESS:
         ui_open_wifi();
         break;
     case HW_UI_SETTINGS:
@@ -3885,13 +4257,21 @@ static void ui_on_click() {
         } else if (settings_sel == SETTINGS_AUTODIM) {
             backlight_idle_toggle();
             ui_open_settings();
+        } else if (settings_sel == SETTINGS_SILENT) {
+            settings_toggle_silent();
+            ui_open_settings();
+        } else if (settings_sel == SETTINGS_AUTOLOCK) {
+            settings_autolock_s = settings_autolock_next(settings_autolock_s);
+            settings_save();
+            hw_haptic_notify(0);
+            ui_open_settings();
         }
         break;
     case HW_UI_MESHCORE:
         if (mesh_sel == MESH_ACT_BACK) {
             ui_open_menu();
         } else if (mesh_sel == MESH_ACT_STATUS) {
-            ui_mesh_show_status();
+            ui_open_net(UINAV_MESHCORE);
         } else {
             ui_mesh_ping_gateway();
         }
@@ -3910,37 +4290,6 @@ static void ui_on_click() {
             hw_haptic_notify(0);
             // Re-draw so the * marker jumps to the new default.
             hw_ui_show_layout(layout_sel, (int)hw_kb_layout());
-        }
-        break;
-    case HW_UI_AGENTS:
-        if (agents_sel >= ag_inbox_n) {          /* the trailing BACK row */
-            ui_open_menu();
-        } else {
-            /* THE SLOT MAY HAVE CHANGED HANDS since the list was drawn: the
-             * off-loop drain mints while the inbox sits open, and minting on a
-             * full table recycles a slot. Opening without checking would put
-             * the user in a stranger's thread under the name they picked. The
-             * check is one string compare against the id the row displayed;
-             * rebuilding the list on every scroll tick would cost a lock and a
-             * repaint per knob step instead. */
-            int slot = ag_inbox_slot[agents_sel];
-            InboxRow probe;
-            memset(&probe, 0, sizeof(probe));
-            snprintf(probe.id, sizeof(probe.id), "%s", ag_inbox_ids[agents_sel]);
-            agents_lock();
-            bool same = inbox_row_matches(&probe, agents_id(slot));
-            agents_unlock();
-            if (!same) {
-                /* Show what is actually there now rather than opening it —
-                 * and force the repaint, or the stale name stays on screen and
-                 * the next click opens the stranger under it. */
-                ui_inbox_refresh(agents_sel);
-                break;
-            }
-            // Land straight in the conversation's active (last-used) room, even
-            // when it has several — one tap to read/type. The room list stays
-            // reachable with BACKSPACE from inside the chat (see ui_go_back).
-            ui_open_agent_chat(slot);
         }
         break;
     case HW_UI_AGENT_SESSIONS: {
@@ -3966,7 +4315,9 @@ static void ui_on_click() {
                 event_add("agent new session refused (full)");
             }
         } else {  // BACK
-            ui_open_msglist();   // → the unified feed, not the retired list
+            // Back to whatever list opened the picker (the unified feed or the
+            // contacts list), not the retired agents list.
+            ui_go_to_screen(agent_origin);
         }
         break;
     }
@@ -4003,17 +4354,24 @@ static void ui_on_click() {
                     ui_open_msglist();
                     break;
                 }
-                // Straight into the active (last-used) room's chat; the room
-                // list stays reachable with BACKSPACE from the chat.
-                ui_open_agent_chat(slot);
+                // A multi-session conversation opens its room picker so the user
+                // chooses rather than landing silently in the last-used room; a
+                // single-session one opens the chat directly (one-tap). Either
+                // way the picker backs out to this feed.
+                agent_origin = UINAV_MSGLIST;
+                if (ui_nav_conv_open_target(agents_session_count(slot))
+                        == UINAV_AGENT_SESSIONS)
+                    ui_open_agent_sessions(slot);
+                else
+                    ui_open_agent_chat(slot);
             }
         }
         break;
     case HW_UI_NOTIFY: {
-        // Chat door → open room. Severity page → Ack / Reply / Back.
+        // Chat card → open room. Severity page → Ack / Reply / Back.
         NotifyView v;
         if (notify_card_id && notify_view_by_id(notify_card_id, v, NULL, NULL) &&
-            notify_is_chat_door(v)) {
+            notify_is_chat(v)) {
             ui_enter_agent_from_notify(notify_card_id, v);
         } else {
             ui_open_card_act();
@@ -4030,8 +4388,7 @@ static void ui_on_click() {
         ui_contacts_open_selected();
         break;
     case HW_UI_NET:
-        // Read-only status screen: click returns to the WiFi menu it opened from.
-        ui_open_wifi();
+        ui_go_to_screen(net_origin);
         break;
     case HW_UI_PAGE:
         // Click toggles the two input modes: OPEN the page for in-page scrolling,
@@ -4050,16 +4407,18 @@ static void ui_on_click() {
         // Encoder click = send if draft non-empty, else cancel
         if (reply_buf[0]) {
             ui_reply_submit();
-        } else if (wifi_compose) {
-            wifi_compose = false;
+        } else if (reply_mode == REPLY_MODE_WIFI_SSID ||
+                   reply_mode == REPLY_MODE_WIFI_PASSWORD) {
+            reply_mode = REPLY_MODE_NONE;
             wifi_pending_ssid[0] = '\0';
             reply_buf[0] = '\0';
             ui_open_wifi();
-        } else if (agent_compose) {
-            agent_compose = false;
+        } else if (reply_mode == REPLY_MODE_AGENT) {
+            reply_mode = REPLY_MODE_NONE;
             reply_buf[0] = '\0';
             ui_open_agent_chat(agent_focus);
         } else {
+            reply_mode = REPLY_MODE_NONE;
             notify_card_id = 0;
             reply_buf[0] = '\0';
             ui_go_clock(NULL);
@@ -4098,15 +4457,6 @@ static void ui_on_steps(int steps) {
         while (card_act_sel >= CARD_ACT_COUNT) card_act_sel -= CARD_ACT_COUNT;
         hw_ui_show_card_act(card_act_sel,
                             reply_title[0] ? reply_title : NULL);
-        break;
-    }
-    case HW_UI_AGENTS: {
-        int n = ag_inbox_n + 1;          /* conversations + BACK */
-        if (n < 1) n = 1;
-        agents_sel += steps;
-        while (agents_sel < 0) agents_sel += n;
-        while (agents_sel >= n) agents_sel -= n;
-        ui_inbox_render(agents_sel);
         break;
     }
     case HW_UI_AGENT_SESSIONS: {
@@ -4388,6 +4738,7 @@ void setup() {
     // STA associates.
     hw_ui_begin();
     storage_begin();  // SPIFFS mount → announced format → degraded continue
+    outbox_load();    // durable outgoing replies survive an offline reboot
     // Capture this device's real secrets into NVS, byte-for-byte, the moment
     // storage is up and BEFORE any consumer (auth/gw/rns/mesh) loads one. NVS
     // survives a SPIFFS format, so this is what keeps the live identity, RNS
@@ -4402,6 +4753,7 @@ void setup() {
     hw_sound_begin();
     hw_kb_begin();
     kb_layout_load(); // SPIFFS /kb_layout.txt → EN / RU PHON / RU
+    settings_load();  // SPIFFS /settings.json; missing keys keep defaults
     mesh_gw_load();   // SPIFFS /mesh_gw.txt → home Heltec daemon URL
     gw_token_load();  // SPIFFS /gw_token.txt → gateway capability token
     hw_probe();
@@ -4531,18 +4883,19 @@ void loop() {
     }
 
     // Front panel: encoder + click (must run before screens consume edges).
-    // Pocket lock (long CAPS): swallow wheel + click — keys already silent in
+    // Pocket lock: swallow wheel + click — keys are already silent in
     // hw_kb. Still poll+drain so detents don't queue and fire after unlock.
     hw_input_poll();
     int steps = hw_input_steps();
     bool click = hw_input_click();
+    if (hw_input_long_press()) hw_kb_set_locked(!hw_kb_locked());
     if (!hw_kb_locked()) {
         if (steps) ui_on_steps(steps);
         if (click) ui_on_click();
     }
 
     // Keyboard → UTF-8 into reply / open compose from card.
-    // ALT+CAPS cycles layout; long CAPS = full lock (kb + wheel). Refresh badges.
+    // ALT+CAPS cycles layout; held USER toggles full lock. Refresh badges.
     // Any key also wakes a blanked panel (stamps idle clock).
     {
         char u8[5];
@@ -4555,7 +4908,7 @@ void loop() {
         }
         if (hw_kb_take_lock_changed()) {
             hw_haptic_notify(hw_kb_locked() ? 1 : 0);
-            if (hw_kb_locked()) hw_sound_notify(0);
+            if (hw_kb_locked() && !settings_silent) hw_sound_notify(0);
             if (hw_ui_screen() == HW_UI_CLOCK) {
                 hw_ui_invalidate_clock();
                 ui_clock_paint(hw_kb_locked() ? "LOCKED" : "unlocked");
@@ -4569,6 +4922,21 @@ void loop() {
             else if (hw_ui_screen() == HW_UI_LAYOUT)
                 hw_ui_show_layout(layout_sel, (int)hw_kb_layout());
         }
+        if (hw_kb_take_silent_toggle()) {
+            settings_toggle_silent();
+            if (hw_ui_screen() == HW_UI_SETTINGS) ui_open_settings();
+            else if (hw_ui_screen() == HW_UI_CLOCK) {
+                hw_ui_invalidate_clock();
+                ui_clock_paint(settings_silent ? "SILENT ON" : "SILENT OFF");
+            }
+            ui_note_input();
+        }
+    }
+
+    if (settings_autolock_due(settings_autolock_s,
+                              millis() - ui_last_input_ms,
+                              hw_kb_locked())) {
+        hw_kb_set_locked(true);
     }
 
     // Idle policy owns brightness; drive pulses after the decision.
@@ -4597,7 +4965,7 @@ void loop() {
     // Typed reply on its way to the gateway. ORDER: hand-placed — after the
     // keyboard drain above, so an Enter is carried on the pass that produced
     // it, and after the card has already painted its way back to the clock.
-    reply_upstream_poll();
+    outbox_poll();
 
     // Flush beacon: staged by conn_mgr_service() on the WiFi attach edge, sent
     // here on the loop task (off AsyncTCP), same deferral as the reply above.
@@ -4613,23 +4981,10 @@ void loop() {
         uint8_t lvl = 0;
         char src[NOTIFY_SOURCE_LEN];
         if (notify_take_sound_arrival(&lvl, src, sizeof(src))) {
-            hw_sound_notify(lvl);   // amp + queue before haptic I2C
+            if (!settings_silent) hw_sound_notify(lvl);
             hw_haptic_notify(lvl);
             hw_sound_poll();        // prime DMA immediately
         }
-    }
-
-    // Inbox open when something arrives: the rows themselves changed — a new
-    // conversation may have been minted, an unread mark raised, the order
-    // moved — so the list is rebuilt and repainted. Without this the inbox
-    // shows the state it had when it was opened until the user leaves and
-    // comes back.
-    if (display_force && hw_ui_screen() == HW_UI_AGENTS) {
-        display_force = false;
-        bool real_in = g_agents_real_inbound;
-        g_agents_real_inbound = false;
-        ui_inbox_refresh(agents_sel);
-        if (real_in) ui_note_wake();
     }
 
     // Agent thread inbound (display_force) — refresh open chat room live.
@@ -4649,7 +5004,10 @@ void loop() {
     }
 
     uint32_t arrived_id = 0;
-    if (notify_take_arrival(&arrived_id) || display_force) {
+    bool got_notify_arrival = notify_take_arrival(&arrived_id);
+    bool notify_chat_retry_due = notify_chat_retry_pending &&
+        (long)(millis() - notify_chat_retry_at) >= 0;
+    if (got_notify_arrival || display_force || notify_chat_retry_due) {
         display_force = false;
         // Room not on screen: the arrival flag must not survive to be claimed
         // by a later, unrelated repaint of the room.
@@ -4657,28 +5015,28 @@ void loop() {
         NotifyView v;
         HwUiScreen scr = hw_ui_screen();
         bool on_clock = (scr == HW_UI_CLOCK);
+        notify_take_chat_completions(scr);
+        if (got_notify_arrival || notify_chat_retry_due) {
+            bool retry_after_drain = notify_reconcile_pending_chats(scr);
+            notify_chat_retry_pending = retry_after_drain;
+            if (notify_chat_retry_pending) notify_chat_retry_at = millis() + 1000;
+        }
         if (arrived_id && notify_view_by_id(arrived_id, v, NULL, NULL)) {
-            if (notify_is_chat_door(v)) {
-                // Chat reply door (id "hermes-chat" etc.) — not a severity page.
-                int ax = agents_index_from_door(v);
-                if (ax >= 0 && scr == HW_UI_AGENT_CHAT && agent_focus == ax) {
-                    notify_ack_id(arrived_id);
-                    ui_agent_chat_refresh();
-                    ui_note_wake();  // real inbound message, not a repaint
-                } else if (ax >= 0 && scr == HW_UI_REPLY && agent_compose &&
-                           agent_focus == ax) {
-                    // Typing in that room — leave compose; thread updates later.
-                } else {
-                    // Pretty door: open chat from it. Full text is in the room.
-                    ui_show_agent_invite_from_view(v, arrived_id);
-                }
-            } else if (on_clock || scr == HW_UI_MENU || scr == HW_UI_AGENTS ||
-                       scr == HW_UI_MSGLIST || scr == HW_UI_INFO) {
+            NotifyChatResolution resolution = notify_chat_candidate(v);
+            bool is_pending_chat = resolution.conversation >= 0 &&
+                                   notify_chat_normalized[0] &&
+                                   notify_event_id_valid(&v.event_id);
+            if (is_pending_chat) {
+                /* The bounded drain above handled it or deliberately left it
+                 * visible for retry. Never misrender a failed chat as severity. */
+            } else if (on_clock || scr == HW_UI_MENU || scr == HW_UI_MSGLIST ||
+                       scr == HW_UI_INFO) {
                 // Real message from any service: severity colours (info/warn/crit).
                 notify_card_id = arrived_id;
                 snprintf(reply_title, sizeof(reply_title), "%s", v.title);
                 hw_ui_show_notify(notify_level_name(v.level), v.source, v.title,
-                                  v.body, notify_unread_count());
+                                  v.body, notify_unread_count(),
+                                  outbox_reply_status(v.key));
                 ui_note_wake();
             } else {
                 // In reply compose / sheets — badge only, don't yank the user.

@@ -796,6 +796,18 @@ static uint32_t mesh_on_private_text(const uint8_t *from_pubkey,
         if (!a) return 0;
         const char *chunk = a + 1;
 
+        char delivery_key[NW_KEY_CAP];
+        if (side == 'u')
+            snprintf(delivery_key, sizeof(delivery_key), "%s", mid);
+        else
+            snprintf(delivery_key, sizeof(delivery_key), "%s:%s", agent, mid);
+        if (agents_inbound_key_duplicate(delivery_key)) {
+            /* A local user line was already persisted before its uplink, or
+             * this completed agent delivery was replayed. It is an ACK/route
+             * duplicate, not a second history line. */
+            return MESH_RX_HANDLED;
+        }
+
         MeshReasm *r = mesh_reasm_get('C', mid, agent);
         if (r->got_count == 0) {
             snprintf(r->agent, sizeof(r->agent), "%s", agent);
@@ -814,15 +826,25 @@ static uint32_t mesh_on_private_text(const uint8_t *from_pubkey,
             if (idx >= 0 && agents_transport(idx) != CONV_AGENT) idx = -1;
             if (idx >= 0) {
                 bool from_me = (r->side == 'u');
-                agents_push_line(idx, from_me, r->buf);
-                /* Genuine mesh chat arrival: same wake as the WiFi door path.
-                 * Set before display_force (loop consumes them together). */
-                g_agents_real_inbound = true;
-                display_force = true;
-                id = 1;  /* non-zero = handled */
+                if (agents_push_line(idx, from_me, r->buf)) {
+                    agents_inbound_key_commit(delivery_key);
+                    /* Genuine mesh chat arrival: same wake as the WiFi door path.
+                     * Set before display_force (loop consumes them together). */
+                    g_agents_real_inbound = true;
+                    display_force = true;
+                    id = 1;  /* non-zero = handled */
+                } else {
+                    /* Preserve the message as a retryable visible card when the
+                     * conversation store cannot durably append it. */
+                    id = notify_ingest("info", r->agent, "CHAT", r->buf,
+                                       delivery_key);
+                    if (id) agents_inbound_key_commit(delivery_key);
+                }
             } else {
                 /* unknown agent → notify card */
-                id = notify_ingest("info", r->agent, "CHAT", r->buf, NULL);
+                id = notify_ingest("info", r->agent, "CHAT", r->buf,
+                                   delivery_key);
+                if (id) agents_inbound_key_commit(delivery_key);
             }
             r->used = false;
         }
@@ -936,58 +958,6 @@ static void mesh_status_json(JsonDocument &doc) {
                              ? "sparse private MC|k probe + P1 notify"
                              : "keys ready; sparse probe waits for radio stack")
                       : "need /mesh_identity.id on SPIFFS";
-}
-
-/* Fill short status lines for MESHCORE → STATUS screen (caller owns buffers). */
-static int mesh_status_lines(char lines[][40], int max_lines) {
-    int n = 0;
-    auto push = [&](const char *s) {
-        if (n >= max_lines) return;
-        snprintf(lines[n], 40, "%s", s);
-        n++;
-    };
-    char buf[40];
-    if (g_mesh.has_identity) {
-        snprintf(buf, sizeof(buf), "NODE %s", g_mesh.name);
-        push(buf);
-        snprintf(buf, sizeof(buf), "PK %.12s…", g_mesh.public_key_hex);
-        push(buf);
-    } else {
-        push("NO IDENTITY");
-        push("flash SPIFFS keys");
-    }
-    if (g_mesh.heltec_pk_hex[0]) {
-        snprintf(buf, sizeof(buf), "GW %.8s…", g_mesh.heltec_pk_hex);
-        push(buf);
-    }
-    snprintf(buf, sizeof(buf), "RF %.3f SF%u", (double)g_mesh.freq, (unsigned)g_mesh.sf);
-    push(buf);
-    snprintf(buf, sizeof(buf), "RADIO %s", g_mesh.radio_state);
-    push(buf);
-    {
-        const char *lk = "?";
-        switch (mesh_ui_state()) {
-            case MESH_UI_OFF: lk = "off"; break;
-            case MESH_UI_WAIT: lk = "wait"; break;
-            case MESH_UI_OK: lk = "OK"; break;
-            case MESH_UI_STALE: lk = "stale"; break;
-            case MESH_UI_DOWN: lk = "DOWN"; break;
-        }
-        snprintf(buf, sizeof(buf), "LINK %s", lk);
-        push(buf);
-    }
-    snprintf(buf, sizeof(buf), "PROBE every %lus",
-             (unsigned long)g_mesh.probe_interval_s);
-    push(buf);
-    if (g_mesh.last_rtt_ms)
-        snprintf(buf, sizeof(buf), "RTT %lu ms", (unsigned long)g_mesh.last_rtt_ms);
-    else
-        snprintf(buf, sizeof(buf), "RTT --");
-    push(buf);
-    snprintf(buf, sizeof(buf), "DM RX %lu", (unsigned long)g_mesh.dm_rx_count);
-    push(buf);
-    push("private DM only");
-    return n;
 }
 
 static void skill_meshcore_poll() {
@@ -1151,7 +1121,8 @@ static const Skill meshcore_skill = {
 };
 
 /* Encode user chat as C1 frames and TX private DM to Heltec (same wire as downlink). */
-static bool mesh_chat_uplink(const char *agent_id, const char *text) {
+static bool mesh_chat_uplink(const char *agent_id, const char *text,
+                             const char *delivery_key) {
     if (!agent_id || !text || !text[0]) return false;
     if (!g_mesh.radio_ready || !mesh_client_ready()) return false;
     if (g_mesh_chat_tx.active) return false;
@@ -1159,7 +1130,9 @@ static bool mesh_chat_uplink(const char *agent_id, const char *text) {
     char agent[13];
     snprintf(agent, sizeof(agent), "%.12s", agent_id);
     char mid[8];
-    snprintf(mid, sizeof(mid), "%04x", (unsigned)(millis() & 0xFFFF));
+    if (!agents_delivery_key_valid(delivery_key) || strlen(delivery_key) >= sizeof(mid))
+        return false;
+    snprintf(mid, sizeof(mid), "%s", delivery_key);
 
     const uint8_t *raw = (const uint8_t *)text;
     size_t raw_len = strlen(text);

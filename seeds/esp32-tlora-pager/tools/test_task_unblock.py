@@ -164,7 +164,7 @@ assert "void gps_request_fix(void)" in gps
 assert "gps_wake_requested" in gps[gps.index("static void gps_tick()") :]
 
 # --- 4. Connect timeouts on every loop-task HTTPClient site ------------------
-reply = main[main.index("static bool reply_upstream_http") :
+reply = main[main.index("static ReplyHttpResult reply_upstream_http") :
              main.index("static bool reply_upstream_mesh")]
 assert "http.setConnectTimeout(1000)" in reply, (
     "a black-holed gateway must cost ~1 s on the reply path"
@@ -2553,29 +2553,18 @@ assert "rns_link_up(" not in wrapper and "rns_link_up(" not in offer_code, (
     "the link check must NOT be inside the shared send path: refusing every "
     "offer made over a resolving link would make POST /rns/send flaky"
 )
-# 11f. A TOTAL FAILURE IS ONE SHORT LINE IN THE ROOM — and only on total
-# failure. C2 makes a successful send SILENT (the card just goes; a seven-row
-# screen is precious), so the room prints only when NO rung carried the message,
-# naming the single most actionable cause. The RNS reason wins when there is one
-# (for `claude` the peer is the path the user configured).
-assert 'snprintf(line, sizeof(line), "(rns: %s)", rns_why);' in send, (
-    "a total failure with an RNS cause must name it in the room"
+# 11f. A total ladder failure returns false to agents_send(), which persists the
+# same semantic message and delivery key in the durable outbox. The room shows
+# one compact state line instead of claiming a failed one-shot was sent.
+agent_send_at = agents.index("static bool agents_send(const char *agent_id, const char *text) {")
+agent_send = agents[agent_send_at:
+                    agents.index("static bool agents_on_inbound(", agent_send_at)]
+assert "return false;" in send, (
+    "a total ladder failure must reach the durable outbox caller"
 )
-assert '"(no route home - mesh failed)"' in send, (
-    "when the bridge is configured but the route home is NOT proven, the room "
-    "must say so — this is the captive/no-route case C2 stops blocking on"
-)
-assert send.index("if (rns_why) {") < send.index(
-    "} else if (wifi_avail && reach != REACH_UP) {"), (
-    "the RNS reason must REPLACE the other complaints rather than join them: "
-    "two lines per keystroke would push the typed message off the screen"
-)
-# The `why` values are static literals, so the room line needs no allocation and
-# the buffer is a small stack array on the 8 KB loop task.
-assert "char line[64];" in send, (
-    "the room line must be a small fixed buffer: this runs on the loop task "
-    "from the keyboard path, which is where the old oversized buffers overran"
-)
+assert "outbox_enqueue(&g_outbox, OUTBOX_KIND_AGENT" in agent_send
+assert 'agents_push_line(idx, false, "(~ queued)")' in agent_send
+assert 'agents_push_line(idx, false, "(! outbox full)")' in agent_send
 # 11g. AND IT MUST NOT PRINT THE OLD LIE. The room said "(bridge: claude not
 # wired yet)"-shaped things for a path that was dead; a bare bridge complaint
 # for `claude` is now wrong by construction.
@@ -2583,75 +2572,21 @@ assert "not wired yet" not in agents, (
     "the placeholder that told the user claude had no transport must be gone"
 )
 
-# --- 12. the inbox list is a SNAPSHOT taken under the store lock -------------
-# The off-loop drain mints and evicts conversations while the panel paints, so
-# a list built from the live table could read a slot mid-rewrite. The lock is
-# the whole reason the snapshot is safe, and deleting it breaks nothing that
-# any other assertion can see.
-# Sliced inline (this file has no fn_body helper) and anchored on the DEFINITION
-# — the opening brace is part of the signature, so a forward declaration cannot
-# be matched instead.
-_bi = main.index("static void ui_inbox_build() {")
-build = main[_bi : main.index("\n}", _bi) + 2]
-assert build.index("agents_lock();") < build.index("agents_name("), (
-    "the inbox snapshot must be taken under the store lock — the off-loop "
-    "drain mints and evicts while the panel paints"
-)
-assert "agents_unlock();" in build, "the snapshot must release the lock"
-
-# A chosen row must be revalidated: minting on a full table recycles a slot,
-# so a row can still show the old name over a new occupant.
-open_row = main[main.index("case HW_UI_AGENTS:") :]
-open_row = open_row[: open_row.index("break;")]
-assert "inbox_row_matches(&probe, agents_id(slot))" in open_row, (
-    "opening a row must confirm the slot still holds the conversation the row "
-    "displayed — otherwise a recycled slot opens a stranger's thread under the "
-    "name the user picked"
-)
-assert "ui_inbox_refresh(agents_sel);" in open_row, (
-    "a row that no longer matches must rebuild AND repaint the list, not open "
-    "anything — a rebuild alone draws nothing, because the renderer skips a "
-    "repaint when the selection has not moved, and the stale name stays up"
-)
-
-# A REBUILT LIST MUST ACTUALLY REPAINT. The renderer skips drawing when the
-# selection has not moved, so a refresh that rebuilds the snapshot without
-# dropping the drawn-state memo draws NOTHING: the stale row stays on screen and
-# the next click opens the new occupant under the old name. Deleting the
-# invalidate call broke exactly that and left all 19 pin files green.
-_ri = main.index("static void ui_inbox_refresh(int selected) {")
-refresh = main[_ri : main.index("\n}", _ri) + 2]
-assert "ui_inbox_build();" in refresh, "a refresh must rebuild the snapshot"
-assert "hw_ui_inbox_invalidate();" in refresh, (
-    "a refresh must drop the renderer's drawn-state memo — without it the "
-    "rebuilt rows are never painted and the stale name stays up"
-)
-assert refresh.index("hw_ui_inbox_invalidate();") < refresh.index("hw_ui_show_inbox("), (
-    "the memo must be dropped BEFORE the draw, or the draw is the one that skips"
-)
-
-# THE INBOX MUST FOLLOW ARRIVALS WHILE IT IS OPEN. A chat message mints and
-# reorders without raising a card, so nothing else brings the list up to date:
-# without this block a new conversation or unread mark appears only after the
-# user leaves the screen and comes back.
-_ai = main.index("if (display_force && hw_ui_screen() == HW_UI_AGENTS) {")
-arrival = main[_ai : main.index("\n    }", _ai) + 6]
-assert "ui_inbox_refresh(agents_sel);" in arrival, (
-    "an arrival while the inbox is open must rebuild AND repaint the list"
-)
-assert "display_force = false;" in arrival, (
-    "the repaint flag must be consumed, or the block runs every tick"
-)
-
-# The fixed three-row constant is gone; it is what a later edit would grab.
+# --- 12. the retired standalone inbox must stay gone ------------------------
 main_code = re.sub(r"/\*.*?\*/", " ", main, flags=re.S)
 main_code = re.sub(r"//[^\n]*", " ", main_code)
-assert "AGENTS_LIST_COUNT" not in main_code, (
-    "the hardcoded inbox row count must not come back — the list is built from "
-    "the conversation table now"
-)
-assert "AGENTS_BACK" not in main_code, (
-    "BACK is the trailing row of a dynamic list, not a fixed index"
+for dead in (
+    "HW_UI_AGENTS", "ui_inbox_build", "ui_inbox_refresh", "ui_inbox_render",
+    "hw_ui_show_inbox", "hw_ui_inbox_invalidate", "inbox_build_rows",
+):
+    assert dead not in main_code, f"retired standalone inbox path returned: {dead}"
+
+# Conversation rows in the live unified feed still revalidate their stable id
+# before opening a recyclable slot.
+feed_case = main[main.index("case HW_UI_MSGLIST:") :]
+feed_case = feed_case[: feed_case.index("case HW_UI_NOTIFY:")]
+assert "inbox_row_matches(&probe, agents_id(slot))" in feed_case, (
+    "the unified feed must still reject a conversation row whose slot was recycled"
 )
 
 print("Task unblock policy tests: OK")

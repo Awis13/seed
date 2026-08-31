@@ -22,32 +22,40 @@ assert "repaints and synthetic errors must not call this" in wake_decl, (
 )
 
 # --- the WHOLE notify_take_arrival consumption block -------------------------
-# Covers the chat-door branch, the severity-card branch, the compose branch and
-# the on_clock tail: exactly two wakes (door + severity card), no user-input
-# stamps, and nothing stamped after the branches either.
+# Covers the chat branch, the severity-card branch, the compose branch and the
+# on_clock tail: exactly two wakes (chat open-room + severity card), no
+# user-input stamps, and nothing stamped after the branches either.
 arrival = main[main.index("uint32_t arrived_id = 0;") :]
 arrival = arrival[: arrival.index("hw_sound_poll();")]
-assert arrival.count("ui_note_wake();") == 2, (
-    "the arrival block must wake exactly twice: chat-door branch + severity card"
+drain = main[main.index("static bool notify_reconcile_pending_chats(") :]
+drain = drain[: drain.index("static void agents_head_time(")]
+assert arrival.count("ui_note_wake();") == 1 and drain.count("ui_note_wake();") == 1, (
+    "arrival handling must wake once for an open chat and once for severity"
 )
 assert "ui_note_input" not in arrival, (
     "an arriving card is a system event, not user input"
 )
-door = arrival[arrival.index("notify_is_chat_door") :]
-door = door[: door.index("// Real message from any service")]
-assert "ui_note_wake();" in door, (
-    "a chat-door message landing in the open room must wake the panel"
+assert "ui_note_wake();" in drain, (
+    "a chat message landing in the open room must wake the panel"
 )
 sev = arrival[arrival.index("// Real message from any service") :]
 sev = sev[: sev.index("} else {")]
 assert "ui_note_wake();" in sev, "an arriving severity card must light the screen"
 
-# --- the invite card reachable from the arrival path is a wake, not input ----
-invite = main[main.index(
-    "ui_show_agent_invite_from_view(const NotifyView &v, uint32_t id) {") :]
-invite = invite[: invite.index("static void ui_enter_agent_from_notify")]
-assert "ui_note_wake();" in invite and "ui_note_input" not in invite, (
-    "the agent invite card is reachable from loop() arrivals: system wake only"
+# --- an arriving chat lands in its thread, never as an invite/severity card ---
+# The loop() arrival chat branch mirrors the mesh/LXMF model: it delivers the
+# text with agents_on_inbound() and badges; it must NOT pop the agent invite or
+# a severity card, and must not stamp user input.
+chat_arr = drain
+assert "agents_chat_door_enqueue(" in chat_arr, (
+    "an arriving chat must enqueue off-loop delivery into its conversation"
+)
+assert (
+    "hw_ui_show_agent_invite" not in chat_arr
+    and "hw_ui_show_notify" not in chat_arr
+), "an arriving chat must not pop an invite or a severity card"
+assert "ui_note_input" not in chat_arr, (
+    "an arriving chat is a system event, not user input"
 )
 
 # --- a chat repaint is not activity ------------------------------------------
@@ -83,8 +91,22 @@ assert "g_agents_real_inbound = false;" in consume, (
 
 # --- real_inbound classification of every agents_on_inbound producer ---------
 assert "static volatile bool g_agents_real_inbound = false;" in agents
-assert 'agents_on_inbound(agent, text, true);' in agents, (
-    "HTTP /agents/inbound is a genuine arrival: real_inbound = true"
+inbound_http = agents[agents.index('server.on(AsyncURIMatcher::exact("/agents/inbound")'):]
+inbound_http = inbound_http[:inbound_http.index('server.on(AsyncURIMatcher::exact("/agents/bridge")')]
+assert "inbox_deliver_card(" in inbound_http and "CONV_AGENT" in inbound_http, (
+    "HTTP agent replies must enter through their backing card"
+)
+assert "agents_on_inbound(" not in inbound_http, (
+    "the HTTP route must not append a second copy beside the backing card"
+)
+assert 'const char *key   = input["id"]' in inbound_http
+assert "agents_inbound_key_duplicate(key)" in inbound_http
+assert "key[0] ? key : nullptr" in inbound_http
+assert "agents_inbound_key_commit(key)" in inbound_http
+door_worker = agents[agents.index("if (item.kind == 3)"):]
+door_worker = door_worker[:door_worker.index("if (idx < 0) continue;")]
+assert "agents_on_inbound(" in door_worker and "item.door_event" in door_worker, (
+    "the off-loop card worker must be the canonical thread receiver"
 )
 assert "agents_on_inbound(g_convs[idx].id, line, true);" in agents, (
     "a GPS answer landing (possibly minutes later) is an arrival for the user"
@@ -92,9 +114,9 @@ assert "agents_on_inbound(g_convs[idx].id, line, true);" in agents, (
 assert 'agents_on_inbound(agent, "(mesh delivery failed - resend)", false);' in mesh, (
     "the synthetic failure line must never claim to be a genuine arrival"
 )
-onin = agents[agents.index("static void agents_on_inbound(const char *agent_id,"
+onin = agents[agents.index("static bool agents_on_inbound(const char *agent_id,"
                            " const char *text,\n                              "
-                           "bool real_inbound) {") :]
+                           "bool real_inbound, uint32_t origin_id,") :]
 onin = onin[: onin.index("static bool agents_clear")]
 assert "if (real_inbound) g_agents_real_inbound = true;" in onin
 assert onin.index("if (real_inbound) g_agents_real_inbound = true;") < onin.index(
@@ -108,6 +130,10 @@ assert "g_agents_real_inbound = true;" in c1, (
     "a chat line arriving over LoRa must wake the open room like WiFi does"
 )
 assert c1.index("g_agents_real_inbound = true;") < c1.index("display_force = true;")
+assert "agents_inbound_key_duplicate(delivery_key)" in c1, (
+    "a looped-back user line or replayed agent delivery must not append twice"
+)
+assert "agents_inbound_key_commit(delivery_key)" in c1
 
 # --- mesh TX failure line: per-agent, only on that room's success->fail edge --
 assert "static bool g_mesh_chat_tx_failed[AGENTS_N]" in mesh, (

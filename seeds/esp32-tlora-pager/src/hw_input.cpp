@@ -15,6 +15,7 @@
 #define INPUT_MAX_STEPS_PER_READ 1
 #define INPUT_DEBOUNCE_MS       30
 #define INPUT_CLICK_MAX_MS      800
+#define INPUT_LONG_MS          1000
 
 static ESP32Encoder enc;
 static int64_t enc_raw = 0;
@@ -26,6 +27,8 @@ static bool key_stable = false;
 static unsigned long key_changed = 0;
 static unsigned long key_down_at = 0;
 static bool pending_click = false;
+static bool pending_long = false;
+static bool long_fired = false;
 
 void hw_input_begin() {
     ESP32Encoder::useInternalWeakPullResistors = puType::up;
@@ -41,6 +44,8 @@ void hw_input_begin() {
     key_stable = key_level;
     key_changed = millis();
     pending_click = false;
+    pending_long = false;
+    long_fired = false;
 
     Serial.printf("[input] encoder A=%d B=%d C=%d\n",
                   PIN_ROTARY_A, PIN_ROTARY_B, PIN_ROTARY_C);
@@ -73,9 +78,15 @@ void hw_input_poll() {
         key_stable = key_level;
         if (key_stable && !was) {
             key_down_at = t;
+            long_fired = false;
         } else if (!key_stable && was) {
-            if ((t - key_down_at) < INPUT_CLICK_MAX_MS) pending_click = true;
+            if (!long_fired && (t - key_down_at) < INPUT_CLICK_MAX_MS) pending_click = true;
         }
+    }
+    if (key_stable && !long_fired && (t - key_down_at) >= INPUT_LONG_MS) {
+        long_fired = true;
+        pending_long = true;
+        pending_click = false;
     }
 }
 
@@ -101,4 +112,10 @@ bool hw_input_click() {
 
 bool hw_input_held() {
     return key_stable;
+}
+
+bool hw_input_long_press() {
+    if (!pending_long) return false;
+    pending_long = false;
+    return true;
 }

@@ -10,6 +10,8 @@
 #include "micron/micron_layout.h"  // pure page layout -> grid (C3)
 #include "box_glyphs.h"            // box-drawing + block glyphs for micron pages
 #include "conv_store.h"             // CONV_LABEL_LEN: the inbox row label width
+#include "feed_view.h"              // FEED_LABEL_LEN for UTF-8-safe feed titles
+#include "utf8_text.h"              // shared code-point-safe display truncation
 #include "net_view.h"               // NetLevel + net_level_glyph: network status screen
 #include "boot_logo.h"             // PURE b33pr boot-splash decrypt logic
 #include "psram_alloc.h"           // psram_calloc_pref: micron grids in PSRAM
@@ -478,6 +480,11 @@ static const uint8_t *font_glyph(uint32_t cp) {
     // En/em dash → ASCII -
     if (cp == 0x2013 || cp == 0x2014 || cp == 0x2212)
         return &FONT5X7[('-' - 0x20) * 5];
+    // Right arrow → visible ASCII chevron. The compact 5x7 font has no native
+    // U+2192 glyph; rendering '?' made route/status text look like a missing
+    // character on the device.
+    if (cp == 0x2192)
+        return &FONT5X7[('>' - 0x20) * 5];
     // Middle dot · (chat headers "CLAUDE · s123") → ASCII .
     if (cp == 0x00B7)
         return &FONT5X7[('.' - 0x20) * 5];
@@ -621,13 +628,11 @@ static char fld_note[56]  = "";
 static int  clock_badge   = -1;
 static int  clock_mesh_ui = -1;
 static int  clock_mesh_age_bucket = -2;  // -2 dirty; -1 never; else minutes (or hours*1000)
-static int  clock_wg_ui = -1;
 static bool clock_dirty   = true;
 
-// Selection caches for partial repaint (menu / msglist / card_act / agents).
+// Selection caches for partial repaint.
 static int menu_sel_drawn = -1;
 static int card_act_sel_drawn = -1;
-static int agents_sel_drawn = -1;
 static int agent_sess_sel_drawn = -1;
 static int agent_act_sel_drawn = -1;
 static int layout_sel_drawn = -1;
@@ -635,6 +640,8 @@ static int layout_cur_drawn = -1;
 static int settings_sel_drawn = -1;
 static char settings_bl_cache[12];
 static char settings_idle_cache[8];
+static int settings_silent_cache = -1;
+static char settings_autolock_cache[8];
 static int mesh_sel_drawn = -1;
 static int wifi_sel_drawn = -1;
 static int wifi_list_sel_drawn = -1;
@@ -642,7 +649,7 @@ static int wifi_list_n_drawn = -1;
 static int msglist_sel_drawn = -1;
 static int msglist_top_drawn = -1;
 static int msglist_count_drawn = -1;
-static uint8_t msglist_unread_mask = 0;  // bit i = unread for partial-redraw guard
+static uint32_t msglist_unread_mask = 0;  // bit i = unread for partial-redraw guard
 static int clock_bar_drawn = -1;  // progress band; -1 = bare ground
 
 // Geometry of big time block (measured once at first paint)
@@ -665,11 +672,14 @@ static void clock_measure() {
 static void draw_field(char *cache, size_t n, const char *text,
                        int32_t x, int32_t y, uint8_t scale, uint16_t color,
                        char align /* 'L','C','R' */, uint16_t pad_px) {
-    if (!clock_dirty && strncmp(cache, text, n - 1) == 0) return;
-    snprintf(cache, n, "%s", text);
+    static char next[64];
+    if (n > sizeof(next)) n = sizeof(next);
+    utf8_text_copy(next, n, text, SIZE_MAX, false);
+    if (!clock_dirty && strcmp(cache, next) == 0) return;
+    memcpy(cache, next, strlen(next) + 1);
 
     // Erase pad region then draw
-    uint16_t tw = text_width(text, scale);
+    uint16_t tw = text_width(next, scale);
     uint16_t th = 7 * scale;
     int32_t ex = x;
     if (align == 'C') ex = x - (int32_t)pad_px / 2;
@@ -677,9 +687,9 @@ static void draw_field(char *cache, size_t n, const char *text,
     if (ex < 0) ex = 0;
     tft_fill_rect((uint16_t)ex, (uint16_t)y, pad_px, th + 2, COL_BG);
 
-    if (align == 'C') tft_draw_text_c((uint16_t)x, (uint16_t)y, text, color, COL_BG, scale);
-    else if (align == 'R') tft_draw_text_r((uint16_t)x, (uint16_t)y, text, color, COL_BG, scale);
-    else tft_draw_text((uint16_t)x, (uint16_t)y, text, color, COL_BG, scale);
+    if (align == 'C') tft_draw_text_c((uint16_t)x, (uint16_t)y, next, color, COL_BG, scale);
+    else if (align == 'R') tft_draw_text_r((uint16_t)x, (uint16_t)y, next, color, COL_BG, scale);
+    else tft_draw_text((uint16_t)x, (uint16_t)y, next, color, COL_BG, scale);
     (void)tw;
 }
 
@@ -786,7 +796,6 @@ void hw_ui_invalidate_clock() {
     clock_badge = -1;
     clock_mesh_ui = -1;
     clock_mesh_age_bucket = -2;
-    clock_wg_ui = -1;
     clock_bar_drawn = -1;
 }
 
@@ -796,7 +805,6 @@ void hw_ui_show_clock() {
     // Leaving interactive faces: next visit must full-paint.
     menu_sel_drawn = -1;
     card_act_sel_drawn = -1;
-    agents_sel_drawn = -1;
     agent_sess_sel_drawn = -1;
     agent_act_sel_drawn = -1;
     layout_sel_drawn = -1;
@@ -807,6 +815,8 @@ void hw_ui_show_clock() {
     wifi_list_n_drawn = -1;
     settings_bl_cache[0] = '\0';
     settings_idle_cache[0] = '\0';
+    settings_silent_cache = -1;
+    settings_autolock_cache[0] = '\0';
     mesh_sel_drawn = -1;
     msglist_sel_drawn = -1;
     msglist_top_drawn = -1;
@@ -831,13 +841,12 @@ void hw_ui_clock_tick(const char *version,
                       const char *date_str,
                       bool crit_unread,
                       int mesh_ui,
-                      int mesh_age_s,
-                      int wg_ui) {
+                      int mesh_age_s) {
     if (!panel_ok || screen != HW_UI_CLOCK) return;
     (void)crit_unread;
     HwSpiBusGuard bus;  // one tick = one logical paint operation
 
-    // Header: version | badge | W | M+age | BAT | IP
+    // Header: version | badge | M+age | BAT | IP
     draw_field(fld_ver, sizeof(fld_ver), version ? version : "",
                MARGIN, HDR_Y, 2, COL_DIM, 'L', 80);
     draw_field(fld_batt, sizeof(fld_batt), batt ? batt : "",
@@ -857,20 +866,6 @@ void hw_ui_clock_tick(const char *version,
             if (badge > 9) snprintf(b, sizeof(b), "9+");
             else snprintf(b, sizeof(b), "%d", badge);
             tft_draw_text(bx + 8, HDR_Y, b, COL_ACCENT, COL_BG, 2);
-        }
-    }
-
-    // WireGuard "W" just left of MeshCore slot.
-    if (clock_dirty || wg_ui != clock_wg_ui) {
-        clock_wg_ui = wg_ui;
-        const int wx = PANEL_W / 2 - 140;
-        tft_fill_rect(wx - 2, HDR_Y, 20, 16, COL_BG);
-        if (wg_ui > WG_UI_OFF) {
-            uint16_t col = COL_DIM;
-            if (wg_ui == WG_UI_OK) col = COL_INFO;
-            else if (wg_ui == WG_UI_STALE) col = COL_WARN;
-            else if (wg_ui == WG_UI_DOWN) col = COL_CRIT;
-            tft_draw_text((uint16_t)wx, HDR_Y, "W", col, COL_BG, 2);
         }
     }
 
@@ -1007,7 +1002,8 @@ void hw_ui_show_notify(const char *level,
                        const char *source,
                        const char *title,
                        const char *body,
-                       int unread) {
+                       int unread,
+                       const char *delivery) {
     if (!panel_ok) return;
     screen = HW_UI_NOTIFY;
 
@@ -1023,7 +1019,9 @@ void hw_ui_show_notify(const char *level,
     snprintf(head, sizeof(head), "%s", level && level[0] ? level : "info");
     for (char *p = head; *p; p++) if (*p >= 'a' && *p <= 'z') *p -= 32;
     tft_draw_text(MARGIN, 4, head, COL_BG, accent, 2);
-    if (unread > 0) {
+    if (delivery && delivery[0]) {
+        tft_draw_text_r(PANEL_W - MARGIN, 4, delivery, COL_BG, accent, 2);
+    } else if (unread > 0) {
         char badge[16];
         snprintf(badge, sizeof(badge), "%d UNREAD", unread);
         tft_draw_text_r(PANEL_W - MARGIN, 4, badge, COL_BG, accent, 2);
@@ -1143,12 +1141,12 @@ static const char *const MENU_ITEMS[MENU_N] = {
 };
 
 // WiFi submenu
-static const int WIFI_MENU_N = 5;
-static const int WIFI_MENU_ROW0_Y = 48;
-static const int WIFI_MENU_ROW_H = 32;
-static const int WIFI_MENU_BAR_H = 28;
+static const int WIFI_MENU_N = 6;
+static const int WIFI_MENU_ROW0_Y = 38;
+static const int WIFI_MENU_ROW_H = 29;
+static const int WIFI_MENU_BAR_H = 25;
 static const char *const WIFI_MENU_ITEMS[WIFI_MENU_N] = {
-    "STATUS", "SCAN", "PROFILES", "TOGGLE WIFI", "BACK"
+    "STATUS", "SCAN", "PROFILES", "HIDDEN SSID", "TOGGLE WIFI", "BACK"
 };
 
 // MeshCore submenu
@@ -1168,15 +1166,6 @@ static const int LAYOUT_BAR_H = 28;
 static const char *const LAYOUT_ITEMS[LAYOUT_N] = {
     "ABC", "RU PHON", "RU", "BACK"
 };
-
-// Inbox list (same geometry language as menu). The rows are built from the
-// conversation store now, so there is no fixed item table: what used to be
-// {"CLAUDE","HERMES","BACK"} is whatever has been talked to, newest first.
-static const int AGENTS_ROW0_Y = 42;
-static const int AGENTS_ROW_H = 30;
-static const int AGENTS_BAR_H = 25;
-// Rows the panel has height for below the title bar. A longer list scrolls.
-static const int INBOX_ROWS_VISIBLE = 6;
 
 // Card action sheet (after click/Enter on a notification).
 static const int CARD_ACT_N = 4;
@@ -1318,14 +1307,15 @@ void hw_ui_show_layout(int selected, int current_layout) {
     layout_cur_drawn = current_layout;
 }
 
-// SETTINGS: LAYOUT / BACKLIGHT / AUTO-DIM / BACK
-static const int SETTINGS_N = 4;
-static const int SETTINGS_ROW0_Y = 48;
-static const int SETTINGS_ROW_H = 34;
-static const int SETTINGS_BAR_H = 28;
+// SETTINGS: LAYOUT / BACKLIGHT / AUTO-DIM / SILENT / AUTOLOCK / BACK
+static const int SETTINGS_N = 6;
+static const int SETTINGS_ROW0_Y = 38;
+static const int SETTINGS_ROW_H = 29;
+static const int SETTINGS_BAR_H = 25;
 
 static void settings_draw_row(int i, bool on,
-                              const char *bl_label, const char *idle_word) {
+                              const char *bl_label, const char *idle_word,
+                              bool silent, const char *autolock_word) {
     uint16_t y = (uint16_t)(SETTINGS_ROW0_Y + i * SETTINGS_ROW_H);
     uint16_t bar_y = y - 4;
     uint16_t bar_w = PANEL_W - 2 * MARGIN;
@@ -1335,6 +1325,8 @@ static void settings_draw_row(int i, bool on,
                               bl_label && bl_label[0] ? bl_label : "?");
     else if (i == 2) snprintf(label, sizeof(label), "AUTO-DIM %s",
                               idle_word && idle_word[0] ? idle_word : "?");
+    else if (i == 3) snprintf(label, sizeof(label), "SILENT %s", silent ? "ON" : "OFF");
+    else if (i == 4) snprintf(label, sizeof(label), "AUTOLOCK %s", autolock_word);
     else snprintf(label, sizeof(label), "BACK");
     if (on) {
         tft_fill_rect(MARGIN, bar_y, bar_w, SETTINGS_BAR_H, COL_ACCENT);
@@ -1347,22 +1339,27 @@ static void settings_draw_row(int i, bool on,
 
 void hw_ui_show_settings(int selected,
                          const char *bl_label,
-                         const char *idle_word) {
+                         const char *idle_word,
+                         bool silent,
+                         const char *autolock_word) {
     if (!panel_ok) return;
     if (selected < 0) selected = 0;
     if (selected >= SETTINGS_N) selected = SETTINGS_N - 1;
     if (!bl_label) bl_label = "";
     if (!idle_word) idle_word = "";
+    if (!autolock_word) autolock_word = "OFF";
 
     bool labels_same =
         (strncmp(settings_bl_cache, bl_label, sizeof(settings_bl_cache) - 1) == 0) &&
-        (strncmp(settings_idle_cache, idle_word, sizeof(settings_idle_cache) - 1) == 0);
+        (strncmp(settings_idle_cache, idle_word, sizeof(settings_idle_cache) - 1) == 0) &&
+        settings_silent_cache == (silent ? 1 : 0) &&
+        strcmp(settings_autolock_cache, autolock_word) == 0;
     HwSpiBusGuard bus;
 
     if (screen == HW_UI_SETTINGS && settings_sel_drawn >= 0 &&
         settings_sel_drawn != selected && labels_same) {
-        settings_draw_row(settings_sel_drawn, false, bl_label, idle_word);
-        settings_draw_row(selected, true, bl_label, idle_word);
+        settings_draw_row(settings_sel_drawn, false, bl_label, idle_word, silent, autolock_word);
+        settings_draw_row(selected, true, bl_label, idle_word, silent, autolock_word);
         settings_sel_drawn = selected;
         return;
     }
@@ -1374,10 +1371,12 @@ void hw_ui_show_settings(int selected,
     tft_fill_rect(0, 0, PANEL_W, 22, COL_ACCENT);
     tft_draw_text(MARGIN, 4, "SETTINGS", COL_BG, COL_ACCENT, 2);
     for (int i = 0; i < SETTINGS_N; i++)
-        settings_draw_row(i, i == selected, bl_label, idle_word);
+        settings_draw_row(i, i == selected, bl_label, idle_word, silent, autolock_word);
     settings_sel_drawn = selected;
     snprintf(settings_bl_cache, sizeof(settings_bl_cache), "%s", bl_label);
     snprintf(settings_idle_cache, sizeof(settings_idle_cache), "%s", idle_word);
+    settings_silent_cache = silent ? 1 : 0;
+    snprintf(settings_autolock_cache, sizeof(settings_autolock_cache), "%s", autolock_word);
 }
 
 static void mesh_draw_row(int i, bool on) {
@@ -1451,20 +1450,7 @@ void hw_ui_show_mesh_ping(const char *phase,
     tft_draw_text(MARGIN, PANEL_H - 16, "click = back", COL_DIM, COL_BG, 1);
 }
 
-// ---- dual-path ping result (glance: WiFi | Mesh) ---------------------------
-// Simple geometric icons so the eye hits OK/NO before reading text.
-
-static void ping_draw_wifi_icon(int cx, int cy, uint16_t col) {
-    /* Arc bars + stem — readable at a glance on 480×222. */
-    for (int b = 0; b < 3; b++) {
-        int w = 10 + b * 14;
-        int y = cy - 22 + b * 10;
-        tft_fill_rect((uint16_t)(cx - w / 2), (uint16_t)y,
-                      (uint16_t)w, 4, col);
-    }
-    tft_fill_rect((uint16_t)(cx - 3), (uint16_t)(cy + 10), 6, 10, col);
-    tft_fill_rect((uint16_t)(cx - 8), (uint16_t)(cy + 18), 16, 4, col);
-}
+// ---- MeshCore ping result --------------------------------------------------
 
 static void ping_draw_mesh_icon(int cx, int cy, uint16_t col) {
     /* Three nodes + links — MeshCore private path, not WiFi. */
@@ -1494,54 +1480,44 @@ static void ping_draw_path_column(int cx, bool ok,
     uint16_t muted = ok ? COL_TIME : COL_DIM;
 
     /* label above icon */
-    int lab_w = (int)strlen(label) * 12;  // scale-2 cell ≈12px
+    int lab_w = (int)text_width(label, 2);
     tft_draw_text((uint16_t)(cx - lab_w / 2), 30, label, muted, COL_BG, 2);
 
     draw_icon(cx, 88, col);
 
     /* big OK / NO */
     const char *word = ok ? "OK" : "NO";
-    int ww = (int)strlen(word) * 18;  // scale 3
+    int ww = (int)text_width(word, 3);
     tft_draw_text((uint16_t)(cx - ww / 2), 130, word, col, COL_BG, 3);
 
     /* strength lines — slightly smaller */
     uint16_t y = 162;
     if (sub1 && sub1[0]) {
-        int sw = (int)strlen(sub1) * 12;
+        int sw = (int)text_width(sub1, 2);
         tft_draw_text((uint16_t)(cx - sw / 2), y, sub1, muted, COL_BG, 2);
         y = (uint16_t)(y + 22);
     }
     if (sub2 && sub2[0]) {
-        int sw = (int)strlen(sub2) * 6;
+        int sw = (int)text_width(sub2, 1);
         tft_draw_text((uint16_t)(cx - sw / 2), y, sub2, COL_DIM, COL_BG, 1);
     }
 }
 
-void hw_ui_show_mesh_ping_result(bool wifi_ok, const char *wifi_sub1,
-                                 const char *wifi_sub2,
-                                 bool mesh_ok, const char *mesh_sub1,
+void hw_ui_show_mesh_ping_result(bool mesh_ok, const char *mesh_sub1,
                                  const char *mesh_sub2) {
     if (!panel_ok) return;
     screen = HW_UI_MESH_PING;
 
     HwSpiBusGuard bus;
     tft_fill(COL_BG);
-    uint16_t accent = (wifi_ok || mesh_ok) ? COL_INFO : COL_CRIT;
-    if (wifi_ok && mesh_ok) accent = COL_INFO;
-    else if (wifi_ok || mesh_ok) accent = COL_WARN;
+    uint16_t accent = mesh_ok ? COL_INFO : COL_CRIT;
 
     tft_fill_rect(0, 0, PANEL_W, 22, accent);
     tft_draw_text(MARGIN, 4, "MESH PING", COL_BG, accent, 2);
-    const char *tag = (wifi_ok && mesh_ok) ? "BOTH"
-                    : (wifi_ok ? "WIFI" : (mesh_ok ? "MESH" : "NONE"));
+    const char *tag = mesh_ok ? "OK" : "NO";
     tft_draw_text_r(PANEL_W - MARGIN, 4, tag, COL_BG, accent, 2);
 
-    /* vertical divider */
-    tft_fill_rect(PANEL_W / 2 - 1, 28, 2, PANEL_H - 48, COL_RULE);
-
-    ping_draw_path_column(PANEL_W / 4, wifi_ok, "WiFi",
-                          ping_draw_wifi_icon, wifi_sub1, wifi_sub2);
-    ping_draw_path_column(3 * PANEL_W / 4, mesh_ok, "Mesh",
+    ping_draw_path_column(PANEL_W / 2, mesh_ok, "Mesh",
                           ping_draw_mesh_icon, mesh_sub1, mesh_sub2);
 
     tft_draw_text(MARGIN, PANEL_H - 16, "click = back", COL_DIM, COL_BG, 1);
@@ -1579,8 +1555,8 @@ void hw_ui_show_wifi(int selected) {
     tft_fill(COL_BG);
     tft_fill_rect(0, 0, PANEL_W, 22, COL_ACCENT);
     tft_draw_text(MARGIN, 4, "WIFI", COL_BG, COL_ACCENT, 2);
-    tft_draw_text_r(PANEL_W - MARGIN, 6, "STA+WG", COL_BG, COL_ACCENT, 1);
-    tft_draw_text(MARGIN, 32, "networks + tunnel", COL_DIM, COL_BG, 1);
+    tft_draw_text_r(PANEL_W - MARGIN, 6, "STA", COL_BG, COL_ACCENT, 1);
+    tft_draw_text(MARGIN, 32, "networks", COL_DIM, COL_BG, 1);
     for (int i = 0; i < WIFI_MENU_N; i++) wifi_menu_draw_row(i, i == selected);
     wifi_sel_drawn = selected;
 }
@@ -1641,16 +1617,16 @@ void hw_ui_show_wifi_list(const char *header,
     wifi_list_n_drawn = n;
 }
 
-void hw_ui_show_wifi_info(const char *const *lines, int n_lines) {
+void hw_ui_show_wifi_progress(const char *const *lines, int n_lines) {
     if (!panel_ok) return;
-    screen = HW_UI_WIFI_INFO;
+    screen = HW_UI_WIFI_PROGRESS;
     if (n_lines < 0) n_lines = 0;
     if (n_lines > 12) n_lines = 12;
 
     HwSpiBusGuard bus;
     tft_fill(COL_BG);
     tft_fill_rect(0, 0, PANEL_W, 22, COL_ACCENT);
-    tft_draw_text(MARGIN, 4, "WIFI STATUS", COL_BG, COL_ACCENT, 2);
+    tft_draw_text(MARGIN, 4, "WIFI", COL_BG, COL_ACCENT, 2);
 
     uint16_t y = 32;
     for (int i = 0; i < n_lines; i++) {
@@ -1660,103 +1636,6 @@ void hw_ui_show_wifi_info(const char *const *lines, int n_lines) {
         if (y > PANEL_H - 24) break;
     }
     tft_draw_text(MARGIN, PANEL_H - 16, "click = back", COL_DIM, COL_BG, 1);
-}
-
-/* One inbox row: "<glyph> <mark><label>".
- *
- * The glyph is drawn in its own column rather than glued to the label, so the
- * eye can run down the transports without reading the names — which is the
- * point of having it on a seven-row screen. The label is text scale 2 like the
- * old fixed rows; the glyph shares that scale so it cannot be mistaken for
- * part of the name. */
-static void inbox_draw_row(const char *label, char glyph, bool unread,
-                           int i, bool on) {
-    uint16_t y = (uint16_t)(AGENTS_ROW0_Y + i * AGENTS_ROW_H);
-    uint16_t bar_y = y - 4;
-    uint16_t bar_w = PANEL_W - 2 * MARGIN;
-    uint16_t fg = on ? COL_BG : COL_TIME;
-    uint16_t bg = on ? COL_ACCENT : COL_BG;
-    tft_fill_rect(MARGIN, bar_y, bar_w, AGENTS_BAR_H, bg);
-    char g[2] = { glyph ? glyph : ' ', '\0' };
-    tft_draw_text(MARGIN + 6, y, g, fg, bg, 2);
-    char row[CONV_LABEL_LEN + 2];
-    snprintf(row, sizeof(row), "%c%s", unread ? '*' : ' ', label ? label : "");
-    tft_draw_text(MARGIN + 28, y, row, fg, bg, 2);
-}
-
-/* The BACK row keeps the old look: no glyph column, no marker. */
-static void inbox_draw_back(int i, bool on) {
-    uint16_t y = (uint16_t)(AGENTS_ROW0_Y + i * AGENTS_ROW_H);
-    uint16_t bar_w = PANEL_W - 2 * MARGIN;
-    uint16_t fg = on ? COL_BG : COL_TIME;
-    uint16_t bg = on ? COL_ACCENT : COL_BG;
-    tft_fill_rect(MARGIN, y - 4, bar_w, AGENTS_BAR_H, bg);
-    tft_draw_text(MARGIN + 12, y, "BACK", fg, bg, 2);
-}
-
-/* Drop the drawn-state memo so the next hw_ui_show_inbox() repaints in full
- * even when the selection has not moved — the row CONTENT changed. Without it
- * a rebuilt list silently redraws nothing and keeps showing stale names. */
-void hw_ui_inbox_invalidate(void) { agents_sel_drawn = -1; }
-
-void hw_ui_show_inbox(const char *const *labels, const char *glyphs,
-                      const int *unread, int count, int selected,
-                      bool bridge_ok) {
-    if (!panel_ok) return;
-    if (count < 0) count = 0;
-    int total = count + 1;                 /* conversations + BACK */
-    if (selected < 0) selected = 0;
-    if (selected >= total) selected = total - 1;
-
-    /* Scroll so the selection is always on screen: the list is as long as the
-     * user has correspondents, and a fixed window would make the newest
-     * conversations unreachable once there are more than fit. */
-    int first = 0;
-    if (total > INBOX_ROWS_VISIBLE) {
-        if (selected >= INBOX_ROWS_VISIBLE) first = selected - INBOX_ROWS_VISIBLE + 1;
-        if (first > total - INBOX_ROWS_VISIBLE) first = total - INBOX_ROWS_VISIBLE;
-        if (first < 0) first = 0;
-    }
-    int shown = total - first;
-    if (shown > INBOX_ROWS_VISIBLE) shown = INBOX_ROWS_VISIBLE;
-
-    HwSpiBusGuard bus;
-    /* Full repaint whenever the window moved; otherwise only the two rows that
-     * changed, which is what keeps knob scrolling from flickering. */
-    static int inbox_first_drawn = -1;
-    if (screen == HW_UI_AGENTS && agents_sel_drawn >= 0 &&
-        agents_sel_drawn != selected && inbox_first_drawn == first) {
-        int a = agents_sel_drawn - first, b = selected - first;
-        for (int k = 0; k < shown; k++) {
-            if (k != a && k != b) continue;
-            int r = first + k;
-            if (r < count) inbox_draw_row(labels ? labels[r] : "",
-                                          glyphs ? glyphs[r] : ' ',
-                                          unread && unread[r] > 0, k, r == selected);
-            else           inbox_draw_back(k, r == selected);
-        }
-        agents_sel_drawn = selected;
-        return;
-    }
-    if (screen == HW_UI_AGENTS && agents_sel_drawn == selected &&
-        inbox_first_drawn == first)
-        return;
-
-    screen = HW_UI_AGENTS;
-    tft_fill(COL_BG);
-    tft_fill_rect(0, 0, PANEL_W, 22, COL_ACCENT);
-    tft_draw_text(MARGIN, 4, "INBOX", COL_BG, COL_ACCENT, 2);
-    tft_draw_text_r(PANEL_W - MARGIN, 6, bridge_ok ? "bridge" : "local",
-                    COL_BG, COL_ACCENT, 1);
-    for (int k = 0; k < shown; k++) {
-        int r = first + k;
-        if (r < count) inbox_draw_row(labels ? labels[r] : "",
-                                      glyphs ? glyphs[r] : ' ',
-                                      unread && unread[r] > 0, k, r == selected);
-        else           inbox_draw_back(k, r == selected);
-    }
-    agents_sel_drawn = selected;
-    inbox_first_drawn = first;
 }
 
 // Session list for one agent — like AGENTS but rows are smaller (up to
@@ -1961,8 +1840,6 @@ int hw_ui_show_agent_chat(const char *agent_name,
     bool same_room = (screen == HW_UI_AGENT_CHAT &&
                       strncmp(chat_head, head, sizeof(chat_head)) == 0);
     screen = HW_UI_AGENT_CHAT;
-    agents_sel_drawn = -1;
-
     if (!same_room) {
         tft_fill(COL_BG);
         tft_fill_rect(0, 0, PANEL_W, 22, COL_ACCENT);
@@ -2114,16 +1991,21 @@ static uint16_t msglist_glyph_color(char g, bool is_conv) {
     return COL_INFO;
 }
 
-static uint8_t msglist_mask_of(const bool *unread, int count) {
-    uint8_t m = 0;
+static uint32_t msglist_mask_of(const bool *unread, int count) {
+    uint32_t m = 0;
     if (!unread) return 0;
-    for (int i = 0; i < count && i < 8; i++)
-        if (unread[i]) m |= (uint8_t)(1u << i);
+    for (int i = 0; i < count && i < HW_UI_MSGLIST_MAX; i++)
+        if (unread[i]) m |= (uint32_t)(1u << i);
     return m;
 }
 
-// Row:  [*| ][W]  Title…     — * only when NEW; title bright vs dim.
+static void msglist_copy_title(const char *raw, char *out, size_t out_n) {
+    utf8_text_copy(out, out_n, raw, 28, true);
+}
+
+// Row:  [*| ][W]  Title…                  HH:MM
 static void msglist_draw_row(const char *const *titles,
+                             const char *const *times,
                              const char *glyphs,
                              const bool *is_conv,
                              const bool *unread,
@@ -2154,21 +2036,20 @@ static void msglist_draw_row(const char *const *titles,
     // Severity letter chip
     tft_draw_text(MARGIN + 30, y + 4, letter, chip_fg, bg, 2);
 
-    // Title — truncate so it never crashes the right edge (scale-2 ~12px/glyph)
+    // Title — truncate by code point so Cyrillic remains valid UTF-8.
     const char *raw = (titles && titles[i] && titles[i][0]) ? titles[i] : "(no title)";
-    char t[36];
-    // ~28 glyphs fit after mark+chip (x≈54 … 468)
-    snprintf(t, sizeof(t), "%s", raw);
-    if (strlen(t) > 28) {
-        t[27] = '.';
-        t[26] = '.';
-        t[25] = '.';
-        t[28] = '\0';
-    }
+    static char t[FEED_LABEL_LEN];
+    msglist_copy_title(raw, t, sizeof(t));
     tft_draw_text(MARGIN + 52, y + 4, t, title_fg, bg, 2);
+
+    const char *stamp = (times && times[i]) ? times[i] : "";
+    if (stamp[0])
+        tft_draw_text_r(PANEL_W - MARGIN - 4, y + 8, stamp,
+                        on ? COL_BG : COL_DIM, bg, 1);
 }
 
 void hw_ui_show_msglist(const char *const *titles,
+                        const char *const *times,
                         const char *glyphs,
                         const bool *is_conv,
                         const bool *unread,
@@ -2182,7 +2063,7 @@ void hw_ui_show_msglist(const char *const *titles,
     if (count > 0 && selected >= count) selected = count - 1;
 
     int top = (count > 0) ? msglist_top_for(selected, count) : 0;
-    uint8_t mask = msglist_mask_of(unread, count);
+    uint32_t mask = msglist_mask_of(unread, count);
     HwSpiBusGuard bus;
 
     // Same list + unread set + scroll window → only move the selection bar.
@@ -2196,10 +2077,10 @@ void hw_ui_show_msglist(const char *const *titles,
         int old_row = msglist_sel_drawn - top;
         int new_row = selected - top;
         if (old_row >= 0 && old_row < MSGLIST_VIS)
-            msglist_draw_row(titles, glyphs, is_conv, unread, msglist_sel_drawn,
+            msglist_draw_row(titles, times, glyphs, is_conv, unread, msglist_sel_drawn,
                              (uint16_t)(MSGLIST_ROW0_Y + old_row * MSGLIST_ROW_H), false);
         if (new_row >= 0 && new_row < MSGLIST_VIS)
-            msglist_draw_row(titles, glyphs, is_conv, unread, selected,
+            msglist_draw_row(titles, times, glyphs, is_conv, unread, selected,
                              (uint16_t)(MSGLIST_ROW0_Y + new_row * MSGLIST_ROW_H), true);
         msglist_sel_drawn = selected;
         return;
@@ -2248,7 +2129,7 @@ void hw_ui_show_msglist(const char *const *titles,
     for (int row = 0; row < MSGLIST_VIS; row++) {
         int i = top + row;
         if (i >= count) break;
-        msglist_draw_row(titles, glyphs, is_conv, unread, i,
+        msglist_draw_row(titles, times, glyphs, is_conv, unread, i,
                          (uint16_t)(MSGLIST_ROW0_Y + row * MSGLIST_ROW_H),
                          i == selected);
         // Subtle separator between rows (Symbian-era lists had rules)
@@ -2451,7 +2332,8 @@ void hw_ui_show_net(const char *const *labels,
                     COL_DIM, COL_BG, 1);
 }
 
-void hw_ui_show_reply(const char *title,
+void hw_ui_show_reply(const char *mode,
+                      const char *title,
                       const char *buffer,
                       bool caps,
                       bool symbol,
@@ -2462,7 +2344,8 @@ void hw_ui_show_reply(const char *title,
     HwSpiBusGuard bus;
     tft_fill(COL_BG);
     tft_fill_rect(0, 0, PANEL_W, 22, COL_ACCENT);
-    tft_draw_text(MARGIN, 4, "REPLY", COL_BG, COL_ACCENT, 2);
+    tft_draw_text(MARGIN, 4, mode && mode[0] ? mode : "COMPOSE",
+                  COL_BG, COL_ACCENT, 2);
     // Badge: layout (ABC/PHON/RU) + CAPS + 123 while ALT held.
     char mods[28];
     const char *lay = (layout_name && layout_name[0]) ? layout_name : "ABC";
@@ -2553,10 +2436,8 @@ void hw_ui_show_reply(const char *title,
 
 void hw_ui_show_info(const char *version,
                      const char *host,
-                     const char *ip,
                      const char *token,
-                     uint32_t free_heap,
-                     int unread) {
+                     uint32_t free_heap) {
     if (!panel_ok) return;
     screen = HW_UI_INFO;
 
@@ -2571,11 +2452,7 @@ void hw_ui_show_info(const char *version,
     tft_draw_text(MARGIN, y, line, COL_TIME, COL_BG, 2); y += 28;
     snprintf(line, sizeof(line), "HOST  %s", host ? host : "?");
     tft_draw_text(MARGIN, y, line, COL_TIME, COL_BG, 2); y += 28;
-    snprintf(line, sizeof(line), "IP    %s", ip && ip[0] ? ip : "offline");
-    tft_draw_text(MARGIN, y, line, COL_TIME, COL_BG, 2); y += 28;
     snprintf(line, sizeof(line), "HEAP  %u", (unsigned)free_heap);
-    tft_draw_text(MARGIN, y, line, COL_DIM, COL_BG, 2); y += 28;
-    snprintf(line, sizeof(line), "INBOX %d unread", unread);
     tft_draw_text(MARGIN, y, line, COL_DIM, COL_BG, 2); y += 28;
     tft_draw_text(MARGIN, y, "TOKEN", COL_DIM, COL_BG, 1); y += 16;
     tft_draw_text(MARGIN, y, token && token[0] ? token : "(none)", COL_TIME, COL_BG, 1);

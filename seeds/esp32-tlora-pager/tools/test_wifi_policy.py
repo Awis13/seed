@@ -86,10 +86,10 @@ assert "mesh_owned" not in send
 assert "agent_pick_transport(" in send, (
     "the WiFi rung must be chosen by the pure reachability picker"
 )
-assert "agents_bridge_post(conv_id, session, text)" in send, (
+assert "agents_bridge_post(conv_id, session, text, delivery_key)" in send, (
     "the WiFi rung is still a bridge POST"
 )
-assert "g_agents_mesh_uplink(conv_id, text)" in send, (
+assert "g_agents_mesh_uplink(conv_id, text, delivery_key)" in send, (
     "the mesh uplink remains the fallback rung"
 )
 

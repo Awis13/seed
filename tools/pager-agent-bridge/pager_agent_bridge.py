@@ -3,7 +3,7 @@
 pager-agent-bridge — thin LAN bridge: T-Lora AGENTS skill ↔ Hermes API server.
 
 Pager contract (seed skills/agents.cpp):
-  POST /v1/chat  JSON { "agent", "session", "text", "from" }
+  POST /v1/chat  JSON { "agent", "session", "text", "from", "id"? }
   → 2xx means "accepted"; real reply is pushed later.
 
 Hermes (docs: api-server.md):
@@ -12,8 +12,8 @@ Hermes (docs: api-server.md):
   OpenAI-compatible; full agent tool loop runs server-side.
 
 Reply path:
-  1) POST pager /agents/inbound  {agent, text}  — thread on device
-  2) POST pager /notify          {source, title, body, level} — buzz + card
+  POST pager /agents/inbound {agent, text, id?}; the pager's backing card is
+  the single receiver and points at the durably stored thread line.
 
 Env (or flags):
   BRIDGE_ADDR=0.0.0.0:8091
@@ -27,8 +27,10 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import threading
+import time
 import traceback
 import urllib.error
 import urllib.request
@@ -48,6 +50,30 @@ SYSTEM = (
     "ASCII + Cyrillic only — no emoji, no markdown fences. "
     "Prefer clear prose under ~1500 characters; he can scroll."
 )
+
+_DELIVERY_TTL_S = 300.0
+_delivery_lock = threading.Lock()
+_deliveries: dict[str, float] = {}
+
+
+def _delivery_reserve(delivery_id: str) -> bool:
+    """Reserve a keyed request once; keyless requests remain distinct."""
+    if not delivery_id:
+        return True
+    now = time.monotonic()
+    with _delivery_lock:
+        stale = [key for key, stamp in _deliveries.items() if now - stamp > _DELIVERY_TTL_S]
+        for key in stale:
+            _deliveries.pop(key, None)
+        if delivery_id in _deliveries:
+            return False
+        _deliveries[delivery_id] = now
+    return True
+
+
+def _reply_delivery_id(delivery_id: str) -> str:
+    candidate = f"{delivery_id}.r"
+    return candidate if re.fullmatch(r"[A-Za-z0-9_.:-]{1,24}", candidate) else ""
 
 
 def _http_json(
@@ -126,7 +152,7 @@ def hermes_chat(session: str, text: str) -> str:
     return cleaned or "(empty reply)"
 
 
-def pager_push(agent: str, text: str) -> None:
+def pager_push(agent: str, text: str, delivery_id: str = "") -> None:
     if not PAGER_TOKEN:
         print("PAGER_TOKEN missing; skip push", file=sys.stderr)
         return
@@ -134,28 +160,16 @@ def pager_push(agent: str, text: str) -> None:
     # 1) Full reply → chat room (may be long; pager splits + scrolls).
     # Slice by characters (not bytes) so UTF-8 Cyrillic stays intact.
     inbound = text[:3500]
+    payload = {"agent": agent, "text": inbound}
+    reply_id = _reply_delivery_id(delivery_id)
+    if reply_id:
+        payload["id"] = reply_id
     _http_json(
         "POST",
         f"{PAGER_URL}/agents/inbound",
-        body={"agent": agent, "text": inbound},
+        body=payload,
         headers=auth,
         timeout=12.0,
-    )
-    # 2) Notify is only a HEADER / door into the chat room.
-    name = agent.upper()[:16]
-    teaser = text[:48] + ("..." if len(text) > 48 else "")
-    _http_json(
-        "POST",
-        f"{PAGER_URL}/notify",
-        body={
-            "level": "info",
-            "source": agent[:16],
-            "title": name,
-            "body": teaser or "new reply - open chat",
-            "id": f"{agent}-chat"[:24],
-        },
-        headers=auth,
-        timeout=8.0,
     )
 
 
@@ -163,14 +177,19 @@ def handle_chat(payload: dict) -> tuple[int, dict]:
     agent = (payload.get("agent") or "").strip().lower()
     text = (payload.get("text") or "").strip()
     session = (payload.get("session") or "pager").strip() or "pager"
+    delivery_id = str(payload.get("id") or "")
     if agent not in ("hermes", "grok", "claude"):
         return 400, {"error": "agent must be hermes, grok or claude"}
     if not text:
         return 400, {"error": "text required"}
+    if delivery_id and not re.fullmatch(r"[A-Za-z0-9_.:-]{1,24}", delivery_id):
+        return 400, {"error": "invalid id"}
+    if not _delivery_reserve(delivery_id):
+        return 202, {"ok": True, "queued": True, "agent": agent, "duplicate": True}
     if agent != "hermes":
         # Phase 2: only Hermes wired. Others get an honest stub.
         def _stub() -> None:
-            pager_push(agent, f"(bridge: {agent} not wired yet)")
+            pager_push(agent, f"(bridge: {agent} not wired yet)", delivery_id)
 
         threading.Thread(target=_stub, daemon=True).start()
         return 202, {"ok": True, "queued": True, "agent": agent, "stub": True}
@@ -179,11 +198,11 @@ def handle_chat(payload: dict) -> tuple[int, dict]:
         try:
             reply = hermes_chat(session, text)
             print(f"[bridge] hermes << {text!r} >> {reply!r}", flush=True)
-            pager_push("hermes", reply)
+            pager_push("hermes", reply, delivery_id)
         except Exception:
             traceback.print_exc()
             try:
-                pager_push("hermes", "(bridge exception — see home-rig log)")
+                pager_push("hermes", "(bridge exception — see home-rig log)", delivery_id)
             except Exception:
                 pass
 

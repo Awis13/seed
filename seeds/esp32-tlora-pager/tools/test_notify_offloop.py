@@ -129,6 +129,11 @@ assert setup.index("history_begin();") < setup.index("notify_restore_from_archiv
     "notify_restore_from_archive must run AFTER history_begin (archive mounted + "
     "index seeded before the ring is rebuilt)"
 )
+assert setup.index("skills_init();") < setup.index("history_begin();"), (
+    "conversation init must finish before notify archive restore/reconciliation"
+)
+skills = fn_body(main, "static void skills_init()")
+assert skills.index("skill_agents_init();") < skills.index("skill_meshcore_init();")
 restore = fn_body(main, "static void notify_restore_from_archive()")
 assert "history_restore_at(MICRON_NS_NOTIFY" in restore, (
     "boot-restore must walk the archive index for MICRON_NS_NOTIFY, newest-first"
@@ -136,5 +141,111 @@ assert "history_restore_at(MICRON_NS_NOTIFY" in restore, (
 assert "notify_rec_decode(" in restore and "notify_restore_one(" in restore, (
     "boot-restore must decode each archived card body and insert it into the ring"
 )
+assert "notify_restore_finish(restored);" in restore
+assert "notify_reconcile_restored_chats();" in restore
+assert restore.index("notify_restore_finish(restored);") < restore.index(
+    "notify_reconcile_restored_chats();"
+), "legacy chat doors must reconcile only after the complete archive restore"
+reconcile = fn_body(main, "static void notify_reconcile_restored_chats() {")
+assert "notify_chat_reconcile_plan(" in reconcile
+assert "agents_restore_inbound(" in reconcile
+assert "notify_chat_restore_before(" in reconcile, (
+    "restored chat doors must be replayed oldest-first"
+)
+assert "agents_has_origin(" in reconcile, (
+    "boot dedup must use durable card origin, never text equality"
+)
+assert "NOTIFY_CHAT_DRAIN_ACK_ROUTED" in reconcile
+assert "blocked[ax] = true" in reconcile
+assert "notify_chat_retry_pending = true" in reconcile
+assert reconcile.index("agents_restore_inbound(") < reconcile.index(
+    "notify_ack_id(view.id);"
+), "a restored card may be ACKed only after the thread accepts it"
+assert "ui_note_input" not in reconcile and "ui_note_wake" not in reconcile
+assert "SPIFFS" not in reconcile and "history_enqueue" not in reconcile, (
+    "boot reconciliation must persist only through notify_ack_id"
+)
+runtime = fn_body(main, "static bool notify_reconcile_pending_chats(")
+assert "agents_chat_door_enqueue(" in runtime
+assert "agents_has_origin(" not in runtime and "agents_on_inbound(" not in runtime
+assert "notify_ack" not in runtime, (
+    "loop-side pending scan may only enqueue; origin scan, durable append and ACK wait for completion"
+)
+completion = fn_body(main, "static void notify_take_chat_completions(")
+assert "notify_ack_identity(" in completion
+assert "notify_chat_inflight_remove(done.conversation, &done.event)" in completion
+assert "done.slot_hint" not in completion
+pending = fn_body(main, "static bool notify_reconcile_pending_chats(")
+assert "notify_chat_inflight_find(resolution.id)" in pending
+assert "notify_chat_inflight_add(resolution.id, &view.event_id)" in pending
+assert "notify_set_event_distinct_fn(notify_event_distinct_cb);" in main
+classifier = fn_body(main, "static bool notify_event_distinct_cb(const char *source, const char *key) {")
+assert "agents_notify_chat_resolve_snapshot(" in classifier
+
+agents = (ROOT / "src" / "skills" / "agents.cpp").read_text(encoding="utf-8")
+worker = fn_body(agents, "static void agents_route_task(")
+assert "agents_has_origin(" in worker and "agents_on_inbound(" in worker
+assert worker.index("agents_has_origin(") < worker.index("agents_on_inbound(")
+assert "xQueueSend(g_door_done_q, &done, portMAX_DELAY)" in worker
+assert "item.door_source, item.door_key" in worker
+assert "notify_chat_stable_slot(" in worker
+enqueue = fn_body(agents, "static bool agents_chat_door_enqueue(")
+assert "strcmp(g_convs[idx].id, conversation) != 0" in enqueue
+assert "item.via =" not in enqueue, "notification jobs must not retain recyclable slots"
+snapshot = fn_body(agents, "static NotifyChatResolution agents_notify_chat_resolve_snapshot(")
+assert "portENTER_CRITICAL(&agents_registry_spin)" in snapshot
+assert "agents_lock" not in snapshot and "xSemaphoreTake" not in snapshot
+assert "agents_registry_publish_locked();" in agents
+append = fn_body(agents, "static bool agents_store_append(int idx, bool from_me, const char *text,")
+persist = append.index("if (!persisted) return false;")
+assert persist < append.index("a.last.from_me = from_me;")
+assert persist < append.index("agents_view_append(g_win")
+assert persist < append.index("a.unread++")
+assert "if (!persisted) return false;" in append, (
+    "verified persistence failure must stop before RAM/unread state changes"
+)
+record = fn_body(agents, "static size_t agents_record_build(")
+assert all(field in record for field in
+           ('\\"origin_id\\"', '\\"origin_key\\"', '\\"origin_event\\"')), (
+    "notification-backed lines must persist durable origin correlation"
+)
+origin = fn_body(agents, "static bool agents_has_origin(")
+assert "for (int i = 0; i < a.n_sessions && !found; i++)" in origin, (
+    "origin search must cover non-active rooms too"
+)
+assert "agents_jsonl_origin_matches(record, origin_id," in origin
+assert "notify_event_id_valid(origin_event)" in origin
+matcher = fn_body(agents, "static bool agents_jsonl_origin_matches(")
+assert "notify_event_origin_matches(" in matcher, (
+    "numeric ids and reused client keys must never deduplicate distinct events"
+)
+
+notify = (ROOT / "src" / "skills" / "notify.cpp").read_text(encoding="utf-8")
+take_event = fn_body(notify, "static bool notify_event_take(NotifyEventId &out) {")
+assert "portENTER_CRITICAL" in take_event
+assert "notify_event_ram_take(" in take_event
+for forbidden in ("Preferences", "notify_event_reserve_locked", "portMAX_DELAY",
+                  "xSemaphoreTake"):
+    assert forbidden not in take_event, f"live event allocation must not use {forbidden}"
+raise_fn = fn_body(notify, "static uint32_t notify_raise(")
+assert "Preferences" not in raise_fn and "notify_event_reserve_locked" not in raise_fn
+init_fn = fn_body(notify, "static void skill_notify_init() {")
+assert "notify_event_reserve_locked();" in init_fn
+reserve = fn_body(notify, "static bool notify_event_reserve_locked() {")
+assert 'putULong64("counter_hi", new_limit)' in reserve
+assert 'getULong64("counter_hi", 0) == new_limit' in reserve
+assert 'NOTIFY_EVENT_STATE_INITIALIZING' in reserve
+assert 'NOTIFY_EVENT_STATE_READY' in reserve
+assert 'getType("counter_hi") == PT_U64' in reserve
+assert reserve.index('putULong64("counter_hi", new_limit)') < reserve.index(
+    "notify_event_next.counter = reservation.first;"
+), "a counter block must persist and read back before any identity is issued"
+verified = fn_body(agents, "static bool agents_store_append_verified(")
+for required in ("ftruncate", "fsync", "agents_fd_write_all",
+                 "agents_fd_read_all", "memcmp", "agents_fd_rollback"):
+    assert required in verified, f"strict door append must use {required}"
+write_path = verified[verified.index("agents_fd_write_all") :]
+assert write_path.index("fsync(fd)") < write_path.index("close(fd)")
+assert "O_RDONLY" in verified, "verification must reopen the file after close"
 
 print("notify off-loop persistence pin: OK")

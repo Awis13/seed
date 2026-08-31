@@ -1114,6 +1114,7 @@ async def handle_c1_uplink(sender: str, text: str) -> None:
             "session": "pager-mesh",
             "text": full,
             "from": "tlora-mesh",
+            "id": mid,
         },
         30.0,
     )

@@ -17,7 +17,6 @@ enum UiNavScreen : uint8_t {
     UINAV_NOTIFY,
     UINAV_CARD_ACT,
     UINAV_MENU,
-    UINAV_AGENTS,
     UINAV_AGENT_CHAT,
     UINAV_AGENT_ACT,
     UINAV_AGENT_SESSIONS,
@@ -30,7 +29,7 @@ enum UiNavScreen : uint8_t {
     UINAV_MESH_PING,
     UINAV_WIFI,
     UINAV_WIFI_LIST,
-    UINAV_WIFI_INFO,
+    UINAV_WIFI_PROGRESS,
     UINAV_PAGE,
     UINAV_CONTACTS,
     UINAV_NET,
@@ -51,15 +50,24 @@ static inline bool ui_nav_is_text_entry(uint8_t screen) {
 // backs out to its room list (so the list stays reachable after we drop the
 // intermediate stop and open the active room directly); a single-room chat backs
 // straight to the unified feed.
-static inline uint8_t ui_nav_back_target(uint8_t screen, bool has_rooms) {
+//
+// sessions_origin only matters for AGENT_SESSIONS: the picker can be entered
+// forward from the unified feed (MSGLIST) or from the contacts list (CONTACTS),
+// so it backs out to whichever list opened it. Defaults to MSGLIST — the
+// historical target and the value every non-forward path passes.
+//
+// net_origin matters for NET because both WiFi STATUS and MeshCore STATUS open
+// the shared screen. It defaults to WiFi for existing callers.
+static inline uint8_t ui_nav_back_target(uint8_t screen, bool has_rooms,
+                                         uint8_t sessions_origin = UINAV_MSGLIST,
+                                         uint8_t net_origin = UINAV_WIFI) {
     switch (screen) {
     case UINAV_NOTIFY:         return UINAV_MSGLIST;
     case UINAV_CARD_ACT:       return UINAV_NOTIFY;
     case UINAV_MENU:           return UINAV_CLOCK;
-    case UINAV_AGENTS:         return UINAV_MENU;
     case UINAV_AGENT_CHAT:     return has_rooms ? UINAV_AGENT_SESSIONS : UINAV_MSGLIST;
     case UINAV_AGENT_ACT:      return UINAV_AGENT_CHAT;
-    case UINAV_AGENT_SESSIONS: return UINAV_MSGLIST;
+    case UINAV_AGENT_SESSIONS: return sessions_origin;
     case UINAV_MSGLIST:        return UINAV_MENU;
     case UINAV_INFO:           return UINAV_MENU;
     case UINAV_LAYOUT:         return UINAV_SETTINGS;
@@ -68,10 +76,10 @@ static inline uint8_t ui_nav_back_target(uint8_t screen, bool has_rooms) {
     case UINAV_MESH_PING:      return UINAV_MESHCORE;
     case UINAV_WIFI:           return UINAV_MENU;
     case UINAV_WIFI_LIST:      return UINAV_WIFI;
-    case UINAV_WIFI_INFO:      return UINAV_WIFI;
+    case UINAV_WIFI_PROGRESS:  return UINAV_WIFI;
     case UINAV_PAGE:           return UINAV_CLOCK;
     case UINAV_CONTACTS:       return UINAV_MENU;
-    case UINAV_NET:            return UINAV_WIFI;  // reached from the WiFi menu
+    case UINAV_NET:            return net_origin;
     default:                   return screen;  // CLOCK, REPLY: no back
     }
 }
@@ -80,4 +88,12 @@ static inline uint8_t ui_nav_back_target(uint8_t screen, bool has_rooms) {
 // entry and it is not the root clock).
 static inline bool ui_nav_backspace_goes_back(uint8_t screen) {
     return !ui_nav_is_text_entry(screen) && screen != UINAV_CLOCK;
+}
+
+// Forward-open policy for a conversation row: always enter its active chat.
+// Multi-session conversations still expose their picker by backing out of the
+// chat, so the common "tap Hermes and read/reply" path remains one tap.
+static inline uint8_t ui_nav_conv_open_target(int session_count) {
+    (void)session_count;
+    return UINAV_AGENT_CHAT;
 }

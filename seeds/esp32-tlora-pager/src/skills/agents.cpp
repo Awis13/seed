@@ -57,11 +57,15 @@
 #include <SPI.h>
 
 #include "../agents_chat_route.h"  // chat-route seam: claude_route_incoming + pure planner
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/stat.h>
 #include "../conv_store.h"         // the conversation record: keys, manifest, transports
 #include "../mesh/contact_record.h" // /contacts3 layout: which peers this device has met
 #include "../transport.h"          // the backend contract: transport_send + the inbox doors
 #include "../rns/outbox.h"         // the OTHER half of that seam: rns_send_envelope + rns_peer_addr
 #include "../agent_transport.h"    // C2: pure rung selection over the C1 reachability verdict
+#include "../card_ack.h"          // bounded recent-key ring + shared key grammar
 
 /* Conversation slots. A slot used to carry its own AGENT_VIEW_MAX viewport, so
  * the table cost 12.6 KB per conversation and could not grow without spending
@@ -208,6 +212,45 @@ static char g_bridge[AGENT_BRIDGE_LEN] = "";
 static char g_session[AGENT_SESSION_LEN] = "pager";
 static FS *g_store = nullptr;        // &SD (primary) or &SPIFFS (fallback)
 static bool g_store_is_sd = false;
+static portMUX_TYPE g_agent_key_spin = portMUX_INITIALIZER_UNLOCKED;
+static uint16_t g_agent_key_next = 1;
+static CardAckSeen g_agent_sent_keys = {};
+static CardAckSeen g_agent_inbound_keys = {};
+
+static bool agents_delivery_key_valid(const char *key) {
+    return key && key[0] && notify_wire_key_plausible(key);
+}
+
+static void agents_delivery_key_next(char out[NW_KEY_CAP]) {
+    portENTER_CRITICAL(&g_agent_key_spin);
+    uint16_t seq = g_agent_key_next++;
+    if (g_agent_key_next == 0) g_agent_key_next = 1;
+    portEXIT_CRITICAL(&g_agent_key_spin);
+    snprintf(out, NW_KEY_CAP, "tx-%04x", (unsigned)seq);
+}
+
+static bool agents_inbound_key_duplicate(const char *key) {
+    if (!agents_delivery_key_valid(key)) return false; /* keyless is distinct */
+    portENTER_CRITICAL(&g_agent_key_spin);
+    bool duplicate = card_ack_seen_has(&g_agent_sent_keys, key) ||
+                     card_ack_seen_has(&g_agent_inbound_keys, key);
+    portEXIT_CRITICAL(&g_agent_key_spin);
+    return duplicate;
+}
+
+static void agents_inbound_key_commit(const char *key) {
+    if (!agents_delivery_key_valid(key)) return;
+    portENTER_CRITICAL(&g_agent_key_spin);
+    card_ack_seen_add(&g_agent_inbound_keys, key);
+    portEXIT_CRITICAL(&g_agent_key_spin);
+}
+
+static void agents_sent_key_commit(const char *key) {
+    if (!agents_delivery_key_valid(key)) return;
+    portENTER_CRITICAL(&g_agent_key_spin);
+    card_ack_seen_add(&g_agent_sent_keys, key);
+    portEXIT_CRITICAL(&g_agent_key_spin);
+}
 
 /* Recursive mutex: agents_push_line() locks itself (mesh task calls it without
  * a lock) while send/inbound/view also take the same lock (nested). File IO
@@ -226,6 +269,25 @@ static bool g_store_is_sd = false;
  * takes it again (pure FS calls + parsing only), and nothing anywhere takes
  * agents_mux while holding the bus lock. */
 static SemaphoreHandle_t agents_mux = nullptr;
+static portMUX_TYPE agents_registry_spin = portMUX_INITIALIZER_UNLOCKED;
+static uint8_t agents_registry_count = 0;
+static char agents_registry_ids[CONV_MAX][CONV_ID_LEN] = {};
+
+/* Publish one coherent, bounded registry generation for notification producers.
+ * They can run on the loop or HTTP task and must never wait behind SD I/O held
+ * under agents_mux merely to classify a card. Writers already hold agents_mux;
+ * the short critical section makes readers see the old or new generation. */
+static void agents_registry_publish_locked() {
+    portENTER_CRITICAL(&agents_registry_spin);
+    agents_registry_count = g_conv_n;
+    for (int i = 0; i < CONV_MAX; i++) {
+        if (i < g_conv_n)
+            memcpy(agents_registry_ids[i], g_convs[i].id, CONV_ID_LEN);
+        else
+            memset(agents_registry_ids[i], 0, CONV_ID_LEN);
+    }
+    portEXIT_CRITICAL(&agents_registry_spin);
+}
 
 static void agents_lock() {
     if (agents_mux) xSemaphoreTakeRecursive(agents_mux, portMAX_DELAY);
@@ -316,11 +378,13 @@ void gps_set_on_fix(void (*cb)(void));
 void gps_request_fix(void);
 
 /* Defined later in this file (used by the GPS interception below). */
-static void agents_on_inbound(const char *agent_id, const char *text,
-                              bool real_inbound);
+static bool agents_on_inbound(const char *agent_id, const char *text,
+                              bool real_inbound, uint32_t origin_id = 0,
+                              const char *origin_key = nullptr,
+                              const NotifyEventId *origin_event = nullptr);
 
-/* A genuine arrival (a mesh chat frame, HTTP /agents/inbound, a GPS answer)
- * pushed a line into a room. loop() consumes it together with display_force:
+/* A genuine arrival (a transport chat, a notification-backed agent reply, or
+ * a GPS answer) pushed a line into a room. loop() consumes it with display_force:
  * if the room is open on screen, the repaint wakes the panel once. Synthetic
  * error lines never set this. Set BEFORE display_force so the loop cannot
  * consume the repaint without seeing the arrival. */
@@ -331,6 +395,8 @@ static volatile bool g_agents_real_inbound = false;
 static const char *agents_store_name() { return g_store_is_sd ? "sd" : "spiffs"; }
 
 static bool agents_store_ready() { return g_store != nullptr; }
+static char g_agents_append_record[AGENT_JSONL_MAX];
+static uint8_t g_agents_verify_buf[64];
 
 /* Flat key path (no directory on SPIFFS; FAT root on SD) for one thread of one
  * conversation: /conv.<conv_id>[.<session>]. The old form was
@@ -368,69 +434,206 @@ static void agents_session_sanitize(const char *in, char *out, size_t out_n) {
 }
 
 /* Append one message to the JSONL file for (agent, active session) and fold it
- * into the RAM viewport index. On a full/broken store it silently keeps the
- * last persisted window (no hardlock).
+ * into the RAM viewport only after the complete JSONL record is durably
+ * accepted. A full/broken store leaves both the persisted and RAM views
+ * unchanged, allowing a notification door to remain unread and retryable.
  *
  * Written STREAMING (field by field, small stack): this runs on the 8 KB
  * loop task from the keyboard path, and the old esc[1088]+line[1088] buffers
  * overran it (Stack canary / loopTask panic on Enter). */
-static void agents_store_append(int idx, bool from_me, const char *text) {
+static bool agents_record_add(char *out, size_t cap, size_t &used,
+                              const char *src, size_t n) {
+    if (!out || !src || used + n >= cap) return false;
+    memcpy(out + used, src, n);
+    used += n;
+    out[used] = '\0';
+    return true;
+}
+
+static bool agents_record_escape(char *out, size_t cap, size_t &used,
+                                 const char *src) {
+    for (const unsigned char *p = (const unsigned char *)src; p && *p; p++) {
+        char esc[7];
+        size_t n = 0;
+        if (*p == '"' || *p == '\\') {
+            esc[0] = '\\'; esc[1] = (char)*p; n = 2;
+        } else if (*p < 0x20 || *p == 0x7f) {
+            n = (size_t)snprintf(esc, sizeof(esc), "\\u%04x", (unsigned)*p);
+        } else {
+            esc[0] = (char)*p; n = 1;
+        }
+        if (!agents_record_add(out, cap, used, esc, n)) return false;
+    }
+    return true;
+}
+
+static size_t agents_record_build(bool from_me, uint32_t ts, const char *text,
+                                  uint32_t origin_id, const char *origin_key,
+                                  const NotifyEventId *origin_event) {
+    size_t used = 0;
+    char pfx[96];
+    int pn = snprintf(pfx, sizeof(pfx), "{\"ts\":%lu,\"from_me\":%s,\"text\":\"",
+                      (unsigned long)ts, from_me ? "true" : "false");
+    if (pn <= 0 || (size_t)pn >= sizeof(pfx) ||
+        !agents_record_add(g_agents_append_record,
+                           sizeof(g_agents_append_record), used,
+                           pfx, (size_t)pn) ||
+        !agents_record_escape(g_agents_append_record,
+                              sizeof(g_agents_append_record), used, text))
+        return 0;
+    char origin[160];
+    if (notify_event_id_valid(origin_event)) {
+        int on = snprintf(origin, sizeof(origin),
+                          "\",\"origin_id\":%lu,\"origin_event\":\"%016llx%016llx%016llx\",\"origin_key\":\"",
+                          (unsigned long)origin_id,
+                          (unsigned long long)origin_event->epoch_hi,
+                          (unsigned long long)origin_event->epoch_lo,
+                          (unsigned long long)origin_event->counter);
+        if (on <= 0 || (size_t)on >= sizeof(origin) ||
+            !agents_record_add(g_agents_append_record,
+                               sizeof(g_agents_append_record), used,
+                               origin, (size_t)on) ||
+            !agents_record_escape(g_agents_append_record,
+                                  sizeof(g_agents_append_record), used,
+                                  origin_key ? origin_key : "") ||
+            !agents_record_add(g_agents_append_record,
+                               sizeof(g_agents_append_record), used, "\"}\n", 3))
+            return 0;
+    } else if (!agents_record_add(g_agents_append_record,
+                                  sizeof(g_agents_append_record), used,
+                                  "\"}\n", 3)) {
+        return 0;
+    }
+    return used;
+}
+
+static bool agents_fd_write_all(int fd, const uint8_t *buf, size_t n) {
+    size_t off = 0;
+    while (off < n) {
+        ssize_t w = write(fd, buf + off, n - off);
+        if (w <= 0) return false;
+        off += (size_t)w;
+    }
+    return true;
+}
+
+static bool agents_fd_read_all(int fd, uint8_t *buf, size_t n) {
+    size_t off = 0;
+    while (off < n) {
+        ssize_t r = read(fd, buf + off, n - off);
+        if (r <= 0) return false;
+        off += (size_t)r;
+    }
+    return true;
+}
+
+static void agents_fd_rollback(const char *full, off_t clean_eof) {
+    int fd = open(full, O_RDWR);
+    if (fd < 0) return;
+    if (ftruncate(fd, clean_eof) == 0) fsync(fd);
+    close(fd);
+}
+
+/* Strong notification-door contract: repair a torn tail to the last newline,
+ * append one bounded record, fsync, close, reopen and compare the exact tail.
+ * Failure rolls back to the clean EOF so the backing card remains retryable. */
+static bool agents_store_append_verified(const String &path,
+                                         const uint8_t *record, size_t n) {
+    const char *mount = g_store ? g_store->mountpoint() : nullptr;
+    if (!mount || !mount[0] || !path.length() || !record || n == 0) return false;
+    char full[96];
+    int fn = snprintf(full, sizeof(full), "%s%s", mount, path.c_str());
+    if (fn <= 0 || (size_t)fn >= sizeof(full)) return false;
+
+    int fd = open(full, O_RDWR | O_CREAT, 0666);
+    if (fd < 0) return false;
+    off_t eof = lseek(fd, 0, SEEK_END);
+    if (eof < 0) { close(fd); return false; }
+    off_t clean_eof = eof;
+    if (eof > 0) {
+        uint8_t last = 0;
+        bool last_ok = lseek(fd, eof - 1, SEEK_SET) == eof - 1 &&
+                       read(fd, &last, 1) == 1;
+        if (notify_chat_tail_needs_separator((uint32_t)eof, last_ok, last)) {
+            clean_eof = 0;
+            for (off_t pos = eof; pos > 0; pos--) {
+                uint8_t c = 0;
+                if (lseek(fd, pos - 1, SEEK_SET) != pos - 1 ||
+                    read(fd, &c, 1) != 1) {
+                    close(fd); return false;
+                }
+                if (c == '\n') { clean_eof = pos; break; }
+            }
+            if (ftruncate(fd, clean_eof) != 0 || fsync(fd) != 0) {
+                close(fd); return false;
+            }
+        }
+    }
+    bool ok = lseek(fd, clean_eof, SEEK_SET) == clean_eof &&
+              agents_fd_write_all(fd, record, n) && fsync(fd) == 0;
+    if (close(fd) != 0) ok = false;
+    if (!ok) { agents_fd_rollback(full, clean_eof); return false; }
+
+    fd = open(full, O_RDONLY);
+    if (fd < 0) { agents_fd_rollback(full, clean_eof); return false; }
+    struct stat st;
+    ok = fstat(fd, &st) == 0 && st.st_size == clean_eof + (off_t)n &&
+         lseek(fd, clean_eof, SEEK_SET) == clean_eof;
+    size_t checked = 0;
+    while (ok && checked < n) {
+        size_t want = n - checked;
+        if (want > sizeof(g_agents_verify_buf)) want = sizeof(g_agents_verify_buf);
+        ok = agents_fd_read_all(fd, g_agents_verify_buf, want) &&
+             memcmp(g_agents_verify_buf, record + checked, want) == 0;
+        checked += want;
+    }
+    if (close(fd) != 0) ok = false;
+    if (!ok) agents_fd_rollback(full, clean_eof);
+    return ok;
+}
+
+static bool agents_store_append(int idx, bool from_me, const char *text,
+                                uint32_t origin_id, const char *origin_key,
+                                const NotifyEventId *origin_event) {
     Conversation &a = g_convs[idx];
     uint32_t ts = agents_now_s();
+    if (!agents_store_ready() && notify_event_id_valid(origin_event)) return false;
+    String path = agents_log_path(a.id, a.sessions[a.active_idx]);
+    size_t record_n = agents_record_build(from_me, ts, text,
+                                          origin_id, origin_key, origin_event);
+    if (record_n == 0) return false;
+    /* Caller holds agents_mux (agents_push_line); bus lock second — order. */
+    bool persisted = true;
+    {
+        HwSpiBusGuard bus;
+        if (notify_event_id_valid(origin_event)) {
+            persisted = agents_store_append_verified(
+                path, (const uint8_t *)g_agents_append_record, record_n);
+        } else if (agents_store_ready()) {
+            File f = g_store->open(path.c_str(), "a");
+            if (f) {
+                f.write((const uint8_t *)g_agents_append_record, record_n);
+                f.flush(); f.close();
+            }
+            /* Generic chat preserves its historic RAM-first accepted contract;
+             * only notification doors require verified persistence before ACK. */
+        }
+    }
+    if (!persisted) return false;
+
     /* The picker's cache is updated for EVERY conversation; the scrollback
-     * window only when this conversation is the one on screen. A line arriving
-     * for a conversation nobody is reading must not disturb the open chat. */
+     * window only when this conversation is the one on screen. */
     a.last.from_me = from_me;
     a.last.ts = ts;
     snprintf(a.last.text, sizeof(a.last.text), "%s", text ? text : "");
     a.last_use = ++g_conv_clock;
-    /* Their line, in a conversation nobody is READING. "Reading" is the chat
-     * screen being open on it — not window ownership: the window stays owned
-     * after the user walks back to the clock, so keying on it left every
-     * conversation they had ever opened permanently unable to go unread. */
     if (!from_me && !agents_is_on_screen(idx) && a.unread < 0xFFFF) a.unread++;
     if (g_win.owner == idx) agents_view_append(g_win, from_me, ts, text);
-    if (!agents_store_ready()) return;
-    String path = agents_log_path(a.id, a.sessions[a.active_idx]);
-    /* Caller holds agents_mux (agents_push_line); bus lock second — order. */
-    HwSpiBusGuard bus;
-    File f = g_store->open(path.c_str(), "a");
-    if (!f) return;
-    uint32_t written = 0;
-    {
-        char pfx[96];
-        int pn = snprintf(pfx, sizeof(pfx), "{\"ts\":%lu,\"from_me\":%s,\"text\":\"",
-                          (unsigned long)ts, from_me ? "true" : "false");
-        if (pn > 0 && (size_t)pn < sizeof(pfx))
-            written += (uint32_t)f.write((const uint8_t *)pfx, (size_t)pn);
-        char esc[64];
-        const char *p = text;
-        size_t ej = 0;
-        while (p && *p) {
-            unsigned char c = (unsigned char)*p;
-            if (c == '"' || c == '\\') {
-                if (ej + 2 > sizeof(esc)) { written += (uint32_t)f.write((const uint8_t *)esc, ej); ej = 0; }
-                esc[ej++] = '\\'; esc[ej++] = (char)c;
-            } else if (c < 0x20 || c == 0x7f) {
-                if (ej + 6 > sizeof(esc)) { written += (uint32_t)f.write((const uint8_t *)esc, ej); ej = 0; }
-                ej += (size_t)snprintf(esc + ej, sizeof(esc) - ej, "\\u%04x", c);
-            } else {
-                if (ej + 1 > sizeof(esc)) { written += (uint32_t)f.write((const uint8_t *)esc, ej); ej = 0; }
-                esc[ej++] = (char)c;
-            }
-            p++;
-        }
-        if (ej > 0) written += (uint32_t)f.write((const uint8_t *)esc, ej);
-        char sfx[4] = "\"}\n";
-        written += (uint32_t)f.write((const uint8_t *)sfx, 3);
-    }
-    f.flush();
-    f.close();
-    if (written > 0) {
-        a.lines++;
-        a.session_lines[a.active_idx]++;
-        if (g_win.owner == idx) g_win.file_sync += written;
-    }
+    a.lines++;
+    a.session_lines[a.active_idx]++;
+    if (g_win.owner == idx && agents_store_ready())
+        g_win.file_sync += (uint32_t)record_n;
+    return true;
 }
 
 static void agents_view_append(ConvWindow &w, bool from_me, uint32_t ts,
@@ -519,6 +722,20 @@ static bool agents_jsonl_parse(char *buf, bool &from_me, uint32_t &ts,
     const char *t = doc["text"] | "";
     snprintf(text, text_n, "%s", t);
     return true;
+}
+
+static bool agents_jsonl_origin_matches(char *buf, uint32_t origin_id,
+                                        const char *origin_key,
+                                        const NotifyEventId *origin_event) {
+    if (!buf || origin_id == 0 || !origin_key ||
+        !notify_event_id_valid(origin_event)) return false;
+    JsonDocument doc;
+    if (deserializeJson(doc, buf) != DeserializationError::Ok) return false;
+    const char *stored_key = doc["origin_key"] | "";
+    const char *stored_event = doc["origin_event"] | "";
+    return notify_event_origin_matches(doc["origin_id"] | 0u, stored_key,
+                                       stored_event, origin_id, origin_key,
+                                       origin_event);
 }
 
 /* Scan an already-open JSONL file line by line while BOUNDING the SPI-bus
@@ -687,6 +904,7 @@ static int conv_mint(const char *id, const char *label, uint8_t transport,
     }
     a.seeded = 0;
     a.last_use = ++g_conv_clock;
+    agents_registry_publish_locked();
     return idx;
 }
 
@@ -900,6 +1118,35 @@ static int agents_find(const char *id) {
         if (strcmp(g_convs[i].id, id) == 0) return i;
     }
     return -1;
+}
+
+static int agents_current_find_cb(const char *id, void * /*ctx*/) {
+    return agents_find(id);
+}
+
+struct AgentsRegistryView {
+    uint8_t count;
+    char ids[CONV_MAX][CONV_ID_LEN];
+};
+
+static int agents_registry_view_find(const char *id, void *ctx) {
+    AgentsRegistryView *view = static_cast<AgentsRegistryView *>(ctx);
+    if (!view || !id || !id[0]) return -1;
+    for (int i = 0; i < view->count; i++)
+        if (strcmp(view->ids[i], id) == 0) return i;
+    return -1;
+}
+
+/* Lock-free with respect to agents_mux: producer tasks copy one registry
+ * generation under a tiny spin lock and run the shared resolver on the copy. */
+static NotifyChatResolution agents_notify_chat_resolve_snapshot(
+        const char *source, const char *key) {
+    AgentsRegistryView view = {};
+    portENTER_CRITICAL(&agents_registry_spin);
+    view.count = agents_registry_count;
+    memcpy(view.ids, agents_registry_ids, sizeof(view.ids));
+    portEXIT_CRITICAL(&agents_registry_spin);
+    return notify_chat_resolve(source, key, agents_registry_view_find, &view);
 }
 
 static int agents_session_exists(int idx, const char *name) {
@@ -1213,14 +1460,19 @@ static int agents_utf8_len(const char *s) {
 /* Push arbitrary-length text: split on word boundaries into <AGENT_TEXT_LEN
  * chunks, store each as one JSONL line. Never cuts mid-UTF-8. Thread-safe
  * (locks itself; callers that already hold the recursive lock are fine). */
-static void agents_push_line(int idx, bool from_me, const char *text) {
+static bool agents_push_line_with_origin(int idx, bool from_me, const char *text,
+                                         uint32_t origin_id,
+                                         const char *origin_key,
+                                         const NotifyEventId *origin_event) {
     agents_lock();
     if (idx < 0 || idx >= g_conv_n || !text || !text[0]) {
         agents_unlock();
-        return;
+        return false;
     }
 
     const char *p = text;
+    bool persisted_any = false;
+    bool persisted_all = true;
     while (*p) {
         while (*p == ' ') p++;
         if (!*p) break;
@@ -1247,10 +1499,22 @@ static void agents_push_line(int idx, bool from_me, const char *text) {
         memcpy(chunk, p, (size_t)n);
         chunk[n] = '\0';
         while (n > 0 && chunk[n - 1] == ' ') chunk[--n] = '\0';
-        if (n > 0) agents_store_append(idx, from_me, chunk);
+        if (n > 0) {
+            bool persisted = agents_store_append(idx, from_me, chunk,
+                                                  origin_id, origin_key,
+                                                  origin_event);
+            persisted_any = persisted_any || persisted;
+            persisted_all = persisted_all && persisted;
+            if (!persisted) break;
+        }
         p += n;
     }
     agents_unlock();
+    return persisted_any && persisted_all;
+}
+
+static bool agents_push_line(int idx, bool from_me, const char *text) {
+    return agents_push_line_with_origin(idx, from_me, text, 0, nullptr, nullptr);
 }
 
 /* Chronological view (oldest first) for the scrollable chat. Synced from SD
@@ -1343,7 +1607,7 @@ static bool agents_bridge_save(const char *url) {
 /* Best-effort POST to the bridge. Runs on the loop/web task — short timeout.
    Returns true if the bridge accepted the message (2xx). */
 static bool agents_bridge_post(const char *agent_id, const char *session,
-                               const char *text) {
+                               const char *text, const char *delivery_key) {
     if (!g_bridge[0] || !agent_id || !session || !text || !text[0]) return false;
     if (WiFi.status() != WL_CONNECTED) return false;
 
@@ -1357,6 +1621,7 @@ static bool agents_bridge_post(const char *agent_id, const char *session,
     doc["session"] = session;
     doc["text"] = text;
     doc["from"] = "tlora-pager";
+    if (agents_delivery_key_valid(delivery_key)) doc["id"] = delivery_key;
     String body;
     serializeJson(doc, body);
 
@@ -1408,8 +1673,17 @@ static void agents_clean_text(const char *in, char *out, size_t out_n) {
     out[j] = '\0';
 }
 
+/* Normalize one incoming line exactly as the thread store will. Keeping this
+ * seam separate lets the notification router validate before it acknowledges
+ * the backing card, so an empty/control-only body remains visible. */
+static bool agents_normalize_inbound(const char *text, char *out, size_t out_n) {
+    agents_clean_text(text, out, out_n);
+    return out && out_n > 0 && out[0] != '\0';
+}
+
 /* Optional mesh uplink (registered by meshcore skill). Same framing as downlink. */
-typedef bool (*AgentsMeshUplinkFn)(const char *agent_id, const char *text);
+typedef bool (*AgentsMeshUplinkFn)(const char *agent_id, const char *text,
+                                   const char *delivery_key);
 static AgentsMeshUplinkFn g_agents_mesh_uplink = nullptr;
 
 static void agents_set_mesh_uplink(AgentsMeshUplinkFn fn) {
@@ -1629,27 +1903,21 @@ static bool agents_rns_rung_ok(const char *agent_id, const char **why) {
  * configured address, so offering it to every agent would put `hermes` traffic
  * on a link the user configured for something else. */
 static bool transport_send_agent(int idx, const char *conv_id, const char *session,
-                                 const char *text) {
+                                 const char *text, const char *delivery_key) {
     /* LXMF-ORIGIN ROOMS ANSWER AS LXMF, and BEFORE the seed.pager uplink below.
      * If this room last received an LXMF message, its reply goes back to THAT
      * sender over lxmf.delivery, not to the configured seed.pager peer — which
      * is a different node. A build/enqueue failure does NOT fall through to
-     * seed.pager: that peer is not the LXMF sender and would misdeliver, so the
-     * fault is put in the room (one short line) and the reply stops here. */
+     * seed.pager: that peer is not the LXMF sender and would misdeliver. */
     if (strcmp(conv_id, "claude") == 0) {
         uint8_t lxmf_dest[16];
         if (rns_lxmf_reply_target(session, lxmf_dest)) {
             const char *lx_why = nullptr;
             if (rns_send_lxmf_reply(lxmf_dest, text, &lx_why)) {
                 event_add("agent %s lxmf reply", conv_id);
-            } else {
-                char line[64];
-                snprintf(line, sizeof(line), "(lxmf: %s)",
-                         lx_why ? lx_why : "not sent");
-                agents_push_line(idx, false, line);
-                display_force = true;
+                return true;
             }
-            return true;
+            return false;
         }
     }
 
@@ -1675,7 +1943,7 @@ static bool transport_send_agent(int idx, const char *conv_id, const char *sessi
      * rung below it (WiFi -> RNS -> MeshCore) so a transient higher-rung fault
      * does not drop the card. */
     if (rung == AGENT_RUNG_WIFI) {
-        if (agents_bridge_post(conv_id, session, text)) {
+        if (agents_bridge_post(conv_id, session, text, delivery_key)) {
             event_add("agent %s bridge uplink", conv_id);
             return true;
         }
@@ -1691,32 +1959,13 @@ static bool transport_send_agent(int idx, const char *conv_id, const char *sessi
         rung = mesh_avail ? AGENT_RUNG_MESHCORE : AGENT_RUNG_NONE;
     }
     if (rung == AGENT_RUNG_MESHCORE && g_agents_mesh_uplink) {
-        if (g_agents_mesh_uplink(conv_id, text)) {
+        if (g_agents_mesh_uplink(conv_id, text, delivery_key)) {
             event_add("agent %s mesh uplink", conv_id);
             return true;
         }
     }
 
-    /* Nothing carried it. ONE short line — a second would push the just-typed
-     * message off the seven-row screen. Prefer the RNS cause when there is one
-     * (for `claude` the peer is the path the user configured, so naming what is
-     * wrong with it is the most actionable), else name why the WiFi/mesh rungs
-     * could not take it. */
-    if (rns_why) {
-        char line[64];
-        snprintf(line, sizeof(line), "(rns: %s)", rns_why);
-        agents_push_line(idx, false, line);
-    } else if (wifi_avail && reach != REACH_UP) {
-        agents_push_line(idx, false, "(no route home - mesh failed)");
-    } else if (wifi_avail) {
-        agents_push_line(idx, false, "(bridge offline)");
-    } else if (mesh_avail) {
-        agents_push_line(idx, false, "(mesh failed)");
-    } else {
-        agents_push_line(idx, false, "(no bridge / mesh)");
-    }
-    display_force = true;
-    return true;
+    return false;
 }
 
 /* CONV_LXMF: answer the sender this conversation was opened by. The address is
@@ -1759,7 +2008,8 @@ static bool transport_send_mesh(const uint8_t *addr, uint8_t addr_len,
  * chat path. The active room is read off the conversation so no caller has to
  * pass — or pick — one.
  */
-bool transport_send(const struct Conversation *conv, const char *text) {
+bool transport_send(const struct Conversation *conv, const char *text,
+                    const char *delivery_key) {
     if (!conv || !text || !text[0]) return false;
     int idx = agents_find(conv->id);
     if (idx < 0) return false;
@@ -1782,7 +2032,8 @@ bool transport_send(const struct Conversation *conv, const char *text) {
     } else if (backend == TRANSPORT_BACKEND_AGENT) {
         /* Owns its own in-room reporting (the bridge/RNS ladder's error lines). */
         return transport_send_agent(idx, conv->id,
-                                    conv->sessions[conv->active_idx], text);
+                                    conv->sessions[conv->active_idx], text,
+                                    delivery_key);
     } else if (backend == TRANSPORT_BACKEND_LXMF) {
         ok = transport_send_lxmf(addr, text, &why);
         if (ok) event_add("conv %s lxmf reply", conv->id);
@@ -1805,7 +2056,7 @@ bool transport_send(const struct Conversation *conv, const char *text) {
 /* Public: send a line as the user, into the conversation's ACTIVE room.
  * Path: local thread/history → transport_send(), which picks the wire from the
  * conversation record. Downlink replies arrive on the same wire (or WiFi
- * /agents/inbound). One chat loop. */
+ * /agents/inbound, admitted through the notification door). One chat loop. */
 static bool agents_send(const char *agent_id, const char *text) {
     int idx = agents_find(agent_id);
     if (idx < 0 || !text || !text[0]) return false;
@@ -1817,14 +2068,32 @@ static bool agents_send(const char *agent_id, const char *text) {
     /* "where are you?" never leaves the device: answer with the GPS fix. */
     if (agents_gps_intercept(idx, cleaned)) return true;
 
-    agents_push_line(idx, true, cleaned);   // persists + updates viewport
+    if (!agents_push_line(idx, true, cleaned)) return false;
     agents_lock();
     const char *session = agents_active_session(idx);
     event_add("agent %s<<%s %s", agent_id, session, cleaned);
     agents_unlock();
     display_force = true;
 
-    transport_send(&g_convs[idx], cleaned);
+    char delivery_key[NW_KEY_CAP];
+    agents_delivery_key_next(delivery_key);
+    agents_sent_key_commit(delivery_key);
+    bool sent = transport_send(&g_convs[idx], cleaned, delivery_key);
+    if (!sent && g_convs[idx].transport == CONV_AGENT) {
+        uint32_t out_id = outbox_enqueue(&g_outbox, OUTBOX_KIND_AGENT,
+                                         g_convs[idx].id,
+                                         g_convs[idx].sessions[g_convs[idx].active_idx],
+                                         delivery_key, cleaned);
+        if (out_id && outbox_persist()) {
+            agents_push_line(idx, false, "(~ queued)");
+            display_force = true;
+            return true;
+        }
+        if (out_id) outbox_remove(&g_outbox, out_id);
+        agents_push_line(idx, false, "(! outbox full)");
+        display_force = true;
+        return false;
+    }
     /* The room already carries the outcome (the backend puts one line in it on
      * failure), and the caller's contract has always been "accepted into the
      * thread", not "delivered" — GET /agents and the transport status routes
@@ -1832,20 +2101,66 @@ static bool agents_send(const char *agent_id, const char *text) {
     return true;
 }
 
-/* Inject an agent reply into the active session of the agent (long texts split).
- * real_inbound: true only for genuine arrivals (HTTP /agents/inbound, GPS
- * answer) — they may wake the panel when the room is open on screen. Synthetic
- * lines (mesh_chat_tx_fail) pass false and never restart the idle countdown. */
-static void agents_on_inbound(const char *agent_id, const char *text,
-                              bool real_inbound) {
+/* Canonical thread sink for an accepted inbound line. Notification-backed
+ * replies reach this only from the off-loop door worker, which attaches their
+ * durable event origin before ACKing the backing card. No HTTP route appends a
+ * second copy directly. real_inbound is true for genuine arrivals and GPS
+ * answers; synthetic error lines pass false and do not restart idle. */
+static bool agents_on_inbound(const char *agent_id, const char *text,
+                              bool real_inbound, uint32_t origin_id,
+                              const char *origin_key,
+                              const NotifyEventId *origin_event) {
     int idx = agents_find(agent_id);
-    if (idx < 0 || !text || !text[0]) return;
+    if (idx < 0 || !text || !text[0]) return false;
     char cleaned[2048];
-    agents_clean_text(text, cleaned, sizeof(cleaned));
-    if (!cleaned[0]) return;
-    agents_push_line(idx, false, cleaned);
+    if (!agents_normalize_inbound(text, cleaned, sizeof(cleaned))) return false;
+    if (!agents_push_line_with_origin(idx, false, cleaned,
+                                      origin_id, origin_key, origin_event)) return false;
     if (real_inbound) g_agents_real_inbound = true;
     display_force = true;
+    return true;
+}
+
+/* Boot reconciliation accepts a proven-new restored card without synthesizing
+ * an arrival or repaint. agents_push_line still records conversation unread,
+ * which is the one user-visible signal after the backing card is acknowledged. */
+static bool agents_restore_inbound(int idx, const char *normalized,
+                                   uint32_t origin_id, const char *origin_key,
+                                   const NotifyEventId *origin_event) {
+    if (idx < 0 || idx >= g_conv_n || !normalized || !normalized[0]) return false;
+    return agents_push_line_with_origin(idx, false, normalized,
+                                        origin_id, origin_key, origin_event);
+}
+
+/* Scan every room because a card may have been appended before the active room
+ * changed. Match the NVS-backed event identity as well as diagnostic id/key;
+ * either of those latter fields can be reused and is never proof by itself. */
+static bool agents_has_origin(int idx, uint32_t origin_id,
+                              const char *origin_key,
+                              const NotifyEventId *origin_event) {
+    if (idx < 0 || idx >= g_conv_n || origin_id == 0 || !origin_key ||
+        !notify_event_id_valid(origin_event) ||
+        !agents_store_ready())
+        return false;
+    bool found = false;
+    agents_lock();
+    Conversation &a = g_convs[idx];
+    for (int i = 0; i < a.n_sessions && !found; i++) {
+        String path = agents_log_path(a.id, a.sessions[i]);
+        File f;
+        { HwSpiBusGuard bus; f = g_store->open(path.c_str(), "r"); }
+        if (!f) continue;
+        char line[AGENT_JSONL_MAX];
+        AgentJScanner sc(f);
+        agents_scan_chunked(sc, line, sizeof(line), [&](char *record) {
+            if (!found && agents_jsonl_origin_matches(record, origin_id,
+                                                       origin_key,
+                                                       origin_event)) found = true;
+        });
+        { HwSpiBusGuard bus; f.close(); }
+    }
+    agents_unlock();
+    return found;
 }
 
 /*
@@ -1871,8 +2186,7 @@ bool inbox_deliver_msg(uint8_t via, const char *peer_id, const char *label,
         snprintf(a.label, sizeof(a.label), "%s", label);
     agents_unlock();
     if (!wire_ok) return false;
-    agents_on_inbound(a.id, text, true);   /* sets the arrival flag + repaint */
-    return true;
+    return agents_on_inbound(a.id, text, true); /* sets arrival only if durable */
 }
 
 /* ---- chat-route seam: claude_route_incoming() ----------------------------- *
@@ -1899,7 +2213,7 @@ bool inbox_deliver_msg(uint8_t via, const char *peer_id, const char *label,
  * bounded (agents_clean_text) — the third untrusted-input barrier after the mac
  * and the transport receiver. */
 struct AgentRouteItem {
-    uint8_t kind;                       /* 0 = chat message, 1 = roster, 2 = mesh peer message */
+    uint8_t kind;                       /* 0 chat, 1 roster, 2 peer, 3 notify door */
     bool newest;                        /* empty name => newest-active room */
     char session[AGENT_SESSION_LEN];    /* kind 0/1: room; kind 2: sender display name */
     char text[AGENT_TEXT_LEN];          /* kind 0/2: cleaned message; kind 1: roster payload */
@@ -1909,13 +2223,26 @@ struct AgentRouteItem {
     uint8_t peer[CONV_REPLY_MAX];
     uint8_t peer_len;
     uint8_t via;                        /* kind 2: CONV_MESH or CONV_LXMF */
+    char door_conv[CONV_ID_LEN];        /* kind 3: stable conversation identity */
+    char door_source[NOTIFY_SOURCE_LEN];/* kind 3: re-resolve mapping in worker */
+    uint32_t door_id;                   /* kind 3: backing notification */
+    char door_key[NOTIFY_KEY_LEN];
+    NotifyEventId door_event;
 };
 
-#define AGENT_ROUTE_QUEUE_DEPTH  8      /* by-value queue: 8 x ~537 B ~= 4.3 KB */
+struct AgentDoorCompletion {
+    uint32_t id;
+    NotifyEventId event;
+    char conversation[CONV_ID_LEN];
+    bool accepted;
+};
+
+#define AGENT_ROUTE_QUEUE_DEPTH  8      /* by-value queue: eight bounded items */
 #define AGENT_ROUTE_TASK_STACK   8192   /* drain task does SD scans (sync_view lbuf) */
 #define AGENT_ROUTE_TASK_PRIO    1      /* same low prio as the history write task */
 
 static QueueHandle_t g_route_q    = nullptr;
+static QueueHandle_t g_door_done_q = nullptr;
 static TaskHandle_t  g_route_task = nullptr;
 
 /* Off-loop roster apply (kind==1): the ONLY place the roster path touches SD.
@@ -2006,7 +2333,11 @@ static bool agents_route_peer(const AgentRouteItem &item) {
      * transport is not the one the message came in on. conv_mint has already
      * compared the full address; this is the second half of the same rule and
      * the reason the door exists at all. */
-    return inbox_deliver_msg(item.via, id, item.session, item.text);
+    if (inbox_deliver_msg(item.via, id, item.session, item.text)) return true;
+    /* The transport already received and acknowledged this queued item. Keep a
+     * visible retryable copy when deferred persistence fails. */
+    notify_ingest("info", id, "CHAT", item.text, NULL);
+    return false;
 }
 
 /* The off-loop drain: the ONLY SD I/O on the route path. Drains the queue
@@ -2018,15 +2349,46 @@ static void agents_route_task(void *arg) {
     int idx = agents_find("claude");
     for (;;) {
         if (xQueueReceive(g_route_q, &item, portMAX_DELAY) != pdTRUE) continue;
-        if (idx < 0) continue;
         if (item.kind == 1) {              /* live-room roster: reconcile + persist */
-            agents_roster_apply(idx, item.text);
+            if (idx >= 0) agents_roster_apply(idx, item.text);
             continue;
         }
         if (item.kind == 2) {              /* peer message: mint + append */
             agents_route_peer(item);
             continue;
         }
+        if (item.kind == 3) {              /* notification chat door */
+            AgentDoorCompletion done;
+            memset(&done, 0, sizeof(done));
+            done.id = item.door_id;
+            done.event = item.door_event;
+            memcpy(done.conversation, item.door_conv, sizeof(done.conversation));
+            agents_lock();
+            NotifyChatResolution current = notify_chat_resolve(
+                item.door_source, item.door_key,
+                agents_current_find_cb, nullptr);
+            int resolved_slot = current.conversation;
+            const char *resolved_id = (resolved_slot >= 0 &&
+                                       resolved_slot < g_conv_n)
+                ? g_convs[resolved_slot].id : "";
+            int door_idx = notify_chat_stable_slot(
+                item.door_conv, resolved_id, resolved_slot);
+            if (door_idx >= 0 && item.text[0]) {
+                done.accepted = agents_has_origin(
+                    door_idx, item.door_id, item.door_key, &item.door_event);
+                if (!done.accepted)
+                    done.accepted = agents_on_inbound(
+                        g_convs[door_idx].id, item.text, true, item.door_id,
+                        item.door_key, &item.door_event);
+            }
+            agents_unlock();
+            if (g_door_done_q) {
+                xQueueSend(g_door_done_q, &done, portMAX_DELAY);
+                display_force = true; /* loop polls completion; no storage here */
+            }
+            continue;
+        }
+        if (idx < 0) continue;
         if (!item.text[0]) continue;
         agents_lock();
         Conversation &a = g_convs[idx];
@@ -2060,11 +2422,46 @@ static void agents_route_task(void *arg) {
                 continue;
             }
         }
-        agents_push_line(idx, false, item.text);   /* view append + SD append */
-        g_agents_real_inbound = true;
-        display_force = true;
+        if (agents_push_line(idx, false, item.text)) {
+            g_agents_real_inbound = true;
+            display_force = true;
+        } else {
+            /* claude_route_incoming already returned queued-success. A visible
+             * chat card is its asynchronous completion-failure channel. */
+            notify_ingest("info", "claude", "CHAT", item.text, NULL);
+        }
         agents_unlock();
     }
+}
+
+static bool agents_chat_door_enqueue(int idx, const char *conversation,
+                                     const char *source,
+                                     const char *normalized,
+                                     uint32_t id, const char *key,
+                                     const NotifyEventId *event) {
+    if (!g_route_q || !g_door_done_q || idx < 0 || idx >= g_conv_n || !normalized ||
+        !normalized[0] || !conversation || !conversation[0] || !source ||
+        !notify_event_id_valid(event)) return false;
+    AgentRouteItem item;
+    memset(&item, 0, sizeof(item));
+    item.kind = 3;
+    agents_lock();
+    if (idx >= g_conv_n || strcmp(g_convs[idx].id, conversation) != 0) {
+        agents_unlock();
+        return false;
+    }
+    memcpy(item.door_conv, g_convs[idx].id, sizeof(item.door_conv));
+    agents_unlock();
+    item.door_id = id;
+    item.door_event = *event;
+    snprintf(item.door_key, sizeof(item.door_key), "%s", key ? key : "");
+    snprintf(item.door_source, sizeof(item.door_source), "%s", source);
+    snprintf(item.text, sizeof(item.text), "%s", normalized);
+    return xQueueSend(g_route_q, &item, 0) == pdTRUE;
+}
+
+static bool agents_chat_door_take_completion(AgentDoorCompletion &out) {
+    return g_door_done_q && xQueueReceive(g_door_done_q, &out, 0) == pdTRUE;
 }
 
 /* Transport entry point (declared in ../agents_chat_route.h). Land `text` into
@@ -2282,6 +2679,7 @@ static bool agents_delete(const char *conv_id) {
     g_conv_n--;
     memset(&g_convs[g_conv_n], 0, sizeof(g_convs[g_conv_n]));
     if (g_win.owner > idx) g_win.owner--;
+    agents_registry_publish_locked();
 
     agents_manifest_persist();   /* rewrite /conversations.txt without the line */
     agents_unlock();
@@ -2420,7 +2818,8 @@ static const char *agents_describe() {
         "Pocket chat with Claude / Hermes.\n"
         "Uplink: WiFi bridge /v1/chat, else MeshCore C1|agent|…|u|… private DM\n"
         "  (agent = claude|hermes).\n"
-        "Downlink: same C1 side=a (or WiFi /agents/inbound) — one loop.\n"
+        "Downlink: same C1 side=a (or WiFi /agents/inbound); the backing card\n"
+        "is ACKed after the reply is durably appended to the thread.\n"
         "A \"where are you?\" / \"где ты\" message is answered locally with the\n"
         "GNSS fix (POST /gps/fix semantics) and never hits the bridge.\n\n"
         "History: append-only JSONL on SD (fallback SPIFFS) at\n"
@@ -2432,7 +2831,7 @@ static const char *agents_describe() {
 static const SkillEndpoint agents_endpoints[] = {
     {"GET",  "/agents",         "List agents, bridge, sessions, history counts"},
     {"POST", "/agents/send",    "Send {agent, text, session?} into a thread (+ bridge)"},
-    {"POST", "/agents/inbound", "Inject agent reply {agent, text} into thread"},
+    {"POST", "/agents/inbound", "Queue agent reply {agent, text} for its thread"},
     {"POST", "/agents/clear",   "Clear active session {agent} or {\"all\":true}"},
     {"POST", "/agents/bridge",  "Set bridge base URL (raw body), empty clears"},
     {"POST", "/agents/session", "Select session {agent, session}"},
@@ -2560,13 +2959,30 @@ static void agents_register_routes(AsyncWebServer &server) {
         free(body);
         const char *agent = input["agent"] | "";
         const char *text  = input["text"]  | "";
+        const char *key   = input["id"]    | "";
         if (agents_find(agent) < 0) { notify_send_error(req, 400, "unknown conversation"); return; }
         if (!text[0]) { notify_send_error(req, 400, "text required"); return; }
-        agents_on_inbound(agent, text, true);
-        event_add("agent %s >> %s", agent, text);
+        if (key[0] && !agents_delivery_key_valid(key)) {
+            notify_send_error(req, 400, "invalid id"); return;
+        }
+        bool duplicate = agents_inbound_key_duplicate(key);
+        /* One receiver: HTTP agent replies enter as a backing card. C3's
+         * off-loop door worker is the sole path that appends the body to the
+         * thread, then ACKs/hides this card by its event identity. Calling
+         * agents_on_inbound here as well would store the same reply twice. */
+        uint32_t card_id = duplicate ? 0 : inbox_deliver_card(
+            CONV_AGENT, key[0] ? key : nullptr, INBOX_SEV_INFO,
+            agent, "CHAT", text);
+        if (!duplicate && !card_id) {
+            notify_send_error(req, 503, "inbound queue full");
+            return;
+        }
+        if (card_id) agents_inbound_key_commit(key);
         JsonDocument doc;
         doc["ok"] = true;
         doc["agent"] = agent;
+        doc["duplicate"] = duplicate;
+        if (card_id) doc["notification_id"] = card_id;
         notify_send_json(req, 200, doc);
     }, NULL, handle_body_collect);
 
@@ -2722,6 +3138,8 @@ static void skill_agents_init() {
     snprintf(g_session, sizeof(g_session), "pager-%04x",
              (unsigned)(mac & 0xFFFF));
     agents_mux = xSemaphoreCreateRecursiveMutex();
+    g_agent_key_next = (uint16_t)esp_random();
+    if (g_agent_key_next == 0) g_agent_key_next = 1;
     agents_bridge_load();
     agents_store_init();
 
@@ -2741,6 +3159,10 @@ static void skill_agents_init() {
     agents_migrate_logs();      // retired /agent.* keys -> /conv.* (once)
     // Guarantee at least the default survives a reboot, in the new format.
     agents_manifest_persist();
+
+    /* Classifiers begin only after this function returns. Publish the complete
+     * restored registry once, before queues/endpoints can ingest a card. */
+    agents_registry_publish_locked();
 
     for (int i = 0; i < g_conv_n; i++) {
         /* One scan each: this fills lines / session_lines / the cached last
@@ -2772,6 +3194,8 @@ static void skill_agents_init() {
     /* Off-loop chat-route drain: the transport (rns.cpp) enqueues incoming
      * replies from the loop task; this task performs all the route's SD I/O. */
     g_route_q = xQueueCreate(AGENT_ROUTE_QUEUE_DEPTH, sizeof(AgentRouteItem));
+    g_door_done_q = xQueueCreate(AGENT_ROUTE_QUEUE_DEPTH,
+                                 sizeof(AgentDoorCompletion));
     if (g_route_q)
         xTaskCreate(agents_route_task, "agt_route", AGENT_ROUTE_TASK_STACK,
                     nullptr, AGENT_ROUTE_TASK_PRIO, &g_route_task);
