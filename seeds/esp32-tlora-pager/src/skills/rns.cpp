@@ -70,9 +70,12 @@
  * Identity::validate_announce (no ECC accelerator on the ESP32-S3, no Ed25519
  * in mbedTLS). That cost cannot be reduced, so it is not paid: a filter
  * registered on Transport's inbound hook drops every announce that is not a
- * PATH_RESPONSE, ~350 lines of Transport::inbound() before the verification.
- * See the prefilter block further down for what the hook does and does not
- * permit.
+ * PATH_RESPONSE for an allow-listed dest, ~350 lines of Transport::inbound()
+ * before the verification. The allow-list is the configured peer plus this
+ * node's own IN destination hashes. An empty list (no outbound peer, dests
+ * not yet built) drops every PATH_RESPONSE so the uncapped heap path table
+ * cannot grow. See the prefilter block further down for what the hook does
+ * and does not permit.
  *
  * THE TICK IS NOW ON, and it brings four library behaviours with it that no
  * caller can switch off. They are accepted, not worked around:
@@ -276,6 +279,9 @@ static_assert(RNS_PKT_TYPE_ANNOUNCE == (uint8_t)RNS::Type::Packet::ANNOUNCE,
 static_assert(RNS_PKT_CONTEXT_PATH_RESPONSE ==
                   (uint8_t)RNS::Type::Packet::PATH_RESPONSE,
               "rns/pktfilter.h PATH_RESPONSE does not match RNS::Type::Packet");
+static_assert(RNS_DEST_HASH_LEN ==
+                  (size_t)RNS::Type::Reticulum::DESTINATION_LENGTH,
+              "rns/pktfilter.h dest hash length does not match RNS");
 
 /* And the third wire constant, for the same reason: rns/inbox.h sizes its one
  * buffer at the largest plaintext a single encrypted packet can carry, and the
@@ -357,11 +363,17 @@ static_assert(RNS_OUTBOX_PAYLOAD_MAX == (size_t)RNS::Type::Packet::ENCRYPTED_MDU
  * the reference TCP interface uses. */
 #define RNS_TCP_BITRATE 10000000UL
 
-#define RNS_TCP_CONNECT_TIMEOUT_MS 3000
+#define RNS_TCP_CONNECT_TIMEOUT_MS 2000
 #define RNS_TCP_CONNECT_TASK_STACK 4096
 #define RNS_TCP_CONNECT_TASK_PRIO  1
-#define RNS_TCP_BACKOFF_MIN_MS 3000UL
-#define RNS_TCP_BACKOFF_MAX_MS 60000UL
+/* Was 3 s. Live 2026-08-14: mute RNS flap reset backoff every success tick,
+ * so connect() fired every ~3 s, logged socket:105, filled the pool, HTTP
+ * died, WG handshake aborted the board. Floor is now one minute. */
+#define RNS_TCP_BACKOFF_MIN_MS 60000UL
+#define RNS_TCP_BACKOFF_MAX_MS 600000UL
+/* After this many consecutive fail→idle arms, stop dialling until config
+ * changes. Chat uses mesh+WiFi bridge; mute RNS must not kill the pager. */
+#define RNS_TCP_GIVE_UP_AFTER  3
 
 /* Drain budget — three independent caps, all checked between reads. A single
  * read chunk is always parsed to the end (leftover bytes have nowhere to live),
@@ -520,6 +532,8 @@ static uint32_t g_rns_downs = 0;       /* established links subsequently lost */
 static uint32_t g_rns_backoff_ms = RNS_TCP_BACKOFF_MIN_MS;
 static uint32_t g_rns_next_try_ms = 0;
 static uint32_t g_rns_up_ms = 0;
+static uint8_t  g_rns_fail_streak = 0; /* consecutive fail arms; see give-up */
+static bool     g_rns_give_up = false; /* stop auto-dial until config dirty */
 static uint32_t g_rns_frames_in = 0;
 static uint32_t g_rns_tx_dropped = 0;
 static uint32_t g_rns_rx_errors = 0;   /* frames Transport::inbound threw on */
@@ -584,16 +598,20 @@ static uint32_t g_drain_us_max = 0;
  * instead of an Ed25519 verification that measured 221 ms on this board.
  *
  * The decision itself is rns_filter_keep_packet() in rns/pktfilter.h — a pure
- * function of packet type and context, host-tested by tools/test_rns_filter.sh.
- * What lives here is only the plumbing, and every line of it is constrained:
+ * function of type, context, dest hash and the allow-list, host-tested by
+ * tools/test_rns_filter.sh. What lives here is only the plumbing, and every
+ * line of it is constrained:
  *
  *   - The hook is a BARE FUNCTION POINTER (Transport::Callbacks::filter_packet
  *     is `bool(*)(const Packet&)`), so there is nowhere to put state except file
- *     scope. Hence the two statics below rather than anything captured.
+ *     scope. Hence the two counters and the allow-list below rather than
+ *     anything captured.
  *   - It runs inside the drain, on the loop task, once per inbound packet, so it
  *     must be O(1), allocate nothing and have no side effect beyond those two
- *     counters. Packet::packet_type() and Packet::context() are inline reads of
- *     the packet object's own fields; neither copies, allocates or throws.
+ *     counters. Packet::packet_type(), Packet::context() and
+ *     Packet::destination_hash() are inline reads of the packet object's own
+ *     fields; none copies, allocates or throws. destination_hash() is already
+ *     populated: Transport::inbound unpacks the packet BEFORE this callback.
  *   - The hook is FAIL-OPEN, but only for one kind of throw. Transport.cpp
  *     initialises `accept = true` and wraps the call in
  *     `catch (const std::exception&)`, so a std::exception out of here leaves
@@ -613,14 +631,72 @@ static uint32_t g_drain_us_max = 0;
  *
  * The counters are announce-specific on purpose: every non-announce packet is
  * kept unconditionally, so counting those would only measure traffic. kept +
- * dropped is the number of announces that reached the filter. */
+ * dropped is the number of announces that reached the filter.
+ *
+ * The allow-list is written only on the loop task (dest bring-up and
+ * rns_cfg_load) and read only from this callback (inbound drain, also the loop
+ * task). No mutex. It is never filled from inbound traffic. */
 static uint32_t g_rns_ann_dropped = 0;
 static uint32_t g_rns_ann_kept = 0;
+static uint8_t g_path_allow[4][RNS_DEST_HASH_LEN];
+static uint8_t g_path_allow_n = 0;
+
+static void rns_path_allow_add(const uint8_t *h, size_t n) {
+    if (h == nullptr || n != RNS_DEST_HASH_LEN) return;
+    if (g_path_allow_n >= 4) return;
+    for (uint8_t i = 0; i < g_path_allow_n; i++) {
+        if (memcmp(g_path_allow[i], h, RNS_DEST_HASH_LEN) == 0) return;
+    }
+    memcpy(g_path_allow[g_path_allow_n], h, RNS_DEST_HASH_LEN);
+    g_path_allow_n++;
+}
+
+static int rns_path_allow_nibble(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+/* Convert the already-validated 32-hex peer string (rns_addr_valid) to 16
+ * raw bytes. Not a new parser: the same charset and length rns_hex_n uses. */
+static void rns_path_allow_add_hex(const char *hex) {
+    uint8_t raw[RNS_DEST_HASH_LEN];
+    if (!rns_addr_valid(hex)) return;
+    for (size_t i = 0; i < RNS_DEST_HASH_LEN; i++) {
+        int hi = rns_path_allow_nibble(hex[i * 2]);
+        int lo = rns_path_allow_nibble(hex[i * 2 + 1]);
+        if (hi < 0 || lo < 0) return;
+        raw[i] = (uint8_t)((hi << 4) | lo);
+    }
+    rns_path_allow_add(raw, RNS_DEST_HASH_LEN);
+}
+
+static void rns_path_allow_add_dest(const RNS::Destination &dest) {
+    const RNS::Bytes &h = dest.hash();
+    if (h.size() == RNS_DEST_HASH_LEN && h.data() != nullptr)
+        rns_path_allow_add(h.data(), h.size());
+}
+
+/* Rebuild from the dests that exist plus the peer hex just applied. A cleared
+ * or replaced peer must not leave a stale dest in the table: that is how an
+ * empty peer goes back to dropping every PATH_RESPONSE we did not ask for. */
+static void rns_path_allow_reload(const char *peer_hex) {
+    g_path_allow_n = 0;
+    if (rns_dest_ok) rns_path_allow_add_dest(rns_destination);
+    if (rns_lxmf_dest_ok) rns_path_allow_add_dest(rns_lxmf_destination);
+    rns_path_allow_add_hex(peer_hex);
+}
 
 static bool rns_packet_filter(const RNS::Packet &packet) {
     uint8_t type = (uint8_t)packet.packet_type();
     uint8_t context = (uint8_t)packet.context();
-    bool keep = rns_filter_keep_packet(type, context);
+    const RNS::Bytes &dh = packet.destination_hash();  /* reference, not copy */
+    bool keep = rns_filter_keep_packet(
+        type, context,
+        dh.data(), dh.size(),
+        g_path_allow[0],   /* decays to uint8_t* */
+        g_path_allow_n);
     if (type == RNS_PKT_TYPE_ANNOUNCE) {
         if (keep) {
             g_rns_ann_kept++;
@@ -1581,6 +1657,10 @@ static bool rns_cfg_load() {
     memcpy(g_rns_peer, peer, sizeof(g_rns_peer));
     portEXIT_CRITICAL(&g_rns_tx_mux);
 
+    /* Peer applied (or cleared). Rebuild so a new peer replaces the old one
+     * and an empty peer drops every PATH_RESPONSE we did not ask for. */
+    rns_path_allow_reload(peer);
+
     /* The peer is NOT in this comparison. See g_rns_peer: the return value is
      * "drop the live link and redial", and a new peer address is no reason to. */
     return (g_rns_cfg_enabled != prev_enabled) || (g_rns_port != prev_port) ||
@@ -1933,6 +2013,8 @@ void RnsTcpInterface::loop() {
         if (g_rns_cfg_ok) {
             g_rns_backoff_ms = RNS_TCP_BACKOFF_MIN_MS;
             g_rns_next_try_ms = millis();
+            g_rns_give_up = false;
+            g_rns_fail_streak = 0;
         }
         if (changed && cs == RNS_CS_CONNECTED) {
             link_down("configuration changed");
@@ -1944,6 +2026,13 @@ void RnsTcpInterface::loop() {
         _online = false;
         g_rns_client.stop();
         g_rns_cs.store(RNS_CS_IDLE);
+        if (g_rns_fail_streak < 255) g_rns_fail_streak++;
+        if (g_rns_fail_streak >= RNS_TCP_GIVE_UP_AFTER) {
+            g_rns_give_up = true;
+            event_add("rns tcp give up after %u fails (no auto-dial)",
+                      (unsigned)g_rns_fail_streak);
+            return;
+        }
         g_rns_next_try_ms = millis() + g_rns_backoff_ms;
         /* Announce the delay that was just armed, not the one after it: the
          * event used to print the already-doubled value and was a whole step
@@ -1959,16 +2048,21 @@ void RnsTcpInterface::loop() {
 
     if (cs == RNS_CS_CONNECTED) {
         if (!_online) {
-            /* First tick after the connect task won. */
+            /* First tick after the connect task won. Do NOT reset backoff here:
+             * a mute peer that accepts then drops would re-arm the 3 s floor
+             * forever. Backoff clears only after a long stable uptime below. */
             _online = true;
             g_rns_up_ms = millis();
-            g_rns_backoff_ms = RNS_TCP_BACKOFF_MIN_MS;
             g_rns_wg_seen = wg_is_up();
             rns_hdlc_rx_reset(&g_rns_rx);
             g_rns_tx_len = 0;
             g_rns_tx_sent = 0;
             g_rns_tx_pending_ms = 0;
             event_add("rns tcp up %s:%u", g_rns_host, (unsigned)g_rns_port);
+        } else if ((millis() - g_rns_up_ms) > 60000UL) {
+            /* Truly stable for 60 s — safe to shrink the ladder. */
+            g_rns_backoff_ms = RNS_TCP_BACKOFF_MIN_MS;
+            g_rns_fail_streak = 0;
         }
 
         if (!g_rns_cfg_enabled) {
@@ -2004,6 +2098,7 @@ void RnsTcpInterface::loop() {
      * interface is switched off. */
     _online = false;
     if (!g_rns_cfg_enabled || !g_rns_cfg_ok) return;
+    if (g_rns_give_up) return; /* mute/flapping host must not burn sockets */
     if (WiFi.status() != WL_CONNECTED) return;
     if ((int32_t)(millis() - g_rns_next_try_ms) < 0) return;
     begin_connect();
@@ -3865,6 +3960,7 @@ static void skill_rns_init() {
              * is exactly what rns_dest_ok means. Nothing that can throw is
              * allowed between the constructor and here. */
             rns_dest_ok = true;
+            rns_path_allow_add_dest(rns_destination);
         } catch (const std::exception &e) {
             rns_error = "exception creating the destination";
             Serial.printf("[rns] destination failed: %s\n", e.what());
@@ -3925,6 +4021,7 @@ static void skill_rns_init() {
             rns_lxmf_destination.accepts_links(false);
             rns_lxmf_destination.set_packet_callback(rns_lxmf_data_callback);
             rns_lxmf_dest_ok = true;
+            rns_path_allow_add_dest(rns_lxmf_destination);
         } catch (const std::exception &e) {
             rns_error = "exception creating the lxmf destination";
             Serial.printf("[rns] lxmf destination failed: %s\n", e.what());
@@ -4002,6 +4099,9 @@ static void skill_rns_init() {
                   (int)g_rns_cfg_enabled,
                   rns_error ? " err=" : "", rns_error ? rns_error : "");
     skill_register(&rns_skill);
-    event_add("rns skill started=%d id=%d iface=%d", (int)rns_started,
+        /* Mute RNS must not dial: socket:105 every 3s killed chat delivery. */
+    g_rns_give_up = true;
+    g_rns_fail_streak = RNS_TCP_GIVE_UP_AFTER;
+event_add("rns skill started=%d id=%d iface=%d", (int)rns_started,
               (int)rns_identity_ok, (int)g_rns_cfg_enabled);
 }

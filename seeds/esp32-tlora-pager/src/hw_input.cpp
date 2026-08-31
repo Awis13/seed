@@ -16,11 +16,16 @@
 #define INPUT_DEBOUNCE_MS       30
 #define INPUT_CLICK_MAX_MS      800
 #define INPUT_LONG_MS          1000
+// Leftover quadrature counts (1..3) sit under the detent threshold. A quiet
+// encoder on a detent edge will drip them in and eventually emit a phantom
+// step. Drop the leftover after this much silence; a real turn is a burst.
+#define INPUT_STALE_MS         200
 
 static ESP32Encoder enc;
 static int64_t enc_raw = 0;
 static int32_t enc_accum = 0;
 static int pending_steps = 0;
+static unsigned long enc_last_edge_ms = 0;
 
 static bool key_level = false;
 static bool key_stable = false;
@@ -38,6 +43,7 @@ void hw_input_begin() {
     enc_raw = enc.getCount();
     enc_accum = 0;
     pending_steps = 0;
+    enc_last_edge_ms = millis();
 
     pinMode(PIN_ROTARY_C, INPUT_PULLUP);  // active low
     key_level = digitalRead(PIN_ROTARY_C) == LOW;
@@ -53,8 +59,16 @@ void hw_input_begin() {
 
 void hw_input_poll() {
     int64_t raw = enc.getCount();
-    enc_accum += (int32_t)(raw - enc_raw);
-    enc_raw = raw;
+    int32_t delta = (int32_t)(raw - enc_raw);
+    unsigned long t = millis();
+    if (delta == 0) {
+        if (enc_accum != 0 && (t - enc_last_edge_ms) >= INPUT_STALE_MS)
+            enc_accum = 0;
+    } else {
+        enc_last_edge_ms = t;
+        enc_accum += delta;
+        enc_raw = raw;
+    }
 
     int steps = 0;
     while (enc_accum >= INPUT_COUNTS_PER_DETENT) {
@@ -68,7 +82,6 @@ void hw_input_poll() {
     pending_steps += steps * INPUT_DIRECTION;
 
     bool now = digitalRead(PIN_ROTARY_C) == LOW;
-    unsigned long t = millis();
     if (now != key_level) {
         key_level = now;
         key_changed = t;

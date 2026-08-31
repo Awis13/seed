@@ -44,8 +44,8 @@ void hw_kb_reset_mods();
 // True once after a layout change (cycle or set); UI clears via this read.
 bool hw_kb_take_layout_changed();
 
-// True once after ALT+S is pressed. The shortcut is consumed before the symbol
-// layer emits '/', so it never leaks into a draft.
+// True once after a dedicated silent-toggle event. ALT+S is '/' on the
+// symbol layer and must type that character — silent lives in Settings.
 bool hw_kb_take_silent_toggle();
 
 // Keyboard lock (pocket / bag), controlled by held USER in main.
@@ -55,3 +55,10 @@ bool hw_kb_locked();
 void hw_kb_set_locked(bool on);
 // True once after lock state flips (for haptic / note).
 bool hw_kb_take_lock_changed();
+
+// Keyboard backlight on GPIO46. That pad is an ESP32-S3 strap pin — never
+// PWM it. park() must run first in setup() so a dirty reset cannot boot-loop.
+void hw_kb_park_backlight();
+void hw_kb_set_backlight(uint8_t level);
+uint8_t hw_kb_get_backlight();
+void hw_kb_toggle_backlight();

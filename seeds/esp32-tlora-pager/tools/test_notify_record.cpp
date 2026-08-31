@@ -20,6 +20,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <string>
 #include <vector>
 
 #include "../src/micron/notify_record.h"
@@ -153,8 +154,11 @@ static void test_event_identity_and_reservation(void) {
     assert(strcmp(notify_rec_archive_event_key(
                       "opencode-pager", 99, &no_event, true,
                       fail_safe, sizeof(fail_safe)), "#99") == 0);
-    assert(!notify_rec_key_replaces("hermes-chat"));
+    assert(notify_rec_key_replaces("hermes-chat"));
     assert(notify_rec_key_replaces("raid-tank"));
+    assert(notify_rec_delete_shadows_older("raid-tank", false));
+    assert(!notify_rec_delete_shadows_older("raid-tank", true));
+    assert(!notify_rec_delete_shadows_older("", false));
 }
 
 /* --- unread flip survives: the acked state is what round-trips ------------- */
@@ -452,11 +456,25 @@ static void mock_append_tombstone(MockArchive &a, const char *akey) {
     mock_append(a, MICRON_NS_NOTIFY, akey, buf, (uint16_t)n);
 }
 
+static void mock_append_key_tombstone(MockArchive &a, const char *akey,
+                                      const char *logical_key) {
+    uint8_t buf[NOTIFY_REC_MAX];
+    size_t n = notify_rec_key_tombstone_encode(logical_key, buf, sizeof(buf));
+    assert(n > 1);
+    mock_append(a, MICRON_NS_NOTIFY, akey, buf, (uint16_t)n);
+}
+
 /* Replay notify_restore_from_archive() over the mock: return the ids restored,
- * newest-first, tombstoned identities skipped. */
+ * newest-first, tombstoned and shadowed identities skipped. */
 static std::vector<uint32_t> mock_restore(MockArchive &a) {
+    static const size_t ring_max = 40;
     std::vector<uint32_t> ids;
-    for (int rank = 0;; rank++) {
+    std::vector<notify_rec> restored;
+    std::vector<std::string> deleted_keys;
+    deleted_keys.reserve(HISTORY_INDEX_MAX);
+    for (int rank = 0;
+         rank < HISTORY_INDEX_MAX && ids.size() < ring_max;
+         rank++) {
         const history_index_entry *e =
             history_index_ns_at(&a.ix, MICRON_NS_NOTIFY, rank);
         if (!e) break;
@@ -466,10 +484,34 @@ static std::vector<uint32_t> mock_restore(MockArchive &a) {
         history_decode_status st = history_decode(a.bytes.data() + e->offset,
                                                   a.bytes.size() - e->offset,
                                                   &rec, &consumed);
-        assert(st == HISTORY_DECODE_OK);
-        if (notify_rec_is_tombstone(rec.payload, rec.len)) continue;  /* deleted */
+        if (st != HISTORY_DECODE_OK) continue;
+        if (notify_rec_is_tombstone(rec.payload, rec.len)) {
+            char key[NR_KEY_CAP] = {};
+            if (deleted_keys.size() < HISTORY_INDEX_MAX &&
+                notify_rec_tombstone_key(rec.payload, rec.len,
+                                         key, sizeof(key)))
+                deleted_keys.push_back(key);
+            continue;
+        }
         notify_rec nr;
-        assert(notify_rec_decode(rec.payload, rec.len, &nr) == 1);
+        if (!notify_rec_decode(rec.payload, rec.len, &nr)) continue;
+        bool shadowed = false;
+        for (const std::string &key : deleted_keys) {
+            if (key == nr.key) {
+                shadowed = true;
+                break;
+            }
+        }
+        for (const notify_rec &newer : restored) {
+            if (newer.id == nr.id ||
+                notify_rec_restore_shadowed(nr.key, newer.key,
+                                            newer.event_distinct)) {
+                shadowed = true;
+                break;
+            }
+        }
+        if (shadowed) continue;
+        restored.push_back(nr);
         ids.push_back(nr.id);
     }
     return ids;
@@ -505,6 +547,19 @@ static void test_tombstone_codec(void) {
     assert(notify_rec_tombstone_encode(buf, 0) == 0);   /* buffer too small */
     assert(!notify_rec_is_tombstone(NULL, 1));
     assert(!notify_rec_is_tombstone(buf, 0));
+
+    /* The versioned form is still a tombstone, but carries a bounded logical
+     * key deletion barrier. The original one-byte form carries no such key. */
+    char key[NR_KEY_CAP];
+    n = notify_rec_key_tombstone_encode("raid", buf, sizeof(buf));
+    assert(n == NOTIFY_REC_TOMBSTONE_KEY_HEAD + 4);
+    assert(notify_rec_is_tombstone(buf, n));
+    assert(notify_rec_tombstone_key(buf, n, key, sizeof(key)));
+    assert(strcmp(key, "raid") == 0);
+    assert(!notify_rec_tombstone_key(buf, 1, key, sizeof(key)));
+    assert(!notify_rec_key_tombstone_encode("", buf, sizeof(buf)));
+    buf[2] = NR_KEY_CAP;
+    assert(!notify_rec_tombstone_key(buf, n, key, sizeof(key)));
 }
 
 static void test_delete_survives_reboot(void) {
@@ -565,6 +620,207 @@ static void test_delete_survives_reboot(void) {
     assert(!mock_has(r3, 100));   /* the old id stays gone; the key now holds 200 */
 }
 
+/* --- keyed replacement repairs legacy event identities after reboot ------- */
+
+static notify_rec mock_card(uint32_t id, const char *key, bool event_distinct,
+                            uint64_t event_counter) {
+    notify_rec r;
+    memset(&r, 0, sizeof(r));
+    r.id = id;
+    r.event_distinct = event_distinct ? 1 : 0;
+    r.event_id.epoch_hi = 1;
+    r.event_id.epoch_lo = 2;
+    r.event_id.counter = event_counter;
+    snprintf(r.title, sizeof(r.title), "card-%u", (unsigned)id);
+    snprintf(r.key, sizeof(r.key), "%s", key);
+    return r;
+}
+
+static void mock_append_event_card(MockArchive &a, const notify_rec *r) {
+    char akey[NOTIFY_ARCHIVE_EVENTKEY_CAP];
+    const char *key = notify_rec_archive_event_key(
+        r->key, r->id, &r->event_id, r->event_distinct,
+        akey, sizeof(akey));
+    mock_append_card(a, key, r);
+}
+
+static void mock_append_invalid_notify(MockArchive &a, const char *akey) {
+    const uint8_t invalid[] = {0x7Fu};
+    mock_append(a, MICRON_NS_NOTIFY, akey, invalid, sizeof(invalid));
+}
+
+static void mock_append_corrupt_card(MockArchive &a, const notify_rec *r) {
+    mock_append_event_card(a, r);
+    const history_index_entry *e =
+        history_index_get(&a.ix, MICRON_NS_NOTIFY, r->key);
+    assert(e && e->offset < a.bytes.size());
+    a.bytes[e->offset] ^= 0xFFu;  /* break the history envelope magic after indexing */
+}
+
+static void test_keyed_replacement_repairs_legacy_duplicates(void) {
+    MockArchive a;
+    a.bytes.clear();
+    history_index_init(&a.ix);
+    a.seq = 0;
+
+    /* Older firmware archived ordinary keyed cards under distinct event
+     * identities, leaving multiple independently indexed records. */
+    notify_rec old1 = mock_card(10, "pills-morning", true, 10);
+    notify_rec unrelated1 = mock_card(20, "weather", true, 20);
+    notify_rec old2 = mock_card(11, "pills-morning", true, 11);
+    notify_rec unrelated2 = mock_card(21, "door", true, 21);
+    mock_append_event_card(a, &old1);
+    mock_append_event_card(a, &unrelated1);
+    mock_append_event_card(a, &old2);
+    mock_append_event_card(a, &unrelated2);
+
+    /* A current ordinary replacement uses the stable key identity and is the
+     * newest record. On reboot it shadows every older same-key identity. */
+    notify_rec replacement = mock_card(12, "pills-morning", false, 12);
+    mock_append_event_card(a, &replacement);
+
+    std::vector<uint32_t> ids = mock_restore(a);
+    assert(ids.size() == 3);
+    assert(ids[0] == 12);
+    assert(ids[1] == 21 && ids[2] == 20);  /* unrelated chronology preserved */
+    assert(!mock_has(ids, 10) && !mock_has(ids, 11));
+}
+
+static void test_shadowed_identities_do_not_consume_restore_capacity(void) {
+    MockArchive a;
+    a.bytes.clear();
+    history_index_init(&a.ix);
+    a.seq = 0;
+
+    /* Fill the complete 64-identity index in chronological append order:
+     * 24 unrelated cards, 39 legacy same-key event identities, then the newest
+     * ordinary replacement. Restore must scan past all 39 shadowed identities
+     * to reach the unrelated cards that still fit in the 40-card ring. */
+    for (uint32_t i = 0; i < 24; i++) {
+        char key[NR_KEY_CAP];
+        snprintf(key, sizeof(key), "unrelated-%u", (unsigned)i);
+        notify_rec unrelated = mock_card(100 + i, key, false, 100 + i);
+        mock_append_event_card(a, &unrelated);
+    }
+    for (uint32_t i = 0; i < 39; i++) {
+        notify_rec legacy = mock_card(200 + i, "pills-morning", true, 200 + i);
+        mock_append_event_card(a, &legacy);
+    }
+    notify_rec replacement = mock_card(300, "pills-morning", false, 300);
+    mock_append_event_card(a, &replacement);
+
+    assert(history_index_ns_count(&a.ix, MICRON_NS_NOTIFY) == HISTORY_INDEX_MAX);
+    std::vector<uint32_t> ids = mock_restore(a);
+    assert(ids.size() == 25);
+    assert(ids[0] == 300);
+    for (size_t i = 1; i < ids.size(); i++)
+        assert(ids[i] == 124 - i);  /* unrelated cards remain newest-first */
+    for (uint32_t id = 200; id < 239; id++) assert(!mock_has(ids, id));
+}
+
+static void test_keyed_delete_barrier_is_bounded_and_capacity_safe(void) {
+    MockArchive a;
+    a.bytes.clear();
+    history_index_init(&a.ix);
+    a.seq = 0;
+
+    /* The complete 64-identity window mixes every production skip path. The
+     * keyed tombstone is newest; 39 legacy identities share its logical key.
+     * Invalid bodies, a corrupt history envelope and an older duplicate id must
+     * also consume no ring slots, allowing every unrelated card to restore. */
+    for (uint32_t i = 0; i < 20; i++) {
+        char key[NR_KEY_CAP];
+        snprintf(key, sizeof(key), "unrelated-%u", (unsigned)i);
+        notify_rec unrelated = mock_card(100 + i, key, false, 100 + i);
+        mock_append_event_card(a, &unrelated);
+    }
+
+    notify_rec duplicate_old = mock_card(500, "duplicate-old", false, 500);
+    notify_rec duplicate_new = mock_card(500, "duplicate-new", false, 501);
+    mock_append_event_card(a, &duplicate_old);
+    mock_append_event_card(a, &duplicate_new);
+    mock_append_invalid_notify(a, "invalid-notify");
+    notify_rec corrupt = mock_card(600, "corrupt-card", false, 600);
+    mock_append_corrupt_card(a, &corrupt);
+
+    for (uint32_t i = 0; i < 39; i++) {
+        notify_rec legacy = mock_card(200 + i, "pills-morning", true, 200 + i);
+        mock_append_event_card(a, &legacy);
+    }
+    notify_rec replacement = mock_card(300, "pills-morning", false, 300);
+    mock_append_event_card(a, &replacement);
+    mock_append_key_tombstone(a, "pills-morning", "pills-morning");
+
+    assert(history_index_ns_count(&a.ix, MICRON_NS_NOTIFY) == HISTORY_INDEX_MAX);
+    std::vector<uint32_t> ids = mock_restore(a);
+    assert(ids.size() == 21);
+    for (uint32_t id = 100; id < 120; id++) assert(mock_has(ids, id));
+    int duplicate_count = 0;
+    for (uint32_t id : ids) if (id == 500) duplicate_count++;
+    assert(duplicate_count == 1);
+    assert(!mock_has(ids, 300) && !mock_has(ids, 600));
+    for (uint32_t id = 200; id < 239; id++) assert(!mock_has(ids, id));
+}
+
+static void test_identity_only_deletes_do_not_overdelete(void) {
+    MockArchive a;
+    a.bytes.clear();
+    history_index_init(&a.ix);
+    a.seq = 0;
+
+    notify_rec ordinary = mock_card(700, "hermes-chat", false, 700);
+    notify_rec distinct = mock_card(701, "hermes-chat", true, 701);
+    notify_rec keyless1 = mock_card(702, "", false, 702);
+    notify_rec keyless2 = mock_card(703, "", false, 703);
+    mock_append_event_card(a, &ordinary);
+    mock_append_event_card(a, &distinct);
+    mock_append_event_card(a, &keyless1);
+    mock_append_event_card(a, &keyless2);
+
+    /* Distinct-event and keyless deletes use the backward-compatible one-byte
+     * tombstone, so they delete only their archive identity. */
+    char distinct_key[NOTIFY_ARCHIVE_EVENTKEY_CAP];
+    const char *distinct_akey = notify_rec_archive_event_key(
+        distinct.key, distinct.id, &distinct.event_id, distinct.event_distinct,
+        distinct_key, sizeof(distinct_key));
+    mock_append_tombstone(a, distinct_akey);
+    char keyless_key[NOTIFY_ARCHIVE_IDKEY_CAP];
+    const char *keyless_akey = notify_rec_archive_event_key(
+        keyless2.key, keyless2.id, &keyless2.event_id, keyless2.event_distinct,
+        keyless_key, sizeof(keyless_key));
+    mock_append_tombstone(a, keyless_akey);
+
+    std::vector<uint32_t> ids = mock_restore(a);
+    assert(ids.size() == 2);
+    assert(mock_has(ids, 700));  /* distinct delete did not hide the keyed card */
+    assert(mock_has(ids, 702));  /* keyless delete did not hide another keyless card */
+    assert(!mock_has(ids, 701) && !mock_has(ids, 703));
+}
+
+static void test_distinct_restore_chronology_is_preserved(void) {
+    MockArchive a;
+    a.bytes.clear();
+    history_index_init(&a.ix);
+    a.seq = 0;
+
+    notify_rec ordinary = mock_card(30, "hermes-chat", false, 30);
+    notify_rec event1 = mock_card(31, "hermes-chat", true, 31);
+    notify_rec event2 = mock_card(32, "hermes-chat", true, 32);
+    notify_rec keyless1 = mock_card(40, "", false, 40);
+    notify_rec keyless2 = mock_card(41, "", false, 41);
+    mock_append_event_card(a, &ordinary);
+    mock_append_event_card(a, &event1);
+    mock_append_event_card(a, &event2);
+    mock_append_event_card(a, &keyless1);
+    mock_append_event_card(a, &keyless2);
+
+    std::vector<uint32_t> ids = mock_restore(a);
+    assert(ids.size() == 5);
+    assert(ids[0] == 41 && ids[1] == 40);  /* keyless cards do not replace */
+    assert(ids[2] == 32 && ids[3] == 31);  /* distinct events coexist */
+    assert(ids[4] == 30);                  /* newer distinct does not hide keyed */
+}
+
 /* --- graceful empty: nothing indexed => nothing restored ------------------- */
 
 static void test_graceful_empty(void) {
@@ -586,6 +842,11 @@ int main(void) {
     test_archive_key_no_collision();
     test_tombstone_codec();
     test_delete_survives_reboot();
+    test_keyed_replacement_repairs_legacy_duplicates();
+    test_shadowed_identities_do_not_consume_restore_capacity();
+    test_keyed_delete_barrier_is_bounded_and_capacity_safe();
+    test_identity_only_deletes_do_not_overdelete();
+    test_distinct_restore_chronology_is_preserved();
     test_graceful_empty();
     printf("notify record + restore tests: OK\n");
     return 0;

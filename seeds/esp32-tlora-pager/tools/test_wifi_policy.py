@@ -54,8 +54,11 @@ assert "wifi_begin_active_profile()" in retry
 toggle = main[main.index("static void ui_wifi_toggle()") :]
 toggle = toggle[: toggle.index("static void ui_wifi_do_scan()")]
 assert "if (!wifi_user_off)" in toggle
-assert "WiFi.mode(WIFI_OFF)" in toggle
-assert "WiFi.disconnect(true, false)" in toggle
+assert "wifi_off_request()" in toggle, "OFF must be deferred; inline WIFI_OFF reboots"
+assert "WiFi.disconnect(true, false)" not in toggle
+assert "WiFi.mode(WIFI_OFF)" not in toggle
+assert "WIFI_OFF_STOP_WG" in main
+assert "static void wifi_off_poll()" in main
 
 for marker, end_marker in (
     ("static void handle_wifi_scan", "static void handle_wifi_networks_post"),
@@ -63,7 +66,7 @@ for marker, end_marker in (
 ):
     scan = main[main.index(marker):main.index(end_marker)]
     assert "wifi_user_off = false" not in scan, "scan must preserve manual Wi-Fi OFF"
-    assert "WiFi.mode(WIFI_OFF)" in scan, "scan must restore RF-off state"
+    assert "wifi_off_request()" in scan, "scan must restore RF-off via the settle machine"
 
 confirm = main[main.index("// Auto-confirm after 60s") :]
 confirm = confirm[: confirm.index("// WiFi reconnect")]
@@ -91,6 +94,27 @@ assert "agents_bridge_post(conv_id, session, text, delivery_key)" in send, (
 )
 assert "g_agents_mesh_uplink(conv_id, text, delivery_key)" in send, (
     "the mesh uplink remains the fallback rung"
+)
+
+wg = (ROOT / "src" / "skills" / "wg.cpp").read_text(encoding="utf-8")
+assert "g_wg_json_ok" in wg, "WG config must stay in RAM so a restart does not fopen SPIFFS"
+# The liveness probe that this rule guarded is gone: 0.9.106 pulled the whole
+# HTTP health check out of the WG poll after live serial showed the probe's own
+# sockets ("socket: 105") driving the handshake timer into abort(). Same intent,
+# stronger form — the poll must do no network I/O at all, and the tunnel may
+# only be stopped by WiFi loss or an explicit request flag.
+poll = wg[wg.index("static void skill_wg_poll()"):]
+assert "http.setConnectTimeout" not in poll and "HTTPClient" not in poll, (
+    "the WG poll must not probe over HTTP — its sockets reboot-looped the device"
+)
+assert "if (g_wg_running) wg_stop_now();" in poll, (
+    "WiFi loss must still stop the tunnel so the library timer stops handshaking"
+)
+for guard in ("if (g_wg_stop_req)", "if (g_wg_restart_req)"):
+    assert guard in poll, f"{guard} must own its wg_stop_now(), nothing else may"
+
+assert "g_wg_restart_req = true" not in main, (
+    "the coordinator must not stop+start WireGuard on the loop task"
 )
 
 print("Wi-Fi/mesh boot policy tests: OK")

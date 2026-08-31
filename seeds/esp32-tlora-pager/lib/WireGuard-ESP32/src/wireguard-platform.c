@@ -34,8 +34,11 @@ void wireguard_platform_init() {
 }
 
 void wireguard_random_bytes(void *bytes, size_t size) {
-	uint8_t *out = (uint8_t *)bytes;
-	mbedtls_ctr_drbg_random(&random_context, bytes, size);
+	/* Direct HW RNG. mbedtls_ctr_drbg_random under socket/DRAM pressure
+	 * (NetworkClient "socket: 105") can log and hit newlib lock_init_generic
+	 * → abort() on the tcpip thread. Serial 2026-08-14: wireguardif_tmr
+	 * handshake → random_bytes → abort. esp_fill_random never allocates. */
+	esp_fill_random(bytes, size);
 }
 
 uint32_t wireguard_sys_now() {

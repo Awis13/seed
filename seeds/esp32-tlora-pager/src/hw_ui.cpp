@@ -1714,11 +1714,22 @@ void hw_ui_show_agent_sessions(const char *agent_name,
 // advanced past the unpainted tail ("Готов" → "Гот" / drop "ов ").
 #define AGENT_CHAT_LINE_MAX  168
 
+// Mine prefix: > history, ~ in flight, * radio/HTTP ACK, ! failed.
+// Theirs is always '<'. delivery is RAM-only (see AGENT_DELIV_*).
+static char agent_chat_mark(bool mine, uint8_t delivery) {
+    if (!mine) return '<';
+    if (delivery == 2) return '*';
+    if (delivery == 3) return '!';
+    if (delivery == 1) return '~';
+    return '>';
+}
+
 // Advance one wrap step of *p; return *bytes* consumed (always == painted body).
-// first=true → prepend "> " or "< ".
+// first=true → prepend the 2-char mark ("* ", "~ ", ...).
 // max_cols is in *codepoints* (glyphs). line_n must hold max_cols*4 + 3.
-static int agent_chat_next_row(const char **pp, bool mine, bool first,
-                               int max_cols, char *line, size_t line_n) {
+static int agent_chat_next_row(const char **pp, bool mine, uint8_t delivery,
+                               bool first, int max_cols, char *line,
+                               size_t line_n) {
     if (!pp || !*pp || !line || line_n < 8) return 0;
     const char *p = *pp;
 
@@ -1731,7 +1742,7 @@ static int agent_chat_next_row(const char **pp, bool mine, bool first,
 
     if (!*p) {
         if (first) {
-            snprintf(line, line_n, "%s", mine ? "> " : "< ");
+            snprintf(line, line_n, "%c ", agent_chat_mark(mine, delivery));
             return 0;
         }
         line[0] = '\0';
@@ -1769,7 +1780,7 @@ static int agent_chat_next_row(const char **pp, bool mine, bool first,
     while (take > 0 && p[take - 1] == ' ') take--;
 
     if (first) {
-        line[0] = mine ? '>' : '<';
+        line[0] = agent_chat_mark(mine, delivery);
         line[1] = ' ';
     }
     memcpy(line + off, p, (size_t)take);
@@ -1781,7 +1792,8 @@ static int agent_chat_next_row(const char **pp, bool mine, bool first,
     return bytes;
 }
 
-static int agent_chat_wrap_rows(const char *raw, bool mine, int max_cols) {
+static int agent_chat_wrap_rows(const char *raw, bool mine, uint8_t delivery,
+                                int max_cols) {
     if (!raw) raw = "";
     const char *p = raw;
     bool first = true;
@@ -1789,7 +1801,8 @@ static int agent_chat_wrap_rows(const char *raw, bool mine, int max_cols) {
     char discard[AGENT_CHAT_LINE_MAX];
     if (!*raw) return 1;
     while (*p) {
-        agent_chat_next_row(&p, mine, first, max_cols, discard, sizeof(discard));
+        agent_chat_next_row(&p, mine, delivery, first, max_cols, discard,
+                            sizeof(discard));
         rows++;
         first = false;
         if (rows > 400) break;
@@ -1803,7 +1816,8 @@ int hw_ui_show_agent_chat(const char *agent_name,
                           int line_count,
                           int scroll_row,
                           int *total_rows_out,
-                          const char *footer) {
+                          const char *footer,
+                          const uint8_t *delivery) {
     if (!panel_ok) return 0;
     HwSpiBusGuard bus;  // whole chat repaint (wrap math + body redraw)
 
@@ -1819,8 +1833,9 @@ int hw_ui_show_agent_chat(const char *agent_name,
     int total = 0;
     for (int i = 0; i < line_count; i++) {
         bool mine = from_me && from_me[i];
+        uint8_t del = delivery ? delivery[i] : 0;
         const char *raw = (lines && lines[i]) ? lines[i] : "";
-        total += agent_chat_wrap_rows(raw, mine, max_cols);
+        total += agent_chat_wrap_rows(raw, mine, del, max_cols);
     }
     if (total < 1) total = 1;
     if (total_rows_out) *total_rows_out = total;
@@ -1872,13 +1887,14 @@ int hw_ui_show_agent_chat(const char *agent_name,
     uint16_t y = y0;
     for (int i = 0; i < line_count; i++) {
         bool mine = from_me && from_me[i];
+        uint8_t del = delivery ? delivery[i] : 0;
         const char *raw = (lines && lines[i]) ? lines[i] : "";
         const char *p = raw;
         bool first = true;
         if (!*raw) {
             if (row_i >= scroll && y + row_h <= y_max) {
                 char line[8];
-                snprintf(line, sizeof(line), "%s", mine ? "> " : "< ");
+                snprintf(line, sizeof(line), "%c ", agent_chat_mark(mine, del));
                 tft_draw_text(MARGIN, y, line,
                               mine ? COL_ACCENT : COL_TIME, COL_BG, sc);
                 y = (uint16_t)(y + row_h);
@@ -1888,7 +1904,8 @@ int hw_ui_show_agent_chat(const char *agent_name,
         }
         while (*p) {
             char line[AGENT_CHAT_LINE_MAX];
-            agent_chat_next_row(&p, mine, first, max_cols, line, sizeof(line));
+            agent_chat_next_row(&p, mine, del, first, max_cols, line,
+                                sizeof(line));
             if (row_i >= scroll && y + row_h <= y_max) {
                 tft_draw_text(MARGIN, y, line,
                               mine ? COL_ACCENT : COL_TIME, COL_BG, sc);

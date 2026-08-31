@@ -90,9 +90,10 @@ assert "tft_sleep();" in poll, "blanking must sleep the panel controller"
 assert "tft_wake();" in poll, "leaving blank must wake the panel controller"
 
 blank = poll[poll.index("if (shown == 0)") : poll.index("} else if (bl_applied == 0)")]
+assert "kb_bl_follow_blank();" in blank, "keyboard light must die with the panel"
 assert "bl_drive(0);" in blank and "tft_sleep();" in blank
-assert blank.index("bl_drive(0);") < blank.index("tft_sleep();"), (
-    "blank order: backlight reaches 0 first, then the controller sleeps"
+assert blank.index("kb_bl_follow_blank();") < blank.index("bl_drive(0);") < blank.index("tft_sleep();"), (
+    "blank order: keys off, panel backlight to 0, then the controller sleeps"
 )
 
 wake = poll[poll.index("} else if (bl_applied == 0)") :]
@@ -101,9 +102,10 @@ assert (
     wake.index("tft_wake();")
     < wake.index("ui_blank_wake_repaint();")
     < wake.index("bl_drive(shown);")
+    < wake.index("kb_bl_follow_wake();")
 ), (
-    "wake order (vendor order): SLPOUT + settle, repaint, and only then raise "
-    "the backlight — the lit panel must never show a stale frame"
+    "wake order (vendor order): SLPOUT + settle, repaint, raise the panel "
+    "backlight, then the keys — the lit panel must never show a stale frame"
 )
 
 # --- s5 (C3): boot with a saved level 0 sleeps the panel controller ----------

@@ -209,13 +209,16 @@ void hw_ui_show_agent_sessions(const char *agent_name,
 // scroll_row: first visual row from top of the wrapped document.
 //   pass -1 to pin to the bottom (latest). Returns the actual scroll used.
 // total_rows_out: optional; total wrapped rows for encoder clamping.
+// delivery[] is RAM-only per line (0 none, 1 pending, 2 ok, 3 fail) and
+// chooses the mine prefix: > history, ~ pending, * delivered, ! failed.
 int hw_ui_show_agent_chat(const char *agent_name,
                           const char *const *lines,
                           const bool *from_me,
                           int line_count,
                           int scroll_row,
                           int *total_rows_out,
-                          const char *footer);
+                          const char *footer,
+                          const uint8_t *delivery = nullptr);
 
 // In-chat sheet. allow_delete true → CLEAR CHAT / DELETE / BACK (selected 0..2);
 // false (a seeded door) → CLEAR CHAT / BACK (selected 0..1).

@@ -31,3 +31,14 @@ static inline void *psram_calloc_pref(size_t size) {
     if (p) memset(p, 0, size);
     return p;
 }
+
+// newlib fopen → lock_init_generic aborts when internal DRAM cannot allocate the
+// FILE lock (serial 2026-08-14: open chat → agents_sync_view → FS::open → abort).
+// Soft-skip the open rather than reboot. 12 KB leaves room for the lock + VFS
+// object + a small JsonDocument without starving lwIP/WiFi.
+#ifndef FS_OPEN_MIN_INTERNAL
+#define FS_OPEN_MIN_INTERNAL 12288u
+#endif
+static inline bool fs_internal_heap_ok(size_t need = FS_OPEN_MIN_INTERNAL) {
+    return heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) >= need;
+}

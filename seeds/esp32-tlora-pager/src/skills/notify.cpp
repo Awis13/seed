@@ -676,7 +676,10 @@ static void notify_archive_tombstone(const char *key, uint32_t id,
     const char *akey = notify_rec_archive_event_key(
         key, id, event, event_distinct, idkey, sizeof(idkey));
     uint8_t buf[NOTIFY_REC_MAX];
-    size_t n = notify_rec_tombstone_encode(buf, sizeof(buf));
+    size_t n = 0;
+    if (notify_rec_delete_shadows_older(key, event_distinct))
+        n = notify_rec_key_tombstone_encode(key, buf, sizeof(buf));
+    if (!n) n = notify_rec_tombstone_encode(buf, sizeof(buf));
     if (n) history_enqueue(MICRON_NS_NOTIFY, akey, buf, n);
 }
 
@@ -735,12 +738,14 @@ static uint32_t notify_push(Notification &e, const NotifyOptions *opts,
 
     portENTER_CRITICAL(&notify_mux);
 
+    /* Drop every same-key card so one update also repairs a duplicate stack
+     * left by older firmware. The walk is oldest-first because order[0] is
+     * newest; the final assignment therefore reports the newest removed id. */
     if (notify_rec_key_replaces(e.key) && !e.event_distinct) {
         for (int i = notify_len - 1; i >= 0; i--) {
             if (strcmp(notify_slot[notify_order[i]].key, e.key) == 0) {
                 replaced = notify_slot[notify_order[i]].id;
                 notify_drop_at(i);
-                break;
             }
         }
     }
@@ -1195,8 +1200,12 @@ static bool notify_restore_one(const notify_rec *r, time_t now, unsigned long no
     if (r->id == 0 || r->id > NOTIFY_ID_MAX) return false;
     if (r->title[0] == '\0') return false;
 
-    for (int i = 0; i < notify_len; i++)
-        if (notify_slot[notify_order[i]].id == r->id) return false;   /* dedup by id */
+    for (int i = 0; i < notify_len; i++) {
+        const Notification &newer = notify_slot[notify_order[i]];
+        if (notify_rec_restore_shadowed(r->key, newer.key,
+                                        newer.event_distinct)) return false;
+        if (newer.id == r->id) return false;   /* dedup by id */
+    }
 
     int slot = notify_free_slot();
     if (slot < 0) return false;
@@ -1282,8 +1291,8 @@ static_assert(INBOX_SEV_CRIT == NOTIFY_CRIT, "inbox/notify severity must agree")
 static uint32_t notify_raise(Notification &e, const NotifyOptions *opts,
                              uint32_t *replaced_out) {
     if (!notify_event_take(e.event_id)) memset(&e.event_id, 0, sizeof(e.event_id));
-    e.event_distinct = notify_rec_is_chat_door_key(e.key) ||
-        (notify_event_distinct_fn && notify_event_distinct_fn(e.source, e.key));
+    e.event_distinct = notify_event_distinct_fn &&
+        notify_event_distinct_fn(e.source, e.key);
     time_t now = time(NULL);
     e.created_epoch = (now > TIME_VALID_EPOCH) ? now : 0;
     e.created_ms = millis();

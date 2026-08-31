@@ -158,7 +158,8 @@ assert "agents_has_origin(" in reconcile, (
 assert "NOTIFY_CHAT_DRAIN_ACK_ROUTED" in reconcile
 assert "blocked[ax] = true" in reconcile
 assert "notify_chat_retry_pending = true" in reconcile
-assert reconcile.index("agents_restore_inbound(") < reconcile.index(
+assert reconcile.count("notify_ack_id(view.id);") >= 2
+assert reconcile.index("agents_restore_inbound(") < reconcile.rindex(
     "notify_ack_id(view.id);"
 ), "a restored card may be ACKed only after the thread accepts it"
 assert "ui_note_input" not in reconcile and "ui_note_wake" not in reconcile
@@ -168,8 +169,11 @@ assert "SPIFFS" not in reconcile and "history_enqueue" not in reconcile, (
 runtime = fn_body(main, "static bool notify_reconcile_pending_chats(")
 assert "agents_chat_door_enqueue(" in runtime
 assert "agents_has_origin(" not in runtime and "agents_on_inbound(" not in runtime
-assert "notify_ack" not in runtime, (
-    "loop-side pending scan may only enqueue; origin scan, durable append and ACK wait for completion"
+assert "notify_ack_id(view.id);" in runtime, (
+    "a doorbell whose body is already in the thread is ACKed here, not queued"
+)
+assert "notify_ack_identity" not in runtime, (
+    "identity ACK of a routed card still waits for the off-loop worker"
 )
 completion = fn_body(main, "static void notify_take_chat_completions(")
 assert "notify_ack_identity(" in completion
@@ -184,8 +188,11 @@ assert "agents_notify_chat_resolve_snapshot(" in classifier
 
 agents = (ROOT / "src" / "skills" / "agents.cpp").read_text(encoding="utf-8")
 worker = fn_body(agents, "static void agents_route_task(")
-assert "agents_has_origin(" in worker and "agents_on_inbound(" in worker
-assert worker.index("agents_has_origin(") < worker.index("agents_on_inbound(")
+kind3 = worker[worker.index("if (item.kind == 3)") :]
+assert "agents_has_origin(" in kind3 and "agents_on_inbound(" in kind3
+assert kind3.index("agents_has_origin(") < kind3.index("agents_on_inbound(")
+assert "item.kind == 4" in worker
+assert "agents_inbound_enqueue(" in agents
 assert "xQueueSend(g_door_done_q, &done, portMAX_DELAY)" in worker
 assert "item.door_source, item.door_key" in worker
 assert "notify_chat_stable_slot(" in worker

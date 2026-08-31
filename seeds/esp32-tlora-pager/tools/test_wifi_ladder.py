@@ -4,7 +4,7 @@
 The driver's own auto-reconnect stays disabled (its retries underneath the
 scheduler stalled the UI); background reconnect is the firmware's own loop()
 attempt. Since 0.9.47 that attempt follows a backoff ladder instead of a flat
-20 minutes, so a rebooted router gets the pager back on the LAN in ~30 s while
+20 minutes, so a rebooted router gets the pager back on the LAN in ~5 s while
 a genuinely absent AP still converges to the old 20-minute cadence.
 """
 
@@ -18,7 +18,7 @@ main = (ROOT / "src" / "main.cpp").read_text(encoding="utf-8")
 #    the documented 20-minute steady state keeps its meaning.
 ladder = main[main.index("WIFI_RETRY_LADDER_MS[]") :]
 ladder = ladder[: ladder.index("};")]
-for rung in ("30000UL", "60000UL", "120000UL", "300000UL", "600000UL"):
+for rung in ("5000UL", "15000UL", "30000UL", "120000UL", "300000UL"):
     assert rung in ladder, f"ladder must keep the {rung} rung"
 assert "WIFI_RETRY_MS" in ladder, "the last rung must be the WIFI_RETRY_MS cap"
 assert "#define WIFI_RETRY_MS 1200000UL" in main, "20-minute steady-state cap"
@@ -50,7 +50,7 @@ assert "wifi_reconnect_state == WIFI_RECONNECT_IDLE" in retry, (
 )
 
 # 4. A successful association resets the ladder, so the next loss starts at
-#    the quick 30 s rung again. Anchor to the connected branch specifically:
+#    the quick 5 s rung again. Anchor to the connected branch specifically:
 #    a reset that drifted out of it (into code that also runs on link loss)
 #    would defeat the backoff. The branch used to be closed by the mDNS
 #    teardown "} else"; with mDNS gone the next statement is the clock repaint,
@@ -93,5 +93,17 @@ assert "wifi_begin_active_profile()" in setup, (
 owner = main[main.index("static void wifi_begin_active_profile()") :]
 owner = owner[: owner.index("}")]
 assert "wifi_last_attempt_ms = millis();" in owner
+
+# 6. Association is not REACH_UP. Recording WL_CONNECTED as a proven route
+#    made the send ladder block on a dead STA instead of falling to mesh.
+#    Anchor on the definition, not the bare name: a forward declaration of
+#    reachability_service() sits ~270 lines above it, and slicing from there
+#    used to grab an unrelated function body and fail on every assertion.
+reach = main[main.index("static void reachability_service(uint32_t now) {") :]
+reach = reach[: reach.index("\n}\n") + 3]
+assert "reach_record(&g_reach, now, false)" in reach
+assert "WL_CONNECTED" in reach
+assert "reach_record(&g_reach, now, WiFi.status() == WL_CONNECTED)" not in reach
+assert "delay(50)" not in retry
 
 print("Wi-Fi retry ladder tests: OK")

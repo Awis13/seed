@@ -14,6 +14,7 @@
 #include <Wire.h>
 #include <ctype.h>
 #include <string.h>
+#include <esp_system.h>
 
 #define TCA_ADDR            0x34
 #define TCA_REG_CFG         0x01
@@ -32,7 +33,14 @@
 #define KEY_BACKSPACE  0x1D
 #define KEY_SPACE      0x1E
 
+// GPIO46 is an ESP32-S3 strapping pin (boot mode with GPIO0).
+// PWM/LEDC on it can sample HIGH across a panic/WDT reset and the next
+// boot is invalid (0x17) — the pager then loops. Drive it as a plain
+// GPIO after boot; park LOW before any reset. No ALT+B: that pad is '!'.
+#define KB_BL_ON       255
+
 static bool kb_ok = false;
+static uint8_t kb_bl = 0;
 static bool caps = false;
 static bool symbol = false;
 static bool alt_held = false;
@@ -202,14 +210,41 @@ bool hw_kb_begin() {
 
     pinMode(PIN_KB_INT, INPUT_PULLUP);
     pinMode(PIN_KB_BACKLIGHT, OUTPUT);
-    digitalWrite(PIN_KB_BACKLIGHT, LOW);
+    /* GPIO46 is a strap pin — no PWM/LEDC. park() runs first in setup() and
+     * on shutdown so a dirty reset does not sample HIGH as an invalid boot.
+     * After boot, plain GPIO HIGH is the keyboard backlight. */
+    kb_bl = KB_BL_ON;
+    digitalWrite(PIN_KB_BACKLIGHT, HIGH);
+    static bool shutdown_hooked = false;
+    if (!shutdown_hooked) {
+        shutdown_hooked = true;
+        esp_register_shutdown_handler(hw_kb_park_backlight);
+    }
 
     kb_ok = true;
     caps = symbol = alt_held = false;
     layout_changed = false;
-    Serial.printf("[kb] TCA8418 ok layout=%s (ALT=sym, CAPS=case, ALT+CAPS=layout)\n",
-                  hw_kb_layout_name());
+    Serial.printf("[kb] TCA8418 ok layout=%s bl=%u (ALT=sym, CAPS=case, ALT+CAPS=layout)\n",
+                  hw_kb_layout_name(), (unsigned)kb_bl);
     return true;
+}
+
+void hw_kb_park_backlight() {
+    pinMode(PIN_KB_BACKLIGHT, OUTPUT);
+    digitalWrite(PIN_KB_BACKLIGHT, LOW);
+    kb_bl = 0;
+}
+
+void hw_kb_set_backlight(uint8_t level) {
+    kb_bl = level;
+    pinMode(PIN_KB_BACKLIGHT, OUTPUT);
+    digitalWrite(PIN_KB_BACKLIGHT, kb_bl > 0 ? HIGH : LOW);
+}
+
+uint8_t hw_kb_get_backlight() { return kb_bl; }
+
+void hw_kb_toggle_backlight() {
+    hw_kb_set_backlight(kb_bl > 0 ? 0 : (uint8_t)KB_BL_ON);
 }
 
 bool hw_kb_ok() { return kb_ok; }
@@ -328,7 +363,7 @@ bool hw_kb_read(char *out, size_t out_sz) {
     }
     if (k == KEY_CAPS) {
         if (!pressed) {
-            if (kb_locked) return false;  // short CAPS ignored while locked
+            if (kb_locked) return false;  // pocket: keys must not unlock
             if (alt_held) {
                 hw_kb_cycle_layout();
             } else {
@@ -355,11 +390,6 @@ bool hw_kb_read(char *out, size_t out_sz) {
     uint8_t row = k / 10;
     uint8_t col = k % 10;
     if (row >= 4 || col >= 10) return false;
-
-    if (pressed && alt_held && row == 1 && col == 1) {
-        silent_toggle = true;  // ALT+S
-        return false;
-    }
 
     bool use_sym = alt_held;
     if (use_sym) {
