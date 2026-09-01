@@ -642,6 +642,7 @@ static int health_check(int port) {
 #include "skills/net.c"
 #include "skills/notes.c"
 #include "skills/gpio.c"
+#include "skills/drop.c"
 
 static void skills_init(void) {
     sysmon_init();
@@ -651,6 +652,7 @@ static void skills_init(void) {
     net_init();
     notes_init();
     gpio_init();
+    drop_init();
 }
 
 /* ===== Request handler ===== */
@@ -1113,8 +1115,9 @@ static void handle(int fd, const char *ip) {
             "Hardware node accessible via HTTP. "
             "This is a **seed** — a minimal firmware that you can grow "
             "by uploading new C source code.\n\n"
-            "> **FIRST:** Run `GET /notes` — previous agents may have left "
-            "tasks, findings, or warnings for you.\n\n"
+            "> **FIRST:** Run `GET /drop/inbox?handle=<your-handle>` — other "
+            "sessions may have left messages for you. Then `GET /notes` for "
+            "task notes from previous agents.\n\n"
             "## Connection\n\n"
             "```\n"
             "Host: %s:%d\n"
@@ -1331,6 +1334,9 @@ int main(int argc, char **argv) {
 
         struct timeval tv = { .tv_sec = SOCK_TIMEOUT };
         setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        /* Writes too: a client that stops reading a large response must
+         * not block the single-threaded loop indefinitely. */
+        setsockopt(client, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 
         handle(client, ip);
         close(client);
