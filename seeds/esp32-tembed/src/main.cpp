@@ -68,7 +68,7 @@
 #include <TFT_eSPI.h>
 
 // ===== Configuration =====
-#define SEED_VERSION        "0.11.0"
+#define SEED_VERSION        "0.18.0"
 #define HTTP_PORT           8080
 #define TOKEN_FILE          "/auth_token.txt"
 #define WIFI_CONFIG_FILE    "/wifi.json"
@@ -325,39 +325,43 @@ static void probe_cc1101() {
     hw.has_cc1101 = (hw.cc1101_version != 0x00 && hw.cc1101_version != 0xFF);
 }
 
-static bool bq27220_read16(uint8_t reg, uint16_t &val) {
-    Wire.beginTransmission(BQ27220_ADDR);
-    Wire.write(reg);
-    if (Wire.endTransmission(false) != 0) return false;
-    if (Wire.requestFrom((int)BQ27220_ADDR, 2) != 2) return false;
-    val = Wire.read() | (Wire.read() << 8);
-    return true;
-}
+// Defined in skills/battery.cpp, which is included further down with the other
+// skills. The fuel gauge is the skill's hardware and every register read now
+// lives there, but the probe has to happen HERE, from hw_probe(): before
+// tft.init() claims the SPI bus and before the first clock face is drawn with a
+// charge level on it. So it is declared here and called below, the same
+// arrangement the clock face already has with progress.cpp and notify.cpp.
+//
+// battery_probe() fills hw.has_battery/battery_v/battery_soc once at boot;
+// battery_refresh() re-reads them from loop(), because otherwise the figures on
+// the panel would stay frozen at the boot-time snapshot.
+//
+// battery_probe() ALSO WRITES, and it did not use to. It applies six charge
+// parameters to the gauge's data memory, describing to the gauge what the
+// charger on the same bus actually does — without them the gauge never sees a
+// charge finish and a full cell reports a few points short of 100. Data memory
+// here is RAM and is lost on a power-on reset, which is why this is a boot-time
+// apply and not a one-off calibration. The addresses, the values and the guard
+// that bounds them are at the head of skills/battery.cpp.
+static void battery_probe();
+static void battery_refresh();
 
-static void probe_battery() {
-    // BQ27220 standard commands: 0x08 = Voltage (mV), 0x2C = StateOfCharge (%)
-    uint16_t mv = 0, soc = 0;
-    if (bq27220_read16(0x08, mv) && mv > 2000 && mv < 6000) {
-        hw.has_battery = true;
-        hw.battery_v = mv / 1000.0f;
-        if (bq27220_read16(0x2C, soc) && soc <= 100) {
-            hw.battery_soc = soc;
-        } else {
-            hw.battery_soc = -1;
-        }
-    }
-}
-
-// probe_battery() runs once at boot, so the cached figures would otherwise stay
-// frozen at the boot-time snapshot. Re-read the same two registers periodically
-// to keep the on-screen charge level honest.
-static void battery_refresh() {
-    if (!hw.has_battery) return;
-    uint16_t mv = 0, soc = 0;
-    if (!bq27220_read16(0x08, mv) || mv <= 2000 || mv >= 6000) return;
-    hw.battery_v = mv / 1000.0f;
-    hw.battery_soc = (bq27220_read16(0x2C, soc) && soc <= 100) ? (int)soc : -1;
-}
+// The charger shares that I2C bus and is a separate skill because it is a
+// separate part with a separate failure: charger_probe() sets four registers on
+// the BQ25896 — the termination current above all, which on the power-on value
+// cuts charging at 77% of this cell. The two fixes are related and land in
+// order: the charger is made to terminate at 64 mA, and the gauge's taper
+// current is set to 100 mA — deliberately ABOVE that figure rather than equal
+// to it, because the gauge waits for the current to sit inside a BAND, and a
+// ceiling equal to the charger's cut-off makes that band one the charger never
+// produces. The values, the order they go out in and the guard that bounds them
+// are at the head of skills/charger.cpp.
+//
+// Declared here, like the gauge's, because the probe has to run from hw_probe()
+// rather than from skills_init(): the charger should be off its power-on
+// defaults from the first second the device is powered.
+static void charger_probe();
+static void charger_refresh();
 
 static void hw_probe() {
     memset(&hw, 0, sizeof(hw));
@@ -376,7 +380,8 @@ static void hw_probe() {
     i2c_scan(Wire, hw.i2c0, hw.i2c0_count);
 
     probe_cc1101();
-    probe_battery();
+    battery_probe();
+    charger_probe();
 
     // Board detection heuristic
     bool fuel_gauge = false;
@@ -585,6 +590,21 @@ static bool clock_local_time(struct tm &out) {
 #define BADGE_TEXT_X 103
 #define BADGE_PAD    20
 
+// Quiet-hours mark, in the gap the version string was given to grow into. Both
+// edges are measured against TFT_eSPI's own width table rather than estimated,
+// the way the badge above was: "v10.10.10" — the worst case that comment
+// reserves room for — is 65px and ends at x=73, and the badge dot starts at 93.
+// So the mark is right-aligned at 91 with an 18px pad, which erases 73..91 and
+// leaves both neighbours untouched.
+//
+// It is a mark and not a word because there is 18px, and the two states have
+// different TEXT rather than only different colours: draw_field caches on the
+// string alone, so a mark that changed colour without changing text would not
+// repaint. One Z is "a window is set", two is "inside it now" — the second is
+// the one that answers "why is this thing silent", and it is the amber one.
+#define QUIET_R     91
+#define QUIET_PAD   18
+
 // Progress bar under the bottom row: a 4px full-width rule at the very bottom
 // edge of the 170px panel, which is the one place a bar this wide fits without
 // renegotiating a layout three connectivity modes already share. It sits
@@ -606,6 +626,13 @@ static bool progress_status_line(char *out, size_t n, int *pct);
 static int notify_unread_count();
 static bool notify_crit_unread();
 
+// Defined in skills/ring.cpp, and the same arrangement again: the night window
+// is one idea shared by the ring and the speaker, and the clock face asks it the
+// only two questions a mark can show — is a window set at all, and is the device
+// inside it right now.
+static bool ring_night_armed();
+static bool ring_night_now();
+
 static bool display_ready = false;
 // Set from the web server task, consumed by the clock tick in loop(): TFT_eSPI
 // owns the SPI bus and must only be driven from one task.
@@ -624,6 +651,7 @@ static char fld_date[24]  = "";
 static char fld_left[32]  = "";
 static char fld_right[32] = "";
 static char fld_note[48]  = "";
+static char fld_quiet[4]  = "";
 // Unread count the badge currently shows, or -1 for "nothing drawn yet". 10
 // stands for "9+", so that going from 12 unread to 11 costs no SPI.
 static int clock_badge_drawn = -1;
@@ -755,6 +783,15 @@ static void display_tick() {
         tft.drawString(buf, BADGE_TEXT_X, HDR_Y, 2);
         tft.setTextPadding(0);
     }
+
+    // Why the device is silent, answered by looking at it rather than by
+    // asking it over the network — which was the only way until the menu grew a
+    // switch. Nothing at all when no window is set, so the ordinary face is
+    // exactly as bare as it was.
+    bool night = ring_night_now();
+    const char *quiet = ring_night_armed() ? (night ? "ZZ" : "Z") : "";
+    draw_field(fld_quiet, sizeof(fld_quiet), quiet, QUIET_R, HDR_Y, 2,
+               night ? COL_ACCENT : COL_DIM, TR_DATUM, QUIET_PAD);
 
     struct tm now;
     char hhmm[8], ss[4], date[24];
@@ -1680,6 +1717,16 @@ static void handle_wifi_post(AsyncWebServerRequest *request) {
 #include "skills/serial.cpp"
 #include "skills/ir.cpp"
 #include "skills/notify.cpp"
+/* After notify.cpp, for the JSON response helpers, and after nothing else: the
+   fuel gauge is its own hardware and no skill reads it. Its probe runs earlier
+   than this, from hw_probe(), through the two forward declarations above it —
+   the panel needs a charge level before any skill exists. */
+#include "skills/battery.cpp"
+/* After battery.cpp, and the order is documentation rather than a dependency:
+   the two share an I2C bus and nothing else, and neither calls into the other.
+   Reading them in this order is reading the power hardware in the order the
+   boot probe touches it. */
+#include "skills/charger.cpp"
 /* After notify.cpp, for the three JSON response helpers its endpoints already
    own — the same borrowing voice.cpp does, rather than a fourth copy of
    serializeJson into a String. It depends on no skill of its own: suppliers
@@ -1709,6 +1756,12 @@ static void skills_init() {
     skill_serial_init();
     skill_ir_init();
     skill_notify_init();
+    /* Only a registration: the gauge was read at boot by hw_probe() and the
+       cache behind GET /battery was filled there. */
+    skill_battery_init();
+    /* Likewise, and the write it did is already done: hw_probe() configured
+       the charger and verified it by reading it back. */
+    skill_charger_init();
     /* Nothing to bring up: no hardware, no stored state, and a store that is
        already zeroed. It is here rather than first only to match the include
        order above. */
@@ -2003,11 +2056,34 @@ void loop() {
     // line, so it does not need the tick above and must not wait for it.
     if (ui_screen == UI_CLOCK) clock_rule_tick();
 
-    // Keep the fuel gauge reading current — probe_battery() only ran at boot.
+    // Keep the fuel gauge and the charger current — the probes only ran at
+    // boot. Nothing else touches the I2C bus once hw_probe() has finished, and
+    // this is the only place the registers behind GET /battery and GET /charger
+    // are read: see the cadence argument at the head of skills/battery.cpp and
+    // the I2C rule at the head of skills/charger.cpp. Neither endpoint may ever
+    // reach the bus itself — it would run the transaction on the AsyncTCP task,
+    // interleaved with this one.
+    //
+    // Both refreshes READ, COMPARE, and write only when the comparison fails.
+    // battery_refresh() re-runs the gauge's data-memory sequence when the
+    // read-back is wrong or unreadable, which is what a power-on reset of the
+    // gauge looks like from here — capped at three attempts per boot, because
+    // that sequence suspends gauging for seconds and must not become a
+    // once-a-minute stutter on a part that will not take it.
+    //
+    // charger_refresh() READS, COMPARES, and writes only when the comparison
+    // fails. The four writes happen once at boot in charger_probe(); after that
+    // the same registers are re-read every pass and checked against the table,
+    // and the table is re-issued only if the part has stopped holding it. That
+    // conditional rewrite is what stands in for the charger's own watchdog,
+    // which is disabled rather than fed — and this is NOT a watchdog kick: 60 s
+    // is longer than its 40 s default, so feeding it from here would let it
+    // expire and revert the configuration on roughly every cycle.
     static unsigned long last_battery = 0;
     if (millis() - last_battery > 60000) {
         last_battery = millis();
         battery_refresh();
+        charger_refresh();
     }
 
     // 10ms is the idle cadence, and it is the whole pass's granularity. A blast

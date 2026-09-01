@@ -5,12 +5,13 @@
  * message; the knob reads it and acknowledges it.
  *
  * Endpoints:
- *   POST /notify      — queue one {level, title, body, source, ttl_s, id, options}
- *   GET  /notify      — list, newest first, plus the unread count (?unread=1)
- *   GET  /notify/one  — one entry by id (?id=N), for a caller waiting on a reply
- *   POST /notify/ack  — mark one read {"id":N} or all of them {"all":true}
+ *   POST /notify        — queue one {level, title, body, source, ttl_s, id, options}
+ *   GET  /notify        — list, newest first, plus the unread count (?unread=1)
+ *   GET  /notify/one    — one entry by id (?id=N), for a caller waiting on a reply
+ *   POST /notify/ack    — mark one read {"id":N} or all of them {"all":true}
+ *   POST /notify/delete — remove one for good {"id":N}
  *
- * All four are registered with AsyncURIMatcher::exact(). The library's default
+ * All five are registered with AsyncURIMatcher::exact(). The library's default
  * matches ^{uri}(/.*)?$, under which /notify would also answer /notify/ack and,
  * being registered first, would silently swallow every acknowledgement. That
  * exact failure already cost this firmware a working POST /ir/tvbgone/stop.
@@ -20,7 +21,9 @@
  * offers both, and this firmware's own route gate — tools/test_routes.sh, part
  * 3 — allows neither, because a matcher looser than exact() is what once made
  * POST /ir/tvbgone swallow /ir/tvbgone/stop. The id is a query parameter and
- * the path is a constant, which is the shape exact() can defend.
+ * the path is a constant, which is the shape exact() can defend. Removal reads
+ * the same way for the same reason: POST /notify/delete carrying {"id":N}, a
+ * constant path with the id in the body, and not DELETE /notify/12.
  *
  * Reply options
  * -------------
@@ -451,15 +454,47 @@ static void notify_age_str(unsigned long age_s, char *out, size_t n) {
     }
 }
 
-/* --- Store primitives (lock held by the caller) --- */
-
+/* --- Store primitives (lock held by the caller) ---
+ *
+ * Sliced onto the host with the arrays they walk, because everything that can
+ * go wrong in here is a slot or an order entry left in a state nothing looks at
+ * again — a shape no test of a return value alone can see. The marker rules
+ * from the types region apply. */
+/* host-test:begin store — sliced out by tools/test_notify_options.sh */
 static void notify_drop_at(int pos) {
     notify_slot[notify_order[pos]].id = 0;
     for (int i = pos; i + 1 < notify_len; i++) notify_order[i] = notify_order[i + 1];
     notify_len--;
 }
 
-/* host-test:begin store — sliced out by tools/test_notify_options.sh */
+/* Where `id` sits in the order list, or -1. Every caller that has the lock uses
+   this one; notify_index_of() is the same walk with the lock taken around it. */
+static int notify_pos_of(uint32_t id) {
+    for (int i = 0; i < notify_len; i++)
+        if (notify_slot[notify_order[i]].id == id) return i;
+    return -1;
+}
+
+/*
+ * Remove the entry carrying `id` and say where it was, or -1 if there was no
+ * such entry.
+ *
+ * The find and the drop are one function rather than two calls at the call
+ * site, so that the position the drop is given cannot be one the list has moved
+ * on from — and so that the host suite exercises the pair the device runs,
+ * rather than its own arrangement of the two halves.
+ *
+ * Nothing else is undone: the slot goes back to free, the order list closes
+ * over the gap, and the labels beside it are left where they are. They mean
+ * nothing without an occupied slot to be indexed by, and notify_push() clears
+ * them on the way in — see the comment on notify_opt[].
+ */
+static int notify_drop_id(uint32_t id) {
+    int pos = notify_pos_of(id);
+    if (pos >= 0) notify_drop_at(pos);
+    return pos;
+}
+
 static int notify_free_slot() {
     for (int i = 0; i < NOTIFY_MAX; i++) if (notify_slot[i].id == 0) return i;
     return -1;
@@ -574,22 +609,48 @@ static bool notify_crit_unread() {
     return found;
 }
 
-/* The most severe level still unacknowledged, or false if nothing is. The LED
-   ring breathes in this colour, so it is asked for once per ring frame — hence
-   one pass under the lock rather than three calls to notify_crit_unread() and
-   friends. */
-static bool notify_top_unread_level(uint8_t &out) {
+/* host-test:begin unread — sliced out by tools/test_notify_options.sh */
+/*
+ * The most severe unread level in the queue, with one id left out of the walk.
+ *
+ * The exclusion exists for the ring. While a message card is open the ring
+ * names that card's message, and the one thing that may interrupt it is an
+ * unread critical the person is NOT looking at — a ring alternating a message
+ * with itself would be nonsense, and a ring that stayed on the card while a
+ * second critical arrived would hide it. Which of those two it is depends on
+ * whether the unread critical is the card's own message, and that question can
+ * only be answered here, where the ids are.
+ *
+ * `except_id` of 0 excludes nothing: no notification is ever issued id 0 — see
+ * notify_take_id() — so it is the one value free to mean "no card is open".
+ *
+ * The lock belongs to the caller, the way it does for notify_pos_of(): this is
+ * the walk, and the walk is what a host can run.
+ */
+static bool notify_top_unread_walk(uint32_t except_id, uint8_t &out) {
     bool found = false;
     uint8_t top = NOTIFY_INFO;
-    portENTER_CRITICAL(&notify_mux);
     for (int i = 0; i < notify_len; i++) {
         const Notification &e = notify_slot[notify_order[i]];
         if (!e.unread) continue;
+        if (except_id != 0 && e.id == except_id) continue;
         if (!found || e.level > top) top = e.level;
         found = true;
     }
-    portEXIT_CRITICAL(&notify_mux);
     if (found) out = top;
+    return found;
+}
+/* host-test:end */
+
+/* The most severe level still unacknowledged, or false if nothing is. The LED
+   ring breathes in this colour, so it is asked for once per ring frame — hence
+   one pass under the lock rather than three calls to notify_crit_unread() and
+   friends. `except_id` defaults to 0, which is every caller that is not the
+   ring asking about the card in front of somebody. */
+static bool notify_top_unread_level(uint8_t &out, uint32_t except_id = 0) {
+    portENTER_CRITICAL(&notify_mux);
+    bool found = notify_top_unread_walk(except_id, out);
+    portEXIT_CRITICAL(&notify_mux);
     return found;
 }
 
@@ -672,11 +733,8 @@ static bool notify_view_by_id(uint32_t id, NotifyView &out, int *index_out,
 /* Position of an id in the list, or -1. The screen holds an id rather than an
    index precisely because the list can shift under it. */
 static int notify_index_of(uint32_t id) {
-    int found = -1;
     portENTER_CRITICAL(&notify_mux);
-    for (int i = 0; i < notify_len; i++) {
-        if (notify_slot[notify_order[i]].id == id) { found = i; break; }
-    }
+    int found = notify_pos_of(id);
     portEXIT_CRITICAL(&notify_mux);
     return found;
 }
@@ -701,6 +759,76 @@ static bool notify_ack_id(uint32_t id) {
         notify_ring_acked = true;
     }
     return found;
+}
+
+/*
+ * Take an entry out of the queue for good. False when there is no such entry,
+ * so the endpoint can answer 404 rather than pretend it removed something.
+ *
+ * This is the counterpart of an ack rather than a stronger one: an ack says a
+ * human has seen the message and leaves the text where it is, and this says the
+ * message should not have been there at all. Something that posts a
+ * notification and then finds it was wrong — a job that recovered, a test
+ * message, an agent tidying up after itself — has no other way to take it back,
+ * and a twenty-slot queue holds junk until something else pushes it out.
+ *
+ * Which flags it raises is the one real difference from notify_ack_id(), and it
+ * is deliberate rather than an oversight to be tidied away. The screen is told
+ * (display_force) and the snapshot is told, but notify_ring_acked is NOT raised.
+ * DO NOT "simplify" this into a call to notify_ack_id() or add the flag to make
+ * the two match. That one-shot does not mean a hand touched anything — it means
+ * an entry went from unread to read, whatever caused it; notify_ack_all() raises
+ * it too, and POST /notify/ack {"all":true} reaches that from off the network.
+ * It gates exactly one thing, the wipe the LED ring plays when the unread pile
+ * clears. A deletion is not that transition: the entry does not become read, it
+ * stops existing, and the unread count falls because the message left rather
+ * than because it was dealt with. notify_expire() is the same case and raises
+ * display_force and the save and nothing else — a removal from off the network
+ * belongs with the expiry, not with the ack.
+ *
+ * The save goes through the ordinary coalescing window, exactly as an ack, an
+ * expiry and a non-critical POST do. Nothing here is urgent enough to bypass it:
+ * the entry is out of RAM the moment the lock is released, and the only thing an
+ * immediate write would buy is surviving a power cut in the next three seconds.
+ * Set against that, the caller this endpoint was built for is an agent tidying
+ * up after a test run — a loop of deletions, which coalesces into ONE erase
+ * cycle here and would be one per call if this were mark_dirty(0). Only the
+ * newest NOTIFY_PERSIST entries reach the file at all, so removing anything
+ * below that mark cannot change the snapshot even in principle — which is what
+ * the guard on pos is for. Without it the file would be rewritten byte for byte
+ * identical and the erase cycle spent anyway, which is the cost this paragraph
+ * is otherwise about avoiding. notify_ack_id() has the same waste and is left
+ * as it is: it predates this endpoint and is not this change to make.
+ *
+ * The cost, stated rather than hidden: a reboot inside that window brings the
+ * entry back. An expiry lost the same way is retaken on load, because every ttl
+ * is re-run there, and nothing re-derives a deletion — so it returns, aged from
+ * its stored epoch, and has to be deleted again. That is a stale message in a
+ * three-second window against an erase cycle per call forever, and the erase
+ * cycles are the finite resource.
+ *
+ * What deletion does NOT do is chase the screen, because expiry and eviction
+ * have always been able to take an entry out from under it and the paths for
+ * that are already there. The card holds an id: its ui_poll() sees
+ * notify_index_of() return -1 and leaves for the list. The list holds a
+ * position, and that one is rougher than it looks, so it is written down as it
+ * is rather than as it ought to be — ui_window() clamps the scroll offset,
+ * never ui_sel, so a selection left past the end of a shortened list draws with
+ * no selection bar at all and a click reaches ui_activate() with an index no
+ * row has, falling through to the main menu. The modulo on the next detent is
+ * what brings it back. That is ui.h's to fix and it is filed on its own,
+ * because every path that shortens the list arrives at it and this one is only
+ * the newest. Deletion joins that road rather than building a second one.
+ */
+static bool notify_delete_id(uint32_t id) {
+    portENTER_CRITICAL(&notify_mux);
+    int pos = notify_drop_id(id);
+    portEXIT_CRITICAL(&notify_mux);
+    if (pos < 0) return false;
+
+    if (pos < NOTIFY_PERSIST) notify_mark_dirty(NOTIFY_COALESCE_MS);
+    display_force = true;
+    return true;
 }
 
 /*
@@ -1122,6 +1250,7 @@ static const SkillEndpoint notify_endpoints[] = {
     {"GET",  "/notify",     "List notifications newest first (?unread=1) plus the unread count"},
     {"GET",  "/notify/one", "One notification by id (?id=N), with its options and the reply"},
     {"POST", "/notify/ack", "Mark one read {\"id\":N} or all of them {\"all\":true}"},
+    {"POST", "/notify/delete", "Remove one notification from the queue for good {\"id\":N}"},
     {NULL, NULL, NULL}
 };
 
@@ -1135,7 +1264,8 @@ static const char *notify_describe() {
            "| POST | /notify | `{\"level\":\"info\"\\|\"warn\"\\|\"crit\",\"title\":\"...\",\"body\":\"...\",\"source\":\"home-rig\",\"ttl_s\":3600,\"id\":\"backup\",\"options\":[\"Yes\",\"No\"]}` |\n"
            "| GET | /notify | `{\"unread\":N,\"count\":M,\"notifications\":[...]}`, newest first; `?unread=1` lists only unread |\n"
            "| GET | /notify/one | one entry by numeric id: `/notify/one?id=12`, 404 if it is gone |\n"
-           "| POST | /notify/ack | `{\"id\":12}` or `{\"all\":true}` |\n\n"
+           "| POST | /notify/ack | `{\"id\":12}` or `{\"all\":true}` → `{\"ok\":true,\"acked\":N,\"id\":12,\"unread\":M}`, and `id` only comes back on the single form |\n"
+           "| POST | /notify/delete | `{\"id\":12}` → `{\"ok\":true,\"id\":12,\"count\":N,\"unread\":M}`; removes it, 404 if it is already gone |\n\n"
            "### Fields\n\n"
            "`title` is the only required one. `level` defaults to `info` and\n"
            "decides the colour on screen. `source` is a short label for who\n"
@@ -1170,6 +1300,28 @@ static const char *notify_describe() {
            "the message it belonged to. A re-post is a new question, and\n"
            "carrying the old reply onto it would be worse than losing it.\n"
            "Answering also marks the entry read.\n\n"
+           "### Taking one back\n\n"
+           "`POST /notify/delete {\"id\":12}` removes an entry outright, where\n"
+           "an ack only marks it read. That is the one for a message that\n"
+           "should not have been sent — a job that recovered, a test that got\n"
+           "away, anything you would rather not leave occupying one of twenty\n"
+           "slots. The id is the numeric one `POST /notify` gave back, not the\n"
+           "`id` key, and an id that is no longer here answers 404 with a\n"
+           "reason rather than pretending it removed something. What comes\n"
+           "back is the id that went — under `id`, the same field the ack\n"
+           "echoes — with the queue's length and the unread count after it, so\n"
+           "a loop cleaning up after itself can see where it got to without\n"
+           "listing the queue again.\n\n"
+           "There is no bulk form on purpose. `{\"all\":true}` acknowledges\n"
+           "everything and the messages are still there to read; the same\n"
+           "gesture on this endpoint would throw away somebody else's unread\n"
+           "critical, and nothing on this device could bring it back. Delete\n"
+           "the ids you posted. If the screen is what needs clearing, that is\n"
+           "what the ack is for.\n\n"
+           "Anything reading the message when it goes — a card on screen, a\n"
+           "row in the list — behaves exactly as it does when a ttl runs out\n"
+           "underneath it: the card drops back to the list and the list\n"
+           "closes up. Nothing on the device has to be told.\n\n"
            "### Behaviour\n\n"
            "Twenty entries are held in RAM and the newest six survive a reboot.\n"
            "A full queue drops the oldest read entry first, and only ever drops\n"
@@ -1188,6 +1340,9 @@ static const char *notify_describe() {
            "  -d '{\"source\":\"claude\",\"title\":\"Deploy to prod?\",\"options\":[\"Yes\",\"No\",\"Later\"]}' \\\n"
            "  http://seed.local:8080/notify\n"
            "curl -H \"Authorization: Bearer $TOKEN\" http://seed.local:8080/notify/one?id=12\n"
+           "\n"
+           "curl -H \"Authorization: Bearer $TOKEN\" -H 'Content-Type: application/json' \\\n"
+           "  -d '{\"id\":12}' http://seed.local:8080/notify/delete\n"
            "```\n";
 }
 
@@ -1521,11 +1676,92 @@ static void notify_register_routes(AsyncWebServer &server) {
         doc["unread"] = notify_unread_count();
         notify_send_json(req, 200, doc);
     }, NULL, handle_body_collect);
+
+    /*
+     * POST /notify/delete — {"id":N}, and nothing else.
+     *
+     * The body carries the id for the reason /notify/one takes it in the query
+     * string: the path has to be a constant, because every route here is
+     * registered with exact() and this firmware's route gate allows no looser
+     * matcher. It reads {"id":N} exactly as the ack does, so the two endpoints
+     * differ in what they do rather than in how they are called.
+     *
+     * handle_body_collect() is the fourth argument for the reason spelled out
+     * in tools/test_routes.sh: without it _tempObject is never filled, the
+     * handler answers "body must be ..." to every request including the good
+     * ones, and the endpoint is unreachable while looking like a client error.
+     *
+     * There is deliberately no {"all":true} here. The ack has one and it is
+     * safe there because acknowledging destroys nothing — the messages stay in
+     * the list and can still be read. Three sessions share this device, and one
+     * of them clearing the queue in a single call would take another's unread
+     * critical with it, permanently and with no trace beyond an event line. The
+     * hole this endpoint fills is a caller unable to withdraw its OWN message,
+     * and that caller is holding the id it was given. A bulk form can be added
+     * later behind a guard of its own; an unread critical somebody deleted
+     * cannot be added back.
+     */
+    server.on(AsyncURIMatcher::exact("/notify/delete"), HTTP_POST, [](AsyncWebServerRequest *req) {
+        char *body = notify_take_body(req);
+        if (!check_auth(req)) {
+            free(body);
+            notify_send_error(req, 401, "Authorization: Bearer <token> required");
+            return;
+        }
+        if (!body) {
+            notify_send_error(req, 400, "body must be {\"id\":N}");
+            return;
+        }
+
+        JsonDocument input;
+        DeserializationError err = deserializeJson(input, body);
+        free(body);
+        if (err != DeserializationError::Ok) {
+            notify_send_error(req, 400, "invalid JSON");
+            return;
+        }
+
+        /* is<unsigned long>() is false for a string and for a negative number
+           alike, which is the same rule the ack applies to the same field. A
+           caller that sent {"id":"12"} is told so rather than having its
+           request read as a lookup of some other entry. */
+        if (!input["id"].is<unsigned long>()) {
+            notify_send_error(req, 400, "body must be {\"id\":N}");
+            return;
+        }
+        uint32_t id = (uint32_t)input["id"].as<unsigned long>();
+        if (!notify_delete_id(id)) {
+            /* A missing id is a 404 with a reason rather than a cheerful
+               no-op: the caller asked for a specific message to be gone, and
+               "it already was" and "your id is wrong" are the same answer to it
+               only if it never has to tell the two apart. */
+            notify_send_error(req, 404, "no notification with that id");
+            return;
+        }
+
+        event_add("notify: deleted %lu", (unsigned long)id);
+
+        /* `id` rather than a `deleted` of its own, because the ack echoes the
+           entry it acted on under exactly that name and a caller should not
+           have to learn a second word for the same thing. There is no count
+           beside it the way the ack has `acked`: that one is there because
+           {"all":true} can act on any number of entries, and this endpoint
+           removes one or answers 404. `count` is the queue's length afterwards
+           and has no ack counterpart because an ack does not change it. Both
+           responses are written out in describe(), so none of this has to be
+           discovered by posting one and reading what comes back. */
+        JsonDocument doc;
+        doc["ok"] = true;
+        doc["id"] = id;
+        doc["count"] = notify_count();
+        doc["unread"] = notify_unread_count();
+        notify_send_json(req, 200, doc);
+    }, NULL, handle_body_collect);
 }
 
 static const Skill notify_skill = {
     .name = "notify",
-    .version = "0.2.0",
+    .version = "0.3.0",
     .describe = notify_describe,
     .endpoints = notify_endpoints,
     .register_routes = notify_register_routes

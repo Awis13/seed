@@ -123,6 +123,31 @@ static void bad_label(const char *label, const char *why) {
     printf("  ok:   %s refused — %s\n", why, err);
 }
 
+/* The longest unbroken stretch, in milliseconds, during which the ring is NOT
+   red while a critical is unacknowledged. That number is what "a glance from
+   across the room lands on the critical" comes to when it is written down, and
+   it is the property both of the ring's other claimants have to respect — so it
+   is measured here once and asked of each of them below.
+
+   Deliberately counts anything that is not PROGRESS_RING_CRIT rather than
+   counting arcs: a claimant added later that quietly took a third phase would
+   lengthen this run, and counting only the phases we already know about is
+   exactly how that would go unnoticed. Four whole cycles, one millisecond at a
+   time, so a run straddling a cycle boundary is counted as the one run it is. */
+static unsigned long longest_without_red(int progress_live, int card_open) {
+    const unsigned long cycle = PROGRESS_CRIT_PHASE_MS + PROGRESS_ALT_PHASE_MS;
+    unsigned long run = 0, worst = 0;
+    for (unsigned long t = 0; t < 4 * cycle; t++) {
+        if (progress_ring_phase(true, progress_live, card_open, t) != PROGRESS_RING_CRIT) {
+            run++;
+            if (run > worst) worst = run;
+        } else {
+            run = 0;
+        }
+    }
+    return worst;
+}
+
 #define S 1000UL   /* one second of deadline, in the units the core uses */
 
 int main(void) {
@@ -465,34 +490,34 @@ int main(void) {
         /* The property being defended: the ring is the across-the-room channel
            and a critical must never be outbid on it by a percentage. It is
            shared rather than surrendered, and the sharing is unequal. */
-        const unsigned long cycle = PROGRESS_CRIT_PHASE_MS + PROGRESS_ARC_PHASE_MS;
+        const unsigned long cycle = PROGRESS_CRIT_PHASE_MS + PROGRESS_ALT_PHASE_MS;
 
-        check(progress_ring_phase(false, false, 0) == PROGRESS_RING_NONE,
-              "no crit and no job: the ring has nothing to say");
-        check(progress_ring_phase(false, true, 0) == PROGRESS_RING_ARC,
+        check(progress_ring_phase(false, false, false, 0) == PROGRESS_RING_NONE,
+              "no crit, no job and no card: the ring has nothing to say");
+        check(progress_ring_phase(false, true, false, 0) == PROGRESS_RING_ARC,
               "a job with nothing unacknowledged: the arc, uninterrupted");
-        check(progress_ring_phase(true, false, 0) == PROGRESS_RING_CRIT,
+        check(progress_ring_phase(true, false, false, 0) == PROGRESS_RING_CRIT,
               "a crit with no job: red, uninterrupted");
 
         /* Unread info and warn are not criticals, so they do not alternate —
            they lose to a live job outright. ring.cpp is what reduces the top
            unread level to this bool; that wiring is not testable here, and no
            claim is made about it. */
-        check(progress_ring_phase(false, true, 4 * S) == PROGRESS_RING_ARC,
+        check(progress_ring_phase(false, true, false, 4 * S) == PROGRESS_RING_ARC,
               "an unread info or warn does not take turns with a job");
 
         /* Both present: alternation, and the boundaries exactly. */
-        check(progress_ring_phase(true, true, 0) == PROGRESS_RING_CRIT,
+        check(progress_ring_phase(true, true, false, 0) == PROGRESS_RING_CRIT,
               "a cycle opens on the critical, not on the arc");
-        check(progress_ring_phase(true, true, PROGRESS_CRIT_PHASE_MS - 1) == PROGRESS_RING_CRIT,
+        check(progress_ring_phase(true, true, false, PROGRESS_CRIT_PHASE_MS - 1) == PROGRESS_RING_CRIT,
               "the last millisecond of the critical phase is still red");
-        check(progress_ring_phase(true, true, PROGRESS_CRIT_PHASE_MS) == PROGRESS_RING_ARC,
+        check(progress_ring_phase(true, true, false, PROGRESS_CRIT_PHASE_MS) == PROGRESS_RING_ARC,
               "and the arc takes over on the boundary exactly");
-        check(progress_ring_phase(true, true, cycle - 1) == PROGRESS_RING_ARC,
+        check(progress_ring_phase(true, true, false, cycle - 1) == PROGRESS_RING_ARC,
               "the last millisecond of the arc phase is still the arc");
-        check(progress_ring_phase(true, true, cycle) == PROGRESS_RING_CRIT,
+        check(progress_ring_phase(true, true, false, cycle) == PROGRESS_RING_CRIT,
               "and the next cycle opens on red again");
-        check(progress_ring_phase(true, true, 137 * cycle + 10) == PROGRESS_RING_CRIT,
+        check(progress_ring_phase(true, true, false, 137 * cycle + 10) == PROGRESS_RING_CRIT,
               "and the same, a hundred and thirty-seven cycles later");
 
         /* Pure function of its arguments: the same `now` twice must give the
@@ -501,9 +526,9 @@ int main(void) {
         {
             int stable = 1;
             for (unsigned long t = 0; t < 3 * cycle; t += 250) {
-                uint8_t a = progress_ring_phase(true, true, t);
-                uint8_t b = progress_ring_phase(true, true, t);
-                uint8_t c = progress_ring_phase(true, true, t);
+                uint8_t a = progress_ring_phase(true, true, false, t);
+                uint8_t b = progress_ring_phase(true, true, false, t);
+                uint8_t c = progress_ring_phase(true, true, false, t);
                 if (a != b || b != c) stable = 0;
             }
             check(stable, "asking twice at the same instant gives the same answer");
@@ -515,18 +540,10 @@ int main(void) {
            under five seconds — which an even 5s/5s split would fail, and which
            is why the two constants must not be tidied into a matching pair. */
         {
-            unsigned long run = 0, worst = 0;
-            for (unsigned long t = 0; t < 4 * cycle; t++) {
-                if (progress_ring_phase(true, true, t) == PROGRESS_RING_ARC) {
-                    run++;
-                    if (run > worst) worst = run;
-                } else {
-                    run = 0;
-                }
-            }
-            printf("  ..   longest stretch without red: %lums\n", worst);
+            unsigned long worst = longest_without_red(true, false);
+            printf("  ..   longest stretch without red, against a job: %lums\n", worst);
             check(worst < 5000, "no five-second glance can miss the red");
-            check(worst == PROGRESS_ARC_PHASE_MS,
+            check(worst == PROGRESS_ALT_PHASE_MS,
                   "and that stretch is exactly one arc phase, not two joined up");
         }
 
@@ -535,7 +552,7 @@ int main(void) {
         {
             unsigned long red = 0;
             for (unsigned long t = 0; t < cycle; t++)
-                if (progress_ring_phase(true, true, t) == PROGRESS_RING_CRIT) red++;
+                if (progress_ring_phase(true, true, false, t) == PROGRESS_RING_CRIT) red++;
             check(red * 2 > cycle, "red owns more than half of every cycle");
         }
 
@@ -549,8 +566,113 @@ int main(void) {
         /* A millis() rollover restarts the cycle. The only thing that can do is
            give the red more time, because a cycle opens on the critical — the
            direction to be wrong in. */
-        check(progress_ring_phase(true, true, 0) == PROGRESS_RING_CRIT,
+        check(progress_ring_phase(true, true, false, 0) == PROGRESS_RING_CRIT,
               "a rollover lands at the start of a critical phase, never an arc");
+    }
+
+    printf("the ring, with a message card open — the third claimant\n");
+    {
+        /* What the owner asked for: opening a message lights the ring in that
+           message's colour, so that the panel in his hand and the ring seen
+           from the doorway are about the same message. The card is a supplier
+           like the other two and it is arbitrated by the same function.
+
+           `card_open` is the third argument. What ring.cpp puts in the FIRST
+           one while a card is up is "an unread critical that is not the message
+           on the card" — it leaves the card's own message out of that walk, and
+           the two cases below headed `crit_unread` false are that exclusion
+           having happened. The exclusion itself is notify_top_unread_walk()'s
+           and is pinned by tools/test_notify_options.sh; nothing here proves
+           it, and nothing here should be read as proving it. */
+        const unsigned long cycle = PROGRESS_CRIT_PHASE_MS + PROGRESS_ALT_PHASE_MS;
+
+        check(progress_ring_phase(false, false, true, 0) == PROGRESS_RING_CARD,
+              "a card open with nothing else going on: the ring names the card");
+        check(progress_ring_phase(false, false, true, 137 * cycle + 4200) == PROGRESS_RING_CARD,
+              "and it stays named, hours in — steady, not a phase of something");
+
+        /* The card outranks the arc outright rather than sharing with it. A
+           person holding the device to read a message is not asking about a
+           download, and a third phase is what the five-second property below
+           cannot afford. */
+        check(progress_ring_phase(false, true, true, 0) == PROGRESS_RING_CARD,
+              "a running job does not take the ring from the card in front");
+        check(progress_ring_phase(false, true, true, PROGRESS_CRIT_PHASE_MS + 1) == PROGRESS_RING_CARD,
+              "not at the moment the arc would otherwise have come round either");
+
+        /* An unread critical somebody is NOT looking at is the one thing that
+           may interrupt the card, and it interrupts it on exactly the terms it
+           interrupts the arc on — same function, same two constants. */
+        check(progress_ring_phase(true, false, true, 0) == PROGRESS_RING_CRIT,
+              "a card against an unread crit elsewhere: the cycle opens on red");
+        check(progress_ring_phase(true, false, true, PROGRESS_CRIT_PHASE_MS - 1) == PROGRESS_RING_CRIT,
+              "the last millisecond of the critical phase is still red");
+        check(progress_ring_phase(true, false, true, PROGRESS_CRIT_PHASE_MS) == PROGRESS_RING_CARD,
+              "and the card takes over on the boundary exactly");
+        check(progress_ring_phase(true, false, true, cycle - 1) == PROGRESS_RING_CARD,
+              "the last millisecond of the card phase is still the card");
+        check(progress_ring_phase(true, false, true, cycle) == PROGRESS_RING_CRIT,
+              "and the next cycle opens on red again");
+
+        /* All three at once. The arc is the one that gives way: it loses to the
+           card, and the card is what shares with the critical. */
+        check(progress_ring_phase(true, true, true, 0) == PROGRESS_RING_CRIT,
+              "crit, job and card together: red still opens the cycle");
+        check(progress_ring_phase(true, true, true, PROGRESS_CRIT_PHASE_MS + 1) == PROGRESS_RING_CARD,
+              "and the other phase is the card, not the arc");
+        {
+            int arc_seen = 0;
+            for (unsigned long t = 0; t < 4 * cycle; t += 7)
+                if (progress_ring_phase(true, true, true, t) == PROGRESS_RING_ARC) arc_seen = 1;
+            check(!arc_seen,
+                  "the arc gets no phase of its own while a card is open — two "
+                  "claimants share the ring, never three");
+        }
+
+        /* The five-second property, asked of the card exactly as it is asked of
+           the arc. This is the check that would catch a card given the longer
+           phase, or given a phase alongside the arc rather than instead of it. */
+        {
+            unsigned long worst = longest_without_red(false, true);
+            printf("  ..   longest stretch without red, against a card: %lums\n", worst);
+            check(worst < 5000, "no five-second glance can miss the red past a card");
+            check(worst == PROGRESS_ALT_PHASE_MS,
+                  "and the card gets the shorter phase, the same one the arc gets");
+
+            unsigned long all_three = longest_without_red(true, true);
+            printf("  ..   longest stretch without red, card and job: %lums\n", all_three);
+            check(all_three < 5000,
+                  "and a job running behind the card does not lengthen it");
+        }
+
+        /* The share, again as a share rather than as the numbers. */
+        {
+            unsigned long red = 0;
+            for (unsigned long t = 0; t < cycle; t++)
+                if (progress_ring_phase(true, false, true, t) == PROGRESS_RING_CRIT) red++;
+            check(red * 2 > cycle, "red owns more than half of every cycle here too");
+        }
+
+        /* Pure, with the card open: the alternation must not be hiding a static
+           that the card path happens to reach. */
+        {
+            int stable = 1;
+            for (unsigned long t = 0; t < 3 * cycle; t += 250) {
+                uint8_t a = progress_ring_phase(true, true, true, t);
+                uint8_t b = progress_ring_phase(true, true, true, t);
+                if (a != b) stable = 0;
+            }
+            check(stable, "asking twice at the same instant gives the same answer");
+        }
+
+        /* And the card claim is genuinely conditional: with no card open,
+           nothing above changes what the two older claimants do. Cheap, and it
+           is the regression that a card supplier bolted on at the wrong end of
+           the chain would produce. */
+        check(progress_ring_phase(false, true, false, 0) == PROGRESS_RING_ARC,
+              "with no card, a job still gets the arc");
+        check(progress_ring_phase(false, false, false, 0) == PROGRESS_RING_NONE,
+              "and an idle device still says nothing");
     }
 
     printf("\n%s\n", failures ? "FAILED" : "all checks passed");

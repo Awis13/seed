@@ -165,6 +165,7 @@ PRELUDE
     slice "$src" text
     slice "$src" id
     slice "$src" store
+    slice "$src" unread
     slice "$src" snapshot
     cat <<'MAIN'
 
@@ -330,6 +331,51 @@ static int slots_occupied(void) {
     int n = 0;
     for (int i = 0; i < NOTIFY_MAX; i++) if (notify_slot[i].id != 0) n++;
     return n;
+}
+
+/* A store holding `n` entries with ids 10, 20, 30 ... newest first, which is
+   the order a stored file carries and the order the list draws. Built through
+   the real restore path rather than by filling the arrays here, so the slots,
+   notify_order[] and notify_len are wired the way the device wires them —
+   entry k lands in slot k-1, which is what lets the checks below name the slot
+   a removal is supposed to give back. */
+static void store_fill(int n, time_t now) {
+    char json[1024];
+    int at = snprintf(json, sizeof(json), "{\"n\":[");
+    for (int i = 1; i <= n; i++)
+        at += snprintf(json + at, sizeof(json) - at, "%s{\"id\":%d,\"ti\":\"m%d\"}",
+                       i > 1 ? "," : "", i * 10, i * 10);
+    snprintf(json + at, sizeof(json) - at, "]}");
+
+    store_reset();
+    if (load_text(json, now) != n) {
+        printf("  FAIL: the test store could not be built with %d entries\n", n);
+        failures++;
+    }
+}
+
+/* The ids in the list, in order, as "10,20,30". A removal is as much about
+   what is left and in what order as about what went, and one string is easier
+   to be visibly wrong about than a walk of separate checks. Reads notify_len
+   entries and not one more, so a stale index left in the tail of
+   notify_order[] by a drop is invisible here — which is the point: nothing on
+   the device reads past notify_len either. */
+static const char *order_str(void) {
+    static char buf[192];
+    int at = 0;
+    buf[0] = '\0';
+    for (int i = 0; i < notify_len; i++)
+        at += snprintf(buf + at, sizeof(buf) - at, "%s%lu", i ? "," : "",
+                       (unsigned long)notify_slot[notify_order[i]].id);
+    return buf;
+}
+
+/* Is `slot` named anywhere in the live part of the order list? A slot that is
+   free but still listed, or listed but not free, is the shape that survives
+   every check on lengths and ids. */
+static bool slot_listed(int slot) {
+    for (int i = 0; i < notify_len; i++) if (notify_order[i] == slot) return true;
+    return false;
 }
 
 /* One id as ?id= carries it, which must be accepted and must come back whole. */
@@ -627,6 +673,124 @@ int main(void) {
         store_reset();
     }
 
+    printf("taking one entry back out of the queue\n");
+    {
+        /* What POST /notify/delete does to the store, which is notify_drop_id()
+           and nothing else — the endpoint around it takes the lock, raises the
+           two flags an expiry raises, and answers 404 on the -1 that comes back
+           from here.
+           Everything that can go wrong is quiet. A removal that forgets to
+           shorten the list leaves the last entry drawn twice. One that forgets
+           to free the slot loses a slot per deletion until POST /notify answers
+           "queue full" on a queue with three messages in it. One that shifts
+           wrongly reorders somebody else's messages. None of that fails a
+           build and none of it is visible from the outside.
+           Every check here was verified by putting the defect it names back
+           into notify_drop_at() or notify_pos_of() and watching it go red —
+           with TWO EXCEPTIONS, both marked below. Those two describe the store
+           the removals run against rather than the removals themselves, so no
+           defect in this code can fail them. They earn their place by saying
+           out loud what the checks under them assume; they add no coverage,
+           and reading them as though they did would overstate what this
+           section proves. */
+
+        /* From the middle: the case with a shift on both sides of it. */
+        store_fill(5, now);
+        /* PRECONDITION, not a guard: this is only what store_fill() built. */
+        check_str(order_str(), "10,20,30,40,50", "five entries, newest first");
+        check(notify_drop_id(30) == 2, "the entry in the middle is removed from position 2");
+        check_str(order_str(), "10,20,40,50", "the ones around it close up, in order");
+        check(notify_len == 4, "and the list is one shorter");
+        check(slots_occupied() == 4, "and its slot goes back to the free pool");
+        check(!slot_listed(2), "and no longer appears in the order list");
+        /* The shift has just broken the identity every other block relies on:
+           order position 2 now holds slot 3. Everywhere else in this section
+           store_fill() leaves position k holding slot k, so a search that
+           walked the slots and returned a slot index would agree with the
+           order position it was supposed to return and pass unnoticed. Here
+           the two differ, which is the whole reason notify_pos_of() lives
+           beside notify_drop_at(): both index through notify_order[]. */
+        check(notify_drop_id(40) == 2,
+              "a second drop uses the order position, not the slot index");
+
+        /* From the front — the shift starts at 0 — and from the back, where it
+           does not run at all and could read past the end if it did. */
+        store_fill(5, now);
+        check(notify_drop_id(10) == 0, "the newest entry is removed from position 0");
+        check_str(order_str(), "20,30,40,50", "leaving the rest in the order they were");
+
+        store_fill(5, now);
+        check(notify_drop_id(50) == 4, "the oldest entry is removed from the end");
+        check_str(order_str(), "10,20,30,40", "leaving the rest untouched");
+        /* The one thing order_str() cannot say, so it is said here directly:
+           the shift wrote nothing at or past the new end. A loop that ran one
+           turn too many would copy notify_order[notify_len] over the tail —
+           harmless-looking at five entries, a read one past the array itself
+           on a full queue, and either way it destroys the stale index the
+           check on id 0 below depends on to be a real test. */
+        check(notify_order[4] == 4,
+              "and writes nothing at or past the new end of the order list");
+
+        /* The last one. An empty queue has to read as empty rather than as one
+           entry nothing can see: notify_free_slot() is what POST /notify asks
+           before it decides the device is full. */
+        store_fill(1, now);
+        check(notify_drop_id(10) == 0, "the last remaining entry is removed");
+        check(notify_len == 0, "and the queue is empty");
+        check_str(order_str(), "", "with nothing left in the list");
+        check(slots_occupied() == 0, "and every slot free again");
+        check(notify_free_slot() == 0, "so the next notification has somewhere to go");
+
+        /* An id that is not here changes nothing. The endpoint answers 404 off
+           this -1, so a removal that reported success while dropping position 0
+           would delete the newest message every time a caller mistyped an id. */
+        store_fill(3, now);
+        check(notify_drop_id(99) == -1, "an id that is not in the queue is not found");
+        check_str(order_str(), "10,20,30", "and nothing is removed");
+        check(notify_len == 3, "and the list is the length it was");
+        check(slots_occupied() == 3, "and the slots are the ones they were");
+
+        /* 0 is the value that marks a slot free, so a search that walked the
+           slots rather than the order list would match one and drop it.
+
+           Asked after a removal rather than on a fresh store, which is what
+           makes it a test of the search's bound and not only of which array it
+           reads. A drop leaves the slot it freed sitting in the tail of
+           notify_order[], one past notify_len, and that slot's id is now 0. A
+           search that walked one entry too far would find it, report a
+           position past the live list, and hand notify_drop_at() an index the
+           list has already moved on from — which after a drop from the middle
+           names a LIVE slot, so deleting an id that was never here would take
+           somebody else's message with it and still answer 200. On a store
+           with no removal behind it the tail holds nothing that can match, and
+           the same three checks pass whatever the bound is. */
+        check(notify_drop_id(30) == 2, "the last of the three is removed from the end");
+        check(notify_drop_id(0) == -1, "id 0, which marks a free slot, matches nothing");
+        check(notify_len == 2, "and takes no entry with it");
+        check_str(order_str(), "10,20", "leaving the two that were not asked for");
+
+        /* Twice is once. The second call is the ordinary case for anything
+           retrying a request it did not see the answer to. */
+        store_fill(3, now);
+        check(notify_drop_id(20) == 1, "an entry is removed the first time it is asked for");
+        check(notify_drop_id(20) == -1, "and is simply not there the second time");
+        check_str(order_str(), "10,30", "with one copy of it gone, not two entries");
+
+        /* A full queue, which is the state this endpoint exists to get out of:
+           the slot that is given back has to be the one a new notification is
+           handed, or a queue that reported itself full stays full. */
+        store_fill(NOTIFY_MAX, now);
+        /* PRECONDITION, not a guard: notify_free_slot() saying -1 here is what
+           makes the check two lines down mean anything, and no removal has run
+           yet for a defect in one to reach it. */
+        check(notify_free_slot() == -1, "a full queue has no free slot");
+        check(notify_drop_id(30) == 2, "removing one entry from a full queue");
+        check(notify_free_slot() == 2, "hands its slot to the next notification");
+        check(!slot_listed(2), "and takes it out of the order list");
+        check(notify_len == NOTIFY_MAX - 1, "leaving the other nineteen");
+        store_reset();
+    }
+
     printf("a stored id that would wrap the id counter\n");
     {
         /* notify_next_id is unsigned and the load loop winds it one past the
@@ -860,6 +1024,90 @@ int main(void) {
                            "\"op\":[\"Yes\"],\"ch\":0}", out, out_op, now),
               "a snapshot carrying fields from some later version");
         check(out.opt_count == 1 && out.chosen == 0, "restores everything it does know");
+    }
+
+    printf("the top unread level, and the one message left out of the walk\n");
+    {
+        /* What the LED ring asks the queue forty times a second, and what it
+           asks it while a message card is open: the same walk, with the card's
+           own message excluded.
+           Why the exclusion has a test of its own. While a card is up the ring
+           holds that message's colour, and an unread CRITICAL is the one thing
+           allowed to interrupt it — see progress_ring_phase(). Get the
+           exclusion wrong in one direction and the ring alternates a message
+           with itself, which is silly; get it wrong in the other — exclude by
+           slot, by index, or unconditionally — and a second critical arriving
+           while somebody reads his mail is HIDDEN, on the channel that exists
+           to make criticals impossible to miss. Neither shows up on the device
+           as anything but a ring that looked fine. */
+        uint8_t top = 200;
+
+        /* Five entries, newest first, and then one removed from the middle —
+           which is the only way to make an entry's SLOT and its POSITION in the
+           order list differ, and the two checks furthest down need them to
+           differ to mean anything. After the drop the unread crit, id 30, sits
+           in slot 2 at position 1.
+
+           Levels: 10 info, 30 crit, 40 warn, 50 crit but READ. That last one is
+           what makes "excluding the crit leaves warn" a real claim — an
+           implementation that forgot `unread` would answer crit from it. */
+        store_reset();
+        check(load_text("{\"n\":["
+                        "{\"id\":10,\"ti\":\"a\",\"lv\":0,\"ur\":true},"
+                        "{\"id\":20,\"ti\":\"b\",\"lv\":0,\"ur\":true},"
+                        "{\"id\":30,\"ti\":\"c\",\"lv\":2,\"ur\":true},"
+                        "{\"id\":40,\"ti\":\"d\",\"lv\":1,\"ur\":true},"
+                        "{\"id\":50,\"ti\":\"e\",\"lv\":2,\"ur\":false}"
+                        "]}", now) == 5,
+              "a queue of five: info, info, crit, warn, and a crit already read");
+        /* PRECONDITIONS, not guards: this is the store the checks below run
+           against, and no defect in the walk can fail either of them. */
+        check(notify_drop_id(20) == 1, "  ..the second entry is dropped");
+        check_str(order_str(), "10,30,40,50", "  ..leaving 10,30,40,50");
+
+        check(notify_top_unread_walk(0, top) && top == NOTIFY_CRIT,
+              "excluding nothing, the top unread level is crit");
+        check(notify_top_unread_walk(30, top) && top == NOTIFY_WARN,
+              "excluding the unread crit leaves warn — not the read crit below it");
+        check(notify_top_unread_walk(40, top) && top == NOTIFY_CRIT,
+              "excluding a lesser message does not disturb the crit above it");
+
+        /* The exclusion is by id and by nothing else. 2 is the slot the unread
+           crit sits in and 1 is its position in the order list; an
+           implementation that compared either of those to `except_id` still
+           passes everything above, and fails exactly one of these two. */
+        top = 200;
+        check(notify_top_unread_walk(2, top) && top == NOTIFY_CRIT,
+              "a number that is only a slot index excludes nothing");
+        check(notify_top_unread_walk(1, top) && top == NOTIFY_CRIT,
+              "and neither does one that is only a position in the list");
+        check(notify_top_unread_walk(99, top) && top == NOTIFY_CRIT,
+              "nor an id no entry carries");
+
+        /* The whole queue excluded one message at a time still answers about
+           the others: an exclusion that leaked into the loop's bookkeeping
+           would empty the queue rather than skip one entry. */
+        store_reset();
+        /* PRECONDITION again, and so is the one further down: what the store
+           was built with, which no defect in the walk can fail. */
+        check(load_text("{\"n\":[{\"id\":7,\"ti\":\"only\",\"lv\":2,\"ur\":true}]}",
+                        now) == 1, "a queue holding one unread crit");
+        check(notify_top_unread_walk(0, top) && top == NOTIFY_CRIT,
+              "reads as crit when nothing is excluded");
+        top = 200;
+        check(!notify_top_unread_walk(7, top),
+              "and as nothing unread when it is the message being excluded — "
+              "the case where the card in front IS the critical");
+        check(top == 200, "with the level left untouched rather than zeroed");
+
+        /* Nothing unread at all, and an empty queue: both must answer false
+           rather than "info", which is a different statement. */
+        store_reset();
+        check(load_text("{\"n\":[{\"id\":8,\"ti\":\"seen\",\"lv\":2,\"ur\":false}]}",
+                        now) == 1, "a queue whose only message has been read");
+        check(!notify_top_unread_walk(0, top), "reports nothing unread");
+        store_reset();
+        check(!notify_top_unread_walk(0, top), "and so does an empty queue");
     }
 
     printf("\n%s\n", failures ? "FAILED" : "all checks passed");

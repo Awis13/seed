@@ -8,6 +8,11 @@
  * unread message exists the ring breathes in that message's colour, and it
  * keeps breathing until somebody acknowledges it.
  *
+ * The one place the two channels meet is a message card: while one is open the
+ * ring holds that message's colour steady, so what is on the panel and what is
+ * visible from the doorway are the same message. Breathing still means
+ * "waiting, unlooked-at"; steady means "this is the one in front of you".
+ *
  *
  * RMT coexistence with the IR transmitter — the thing that had to be settled
  * ------------------------------------------------------------------------
@@ -124,6 +129,11 @@
  * has not reached NTP is usually a freshly booted or offline one, and a pager
  * that goes dark because it lost the time is broken in the direction that loses
  * messages.
+ *
+ * The window is switched on and off from the menu as well as over HTTP, and
+ * switching it off means emptying it — so on a device with no time entry of any
+ * kind the hours would be gone for good. They are kept in a second, saved pair
+ * instead; the night window section further down is the whole of that.
  */
 
 /* --- Geometry and rates --- */
@@ -164,6 +174,8 @@
 
 #define RING_CFG_FILE     "/ring.json"
 #define RING_CFG_TMP      "/ring.tmp"
+
+/* host-test:begin consts — sliced out by tools/test_quiet.sh */
 /* Settings arrive on the web-server task; the flash write is deferred to
    loop(), the one task allowed to spend milliseconds. Same arrangement, and the
    same reason, as the notification store's snapshot. */
@@ -172,6 +184,7 @@
 #define RING_BRIGHT_DEFAULT     50
 #define RING_NIGHT_FROM_DEFAULT 0        /* 00:00 */
 #define RING_NIGHT_TO_DEFAULT   (8 * 60) /* 08:00 */
+/* host-test:end */
 
 #define RING_TEST_MAX_S   60
 #define RING_TEST_DEF_S   8
@@ -227,6 +240,7 @@ static const uint8_t ring_gamma[256] = {
 static bool ring_ready = false;
 static uint8_t ring_blocks = 0;          /* memory blocks the channel actually got */
 
+/* host-test:begin settings — sliced out by tools/test_quiet.sh */
 /* Everything the endpoints can write is volatile: those handlers run on the
    web-server task while ring_poll() reads the same words on the loop task. All
    of them are single aligned scalars, so the worst a collision can cost is one
@@ -236,8 +250,18 @@ static volatile uint8_t ring_brightness = RING_BRIGHT_DEFAULT;   /* percent, 0..
 static volatile uint16_t ring_night_from = RING_NIGHT_FROM_DEFAULT;
 static volatile uint16_t ring_night_to = RING_NIGHT_TO_DEFAULT;
 
+/* The window the silence was last switched off from, and the only copy of it:
+   switching off empties the live pair above, and this device has no way to type
+   a time back in. Empty here means nothing has been remembered yet, which is
+   the same encoding the live window uses for "no silence" — see
+   ring_night_is_window(). Both are persisted, so a reboot restores the schedule and
+   not just the fact that there was one. */
+static volatile uint16_t ring_night_saved_from = 0;
+static volatile uint16_t ring_night_saved_to = 0;
+
 static volatile bool ring_cfg_dirty = false;
 static volatile unsigned long ring_cfg_save_at = 0;
+/* host-test:end */
 
 /* One-shot overlays. Only one can run at a time: they are all half a second
    long and stacking them would say nothing a single one does not. */
@@ -257,6 +281,40 @@ static unsigned long ring_knob_at = 0;
    the same job by construction rather than by two suppliers agreeing. Nothing
    that publishes progress knows this exists. */
 static int ring_progress_pct = -1;
+
+/*
+ * The message card in front of somebody: its level, or -1 for "no card", and
+ * the id it is showing.
+ *
+ * Fed the same way the arc is — the UI hands it over, this file never asks what
+ * screen is up — but from ui_enter() rather than from loop(), because that is
+ * the single place a screen changes and therefore the single place a card can
+ * be left. Every way out of one goes through it: the click that acknowledges
+ * the message, the user key, the idle timeout, the message expiring underneath
+ * the card, a recording taking the panel. None of them has to remember to say
+ * so, which is what makes "the ring goes dark when the card is left" a property
+ * of the code rather than a list of call sites to keep in step.
+ *
+ * The id is here so that an unread critical can be told from THE CARD'S OWN
+ * message — see notify_top_unread_walk() and progress_ring_phase().
+ *
+ * The pair is written level-last on the way in and level-first on the way out,
+ * so a reader that catches the two words mid-update sees "no card" rather than
+ * a level belonging to the wrong id. What that ordering rests on: each word is
+ * a single naturally aligned scalar and is therefore written whole, and both
+ * are volatile — as every other cross-task word in this file is — so the
+ * compiler may not reorder the two stores against each other. Nothing more is
+ * claimed; this is not a barrier between cores.
+ *
+ * It is worth stating exactly how much that buys, because it is less than it
+ * looks. The writers below and ring_compose() — the only reader that decides
+ * what the LEDs show — all run on the loop task, so the ring's colour cannot be
+ * affected by a torn read at all. The two readers on the web-server task are
+ * ring_effect_name() and ring_state_json(), and both only build an HTTP
+ * response. So the worst this ordering prevents is a wrong `effect` string or
+ * `card_level` in one network reply, never a wrong colour on the device. */
+static volatile int ring_card_level = -1;
+static volatile uint32_t ring_card_id = 0;
 
 /* Test pattern, so colours can be judged without inventing a notification. */
 enum { RING_TEST_NONE = 0, RING_TEST_BREATHE, RING_TEST_LEVELS };
@@ -299,19 +357,144 @@ static uint8_t ring_triangle(unsigned long now, unsigned long cycle_ms) {
     return (uint8_t)(up * 255 / half);
 }
 
-/* --- Night window --- */
+/* --- Night window ---
+ *
+ * The window is two numbers and a rule, and all three are pure — which is why
+ * they are sliced out below and held to account on the host by
+ * tools/test_quiet.sh. Only ring_night_now() needs the clock, and it is the one
+ * thing here that is not testable.
+ *
+ * Keep every marker line self-closed and on a line of its own: the slicer drops
+ * the marker and copies what follows verbatim, without understanding it. And
+ * keep the tags from being prefixes of one another — the slicer matches a tag
+ * as a substring, so a region tagged `quietload` would also be pulled in by
+ * every request for `quiet`, and the copy lands in the generated file twice.
+ * That is why the stored-document region below is tagged `stored`.
+ */
 
-/* from == to is an empty window, which is how the silence is turned off without
-   a fourth setting. from > to wraps midnight, which is the shape most people
-   actually want (22:00 to 07:00). */
+/* host-test:begin quiet — sliced out by tools/test_quiet.sh */
+/* The live window and the one it can be brought back from. They travel as a
+   pair because every decision below reads both: switching the silence on and
+   off is nothing but moving hours between them, and the whole point is that no
+   step of it invents an hour or drops one. */
+struct RingQuiet {
+    uint16_t from, to;              /* the live window, minutes from midnight */
+    uint16_t saved_from, saved_to;  /* the window the toggle switched off */
+};
+
+/* Do these two boundaries describe a window at all? from == to describes none,
+   which is how the silence is turned off without a fourth setting — and it is
+   also how the saved pair spells "nothing remembered", one encoding for "no
+   window" rather than two. Asks a question; sets nothing. */
+static bool ring_night_is_window(uint16_t from, uint16_t to) {
+    return from != to;
+}
+
+/* Is `minutes` past midnight inside the window? from > to wraps midnight, which
+   is the shape most people actually want (22:00 to 07:00). The start is
+   inclusive and the end exclusive, so an 08:00 end makes 08:00 the first minute
+   of the morning rather than the last of the night. */
+static bool ring_night_holds(uint16_t from, uint16_t to, int minutes) {
+    if (!ring_night_is_window(from, to)) return false;
+    if (from < to) return minutes >= from && minutes < to;
+    return minutes >= from || minutes < to;
+}
+
+/*
+ * Keep the restore point in step with the live window.
+ *
+ * Called wherever the window is set — the menu toggle, POST /ring, the config
+ * load — so that switching the silence off remembers the hours that were in
+ * force a moment earlier rather than the ones somebody set last week. An empty
+ * window is never remembered: it is the state being switched away from, and
+ * recording it would erase the only copy of the schedule.
+ */
+static void ring_quiet_keep(RingQuiet &q) {
+    if (!ring_night_is_window(q.from, q.to)) return;
+    q.saved_from = q.from;
+    q.saved_to = q.to;
+}
+
+/*
+ * Switch the silence on or off without losing the hours.
+ *
+ * Off collapses the live window onto its own start, which ring_night_holds()
+ * reads as "no silence" — but it remembers the hours first, because this device
+ * has no time entry of any kind and hours erased here cannot be typed back in.
+ *
+ * On with nothing remembered takes the compiled defaults, and that case is real
+ * rather than theoretical: a device whose stored window was already empty
+ * before the saved pair existed comes up with nothing to restore. 00:00-08:00
+ * is the firmware's own default and it is wrong in the harmless direction — a
+ * night that is too long gets noticed and changed, while a toggle that appears
+ * to do nothing reads as broken.
+ */
+static void ring_quiet_switch(RingQuiet &q, bool on,
+                              uint16_t def_from, uint16_t def_to) {
+    if (!on) {
+        ring_quiet_keep(q);
+        q.to = q.from;
+        return;
+    }
+    if (!ring_night_is_window(q.saved_from, q.saved_to)) {
+        q.saved_from = def_from;
+        q.saved_to = def_to;
+    }
+    q.from = q.saved_from;
+    q.to = q.saved_to;
+}
+
+/*
+ * The switch as a click works it: whichever way the window is now, go the other
+ * way, and say which way that was.
+ *
+ * One line, and it is here rather than inside ring_quiet_toggle() because that
+ * function reads the live volatile words and cannot be sliced onto the host — a
+ * test wanting this decision had to re-implement it, which proves something
+ * about the test's copy and nothing about the firmware. The defaults come from
+ * the caller for the same reason ring_quiet_switch() takes them.
+ *
+ * The answer is what the event line names: switched on, the hours are what the
+ * device will be silent for; switched off, what a second click gets back.
+ */
+static bool ring_quiet_flip(RingQuiet &q, uint16_t def_from, uint16_t def_to) {
+    bool on = !ring_night_is_window(q.from, q.to);
+    ring_quiet_switch(q, on, def_from, def_to);
+    return on;
+}
+
+/*
+ * The whole silence rule with the clock reading lifted out of it: a window that
+ * exists, a clock that has been set, and a minute inside the window.
+ *
+ * `clock_set` false stays LIT, deliberately, and it is a parameter here rather
+ * than a call so that the choice is a testable one. A node that has not reached
+ * NTP is usually a freshly booted or offline one, and a pager that goes dark
+ * because it lost the time fails in the direction that loses messages. See the
+ * header.
+ */
+static bool ring_night_active(uint16_t from, uint16_t to, bool clock_set,
+                              int minutes) {
+    if (!clock_set) return false;
+    return ring_night_holds(from, to, minutes);
+}
+/* host-test:end */
+
+/* Is there a window at all? The clock face and the menu row both ask, and it is
+   the same question the silence rule asks first. */
+static bool ring_night_armed() {
+    return ring_night_is_window(ring_night_from, ring_night_to);
+}
+
 static bool ring_night_now() {
-    if (ring_night_from == ring_night_to) return false;
+    /* The early return is a saved clock read and nothing else — with no window
+       ring_night_active() answers false for any minute and any clock. It is
+       here because ring_compose() asks this forty times a second. */
+    if (!ring_night_armed()) return false;
     struct tm t;
-    if (!clock_local_time(t)) return false;   /* time unknown -> stay lit */
-    int m = t.tm_hour * 60 + t.tm_min;
-    if (ring_night_from < ring_night_to)
-        return m >= ring_night_from && m < ring_night_to;
-    return m >= ring_night_from || m < ring_night_to;
+    bool clock_set = clock_local_time(t);
+    return ring_night_active(ring_night_from, ring_night_to, clock_set,
+                             clock_set ? t.tm_hour * 60 + t.tm_min : 0);
 }
 
 /* --- Effect triggers (called from loop(), ui.h and the endpoints) --- */
@@ -360,6 +543,56 @@ static void ring_progress_clear() {
     ring_progress_pct = -1;
 }
 
+/* A card is up, showing message `id` at `level`. */
+static void ring_card_set(uint32_t id, uint8_t level) {
+    ring_card_id = id;
+    ring_card_level = (int)level;   /* last: see the declaration */
+}
+
+/* No card is up. Called for every screen that is not one, so it runs far more
+   often than it changes anything — which is the point of it being the same
+   unconditional statement every time rather than a condition somebody has to
+   get right. */
+static void ring_card_clear() {
+    ring_card_level = -1;           /* first: see the declaration */
+    ring_card_id = 0;
+}
+
+/*
+ * Which of the three bottom claimants has the ring at `now`, and what with.
+ *
+ * Two callers ask the same question: ring_compose(), on the loop task, against
+ * the frame's own clock sample, and ring_effect_name(), on the web-server task,
+ * against a fresh millis(). In a file whose whole argument is that the ring has
+ * a single arbiter, that decision has to exist once — so `now` is a parameter
+ * and each caller keeps its own reading, which is the same move already made
+ * for notify_pos_of() and notify_take_id().
+ *
+ * The card's own message is left out of the unread question here, once, for
+ * both of them. Otherwise a critical would alternate with the card showing that
+ * same critical — one message taking turns with itself, in one colour, for no
+ * gain. A second unread critical is a different message and still gets its
+ * phase. One acquisition of the notification lock serves the whole decision,
+ * which is also why the level comes back from here rather than being asked for
+ * a second time.
+ */
+struct RingOwner {
+    uint8_t who;     /* PROGRESS_RING_NONE, _ARC, _CRIT or _CARD */
+    int card;        /* the open card's level, or -1 for no card */
+    bool unread;     /* an unread message exists, the card's own excluded */
+    uint8_t top;     /* and its level, when one does */
+};
+
+static RingOwner ring_owner(unsigned long now) {
+    RingOwner o;
+    o.card = ring_card_level;       /* one read; see the declaration */
+    o.top = NOTIFY_INFO;
+    o.unread = notify_top_unread_level(o.top, o.card >= 0 ? ring_card_id : 0);
+    bool crit = o.unread && o.top == NOTIFY_CRIT;
+    o.who = progress_ring_phase(crit, ring_progress_pct >= 0, o.card >= 0, now);
+    return o;
+}
+
 /* --- Frame composition ---
  *
  * Priority, highest first:
@@ -370,16 +603,22 @@ static void ring_progress_clear() {
  *   one-shot  arrival or acknowledgement, half a second each
  *   dark      nothing to say
  *
- * and then, at the bottom, two claimants with no fixed order between them:
+ * and then, at the bottom, three claimants with no fixed order between them:
  *
+ *   card      a message is open on the panel and this is its colour
  *   progress  a job is running and its position is the information
  *   breathe   unread messages exist
  *
- * Against an unread info or warn the progress arc simply wins. Against an
- * unread CRITICAL the two alternate, the critical taking the whole ring and the
- * longer phase — the rule and the reason live in progress_ring_phase() in
- * skills/progress.cpp, because that is where somebody tempted to remove it will
- * be reading.
+ * The card outranks the arc; the arc outranks an unread info or warn. Against
+ * an unread CRITICAL whichever of the two holds the ring alternates with it,
+ * the critical taking the whole ring and the longer phase — the rule and the
+ * reason live in progress_ring_phase() in skills/progress.cpp, because that is
+ * where somebody tempted to remove it will be reading.
+ *
+ * The card sits BELOW the knob feedback and the one-shots deliberately. A hand
+ * on the control, an arriving message's comet and an acknowledgement's wipe are
+ * all half a second of something happening right now, and a card that is going
+ * to be there for the next fifteen seconds can wait for them.
  *
  * `now` is passed in rather than read here: ring_poll() retires expired effects
  * against one timestamp, and composing against a second one taken microseconds
@@ -456,21 +695,33 @@ static void ring_compose(uint8_t frame[RING_LEDS][3], unsigned long now) {
         return;
     }
 
-    /* The last two claimants do not have a fixed order between them. A progress
-       arc beats an unread info or warn outright — those are already on the
-       clock face as the amber dot and the count — but against an unread
-       CRITICAL it takes turns, and the shorter turn. The ring is the channel
-       that is readable from across a room, and a critical message must never
-       be outbid on it; see progress_ring_phase() in skills/progress.cpp for why
-       the two phases are deliberately unequal and must stay that way.
+    /* The last three claimants do not have a fixed order between them. An open
+       card beats a progress arc, because it is the message somebody is holding
+       the device to read; an arc beats an unread info or warn outright, because
+       those are already on the clock face as the amber dot and the count; and
+       against an unread CRITICAL whichever of the two holds the ring takes
+       turns with it, and the shorter turn. The ring is the channel that is
+       readable from across a room, and a critical message must never be outbid
+       on it; see progress_ring_phase() in skills/progress.cpp for why the two
+       phases are deliberately unequal and must stay that way.
 
-       One acquisition of the notification lock serves both decisions, which is
-       also why the level is read here rather than by asking twice. */
-    uint8_t top;
-    bool unread = notify_top_unread_level(top);
-    bool crit = unread && top == NOTIFY_CRIT;
+       Made by ring_owner(), against this pass's own `now` — including leaving
+       the card's own message out of the unread question, which is why that is
+       stated there rather than here. */
+    RingOwner o = ring_owner(now);
 
-    if (progress_ring_phase(crit, ring_progress_pct >= 0, now) == PROGRESS_RING_ARC) {
+    if (o.who == PROGRESS_RING_CARD) {
+        /* The whole ring in the card's colour, and STEADY. The breathe means
+           "something is waiting and nobody has looked at it"; this message is
+           being looked at, so it says the same colour with the pulse taken out.
+           Held only as long as the card is — the panel drops back to the clock
+           after UI_IDLE_MS of no input, and this goes out with it. */
+        for (int i = 0; i < RING_LEDS; i++)
+            ring_put(frame, i, ring_level_color((uint8_t)o.card), 255);
+        return;
+    }
+
+    if (o.who == PROGRESS_RING_ARC) {
         /* The lit arc is the progress. The pixel at the boundary carries the
            fraction, so eight LEDs read as rather more than eight steps, and it
            never goes fully dark while a job is running — a blast that has not
@@ -491,14 +742,14 @@ static void ring_compose(uint8_t frame[RING_LEDS][3], unsigned long now) {
 
     /* Either nothing is running, or the critical has the ring for this phase.
        Both land here, and both want the same breathe. */
-    if (unread) {
-        unsigned long cycle = (top == NOTIFY_CRIT) ? RING_BREATHE_CRIT_MS
-                                                   : RING_BREATHE_MS;
+    if (o.unread) {
+        unsigned long cycle = (o.top == NOTIFY_CRIT) ? RING_BREATHE_CRIT_MS
+                                                     : RING_BREATHE_MS;
         uint8_t env = RING_BREATHE_MIN +
                       (uint8_t)((255 - RING_BREATHE_MIN) *
                                 ring_triangle(now, cycle) / 255);
         for (int i = 0; i < RING_LEDS; i++)
-            ring_put(frame, i, ring_level_color(top), env);
+            ring_put(frame, i, ring_level_color(o.top), env);
     }
 }
 
@@ -528,16 +779,149 @@ static void ring_cfg_save() {
     doc["b"] = ring_brightness;
     doc["nf"] = ring_night_from;
     doc["nt"] = ring_night_to;
+    /* The window the toggle would restore. Saved next to the live one and not
+       derived from it, because the two are only equal while the silence is on —
+       the moment it is switched off the live pair is empty and this is the only
+       record of the hours left anywhere on the device. */
+    doc["qf"] = ring_night_saved_from;
+    doc["qt"] = ring_night_saved_to;
     String out;
     serializeJson(doc, out);
     write_spiffs_file_atomic(RING_CFG_FILE, RING_CFG_TMP, out);
 }
 
+/* host-test:begin pair — sliced out by tools/test_quiet.sh */
 static void ring_cfg_mark_dirty() {
     unsigned long at = millis() + RING_CFG_DELAY_MS;
     if (!ring_cfg_dirty || (long)(at - ring_cfg_save_at) < 0) ring_cfg_save_at = at;
     ring_cfg_dirty = true;
 }
+
+/* The four window words as one struct and back again. Everything that changes
+   the window works on a copy and writes it back in one place, for the reason
+   the POST handler already gives about its own locals: a change that is half
+   applied is worse than one that is refused, and here the half that could go
+   missing is the schedule itself.
+
+   Both halves run on either task. The words are single aligned scalars, so the
+   worst a collision costs is one frame or one response composed from a
+   half-applied window — the same trade every setting in this file makes. */
+static void ring_quiet_read(RingQuiet &q) {
+    q.from = ring_night_from;
+    q.to = ring_night_to;
+    q.saved_from = ring_night_saved_from;
+    q.saved_to = ring_night_saved_to;
+}
+
+/*
+ * Put a pair back, and say whether anything actually moved.
+ *
+ * Applying and SCHEDULING THE FLASH WRITE are two jobs, and this one does only
+ * the first — the caller marks. That split is not tidiness: a helper that also
+ * marked rewrote /ring.json on every single power-on. The load path applies a
+ * pair that came out of the file, and ring_quiet_restore() finishes by deriving
+ * the restore point from the live window, so the pair it hands back differs
+ * from the words it started with for a stored empty window, for a document
+ * identical to the compiled defaults, and for one that says nothing at all. One
+ * erase cycle per boot on a battery device, against the erase budget
+ * notify.cpp's own snapshot argues for at NOTIFY_PERSIST.
+ *
+ * The two places somebody actually changes the window — the menu toggle and
+ * POST /ring — both read this answer and mark from it.
+ */
+static bool ring_quiet_apply(const RingQuiet &q) {
+    bool changed = (q.from != ring_night_from) || (q.to != ring_night_to) ||
+                   (q.saved_from != ring_night_saved_from) ||
+                   (q.saved_to != ring_night_saved_to);
+    ring_night_from = q.from;
+    ring_night_to = q.to;
+    ring_night_saved_from = q.saved_from;
+    ring_night_saved_to = q.saved_to;
+    return changed;
+}
+/* host-test:end */
+
+/* host-test:begin stored — sliced out by tools/test_quiet.sh */
+/*
+ * Both windows out of one stored settings document.
+ *
+ * `q` comes in holding what the firmware would have without a file at all — the
+ * compiled defaults — and a field that is absent, of the wrong type or out of
+ * range simply leaves that half of it standing. Ranges are checked rather than
+ * trusted for the reason notify_snapshot_restore() gives about its own fields:
+ * a stored file is not a more trustworthy source than a request body, since
+ * this filesystem can be replaced wholesale by anyone who can write an image.
+ *
+ * EVERY FILE ON EVERY DEVICE TODAY WAS WRITTEN WITHOUT qf/qt, so what happens
+ * to them is not an edge case, it is the next boot everywhere. Spelled out:
+ *
+ *   - qf/qt missing entirely -> the saved pair keeps what it came in with,
+ *     which is 0/0, "nothing remembered". It is NOT invented from the live
+ *     window's boundaries by some default, because a device that has never had
+ *     a schedule must not appear to have one.
+ *
+ *   - qf/qt present but equal -> the same thing, and deliberately
+ *     indistinguishable from missing. An empty pair IS "nothing remembered" —
+ *     one encoding, as ring_night_is_window() says — and giving a stored empty
+ *     pair a second meaning would be a fourth state to reason about for no gain.
+ *
+ *   - a live window that IS set -> ring_quiet_keep() below adopts it as the
+ *     restore point. This is what carries an upgrading device across: a file
+ *     with nf/nt 22:00-07:00 and no qf/qt comes up able to switch off and back
+ *     on, rather than with a schedule it can only destroy once.
+ *
+ *   - a live window that is NOT set and nothing remembered — the state the
+ *     owner's own device is in tonight, its window switched off over the
+ *     network before this firmware existed — leaves the pair empty. The toggle
+ *     then has nothing to restore, and ring_quiet_switch() takes
+ *     RING_NIGHT_FROM_DEFAULT/RING_NIGHT_TO_DEFAULT: 00:00-08:00 appears. That
+ *     is stated there and it is a decision, not a `| 0` falling out of a parse.
+ */
+static void ring_quiet_restore(JsonObjectConst o, RingQuiet &q) {
+    if (o["nf"].is<int>() && o["nt"].is<int>()) {
+        int f = o["nf"].as<int>(), t = o["nt"].as<int>();
+        if (f >= 0 && f < 1440 && t >= 0 && t < 1440) {
+            q.from = (uint16_t)f;
+            q.to = (uint16_t)t;
+        }
+    }
+    if (o["qf"].is<int>() && o["qt"].is<int>()) {
+        int f = o["qf"].as<int>(), t = o["qt"].as<int>();
+        if (f >= 0 && f < 1440 && t >= 0 && t < 1440) {
+            q.saved_from = (uint16_t)f;
+            q.saved_to = (uint16_t)t;
+        }
+    }
+    ring_quiet_keep(q);
+}
+/* host-test:end */
+
+/* host-test:begin docapply — sliced out by tools/test_quiet.sh */
+/*
+ * A stored settings document over the live words.
+ *
+ * Everything ring_cfg_load() does once the file is read and parsed, and it is
+ * its own function so that the one rule it has to keep is testable on the host:
+ * NOTHING HERE SCHEDULES A WRITE. What came out of the file is already in the
+ * file, and the pair ring_quiet_restore() hands back differs from the words it
+ * started with on very nearly every document — see ring_quiet_apply(). A boot
+ * that marked the config dirty cost an erase cycle every power-on.
+ */
+static void ring_cfg_apply_doc(JsonObjectConst o) {
+    if (o["on"].is<bool>()) ring_enabled = o["on"].as<bool>();
+    if (o["b"].is<int>()) {
+        int b = o["b"].as<int>();
+        if (b >= 0 && b <= 100) ring_brightness = (uint8_t)b;
+    }
+    /* Read into a copy of the live pair and written back in one place, so that
+       a file carrying half a window cannot leave half of one behind. The answer
+       — did anything move — is dropped here on purpose, and only here. */
+    RingQuiet q;
+    ring_quiet_read(q);
+    ring_quiet_restore(o, q);
+    ring_quiet_apply(q);
+}
+/* host-test:end */
 
 /* A file that is missing, truncated or nonsense leaves the compiled defaults
    standing: the ring is a notification channel, and the worst outcome of a bad
@@ -547,18 +931,7 @@ static void ring_cfg_load() {
     if (raw.length() == 0) return;
     JsonDocument doc;
     if (deserializeJson(doc, raw) != DeserializationError::Ok) return;
-    if (doc["on"].is<bool>()) ring_enabled = doc["on"].as<bool>();
-    if (doc["b"].is<int>()) {
-        int b = doc["b"].as<int>();
-        if (b >= 0 && b <= 100) ring_brightness = (uint8_t)b;
-    }
-    if (doc["nf"].is<int>() && doc["nt"].is<int>()) {
-        int f = doc["nf"].as<int>(), t = doc["nt"].as<int>();
-        if (f >= 0 && f < 1440 && t >= 0 && t < 1440) {
-            ring_night_from = (uint16_t)f;
-            ring_night_to = (uint16_t)t;
-        }
-    }
+    ring_cfg_apply_doc(doc.as<JsonObjectConst>());
 }
 
 /* --- Poll --- */
@@ -576,18 +949,17 @@ static const char *ring_effect_name() {
     if (ring_test == RING_TEST_BREATHE) return "test-breathe";
     if (ring_fx == RING_FX_COMET) return "comet";
     if (ring_fx == RING_FX_WIPE) return "wipe";
-    /* The same two-claimant decision ring_compose() makes, against a clock read
-       here rather than passed in: this reports on the web-server task, and what
-       it should report is what the ring is doing at the moment of the request.
-       While a critical alternates with a job this therefore flips between
-       "progress" and "breathe" from one GET to the next, which is the honest
-       answer rather than a confusing one. */
-    uint8_t top;
-    bool unread = notify_top_unread_level(top);
-    bool crit = unread && top == NOTIFY_CRIT;
-    if (progress_ring_phase(crit, ring_progress_pct >= 0, millis()) == PROGRESS_RING_ARC)
-        return "progress";
-    if (unread) return "breathe";
+    /* The same decision ring_compose() makes — literally the same function —
+       against a clock read here rather than passed in: this reports on the
+       web-server task, and what it should report is what the ring is doing at
+       the moment of the request. While a critical alternates with a job or a
+       card this therefore flips between "progress"/"card" and "breathe" from
+       one GET to the next, which is the honest answer rather than a confusing
+       one. */
+    RingOwner o = ring_owner(millis());
+    if (o.who == PROGRESS_RING_CARD) return "card";
+    if (o.who == PROGRESS_RING_ARC) return "progress";
+    if (o.unread) return "breathe";
     return "idle";
 }
 
@@ -647,7 +1019,7 @@ static void ring_poll() {
 /* --- Endpoints --- */
 
 static const SkillEndpoint ring_endpoints[] = {
-    {"GET",  "/ring",      "Ring state and settings: brightness, night window, current effect"},
+    {"GET",  "/ring",      "Ring state and settings: brightness, night window and the one it restores, current effect"},
     {"POST", "/ring",      "Set {enabled, brightness, night_from, night_to} — any subset"},
     {"POST", "/ring/test", "Show a pattern {effect, level, seconds} without queueing a message"},
     {NULL, NULL, NULL}
@@ -662,7 +1034,7 @@ static const char *ring_describe() {
            "### Endpoints\n\n"
            "| Method | Path | Description |\n"
            "|--------|------|-------------|\n"
-           "| GET | /ring | `{\"enabled\":true,\"brightness\":50,\"night_from\":\"00:00\",\"night_to\":\"08:00\",\"night_now\":false,\"clock_set\":true,\"effect\":\"breathe\",\"level\":\"warn\",\"unread\":2}` |\n"
+           "| GET | /ring | `{\"enabled\":true,\"brightness\":50,\"night_from\":\"00:00\",\"night_to\":\"08:00\",\"night_on\":true,\"night_saved_from\":\"00:00\",\"night_saved_to\":\"08:00\",\"night_now\":false,\"clock_set\":true,\"effect\":\"breathe\",\"level\":\"warn\",\"unread\":2}` |\n"
            "| POST | /ring | `{\"enabled\":true,\"brightness\":35,\"night_from\":\"23:30\",\"night_to\":\"07:00\"}` — every field optional |\n"
            "| POST | /ring/test | `{\"effect\":\"levels\"\\|\"breathe\"\\|\"comet\"\\|\"wipe\"\\|\"off\",\"level\":\"warn\",\"seconds\":8}` |\n\n"
            "A POST that names a setting it cannot parse changes nothing at all,\n"
@@ -681,13 +1053,32 @@ static const char *ring_describe() {
            "job the progress skill has picked, so it always agrees with the bar\n"
            "on the clock face; nothing that publishes progress knows the ring\n"
            "exists.\n\n"
+           "### The message on the panel\n\n"
+           "While a message card is open the ring is that message's colour,\n"
+           "**steady** — `effect` reads `card` and `card_level` is the colour\n"
+           "it is lit with. Reading a message a second time therefore lights\n"
+           "the ring again, which the unread breathe alone would not do: the\n"
+           "panel and the across-the-room channel say the same thing about the\n"
+           "same message. Steady rather than breathing is the distinction —\n"
+           "a pulse means something is waiting that nobody has looked at yet.\n\n"
+           "It goes out the moment the card is left, by any route: the click\n"
+           "that acknowledges the message, the second button, or the fifteen\n"
+           "seconds of no input that drop the panel back to the clock. A card\n"
+           "outranks the progress arc, because it is the message in somebody's\n"
+           "hand; both lose to the knob dot and to an arriving comet.\n\n"
            "While a `crit` is unacknowledged the ring alternates between the\n"
-           "red breathe and that arc — six seconds of red, three of arc — with\n"
-           "the red deliberately given the longer phase. This is the channel\n"
-           "you read from across a room, where the colour is the whole message,\n"
-           "and a critical must not be outbid on it by a percentage. Unread\n"
-           "info and warn do not alternate; a running job simply wins, because\n"
-           "those are already on the clock face as the dot and the count.\n\n"
+           "red breathe and whatever else wants it — the arc, or an open card —\n"
+           "six seconds of red against three, with the red deliberately given\n"
+           "the longer phase. This is the channel you read from across a room,\n"
+           "where the colour is the whole message, and a critical must not be\n"
+           "outbid on it by a percentage or by the message being read at that\n"
+           "moment. Unread info and warn do not alternate; a running job or an\n"
+           "open card simply wins, because those are already on the clock face\n"
+           "as the dot and the count.\n\n"
+           "A card showing the unread critical ITSELF does not alternate with\n"
+           "it — the answer would be red either way, so it stays steady red for\n"
+           "as long as the card is open. A second unread critical is a\n"
+           "different message and does take its phase.\n\n"
            "### Brightness\n\n"
            "`brightness` is a percentage, 0 to 100, applied to every pixel as a\n"
            "linear cap on drive current. It defaults to 50 and is meant to be\n"
@@ -711,6 +1102,22 @@ static const char *ring_describe() {
            "messages. `clock_set` in `GET /ring` says which of the two a\n"
            "`night_now` of false means — window open, or no window yet — so a\n"
            "ring lit at 3am can be diagnosed over the API.\n\n"
+           "### Switching the silence off, and getting it back\n\n"
+           "The window is also a switch on the device itself: the **Quiet** row\n"
+           "in the on-screen menu turns it on and off from the knob, which is\n"
+           "the only way to do it with no network in reach. Because switching\n"
+           "off means setting the two boundaries equal, and this device has no\n"
+           "way to type a time in, the hours are remembered rather than erased.\n\n"
+           "`GET /ring` therefore carries three fields beyond the boundaries:\n"
+           "`night_on` (false exactly when they are equal), and\n"
+           "`night_saved_from` / `night_saved_to`, the window a switch back on\n"
+           "would restore. The saved pair follows every window set through this\n"
+           "endpoint too, so a schedule pushed over the API is what the knob\n"
+           "brings back. If nothing has ever been remembered — the saved pair is\n"
+           "equal — switching on takes the firmware's own `00:00`-`08:00`.\n\n"
+           "This is a schedule and nothing else. There is no \"be quiet for the\n"
+           "next hour\": two boundaries cannot express one, and the toggle does\n"
+           "not pretend otherwise.\n\n"
            "### Example\n\n"
            "```\n"
            "curl -H \"Authorization: Bearer $TOKEN\" -H 'Content-Type: application/json' \\\n"
@@ -721,8 +1128,56 @@ static const char *ring_describe() {
            "```\n";
 }
 
+/* host-test:begin label — sliced out by tools/test_quiet.sh */
 static void ring_time_str(uint16_t mins, char *out, size_t n) {
     snprintf(out, n, "%02u:%02u", (unsigned)(mins / 60), (unsigned)(mins % 60));
+}
+
+/* What the menu row carries: the hours, or "off". The row says when as well as
+   whether, because this device has no other screen that could and the hours are
+   exactly what a toggle without a memory would have lost. The row's NAME is
+   ui.h's, put in front of this the same way the unread count goes after the
+   Messages row's name — one idiom for both built rows.
+
+   It takes a window rather than reading the live words, which is what lets it
+   be sliced onto the host: it is the only user-facing string this release adds,
+   the width argument at its call site in ui.h counts these exact characters,
+   and formatting somebody reads at one in the morning should not be the one
+   thing here with no test. */
+static void ring_quiet_hours(uint16_t from, uint16_t to, char *out, size_t n) {
+    if (!ring_night_is_window(from, to)) {
+        snprintf(out, n, "off");
+        return;
+    }
+    char f[8], t[8];
+    ring_time_str(from, f, sizeof(f));
+    ring_time_str(to, t, sizeof(t));
+    snprintf(out, n, "%s-%s", f, t);
+}
+/* host-test:end */
+
+/* --- The toggle, as the front panel works it ---
+ *
+ * Until now the window could only be changed over the network, which is no use
+ * at a desk at one in the morning with the pager sitting there silent. These two
+ * are what the menu row in ui.h is made of, and they are here rather than there
+ * for the same reason progress_status_line() is in its own skill: the UI draws,
+ * the skill owns the state and formats the string.
+ */
+
+/* Flip the silence, on the live words. The decision itself is
+   ring_quiet_flip()'s, which is what the host test drives; this is the half
+   that reads the volatiles, writes them back and says so in the log. Nothing
+   asks which way it went — the menu row redraws from the window itself — so
+   this reports nothing rather than returning an answer no caller reads. */
+static void ring_quiet_toggle() {
+    RingQuiet q;
+    ring_quiet_read(q);
+    bool on = ring_quiet_flip(q, RING_NIGHT_FROM_DEFAULT, RING_NIGHT_TO_DEFAULT);
+    if (ring_quiet_apply(q)) ring_cfg_mark_dirty();
+    event_add("ring: quiet %s (%02u:%02u-%02u:%02u)", on ? "on" : "off, kept",
+              (unsigned)(q.saved_from / 60), (unsigned)(q.saved_from % 60),
+              (unsigned)(q.saved_to / 60), (unsigned)(q.saved_to % 60));
 }
 
 /* Accepts "HH:MM" or a plain minute count, because one of those is what a
@@ -768,6 +1223,17 @@ static void ring_state_json(JsonDocument &doc) {
     doc["brightness"] = ring_brightness;
     doc["night_from"] = from;
     doc["night_to"] = to;
+    /* The toggle's own two answers, which the two boundaries above no longer
+       carry on their own now that switching off keeps the hours somewhere.
+       `night_on` is the state the menu row shows, and the saved pair is what a
+       switch back on would restore — an empty one means nothing has been
+       remembered yet and the compiled defaults would be taken instead. */
+    doc["night_on"] = ring_night_armed();
+    char saved_from[8], saved_to[8];
+    ring_time_str(ring_night_saved_from, saved_from, sizeof(saved_from));
+    ring_time_str(ring_night_saved_to, saved_to, sizeof(saved_to));
+    doc["night_saved_from"] = saved_from;
+    doc["night_saved_to"] = saved_to;
     doc["night_now"] = ring_night_now();
     /* Without this, `night_now: false` covers two different situations — the
        window is open, or the clock has never been set and there is no window at
@@ -779,7 +1245,17 @@ static void ring_state_json(JsonDocument &doc) {
     doc["effect"] = ring_effect_name();
     doc["unread"] = notify_unread_count();
     uint8_t top;
+    /* The queue's top unread level, asked WITHOUT the card exclusion on
+       purpose: this field is about what is waiting, not about what the ring is
+       lit with. The two differ exactly when a card is open, which is what
+       `card_level` below is for. */
     if (notify_top_unread_level(top)) doc["level"] = notify_level_name(top);
+    /* Present only while a message card is on the panel, and then it is the
+       ring's colour: an effect of "card" says which supplier has the ring and
+       this says what it is showing. Without it the colour would be the one
+       thing about the ring that cannot be read over the API. */
+    if (ring_card_level >= 0)
+        doc["card_level"] = notify_level_name((uint8_t)ring_card_level);
     if (ring_progress_pct >= 0) doc["progress"] = ring_progress_pct;
 }
 
@@ -855,12 +1331,25 @@ static void ring_register_routes(AsyncWebServer &server) {
             return;
         }
 
-        bool changed = (enabled != ring_enabled) || (brightness != ring_brightness) ||
-                       (from != ring_night_from) || (to != ring_night_to);
+        /* One predicate for the whole request, built as the change is applied.
+           The two settings are compared here and the four window words are
+           compared by ring_quiet_apply(), which is the only thing that can see
+           the restore point move — a body that shifts the window but not the
+           hours the toggle would bring back still has something to write, and a
+           predicate written out here could not say so. */
+        bool changed = (enabled != ring_enabled) || (brightness != ring_brightness);
         ring_enabled = enabled;
         ring_brightness = brightness;
-        ring_night_from = from;
-        ring_night_to = to;
+        /* The restore point follows whatever window is set here, so that the
+           menu toggle brings back the schedule this device was last actually
+           keeping — set over the network or not — rather than the hours it was
+           given the last time somebody stood in front of it. */
+        RingQuiet q;
+        ring_quiet_read(q);
+        q.from = from;
+        q.to = to;
+        ring_quiet_keep(q);
+        if (ring_quiet_apply(q)) changed = true;
         if (changed) {
             ring_cfg_mark_dirty();
             event_add("ring: %s, brightness %u%%, quiet %02u:%02u-%02u:%02u",
