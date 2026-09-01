@@ -71,10 +71,16 @@ seeds/                          <- bootloaders
   esp32/
     src/main.cpp                     1252 lines, PlatformIO, Heltec V3
     src/skills/gpio.cpp              GPIO control skill (360 lines)
-  esp32-tembed/
-    src/main.cpp                     1082 lines, PlatformIO, LilyGO T-Embed CC1101
-    src/skills/gpio.cpp              GPIO control skill (465 lines)
-    src/skills/serial.cpp            UART bridge skill (363 lines)
+  esp32-tembed/                     LilyGO T-Embed CC1101 — grown into a pager
+    src/main.cpp                     2019 lines, PlatformIO
+    src/skills/                      11.5k lines — notifications with reply
+                                     buttons, LED ring, speaker, microphone
+                                     and voice upload, IR blaster, progress,
+                                     GPIO, UART bridge
+  esp32-ats-mini/                   ATS Mini (ESP32-S3 + SI4732) — a receiver
+    src/main.cpp                     1645 lines, PlatformIO
+    src/skills/                      6.1k lines — shortwave tuning, band plans,
+                                     screen capture over HTTP
   pdp11/seed.c                      550 lines, K&R C, 2.11BSD
 
 firmware/                       <- grown from seeds
@@ -209,6 +215,21 @@ serial bridge, security hardening.
 GPIO control, I2C device scanning, WireGuard VPN with peer management,
 LoRa radio, OTA deploy system, mesh discovery.
 
+Two of the seeds under `seeds/` were grown the same way and stayed there,
+because on a board with a screen the seed and the product are the same binary:
+
+**T-Embed pager** (13.5k lines): an agent that needs a human sends a
+notification carrying up to four reply labels; the knob picks one and the answer
+is read back over HTTP. It also records voice and uploads it, drives an LED
+ring, plays sound, blasts IR, and reports its own battery.
+
+**ATS Mini receiver** (7.7k lines): shortwave tuning with band plans, and
+`GET /display/capture` — the screen as a BMP over HTTP, so an agent can see what
+a person in front of the device would see.
+
+Neither needs this README to be used: both answer `GET /skill` with their own
+capabilities, which is what an agent reads.
+
 **PDP-11 Gen 1** (grown live on 2.11BSD):
 system monitoring, process list, disk usage, syslog viewer.
 [Full growth log](docs/pdp11-growth-log.md).
@@ -254,6 +275,8 @@ Run seed on hardware you control, on networks you trust.
 | Any Linux SBC | $5-50 | GPIO, I2C, serial — physical world |
 | ESP32 (Heltec V3) | $15 | WiFi, BLE, LoRa, WireGuard |
 | ESP32-S3 | $5 | WiFi/BLE mesh node |
+| LilyGO T-Embed CC1101 | ~$40 | Screen, knob, ring, speaker, mic, IR, 433 MHz |
+| ATS Mini (ESP32-S3 + SI4732) | ~$40 | Shortwave receiver with a screen |
 | PDP-11 (2.11BSD) | priceless | Because why not |
 
 ## Writing firmware
