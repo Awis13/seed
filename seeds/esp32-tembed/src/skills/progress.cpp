@@ -55,12 +55,18 @@
  * reason rather than quietly dropping the blast the owner is watching.
  *
  * And one rule that outranks all of that, on the LED ring only: an unread
- * CRITICAL notification and a live progress job take turns, with the critical
- * given the longer turn and the whole ring. The ring is the across-the-room
- * channel and a critical message must never be outbid on it. See
- * progress_ring_phase() below for the reasoning and the numbers — it is the
+ * CRITICAL notification and whatever else wants the ring — a live progress job,
+ * or the colour of the message card the owner has open — take turns, with the
+ * critical given the longer turn and the whole ring. The ring is the
+ * across-the-room channel and a critical message must never be outbid on it.
+ * See progress_ring_phase() below for the reasoning and the numbers — it is the
  * part of this file most likely to be "simplified" by somebody who has not
  * thought about what the device is for.
+ *
+ * That the card's claim is arbitrated here, in the progress skill, is on
+ * purpose: the constants, the five-second property and the argument for the
+ * asymmetry all live in this file, and a second copy of them next to the ring's
+ * frame composition is exactly how the two would drift apart.
  *
  * That alternation is the ring's alone. The bar on the clock face runs
  * continuously, because the panel is the up-close channel and it already shows
@@ -358,37 +364,80 @@ static int progress_core_select(const ProgressJob *jobs, unsigned long now) {
  * the red happened to be at, which is the hard visual edge the breathe exists
  * to avoid. tools/test_progress.sh pins the five-second property, so a
  * symmetric pair fails a test rather than merely looking wrong.
+ *
+ * A third claimant has since joined: the colour of the message card the owner
+ * has open, which the ring shows so that what is in his hand and what is
+ * across the room are the same message. It takes the same deal against a
+ * critical, on the same two constants and for the same reason — so the shorter
+ * phase below is now "whatever else wants the ring", the arc or the card,
+ * rather than the arc alone. There is still only one alternation here, and
+ * adding a claimant must not turn it into a rotation: three phases of anything
+ * would push the gap between two reds past five seconds again.
  */
 #define PROGRESS_CRIT_PHASE_MS 6000   /* whole ring, red, three full breaths */
-#define PROGRESS_ARC_PHASE_MS  3000   /* thin arc — deliberately the shorter */
+#define PROGRESS_ALT_PHASE_MS  3000   /* deliberately the shorter */
 
-enum { PROGRESS_RING_NONE = 0, PROGRESS_RING_ARC, PROGRESS_RING_CRIT };
+enum {
+    PROGRESS_RING_NONE = 0,
+    PROGRESS_RING_ARC,
+    PROGRESS_RING_CRIT,
+    PROGRESS_RING_CARD    /* the open card's colour, steady */
+};
+
+/* Which half of the alternation `now` falls in. One function, so the two
+   claimants that can be interrupted by a critical are interrupted on exactly
+   the same edges rather than on two copies of the same expression. */
+static bool progress_crit_phase(unsigned long now) {
+    unsigned long cycle = PROGRESS_CRIT_PHASE_MS + PROGRESS_ALT_PHASE_MS;
+    return (now % cycle) < PROGRESS_CRIT_PHASE_MS;
+}
 
 /*
- * Who owns the ring at time `now`. A pure function of its three arguments and
+ * Who owns the ring at time `now`. A pure function of its four arguments and
  * of nothing else — no static, no millis() call — which is what makes the
  * alternation testable at all.
  *
- * `crit_unread` is specifically a CRITICAL that nobody has acknowledged. Unread
- * info and warn do not qualify and simply lose to a live job: they are already
- * visible on the clock face as the amber dot and the unread count, so the ring
- * is not their only channel. It is a crit's only channel that matters.
+ * `crit_unread` is specifically a CRITICAL that nobody has acknowledged AND
+ * that is not the message the open card is showing. ring.cpp is what leaves the
+ * card's own message out of that question, because only notify.cpp knows the
+ * ids; the effect of it is stated under `card_open` below. Unread info and warn
+ * do not qualify at all and simply lose: they are already visible on the clock
+ * face as the amber dot and the unread count, so the ring is not their only
+ * channel. It is a crit's only channel that matters.
+ *
+ * `card_open` is somebody standing there with a message on the panel, and it
+ * outranks the arc for the reason the bar's own arbiter puts a device job above
+ * a network one: this is the thing he is looking at. The ring naming it is not
+ * decoration — it is what makes the panel and the across-the-room channel agree
+ * about which message is in front of him. The arc loses outright while a card
+ * is up rather than joining the alternation, because a third phase is exactly
+ * what the five-second property cannot afford.
+ *
+ * What happens when the open card IS the unread critical: nothing special, and
+ * that is the point. It arrives here as `crit_unread` false — ring.cpp excluded
+ * it — so the answer is a steady red card for as long as it is open, and NOT a
+ * message alternating with itself. Red is red either way; the only thing an
+ * alternation could add there is a flicker between two shades of the same
+ * answer. A SECOND unread critical still sets `crit_unread` and still gets its
+ * phase, which is the case that actually matters.
  *
  * Phased on the caller's clock rather than on when either party started, the
- * same way the breathe is, so that a job appearing mid-cycle joins the rhythm
- * instead of restarting it. The one artefact of that is a millis() rollover
- * landing inside a cycle, which restarts it — and since a cycle begins with the
- * critical phase, the only thing a rollover can do is give the red MORE time.
- * That is the direction to be wrong in.
+ * same way the breathe is, so that a job or a card appearing mid-cycle joins
+ * the rhythm instead of restarting it. The one artefact of that is a millis()
+ * rollover landing inside a cycle, which restarts it — and since a cycle begins
+ * with the critical phase, the only thing a rollover can do is give the red
+ * MORE time. That is the direction to be wrong in.
  */
 static uint8_t progress_ring_phase(bool crit_unread, bool progress_live,
-                                   unsigned long now) {
+                                   bool card_open, unsigned long now) {
+    if (card_open) {
+        if (!crit_unread) return PROGRESS_RING_CARD;
+        return progress_crit_phase(now) ? PROGRESS_RING_CRIT : PROGRESS_RING_CARD;
+    }
     if (!crit_unread) return progress_live ? PROGRESS_RING_ARC : PROGRESS_RING_NONE;
     if (!progress_live) return PROGRESS_RING_CRIT;
 
-    unsigned long cycle = PROGRESS_CRIT_PHASE_MS + PROGRESS_ARC_PHASE_MS;
-    return (now % cycle) < PROGRESS_CRIT_PHASE_MS ? PROGRESS_RING_CRIT
-                                                  : PROGRESS_RING_ARC;
+    return progress_crit_phase(now) ? PROGRESS_RING_CRIT : PROGRESS_RING_ARC;
 }
 /* host-test:end */
 
