@@ -320,6 +320,11 @@ static void i2c_scan(TwoWire &bus, I2CFound *results, int &count) {
 // CC1101 status registers are read with the burst bit set: 0x30|0xC0.
 // This runs BEFORE tft.init() — the display library owns the shared SPI bus
 // afterwards, and the seed never talks to the CC1101 again.
+//
+// Defined in skills/gate.cpp (included below): full CC1101 OOK bring-up on
+// the bus the probe is holding, before the display claims it.
+static void gate_configure(SPIClass &spi);
+
 static void probe_cc1101() {
     pinMode(PIN_CC1101_CS, OUTPUT);
     digitalWrite(PIN_CC1101_CS, HIGH);
@@ -348,6 +353,16 @@ static void probe_cc1101() {
     digitalWrite(PIN_CC1101_CS, HIGH);
 
     spi.endTransaction();
+
+    // The gate skill configures the chip completely here, on the SAME live
+    // instance the probe just proved — this boot-probe bus is the one road
+    // to the chip that has been measured reliable on this hardware (see
+    // skills/gate.cpp, "The SPI bus, honestly"). Must run before spi.end():
+    // afterwards the display owns the bus and a second SPIClass::begin()
+    // hangs the boot under arduino-esp32 3.x.
+    if (hw.cc1101_version != 0x00 && hw.cc1101_version != 0xFF) {
+        gate_configure(spi);
+    }
     spi.end();
 
     // VERSION reads 0x14 (or 0x04 on older silicon); 0x00/0xFF = nothing there
@@ -1767,6 +1782,12 @@ static void handle_wifi_post(AsyncWebServerRequest *request) {
 #include "skills/gpio.cpp"
 #include "skills/serial.cpp"
 #include "skills/ir.cpp"
+/* After ir.cpp, same job-machine shape with the waveform on the CPU instead
+   of RMT — the S3's four RMT TX memory blocks are fully claimed by ir and
+   ring. Its SPI access rides tft.getSPIinstance() from the loop task, the
+   arbitration contract documented in its file header. No skill of its own,
+   and nothing reads it yet: the on-device button is C4, the webhook is C3. */
+#include "skills/gate.cpp"
 #include "skills/notify.cpp"
 /* After notify.cpp, for the JSON response helpers, and after nothing else: the
    fuel gauge is its own hardware and no skill reads it. Its probe runs earlier
@@ -2020,6 +2041,12 @@ void loop() {
     // Starts frames and collects completions; the transmission itself runs in
     // the RMT peripheral. Advances as far as it can each pass and never blocks.
     ir_poll();
+
+    // Same job machine, waveform on the CPU: one frame per pass, each frame a
+    // bounded CPU burst inside gate_poll (wait-for-TX poll + symbols, <= 250
+    // ms), the gap between frames waited across passes. After ir_poll() for
+    // the same reason every supplier sits in this stretch of the loop.
+    gate_poll();
 
     // A blast is a supplier of progress, not the owner of it. loop() reads the
     // same snapshot the on-device blast screen reads and publishes it under a
