@@ -285,17 +285,18 @@ enum {
        silently shifts every title after it onto the wrong screen. The assert
        below catches a missing entry; nothing can catch a reordering, which is
        why the rule is "append". */
-    UI_REC
+    UI_REC,
+    UI_GATE
 };
 
 /* Capitals: this is the service text of the header bar, not prose. One entry
    per screen above, in the same order. */
 static const char *ui_titles[] = {
     "", "MENU", "MESSAGES", "MESSAGES", "TV-B-GONE", "BY BRAND", "TV-B-GONE",
-    "SETUP AP", "INFO", "RECORDING"
+    "SETUP AP", "INFO", "RECORDING", "GATE"
 };
 
-static_assert(sizeof(ui_titles) / sizeof(ui_titles[0]) == UI_REC + 1,
+static_assert(sizeof(ui_titles) / sizeof(ui_titles[0]) == UI_GATE + 1,
               "ui_titles[] must have one entry per screen, in enum order");
 
 /* Top level. The marker on a selected row is also ">", so a submenu is spelled
@@ -308,6 +309,7 @@ enum {
     UI_ITEM_BACKLIGHT,
     UI_ITEM_DIM,
     UI_ITEM_TVBGONE,
+    UI_ITEM_GATE,
     UI_ITEM_AP,
     UI_ITEM_INFO,
     UI_ITEM_BACK,
@@ -335,8 +337,32 @@ static const char *ui_items[UI_ITEM_COUNT] = {
     "Backlight",    /* ui_list_label() appends the level's word, or its step */
     "Auto-dim",     /* ui_list_label() appends "on" or "off" */
     "TV-B-Gone >",
+    "Gate >",
     "Setup AP",
     "Info",
+    "Back"
+};
+
+/* Gate. The spare-remote app: one pairing sequence to enrol the device into
+   the receiver (hold the gate's program button while Pair fires), then four
+   buttons that each fire their own block sequence. Rows follow the TV-B-Gone
+   submenu shape. */
+enum {
+    UI_GATE_PAIR = 0,
+    UI_GATE_B1,
+    UI_GATE_B2,
+    UI_GATE_B3,
+    UI_GATE_B4,
+    UI_GATE_BACK,
+    UI_GATE_COUNT
+};
+
+static const char *ui_gate_items[UI_GATE_COUNT] = {
+    "Pair (hold gate btn)",
+    "Button 1",
+    "Button 2",
+    "Button 3",
+    "Button 4",
     "Back"
 };
 
@@ -1157,6 +1183,7 @@ static int ui_list_count() {
         case UI_MENU:    return UI_ITEM_COUNT;
         case UI_TVMENU:  return UI_TV_COUNT;
         case UI_BRAND:   return ir_code_count + 1;  /* the codes, then Back */
+        case UI_GATE:    return UI_GATE_COUNT;
         case UI_MSGLIST: return notify_count() + 1; /* the messages, then Back */
     }
     return 0;
@@ -1218,6 +1245,15 @@ static const char *ui_list_label(int i) {
             return ui_items[i];
         case UI_TVMENU: return ui_tv_items[i];
         case UI_BRAND:  return (i < ir_code_count) ? ir_codes[i].brand : "Back";
+        case UI_GATE:
+            /* The Pair row says so when there is no radio to pair with: the
+               screen is reachable either way, and a row that silently did
+               nothing would read as a broken button. */
+            if (i == UI_GATE_PAIR && !gate_ready) {
+                snprintf(built, sizeof(built), "%s (no radio)", ui_gate_items[i]);
+                return built;
+            }
+            return ui_gate_items[i];
     }
     return "";
 }
@@ -1797,14 +1833,16 @@ static void ui_draw_rec() {
    therefore have nothing to gain from the periodic repaint. The message list
    is deliberately not one of them: its age column advances on its own. */
 static bool ui_input_driven(uint8_t screen) {
-    return screen == UI_MENU || screen == UI_TVMENU || screen == UI_BRAND;
+    return screen == UI_MENU || screen == UI_TVMENU || screen == UI_BRAND ||
+           screen == UI_GATE;
 }
 
 static void ui_draw() {
     switch (ui_screen) {
         case UI_MENU:
         case UI_TVMENU:
-        case UI_BRAND:   ui_draw_list();    break;
+        case UI_BRAND:
+        case UI_GATE:    ui_draw_list();    break;
         case UI_MSGLIST: ui_draw_msglist(); break;
         case UI_MSGCARD: ui_draw_card();    break;
         case UI_BLAST:   ui_draw_blast();   break;
@@ -1943,6 +1981,16 @@ static void ui_activate(int item) {
         return;
     }
 
+    if (ui_screen == UI_GATE) {
+        /* Pair fires the enrolment sequence; a button fires its own block.
+           Both go through the same staging path POST /gate/* uses — the job
+           runs on the loop task and shows its result in the event log. */
+        if (item == UI_GATE_PAIR) gate_start_code(GATE_JOB_PAIR, 0);
+        else if (item <= UI_GATE_B4) gate_start_code(GATE_JOB_BUTTON, item - UI_GATE_B1 + 1);
+        else ui_enter_list(UI_MENU, UI_ITEM_GATE);
+        return;
+    }
+
     if (ui_screen == UI_BRAND) {
         /* One named code, repeat 1 — which still means three frames for a Sony
            entry, because that is what SIRC needs. This is the point of the
@@ -2012,6 +2060,9 @@ static void ui_activate(int item) {
         case UI_ITEM_TVBGONE:
             ui_enter_list(UI_TVMENU, UI_TV_ALL);
             break;
+        case UI_ITEM_GATE:
+            ui_enter_list(UI_GATE, UI_GATE_PAIR);
+            break;
         case UI_ITEM_AP:
             /* The only route in on the device, and time-boxed: a session
                nobody reprovisions closes itself. It used to share the job with
@@ -2036,6 +2087,7 @@ static void ui_back() {
     switch (ui_screen) {
         case UI_BRAND:   ui_enter_list(UI_TVMENU, UI_TV_BRAND);   break;
         case UI_TVMENU:  ui_enter_list(UI_MENU, UI_ITEM_TVBGONE); break;
+        case UI_GATE:    ui_enter_list(UI_MENU, UI_ITEM_GATE);    break;
         case UI_MSGLIST: ui_enter_list(UI_MENU, UI_ITEM_MSG);     break;
         default:         ui_enter(UI_CLOCK);                      break;
     }
@@ -2380,6 +2432,7 @@ static void ui_poll() {
         case UI_MENU:
         case UI_TVMENU:
         case UI_BRAND:
+        case UI_GATE:
         case UI_MSGLIST: {
             if (back) { ui_back(); return; }
             if (steps != 0) {

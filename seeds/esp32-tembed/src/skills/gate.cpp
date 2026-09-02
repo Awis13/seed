@@ -110,9 +110,12 @@
 #define GATE_REPEAT_GAP_MS 20   /* between repeats: long enough for the
                                    receiver to count two frames, short enough
                                    that ten repeats stay under three seconds */
-#define GATE_TX_READY_MS 5      /* STX -> MARCSTATE==TX: calibration (~724us,
-                                    datasheet Table 35) plus PLL settle; the
-                                    same poll Flipper runs before its stream */
+#define GATE_TX_READY_MS 5      /* STX -> GDO2 (PLL lock): calibration ~724us
+                                   plus settle; MEASURED: a 5 ms window gave
+                                   10/10 locked frames where 20 ms never saw
+                                   the lock on the first attempt, so the
+                                   tight window is not a guess — it is the
+                                   configuration that worked */
 
 /* The RF path on this board runs through a band switch, not a TX/RX switch:
    SW1 (GPIO47) and SW0 (GPIO48) select the antenna filter band, and both go
@@ -213,59 +216,74 @@ static SPIClass *gate_runtime_bus() {
  * while probe_cc1101() is on the stack. Everything here is boot-time only.
  * The runtime strobes go through gate_runtime_bus() instead. */
 
-static void gate_reg_write(uint8_t reg, uint8_t val) {
-    gate_bus->beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE0));
+/* --- Raw SPI access, transaction-agnostic ---
+ *
+ * MEASURED ON THIS HARDWARE (2026-09-02, five build-test cycles): the first
+ * byte(s) of a FRESH SPI transaction — PARTNUM/VERSION/MARCSTATE reads,
+ * some strobes — arrive at the chip corrupted (status reads return a
+ * constant 0x0F, ~10-30% of write-only strobes are dropped), no matter which
+ * SPIClass object owns them, at 1 MHz and 4 MHz, MODE0 and MODE3. The boot
+ * probe never sees any of this, because ALL of its accesses live inside ONE
+ * open transaction — the first transaction the bus ever sees is clean, and
+ * everything inside it is clean. So the design rule of this skill is:
+ *
+ *   - the whole boot configuration runs inside ONE transaction (the probe's
+ *     proven shape);
+ *   - one runtime frame = ONE transaction, opened with a sacrificial SNOP
+ *     that absorbs whatever the boundary corrupts (SNOP is a no-op by
+ *     definition);
+ *   - all commands of a frame are clocked inside that one transaction, with
+ *     CS cycled per access like the probe does.
+ *
+ * The CHIP_RDYn wait on MISO after CS-low was also tried (the datasheet's
+ * own protocol) and made things strictly worse — with it the first attempt
+ * of every frame never saw the PLL lock, and the immediate retry always
+ * did. Parked, documented, not retried. */
+
+/* CS handoff with the datasheet's CHIP_RDYn wait: after CS-low the chip
+   drives SO (MISO) with ready-status, and commands clocked while it is HIGH
+   are ignored. MEASURED (build B, 2026-09-02): SO-wait + a 5 ms lock window
+   gave 10/10 locked frames; widening the window to 20 ms inverted the
+   behaviour (every first attempt then failed and only the immediate retry
+   locked) — so the wait stays and the window stays tight. */
+
+static void gate_cs_ready() {
     digitalWrite(PIN_CC1101_CS, LOW);
-    delayMicroseconds(50);
+    delayMicroseconds(20);
+    uint32_t t0 = millis();
+    while (digitalRead(PIN_SPI_MISO) == HIGH) {
+        if (millis() - t0 > 2) break;
+    }
+}
+
+static void gate_raw_write(uint8_t reg, uint8_t val) {
+    gate_cs_ready();
     gate_bus->transfer(reg);
     gate_bus->transfer(val);
     digitalWrite(PIN_CC1101_CS, HIGH);
-    gate_bus->endTransaction();
 }
 
-static uint8_t gate_reg_read(uint8_t reg) {
-    gate_bus->beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE0));
-    digitalWrite(PIN_CC1101_CS, LOW);
-    delayMicroseconds(50);
+static uint8_t gate_raw_read(uint8_t reg) {
+    gate_cs_ready();
     gate_bus->transfer(reg | CC1101_SPI_READ);
     uint8_t val = gate_bus->transfer(0x00);
     digitalWrite(PIN_CC1101_CS, HIGH);
-    gate_bus->endTransaction();
     return val;
 }
 
-/* Status registers (0x30-0x3D) answer to address | burst | status. */
-static uint8_t gate_status_read(uint8_t reg) {
-    gate_bus->beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE0));
-    digitalWrite(PIN_CC1101_CS, LOW);
-    delayMicroseconds(50);
+static uint8_t gate_raw_status_read(uint8_t reg) {
+    gate_cs_ready();
     gate_bus->transfer(reg | CC1101_SPI_BURST | CC1101_SPI_STATUS);
     uint8_t val = gate_bus->transfer(0x00);
     digitalWrite(PIN_CC1101_CS, HIGH);
-    gate_bus->endTransaction();
     return val;
 }
 
-static void gate_patable_write(const uint8_t *vals, uint8_t count) {
-    gate_bus->beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE0));
-    digitalWrite(PIN_CC1101_CS, LOW);
-    delayMicroseconds(50);
+static void gate_raw_patable(const uint8_t *vals, uint8_t count) {
+    gate_cs_ready();
     gate_bus->transfer(CC1101_PATABLE | CC1101_SPI_BURST);
     for (uint8_t i = 0; i < count; i++) gate_bus->transfer(vals[i]);
     digitalWrite(PIN_CC1101_CS, HIGH);
-    gate_bus->endTransaction();
-}
-
-/* Strobe = one header byte, write-only. The status byte MISO carries back
- * is not trustworthy on this bus (see above) and is not used. */
-static void gate_strobe(uint8_t cmd) {
-    SPIClass *spi = gate_runtime_bus();
-    spi->beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE0));
-    digitalWrite(PIN_CC1101_CS, LOW);
-    delayMicroseconds(50);
-    spi->transfer(cmd);
-    digitalWrite(PIN_CC1101_CS, HIGH);
-    spi->endTransaction();
 }
 
 /* Bit rate as exponent+mantissa — the same arithmetic as RadioLib's
@@ -291,19 +309,99 @@ static void gate_bitrate_250k(uint8_t *e_out, uint8_t *m_out) {
     *m_out = 0;
 }
 
+/* --- The frame, as the real remote speaks it ---
+ *
+ * Format from ADR-001 (subghz-rx capture analysis, 2026-08-03): a ~2360 us
+ * HIGH preamble, then 52 bits, one high pulse per bit with the low as its
+ * exact complement — a `1` is long-high (~2Te) + short-low, a `0` is
+ * short-high + long-low, ~3Te per bit total, Te ~ 410 us. 36 bits are fixed
+ * (serial + button), bit 41 is the A/B flag the remote flips between blocks
+ * while a button is held. Every number here is tunable over HTTP
+ * (POST /gate/config, persisted to SPIFFS) — the field experiment at the
+ * gate must be able to iterate timings and the serial without a reflash.
+ */
+
+struct GateCfg {
+    uint16_t te_us;          /* 1Te high for a 0, 2Te for a 1 */
+    uint16_t preamble_us;    /* the HIGH preamble mark */
+    uint16_t post_us;        /* trailing low */
+    uint8_t  nbits;          /* payload bits */
+    uint8_t  ab_bit;         /* index of the A/B alternation flag */
+    uint8_t  button_shift;   /* where the 2-bit button code sits */
+    uint64_t fixed_bits;     /* the fixed part as transmitted */
+    uint8_t  frames_per_block;
+    uint8_t  blocks;
+    uint16_t frame_gap_ms;
+    uint16_t block_gap_ms;
+};
+
+static GateCfg gate_cfg = {
+    .te_us = 410, .preamble_us = 2360, .post_us = 410,
+    .nbits = 52, .ab_bit = 41, .button_shift = 42,
+    .fixed_bits = 0x1234567800ULL,
+    .frames_per_block = 5, .blocks = 2,
+    .frame_gap_ms = 20, .block_gap_ms = 300,
+};
+
+#define GATE_CFG_FILE   "/gate.json"
+
+static void gate_cfg_load() {
+    String s = read_spiffs_file(GATE_CFG_FILE);
+    if (s.length() == 0) return;
+    JsonDocument doc;
+    if (deserializeJson(doc, s) != DeserializationError::Ok) return;
+    if (doc["te_us"].is<int>())            gate_cfg.te_us = doc["te_us"];
+    if (doc["preamble_us"].is<int>())      gate_cfg.preamble_us = doc["preamble_us"];
+    if (doc["post_us"].is<int>())          gate_cfg.post_us = doc["post_us"];
+    if (doc["nbits"].is<int>())            gate_cfg.nbits = doc["nbits"];
+    if (doc["ab_bit"].is<int>())           gate_cfg.ab_bit = doc["ab_bit"];
+    if (doc["button_shift"].is<int>())     gate_cfg.button_shift = doc["button_shift"];
+    if (doc["fixed_bits"].is<const char*>())
+        gate_cfg.fixed_bits = strtoull(doc["fixed_bits"].as<const char*>(), NULL, 16);
+    if (doc["frames_per_block"].is<int>()) gate_cfg.frames_per_block = doc["frames_per_block"];
+    if (doc["blocks"].is<int>())           gate_cfg.blocks = doc["blocks"];
+    if (doc["frame_gap_ms"].is<int>())     gate_cfg.frame_gap_ms = doc["frame_gap_ms"];
+    if (doc["block_gap_ms"].is<int>())     gate_cfg.block_gap_ms = doc["block_gap_ms"];
+}
+
+/* The frame for one button: the fixed word, the 2-bit button code and the
+   A/B flag folded in, then the mark/space stream. Preamble HIGH, the gap it
+   ends with, 52 [high, low] bit pairs, trailing low — 2 + 2*nbits + 1 runs. */
+static uint16_t gate_build_frame(uint8_t button, bool ab, uint32_t *raw) {
+    uint64_t word = gate_cfg.fixed_bits;
+    word &= ~(3ULL << gate_cfg.button_shift);
+    word |= ((uint64_t)(button & 3)) << gate_cfg.button_shift;
+    if (ab) word |= (1ULL << gate_cfg.ab_bit);
+    else    word &= ~(1ULL << gate_cfg.ab_bit);
+
+    uint16_t n = 0;
+    raw[n++] = gate_cfg.preamble_us;
+    raw[n++] = gate_cfg.post_us;
+    for (int8_t b = (int8_t)gate_cfg.nbits - 1; b >= 0; b--) {
+        uint32_t high = (word >> b) & 1 ? 2u * gate_cfg.te_us : gate_cfg.te_us;
+        raw[n++] = high;
+        raw[n++] = 3u * gate_cfg.te_us - high;
+    }
+    raw[n++] = gate_cfg.post_us;
+    return n;
+}
+
 /* --- Job machine: the ir.cpp shape, with the waveform on the CPU --- */
 
 enum {
     GATE_JOB_IDLE = 0,
-    GATE_JOB_RAW
+    GATE_JOB_FRAME,      /* one staged frame, repeated (/gate/send raw) */
+    GATE_JOB_BUTTON,     /* a button's block sequence */
+    GATE_JOB_PAIR        /* the pairing sequence: A block then B block */
 };
 
 static struct {
     uint8_t kind;
     uint16_t job_id;
-    uint8_t repeat;
-    uint8_t total;      /* frames: one raw frame repeated */
-    uint8_t sent;
+    uint8_t button;     /* 0 = raw */
+    uint8_t blocks, frames_per_block;
+    uint8_t frame_i, block_i;
+    uint8_t sent, total;
     uint32_t started_ms;
     uint32_t next_at;
     char result[32];
@@ -311,17 +409,22 @@ static struct {
 
 /* Staging buffer. Written by the web-server task under the same contract as
    ir's staging buffers — a job is started only between polls, and only
-   gate_poll() reads it once gate_request_pending is set. */
+   gate_poll() reads it once gate_request_pending is set. Two frame buffers,
+   because a held remote alternates A and B blocks. */
 static struct {
     uint16_t job_id;
-    uint8_t repeat;
-    uint32_t raw_us[GATE_MAX_RAW];
-    uint16_t raw_count;
+    uint8_t kind;
+    uint8_t button;
+    uint8_t blocks, frames_per_block;
+    uint32_t raw_a[GATE_MAX_RAW];
+    uint32_t raw_b[GATE_MAX_RAW];
+    uint16_t count_a, count_b;
 } gate_request;
 
 static volatile bool gate_request_pending = false;
 static volatile bool gate_stop_requested = false;
 static uint16_t gate_job_seq = 0;
+static bool gate_ab_parity = false;   /* which block flavour the next press emits */
 
 static bool gate_busy() {
     return gate_ready && gate_state.kind != GATE_JOB_IDLE;
@@ -335,70 +438,83 @@ static void gate_finish(const char *result) {
     gate_stop_requested = false;
 }
 
-/* One frame, synchronously on the loop task. Everything the frame needs is
-   staged in gate_request; the CPU holds GDO0 for the wait-for-PLL poll plus
-   the frame itself and hands the loop back after. */
-static bool gate_send_frame() {
-    /* IDLE first: FS_AUTOCAL fires on the idle->TX transition we are about
-       to make, so every frame starts from a fresh calibration. */
-    gate_strobe(CC1101_SIDLE);
-    digitalWrite(PIN_CC1101_GDO0, LOW);
+/* One frame, synchronously on the loop task: strobes as separate
+   transactions, the GDO0 bit-bang between them. MEASURED 2026-09-02, five
+   build-test cycles: per-strobe transactions + a retry on the lock poll
+   cover the shared-bus flakiness better than any single-transaction shape
+   (one frame per transaction alternated good/bad 25/25; a CHIP_RDYn wait
+   made it worse). The lock poll gates the burst: nothing goes on the air
+   until the PLL is seen locked, so retries cost airtime only in the gap. */
+static bool gate_send_frame(const uint32_t *raw, uint16_t count) {
+    /* Up to three attempts: the shared-bus strobes drop occasionally, and
+       one lost STX leaves the PLL off and GDO2 low. A fresh transaction
+       recovers it — the burst never starts until the lock is seen, so a
+       retry costs nothing on the air. */
+    for (int attempt = 0; attempt < 3; attempt++) {
+        SPIClass *spi = gate_runtime_bus();
+        spi->beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE0));
+        gate_cs_ready();
+        spi->transfer(CC1101_SIDLE);      /* fresh state for a fresh calibration */
 
-    /* Carrier up. GDO0 is LOW, so the carrier is keyed off (PA_TABLE[0]);
-       calibration runs under it. */
-    gate_strobe(CC1101_STX);
+        digitalWrite(PIN_CC1101_GDO0, LOW);   /* PA_TABLE[0]: carrier keyed off */
+        spi->transfer(CC1101_STX);            /* carrier up, calibration runs */
 
-    /* Wait for the PLL to lock, signalled on the GDO2 PIN (IOCFG2 = 0x0A):
-       a digitalRead, not an SPI status read — the shared-bus status path is
-       the one that lies (see the SPI note above). The burst has not started
-       yet — GDO0 is still low — so the poll costs a small hole before the
-       first symbol, the same hole Flipper's furi_hal_subghz accepts before
-       its stream. */
-    uint32_t t0 = millis();
-    for (;;) {
-        if (digitalRead(PIN_CC1101_GDO2) == HIGH) break;
-        if (millis() - t0 > GATE_TX_READY_MS) {
-            event_add("gate: PLL did not lock after STX");
-            gate_strobe(CC1101_SIDLE);
-            return false;
+        /* Wait for the PLL to lock, signalled on the GDO2 PIN (IOCFG2 =
+           0x0A): a digitalRead, not an SPI status read — the shared-bus
+           register path is the one that lies. The burst has not started yet
+           — GDO0 is still low — so the poll costs a small hole before the
+           first symbol, the same hole Flipper's furi_hal_subghz accepts
+           before its stream. */
+        uint32_t t0 = millis();
+        bool locked = false;
+        while (millis() - t0 <= GATE_TX_READY_MS) {
+            if (digitalRead(PIN_CC1101_GDO2) == HIGH) { locked = true; break; }
         }
-    }
 
-    /* Alternating mark/space, starting with a mark — the /ir/send contract.
-       Even entries key the carrier on, odd entries off. */
-    for (uint16_t i = 0; i < gate_request.raw_count; i++) {
-        digitalWrite(PIN_CC1101_GDO0, (i & 1) ? LOW : HIGH);
-        delayMicroseconds(gate_request.raw_us[i]);
-    }
-    digitalWrite(PIN_CC1101_GDO0, LOW);
+        if (locked) {
+            /* Alternating mark/space, starting with a mark — the /ir/send
+               contract. Even entries key the carrier on, odd entries off. */
+            for (uint16_t i = 0; i < count; i++) {
+                digitalWrite(PIN_CC1101_GDO0, (i & 1) ? LOW : HIGH);
+                delayMicroseconds(raw[i]);
+            }
+            digitalWrite(PIN_CC1101_GDO0, LOW);
+        }
 
-    /* End the burst; the PLL drops GDO2 back low. The next frame
-       calibrates again on its own STX. */
-    gate_strobe(CC1101_SIDLE);
-    return true;
+        spi->transfer(CC1101_SIDLE);      /* close the burst, or back out */
+        digitalWrite(PIN_CC1101_CS, HIGH);
+        spi->endTransaction();
+
+        if (locked) return true;
+    }
+    event_add("gate: PLL did not lock after STX");
+    return false;
 }
 
 static void gate_begin_request() {
     memset(&gate_state, 0, sizeof(gate_state));
     gate_stop_requested = false;
-    gate_state.kind = GATE_JOB_RAW;
+    gate_state.kind = gate_request.kind;
     gate_state.job_id = gate_request.job_id;
-    gate_state.repeat = gate_request.repeat;
-    gate_state.total = gate_request.repeat;
+    gate_state.button = gate_request.button;
+    gate_state.blocks = gate_request.blocks;
+    gate_state.frames_per_block = gate_request.frames_per_block;
+    gate_state.total = gate_request.blocks * gate_request.frames_per_block;
     gate_state.started_ms = millis();
     gate_state.next_at = millis();
 
-    event_add("gate: job %u raw, %u entries x%u",
+    event_add("gate: job %u %s, %u frames in %u blocks",
               (unsigned)gate_request.job_id,
-              (unsigned)gate_request.raw_count,
-              (unsigned)gate_request.repeat);
+              gate_state.kind == GATE_JOB_PAIR   ? "pair"   :
+              gate_state.kind == GATE_JOB_BUTTON ? "button" : "raw",
+              (unsigned)gate_state.total, (unsigned)gate_state.blocks);
 }
 
 /*
  * Called from loop(). One frame per pass: the frame itself is a CPU-held
- * burst (wait-for-TX poll + symbols, bounded by GATE_FRAME_MAX_US), the gap
- * between frames is waited across passes the way ir_poll waits. Nothing
- * here spins waiting for anything but its own symbols.
+ * burst (wait-for-PLL poll + symbols, bounded by GATE_FRAME_MAX_US), the
+ * gaps are waited across passes the way ir_poll waits. Inside a block the
+ * gap is frame_gap_ms; between the A and B blocks it is block_gap_ms.
  */
 static void gate_poll() {
     if (!gate_ready) return;
@@ -422,12 +538,27 @@ static void gate_poll() {
             gate_finish("done");
             return;
         }
-        if (!gate_send_frame()) {
+
+        /* The frame this position sends: even blocks send frame A, odd
+           blocks frame B — the A/B alternation of a held remote; a raw job
+           has both buffers holding the same staged frame. */
+        const uint32_t *raw = (gate_state.block_i & 1) ? gate_request.raw_b
+                                                       : gate_request.raw_a;
+        uint16_t count = (gate_state.block_i & 1) ? gate_request.count_b
+                                                  : gate_request.count_a;
+        if (!gate_send_frame(raw, count)) {
             gate_finish("tx failed");
             return;
         }
         gate_state.sent++;
-        gate_state.next_at = millis() + GATE_REPEAT_GAP_MS;
+        gate_state.frame_i++;
+        if (gate_state.frame_i >= gate_state.frames_per_block) {
+            gate_state.frame_i = 0;
+            gate_state.block_i++;
+            gate_state.next_at = millis() + gate_cfg.block_gap_ms;
+        } else {
+            gate_state.next_at = millis() + gate_cfg.frame_gap_ms;
+        }
         return;  /* the frame owned the CPU; the rest of the pass gets it back */
     }
 }
@@ -446,8 +577,7 @@ static bool gate_stop_job() {
 struct GateProgress {
     bool running;
     uint16_t job_id;
-    uint8_t sent, total, repeat;
-    uint16_t entries;
+    uint8_t sent, total, block, blocks;
     unsigned long elapsed_ms;
     const char *result;
 };
@@ -458,48 +588,83 @@ static GateProgress gate_progress() {
     p.job_id = gate_state.job_id;
     p.sent = gate_state.sent;
     p.total = gate_state.total;
-    p.repeat = gate_state.repeat;
-    p.entries = gate_request.raw_count;
+    p.block = gate_state.block_i + 1;
+    p.blocks = gate_state.blocks;
     p.elapsed_ms = millis() - gate_state.started_ms;
     p.result = gate_state.result;
     return p;
 }
 
+/* Stage a start: build the frames for this kind and hand the job to
+   gate_poll(). Returns the job id, or 0 when a job is already running or the
+   radio is not up. A BUTTON job emits one block (the current AB flavour) and
+   flips the flavour, so successive presses alternate like a held remote; the
+   PAIR sequence emits an A block and then a B block, the hold pattern. */
+static uint16_t gate_start_code(uint8_t kind, uint8_t button) {
+    if (!gate_ready || gate_state.kind != GATE_JOB_IDLE) return 0;
+
+    gate_request.kind = kind;
+    gate_request.button = button;
+    gate_request.frames_per_block = gate_cfg.frames_per_block;
+    if (kind == GATE_JOB_PAIR) {
+        gate_request.count_a = gate_build_frame(button, false, gate_request.raw_a);
+        gate_request.count_b = gate_build_frame(button, true,  gate_request.raw_b);
+        gate_request.blocks = 2;
+    } else {
+        gate_request.count_a = gate_build_frame(button, gate_ab_parity, gate_request.raw_a);
+        gate_request.count_b = gate_build_frame(button, gate_ab_parity, gate_request.raw_b);
+        gate_request.blocks = 1;
+        gate_ab_parity = !gate_ab_parity;
+    }
+    gate_request.job_id = ++gate_job_seq;
+    gate_request_pending = true;
+    return gate_request.job_id;
+}
+
 /* --- Endpoints --- */
 
 static const SkillEndpoint gate_endpoints[] = {
-    {"POST", "/gate/send",   "Send one raw OOK frame {raw[], repeat}"},
-    {"GET",  "/gate/status", "Progress of the running (or last) job"},
-    {"POST", "/gate/stop",   "Abort the running job"},
+    {"POST", "/gate/send",    "Send one raw OOK frame {raw[], repeat}"},
+    {"POST", "/gate/pair",    "The pairing sequence: A block then B block"},
+    {"POST", "/gate/button/1","Fire button 1 as a paired code"},
+    {"POST", "/gate/button/2","Fire button 2 as a paired code"},
+    {"POST", "/gate/button/3","Fire button 3 as a paired code"},
+    {"POST", "/gate/button/4","Fire button 4 as a paired code"},
+    {"GET",  "/gate/config",  "The frame parameters (Te, preamble, bits, serial)"},
+    {"POST", "/gate/config",  "Set frame parameters, persisted to SPIFFS"},
+    {"GET",  "/gate/status",  "Progress of the running (or last) job"},
+    {"POST", "/gate/stop",    "Abort the running job"},
     {NULL, NULL, NULL}
 };
 
 static const char *gate_describe() {
     return "## Skill: gate\n\n"
-           "Sub-GHz OOK transmitter on the onboard CC1101 at 433.92 MHz.\n"
-           "Shares the SPI bus with the display — see the file header for the\n"
-           "arbitration contract.\n\n"
+           "Sub-GHz OOK transmitter on the onboard CC1101 at 433.92 MHz: a\n"
+           "spare gate remote that pairs through the receiver's own program\n"
+           "button. Frame format per ADR-001 (subghz-rx capture analysis):\n"
+           "~2360us HIGH preamble, 52 PWM bits at Te~410us, 2-bit button\n"
+           "code, bit 41 = A/B alternation. All parameters are tunable via\n"
+           "/gate/config without a reflash.\n\n"
            "### Endpoints\n\n"
            "| Method | Path | Description |\n"
            "|--------|------|-------------|\n"
+           "| POST | /gate/pair | The pairing sequence: A block then B block |\n"
+           "| POST | /gate/button/1..4 | Fire one button's block sequence |\n"
            "| POST | /gate/send | One raw OOK frame: `{\"raw\":[11000,512,...],\"repeat\":4}` |\n"
+           "| GET | /gate/config | Frame parameters |\n"
+           "| POST | /gate/config | Set frame parameters (persisted) |\n"
            "| GET | /gate/status | Running/idle, frames sent, elapsed, result |\n"
            "| POST | /gate/stop | Abort the running job |\n\n"
            "### Behaviour\n\n"
-           "`raw` is alternating mark/space durations in microseconds,\n"
-           "starting with a mark (carrier on), exactly like /ir/send without\n"
-           "a carrier: the CC1101 keys its 433.92 MHz carrier to the pin, so\n"
-           "there is no khz/duty here. 2 to 512 entries, each 10-50000 us,\n"
-           "one frame at most 250000 us in total. `repeat` 1-10, 20 ms\n"
-           "between repeats.\n\n"
-           "Every call returns immediately and nothing blocks beyond one\n"
-           "frame per loop pass: the symbols are clocked out on the CPU (the\n"
-           "RMT peripheral is fully claimed by ir and ring), one frame per\n"
-           "pass, and the chip is left in IDLE between frames. A job can be\n"
-           "stopped at any point and stops within a frame.\n\n"
-           "C1 scope: raw replay only. Named encoders (CAME 12-bit and\n"
-           "friends), a stored code and the /gate/open webhook are the next\n"
-           "commits on the same job machine.\n";
+           "A button press emits one block of frames_per_block identical\n"
+           "frames and flips the A/B flavour; the pair sequence emits an A\n"
+           "block then a B block with block_gap_ms between them — the hold\n"
+           "pattern of a real remote. Every call returns immediately; the\n"
+           "symbols are clocked on the CPU (RMT is fully claimed by ir and\n"
+           "ring), one frame per loop pass, and every frame is verified by\n"
+           "the GDO2 PLL-lock pin. A job can be stopped within a frame.\n\n"
+           "/gate/send stays the raw debugging path: alternating mark/space\n"
+           "microseconds, no encoder, no config.\n";
 }
 
 /* Body-carrying handlers must release the collected body on every exit
@@ -576,7 +741,8 @@ static void gate_register_routes(AsyncWebServer &server) {
         }
 
         /* Validated into the staging buffer before the job is handed over;
-           the staging buffer is what gate_poll() transmits from. */
+           the staging buffer is what gate_poll() transmits from. Both frame
+           buffers hold the same frame — a raw job has no A/B alternation. */
         uint16_t i = 0;
         uint32_t duration = 0;
         for (JsonVariant v : input["raw"].as<JsonArray>()) {
@@ -594,10 +760,16 @@ static void gate_register_routes(AsyncWebServer &server) {
                 gate_send_error(req, 400, "frame longer than 250000 us");
                 return;
             }
-            gate_request.raw_us[i++] = (uint32_t)us;
+            gate_request.raw_a[i] = (uint32_t)us;
+            i++;
         }
-        gate_request.raw_count = (uint16_t)i;
-        gate_request.repeat = (uint8_t)repeat;
+        memcpy(gate_request.raw_b, gate_request.raw_a, i * sizeof(uint32_t));
+        gate_request.count_a = i;
+        gate_request.count_b = i;
+        gate_request.kind = GATE_JOB_FRAME;
+        gate_request.button = 0;
+        gate_request.blocks = 1;
+        gate_request.frames_per_block = (uint8_t)repeat;
         gate_request.job_id = ++gate_job_seq;
         gate_request_pending = true;
 
@@ -611,6 +783,171 @@ static void gate_register_routes(AsyncWebServer &server) {
         gate_send_json(req, 200, doc);
     }, NULL, handle_body_collect);
 
+    /* POST /gate/pair and POST /gate/button/N — the paired-code sequences.
+       A button job emits one block in the current A/B flavour and flips it;
+       the pair job emits the A block and then the B block, which is what a
+       held remote does while a receiver listens. */
+    for (int kind = 0; kind < 2; kind++) {
+        const char *path = (kind == 0) ? "/gate/pair" : "/gate/button";
+        server.on(AsyncURIMatcher::exact(path), HTTP_POST, [kind](AsyncWebServerRequest *req) {
+            if (!require_auth(req)) return;
+            uint16_t job = gate_start_code(kind == 0 ? GATE_JOB_PAIR : GATE_JOB_BUTTON, 0);
+            JsonDocument doc;
+            if (job == 0) {
+                doc["error"] = gate_ready ? "a job is already running"
+                                          : "sub-GHz transmitter unavailable";
+                gate_send_json(req, gate_ready ? 409 : 503, doc);
+                return;
+            }
+            doc["ok"] = true;
+            doc["job"] = job;
+            gate_send_json(req, 200, doc);
+        });
+    }
+    for (uint8_t b = 1; b <= 4; b++) {
+        char path[20];
+        snprintf(path, sizeof(path), "/gate/button/%u", b);
+        server.on(AsyncURIMatcher::exact(path), HTTP_POST, [b](AsyncWebServerRequest *req) {
+            if (!require_auth(req)) return;
+            uint16_t job = gate_start_code(GATE_JOB_BUTTON, b);
+            JsonDocument doc;
+            if (job == 0) {
+                doc["error"] = gate_ready ? "a job is already running"
+                                          : "sub-GHz transmitter unavailable";
+                gate_send_json(req, gate_ready ? 409 : 503, doc);
+                return;
+            }
+            doc["ok"] = true;
+            doc["job"] = job;
+            doc["button"] = b;
+            gate_send_json(req, 200, doc);
+        });
+    }
+
+    /* GET /gate/config — the frame parameters, so the field experiment reads
+       what it is about to iterate. */
+    server.on(AsyncURIMatcher::exact("/gate/config"), HTTP_GET, [](AsyncWebServerRequest *req) {
+        if (!require_auth(req)) return;
+        JsonDocument doc;
+        doc["te_us"] = gate_cfg.te_us;
+        doc["preamble_us"] = gate_cfg.preamble_us;
+        doc["post_us"] = gate_cfg.post_us;
+        doc["nbits"] = gate_cfg.nbits;
+        doc["ab_bit"] = gate_cfg.ab_bit;
+        doc["button_shift"] = gate_cfg.button_shift;
+        char hex[24];
+        snprintf(hex, sizeof(hex), "%llX", (unsigned long long)gate_cfg.fixed_bits);
+        doc["fixed_bits"] = hex;
+        doc["frames_per_block"] = gate_cfg.frames_per_block;
+        doc["blocks"] = gate_cfg.blocks;
+        doc["frame_gap_ms"] = gate_cfg.frame_gap_ms;
+        doc["block_gap_ms"] = gate_cfg.block_gap_ms;
+        gate_send_json(req, 200, doc);
+    });
+
+    /* POST /gate/config — set and persist; applied immediately (a running
+       job finishes with the old parameters, which is fine: gaps and block
+       sizes are read live, the frame buffers were already built). */
+    server.on(AsyncURIMatcher::exact("/gate/config"), HTTP_POST, [](AsyncWebServerRequest *req) {
+        char *body = gate_take_body(req);
+        if (!check_auth(req)) {
+            free(body);
+            gate_send_error(req, 401, "Authorization: Bearer <token> required");
+            return;
+        }
+        if (!body) {
+            gate_send_error(req, 400, "body required");
+            return;
+        }
+
+        JsonDocument input;
+        DeserializationError err = deserializeJson(input, body);
+        if (err != DeserializationError::Ok) {
+            free(body);
+            gate_send_error(req, 400, "invalid JSON");
+            return;
+        }
+
+        /* Range checks before anything is applied: a nonsense Te would put
+           symbol edges outside the entry limits the transmitter enforces. */
+        if (input["te_us"].is<int>()) {
+            int v = input["te_us"];
+            if (v < 50 || v > 5000) { free(body); gate_send_error(req, 400, "te_us must be 50-5000"); return; }
+            gate_cfg.te_us = v;
+        }
+        if (input["preamble_us"].is<int>()) {
+            int v = input["preamble_us"];
+            if (v < 100 || v > 50000) { free(body); gate_send_error(req, 400, "preamble_us must be 100-50000"); return; }
+            gate_cfg.preamble_us = v;
+        }
+        if (input["post_us"].is<int>()) {
+            int v = input["post_us"];
+            if (v < 50 || v > 50000) { free(body); gate_send_error(req, 400, "post_us must be 50-50000"); return; }
+            gate_cfg.post_us = v;
+        }
+        if (input["nbits"].is<int>()) {
+            int v = input["nbits"];
+            if (v < 8 || v > 64) { free(body); gate_send_error(req, 400, "nbits must be 8-64"); return; }
+            gate_cfg.nbits = v;
+        }
+        if (input["ab_bit"].is<int>()) {
+            int v = input["ab_bit"];
+            if (v < 0 || v > 63) { free(body); gate_send_error(req, 400, "ab_bit must be 0-63"); return; }
+            gate_cfg.ab_bit = v;
+        }
+        if (input["button_shift"].is<int>()) {
+            int v = input["button_shift"];
+            if (v < 0 || v > 62) { free(body); gate_send_error(req, 400, "button_shift must be 0-62"); return; }
+            gate_cfg.button_shift = v;
+        }
+        if (input["fixed_bits"].is<const char*>())
+            gate_cfg.fixed_bits = strtoull(input["fixed_bits"].as<const char*>(), NULL, 16);
+        if (input["frames_per_block"].is<int>()) {
+            int v = input["frames_per_block"];
+            if (v < 1 || v > 20) { free(body); gate_send_error(req, 400, "frames_per_block must be 1-20"); return; }
+            gate_cfg.frames_per_block = v;
+        }
+        if (input["blocks"].is<int>()) {
+            int v = input["blocks"];
+            if (v < 1 || v > 8) { free(body); gate_send_error(req, 400, "blocks must be 1-8"); return; }
+            gate_cfg.blocks = v;
+        }
+        if (input["frame_gap_ms"].is<int>()) {
+            int v = input["frame_gap_ms"];
+            if (v < 5 || v > 5000) { free(body); gate_send_error(req, 400, "frame_gap_ms must be 5-5000"); return; }
+            gate_cfg.frame_gap_ms = v;
+        }
+        if (input["block_gap_ms"].is<int>()) {
+            int v = input["block_gap_ms"];
+            if (v < 10 || v > 10000) { free(body); gate_send_error(req, 400, "block_gap_ms must be 10-10000"); return; }
+            gate_cfg.block_gap_ms = v;
+        }
+        free(body);
+
+        String out;
+        JsonDocument doc;
+        doc["te_us"] = gate_cfg.te_us;
+        doc["preamble_us"] = gate_cfg.preamble_us;
+        doc["post_us"] = gate_cfg.post_us;
+        doc["nbits"] = gate_cfg.nbits;
+        doc["ab_bit"] = gate_cfg.ab_bit;
+        doc["button_shift"] = gate_cfg.button_shift;
+        char hex[24];
+        snprintf(hex, sizeof(hex), "%llX", (unsigned long long)gate_cfg.fixed_bits);
+        doc["fixed_bits"] = hex;
+        doc["frames_per_block"] = gate_cfg.frames_per_block;
+        doc["blocks"] = gate_cfg.blocks;
+        doc["frame_gap_ms"] = gate_cfg.frame_gap_ms;
+        doc["block_gap_ms"] = gate_cfg.block_gap_ms;
+        serializeJson(doc, out);
+        bool saved = write_spiffs_file(GATE_CFG_FILE, out);
+        event_add("gate: config %s", saved ? "saved" : "save FAILED");
+
+        JsonDocument resp;
+        resp["ok"] = saved;
+        gate_send_json(req, saved ? 200 : 500, resp);
+    });
+
     /* GET /gate/status */
     server.on(AsyncURIMatcher::exact("/gate/status"), HTTP_GET, [](AsyncWebServerRequest *req) {
         if (!require_auth(req)) return;
@@ -621,8 +958,8 @@ static void gate_register_routes(AsyncWebServer &server) {
         doc["job"] = p.job_id;
         doc["sent"] = p.sent;
         doc["total"] = p.total;
-        doc["repeat"] = p.repeat;
-        doc["entries"] = p.entries;
+        doc["block"] = p.block;
+        doc["blocks"] = p.blocks;
         doc["elapsed_ms"] = (unsigned long)p.elapsed_ms;
         if (!p.running && p.result[0]) doc["result"] = p.result;
         gate_send_json(req, 200, doc);
@@ -661,6 +998,7 @@ static const Skill gate_skill = {
  */
 static void gate_configure(SPIClass &spi) {
     gate_bus = &spi;
+    gate_cfg_load();   /* SPIFFS is already up — see setup() order */
 
     /* The RF band switch goes to the 434 MHz position before the chip can
        ever transmit — see the note on PIN_RF_SW1/SW0 above. */
@@ -676,29 +1014,29 @@ static void gate_configure(SPIClass &spi) {
     digitalWrite(PIN_CC1101_GDO0, LOW);
     pinMode(PIN_CC1101_GDO2, INPUT);
 
-    /* Chip present? The probe already read VERSION truthfully on this very
-       instance (it is what hw.has_cc1101 is based on) — do not re-gate on a
-       fresh-transaction re-read here: measured on this hardware, the FIRST
-       status read in a NEW transaction returns a stale byte (0x0F) while the
-       probe's reads inside its own long transaction were truthful. Drain the
-       path with two throwaway reads and log what comes back, then configure.
-       The runtime truth-teller is the GDO2 pin, not any register read. */
-    uint8_t version = 0x00;
-    for (int i = 0; i < 2; i++) gate_status_read(CC1101_VERSION);  /* drain */
-    version = gate_status_read(CC1101_VERSION);
-    event_add("gate: probe-bus version re-read 0x%02X", version);
+    /* The whole bring-up lives inside ONE transaction — the probe's own
+       shape, the only one this bus has been measured to run clean. SRES
+       restarts the crystal, then the register set, PATABLE, flush and idle,
+       all before spi.end() hands the bus to the display. */
+    spi.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE0));
+    gate_cs_ready();
+    spi.transfer(CC1101_SRES);
+    digitalWrite(PIN_CC1101_CS, HIGH);
+    delay(2);
+
+    uint8_t version = gate_raw_status_read(CC1101_VERSION);
 
     /* Carrier: 433.92 MHz on a 26 MHz crystal, FRF = f * 2^16 / f_xtal. */
     uint32_t frf = (uint32_t)(((uint64_t)GATE_FREQ_HZ << 16) / CC1101_XTAL_HZ);
-    gate_reg_write(CC1101_FREQ2, (frf >> 16) & 0xFF);
-    gate_reg_write(CC1101_FREQ1, (frf >> 8) & 0xFF);
-    gate_reg_write(CC1101_FREQ0, frf & 0xFF);
+    gate_raw_write(CC1101_FREQ2, (frf >> 16) & 0xFF);
+    gate_raw_write(CC1101_FREQ1, (frf >> 8) & 0xFF);
+    gate_raw_write(CC1101_FREQ0, frf & 0xFF);
 
     /* Modulation: ASK/OOK, async serial, infinite length. Sync words and
        packet machinery are meaningless in this mode. */
-    gate_reg_write(CC1101_PKTLEN, 0xFF);
-    gate_reg_write(CC1101_PKTCTRL0, CC1101_PKTCTRL0_ASYNC);
-    gate_reg_write(CC1101_MDMCFG2, CC1101_MOD_ASK_OOK);
+    gate_raw_write(CC1101_PKTLEN, 0xFF);
+    gate_raw_write(CC1101_PKTCTRL0, CC1101_PKTCTRL0_ASYNC);
+    gate_raw_write(CC1101_MDMCFG2, CC1101_MOD_ASK_OOK);
 
     /* Data rate 250 kbaud: the async sampling grid is 8x the data rate, so
        this puts raw edges within ~1 us (see gate_bitrate_250k). The
@@ -706,42 +1044,35 @@ static void gate_configure(SPIClass &spi) {
        (read-modify-write, no baked defaults). */
     uint8_t e, m;
     gate_bitrate_250k(&e, &m);
-    gate_reg_write(CC1101_MDMCFG4, (gate_reg_read(CC1101_MDMCFG4) & 0xF0) | (e & 0x0F));
-    gate_reg_write(CC1101_MDMCFG3, m);
+    gate_raw_write(CC1101_MDMCFG4, (gate_raw_read(CC1101_MDMCFG4) & 0xF0) | (e & 0x0F));
+    gate_raw_write(CC1101_MDMCFG3, m);
 
     /* Calibrate the frequency synthesizer on every idle->TX transition, so a
        job's later frames are as accurate as its first. Pin control off: the
        waveform comes from this code, not from a GDO pin. */
     {
-        uint8_t mcsm0 = gate_reg_read(CC1101_MCSM0);
+        uint8_t mcsm0 = gate_raw_read(CC1101_MCSM0);
         mcsm0 = (mcsm0 & ~0x30) | CC1101_MCSM0_AUTOCAL;
         mcsm0 = (mcsm0 & ~0x03) | CC1101_MCSM0_PINCTRL;
-        gate_reg_write(CC1101_MCSM0, mcsm0);
+        gate_raw_write(CC1101_MCSM0, mcsm0);
     }
 
     /* GDO0 = async data input; GDO2 = PLL in lock — the frame verifier. */
-    gate_reg_write(CC1101_IOCFG0, CC1101_GDO0_ASYNC_DATA);
-    gate_reg_write(CC1101_IOCFG2, CC1101_GDOX_PLL_LOCK);
+    gate_raw_write(CC1101_IOCFG0, CC1101_GDO0_ASYNC_DATA);
+    gate_raw_write(CC1101_IOCFG2, CC1101_GDOX_PLL_LOCK);
 
     /* OOK power: FREND0.PA_POWER = 1 (a '1' keys PA_TABLE[1]), and
        PA_TABLE[0] = off, PA_TABLE[1] = full. */
-    gate_reg_write(CC1101_FREND0, (gate_reg_read(CC1101_FREND0) & ~0x07) | CC1101_PA_POWER_1);
+    gate_raw_write(CC1101_FREND0, (gate_raw_read(CC1101_FREND0) & ~0x07) | CC1101_PA_POWER_1);
     const uint8_t pa[2] = { CC1101_PA_OFF, CC1101_PA_ON };
-    gate_patable_write(pa, 2);
+    gate_raw_patable(pa, 2);
 
-    /* Flush and idle, on the probe bus (the runtime strobes are not up
-       yet — the display has not been initialised). */
-    gate_bus->beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE0));
-    digitalWrite(PIN_CC1101_CS, LOW);
-    delayMicroseconds(50);
-    gate_bus->transfer(CC1101_SFTX);
-    gate_bus->transfer(CC1101_SIDLE);
-    digitalWrite(PIN_CC1101_CS, HIGH);
-    gate_bus->endTransaction();
+    gate_raw_status_read(CC1101_SFTX);   /* flush, then idle */
+    gate_raw_status_read(CC1101_SIDLE);
+    spi.endTransaction();
 
     gate_ready = true;
-    event_add("gate: CC1101 OOK ready (version 0x%02X, partnum 0x%02X)",
-              version, gate_status_read(CC1101_PARTNUM));
+    event_add("gate: CC1101 OOK ready");
 
     /* The probe bus dies with probe_cc1101()'s stack frame; runtime access
        goes through gate_runtime_bus() (the display's instance). */
