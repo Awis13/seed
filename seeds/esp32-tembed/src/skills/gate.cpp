@@ -519,6 +519,7 @@ static void gate_cfg_load() {
    `button` is the 1-4 button number; the on-air code comes from
    gate_button_code(), the one mapping both pair and button paths share. */
 static uint16_t gate_build_frame(uint8_t button, bool ab, uint32_t *raw) {
+    if (button < 1 || button > 4) return 0;
     if (2u + 2u * (unsigned)gate_cfg.nbits + 1u > GATE_MAX_RAW) return 0;
     uint8_t code = gate_button_code(button);
     uint64_t word = gate_cfg.fixed_bits;
@@ -783,11 +784,12 @@ static uint16_t gate_start_code(uint8_t kind, uint8_t button) {
         gate_request.count_a = gate_build_frame(button, gate_ab_parity, gate_request.raw_a);
         gate_request.count_b = gate_build_frame(button, gate_ab_parity, gate_request.raw_b);
         gate_request.blocks = 1;
-        gate_ab_parity = !gate_ab_parity;
     }
     /* A zero-length build means the config cannot fit the staging buffer —
-       never stage an empty job. */
+       never stage an empty job, and never flip the flavour on a job that was
+       not staged: the next press must still emit the flavour this one tried. */
     if (gate_request.count_a == 0 || gate_request.count_b == 0) return 0;
+    if (kind == GATE_JOB_BUTTON) gate_ab_parity = !gate_ab_parity;
     gate_request.job_id = ++gate_job_seq;
     gate_request_pending = true;
     return gate_request.job_id;
@@ -936,7 +938,10 @@ static void gate_register_routes(AsyncWebServer &server) {
             }
             duration += (uint32_t)us;
             if (duration > GATE_FRAME_MAX_US) {
-                gate_send_error(req, 400, "frame longer than 250000 us");
+                char msg[48];
+                snprintf(msg, sizeof(msg), "frame longer than %u us",
+                         (unsigned)GATE_FRAME_MAX_US);
+                gate_send_error(req, 400, msg);
                 return;
             }
             gate_request.raw_a[i] = (uint32_t)us;
@@ -984,10 +989,18 @@ static void gate_register_routes(AsyncWebServer &server) {
         doc["button"] = 1;
         gate_send_json(req, 200, doc);
     });
-    for (uint8_t b = 1; b <= 4; b++) {
-        char path[20];
-        snprintf(path, sizeof(path), "/gate/pair/%u", b);
-        server.on(AsyncURIMatcher::exact(path), HTTP_POST, [b](AsyncWebServerRequest *req) {
+    /* Route paths with static storage: the matcher keeps the pointer, so a
+       stack snprintf buffer reused across loop iterations would leave every
+       registration aliasing the last path. Literals live for the whole run. */
+    static const char *const gate_pair_paths[] = {
+        "/gate/pair/1", "/gate/pair/2", "/gate/pair/3", "/gate/pair/4",
+    };
+    static const char *const gate_button_paths[] = {
+        "/gate/button/1", "/gate/button/2", "/gate/button/3", "/gate/button/4",
+    };
+    for (uint8_t i = 0; i < 4; i++) {
+        uint8_t b = (uint8_t)(i + 1);
+        server.on(AsyncURIMatcher::exact(gate_pair_paths[i]), HTTP_POST, [b](AsyncWebServerRequest *req) {
             if (!require_auth(req)) return;
             uint16_t job = gate_start_code(GATE_JOB_PAIR, b);
             JsonDocument doc;
@@ -1003,10 +1016,9 @@ static void gate_register_routes(AsyncWebServer &server) {
             gate_send_json(req, 200, doc);
         });
     }
-    for (uint8_t b = 1; b <= 4; b++) {
-        char path[20];
-        snprintf(path, sizeof(path), "/gate/button/%u", b);
-        server.on(AsyncURIMatcher::exact(path), HTTP_POST, [b](AsyncWebServerRequest *req) {
+    for (uint8_t i = 0; i < 4; i++) {
+        uint8_t b = (uint8_t)(i + 1);
+        server.on(AsyncURIMatcher::exact(gate_button_paths[i]), HTTP_POST, [b](AsyncWebServerRequest *req) {
             if (!require_auth(req)) return;
             uint16_t job = gate_start_code(GATE_JOB_BUTTON, b);
             JsonDocument doc;
@@ -1139,7 +1151,14 @@ static void gate_register_routes(AsyncWebServer &server) {
            single request setting both would. */
         if ((unsigned)tmp.ab_bit >= (unsigned)tmp.nbits) { free(body); gate_send_error(req, 400, "ab_bit must be < nbits"); return; }
         if ((unsigned)tmp.button_shift + 1u >= (unsigned)tmp.nbits) { free(body); gate_send_error(req, 400, "button_shift must leave 2 bits inside nbits"); return; }
-        if (gate_frame_duration_us(tmp) > GATE_FRAME_MAX_US) { free(body); gate_send_error(req, 400, "frame longer than 250000 us"); return; }
+        if (gate_frame_duration_us(tmp) > GATE_FRAME_MAX_US) {
+            free(body);
+            char msg[48];
+            snprintf(msg, sizeof(msg), "frame longer than %u us",
+                     (unsigned)GATE_FRAME_MAX_US);
+            gate_send_error(req, 400, msg);
+            return;
+        }
         gate_cfg = tmp;
         free(body);
 

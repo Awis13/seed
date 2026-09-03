@@ -1987,7 +1987,7 @@ static void ui_activate(int item) {
            staging path POST /gate/* uses — the job runs on the loop task
            and shows its result in the event log. */
         if (item == UI_GATE_PAIR) gate_start_code(GATE_JOB_PAIR, 1);
-        else if (item <= UI_GATE_B4) gate_start_code(GATE_JOB_BUTTON, item - UI_GATE_B1 + 1);
+        else if (item >= UI_GATE_B1 && item <= UI_GATE_B4) gate_start_code(GATE_JOB_BUTTON, item - UI_GATE_B1 + 1);
         else ui_enter_list(UI_MENU, UI_ITEM_GATE);
         return;
     }
