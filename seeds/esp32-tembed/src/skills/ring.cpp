@@ -935,7 +935,7 @@ static void ring_cfg_apply_doc(JsonObjectConst o) {
    standing: the ring is a notification channel, and the worst outcome of a bad
    config read is that it silently stops being one. */
 static void ring_cfg_load() {
-    String raw = read_spiffs_file(RING_CFG_FILE);
+    String raw = spiffs_read_file(RING_CFG_FILE, RING_CFG_TMP);
     if (raw.length() == 0) return;
     JsonDocument doc;
     if (deserializeJson(doc, raw) != DeserializationError::Ok) return;

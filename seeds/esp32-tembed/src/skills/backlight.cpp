@@ -717,7 +717,7 @@ static void bl_cfg_mark_dirty() {
    and coming up dark is what was asked for — the menu and the endpoint both
    still reach it, and the boot event line says so out loud. */
 static void bl_cfg_load() {
-    String raw = read_spiffs_file(BL_CFG_FILE);
+    String raw = spiffs_read_file(BL_CFG_FILE, BL_CFG_TMP);
     if (raw.length() == 0) return;
     JsonDocument doc;
     if (deserializeJson(doc, raw) != DeserializationError::Ok) return;

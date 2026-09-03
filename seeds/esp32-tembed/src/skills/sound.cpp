@@ -993,7 +993,7 @@ static void snd_cfg_mark_dirty() {
 /* A file that is missing, truncated or nonsense leaves the compiled defaults
    standing, exactly as the ring's does. */
 static void snd_cfg_load() {
-    String raw = read_spiffs_file(SND_CFG_FILE);
+    String raw = spiffs_read_file(SND_CFG_FILE, SND_CFG_TMP);
     if (raw.length() == 0) return;
     JsonDocument doc;
     if (deserializeJson(doc, raw) != DeserializationError::Ok) return;

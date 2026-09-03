@@ -444,7 +444,7 @@ static uint8_t gate_button_code(uint8_t button) {
 }
 
 static void gate_cfg_load() {
-    String s = read_spiffs_file(GATE_CFG_FILE);
+    String s = spiffs_read_file(GATE_CFG_FILE);
     if (s.length() == 0) return;
     JsonDocument doc;
     if (deserializeJson(doc, s) != DeserializationError::Ok) {
@@ -1194,7 +1194,7 @@ static void gate_register_routes(AsyncWebServer &server) {
         doc["frame_gap_ms"] = gate_cfg.frame_gap_ms;
         doc["block_gap_ms"] = gate_cfg.block_gap_ms;
         serializeJson(doc, out);
-        bool saved = write_spiffs_file(GATE_CFG_FILE, out);
+        bool saved = spiffs_save_atomic(GATE_CFG_FILE, out);
         event_add("gate: config %s", saved ? "saved" : "save FAILED");
 
         JsonDocument resp;

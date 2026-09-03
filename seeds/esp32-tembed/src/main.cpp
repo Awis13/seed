@@ -170,6 +170,18 @@ static bool gpio_is_safe(int pin) {
 #define MAX_EVENTS          64
 #define EVENT_MSG_LEN       128
 
+// The same entries, mirrored to flash so they survive a reboot. One line per
+// event, exactly the object GET /events serves: {"ts":<unix>,"msg":"..."}.
+// Rotation keeps the file around EVENTS_LOG_MAX by dropping the oldest half;
+// the boot replay reads the tail back into the ring below.
+#define EVENTS_LOG_FILE     "/events.log"
+#define EVENTS_LOG_TMP      "/events.tmp"
+#define EVENTS_LOG_MAX      (24u * 1024u)
+// False once the flash is unreachable or full: the log degrades to RAM-only
+// without another sound, and nothing in the persist path below ever calls
+// event_add() — that would recurse straight back into the append.
+static bool events_spiffs_ok = false;
+
 struct EventEntry {
     unsigned long timestamp;
     char message[EVENT_MSG_LEN];
@@ -178,6 +190,247 @@ struct EventEntry {
 static EventEntry events_buf[MAX_EVENTS];
 static int events_head = 0;
 static int events_count = 0;
+
+// host-test:begin events — sliced out by tools/test_events.sh
+#define EVENTS_LINE_MAX 512
+
+// JSON-escape one message into dst (cap includes the NUL). Each source byte is
+// written whole or not at all, so a truncated result still parses. Returns the
+// length written, without the NUL.
+static size_t events_escape(const char *src, char *dst, size_t cap) {
+    static const char hex[] = "0123456789abcdef";
+    size_t n = 0;
+    if (cap == 0) return 0;
+    if (!src) { dst[0] = '\0'; return 0; }
+    for (; *src; src++) {
+        unsigned char c = (unsigned char)*src;
+        char seq[6];
+        size_t slen = 0;
+        switch (c) {
+            case '"':  seq[0] = '\\'; seq[1] = '"';  slen = 2; break;
+            case '\\': seq[0] = '\\'; seq[1] = '\\'; slen = 2; break;
+            case '\n': seq[0] = '\\'; seq[1] = 'n';  slen = 2; break;
+            case '\r': seq[0] = '\\'; seq[1] = 'r';  slen = 2; break;
+            case '\t': seq[0] = '\\'; seq[1] = 't';  slen = 2; break;
+            default:
+                if (c < 0x20) {
+                    seq[0] = '\\'; seq[1] = 'u'; seq[2] = '0'; seq[3] = '0';
+                    seq[4] = hex[c >> 4]; seq[5] = hex[c & 15]; slen = 6;
+                } else {
+                    seq[0] = (char)c; slen = 1;
+                }
+                break;
+        }
+        if (n + slen + 1 > cap) break;
+        for (size_t i = 0; i < slen; i++) dst[n++] = seq[i];
+    }
+    dst[n] = '\0';
+    return n;
+}
+
+// One log line for one event: {"ts":<unix>,"msg":"<escaped>"} plus a trailing
+// newline. Always NUL-terminated and parseable, even when the message had to
+// be cut to fit. Returns the length written, without the NUL.
+static size_t events_format_line(unsigned long ts, const char *msg,
+                                 char *out, size_t cap) {
+    if (cap == 0) return 0;
+    int h = snprintf(out, cap, "{\"ts\":%lu,\"msg\":\"", ts);
+    if (h < 0) { out[0] = '\0'; return 0; }
+    size_t n = (size_t)h >= cap ? cap - 1 : (size_t)h;
+    n += events_escape(msg, out + n, cap - n);
+    static const char tail[] = "\"}\n";
+    for (size_t i = 0; i < sizeof(tail) - 1; i++) {
+        if (n + 1 >= cap) break;
+        out[n++] = tail[i];
+    }
+    out[n] = '\0';
+    return n;
+}
+
+static int events_hexval(char h) {
+    if (h >= '0' && h <= '9') return h - '0';
+    if (h >= 'a' && h <= 'f') return h - 'a' + 10;
+    if (h >= 'A' && h <= 'F') return h - 'A' + 10;
+    return -1;
+}
+
+// The inverse: split one log line back into its timestamp and message. False
+// for anything but {"ts":<digits>,"msg":"<json string>"} with the object
+// closed — a torn write, a truncated line, garbage — and then only msg_out[0]
+// is touched. A message longer than the ring slot keeps the prefix that fits
+// rather than dropping the whole entry. msg_cap includes the NUL.
+static bool events_parse_line(const char *line, unsigned long *ts_out,
+                              char *msg_out, size_t msg_cap) {
+    if (!line || !ts_out || !msg_out || msg_cap == 0) return false;
+    msg_out[0] = '\0';
+    const char *p = strstr(line, "\"ts\"");
+    if (!p) return false;
+    p = strchr(p + 4, ':');
+    if (!p) return false;
+    p++;
+    while (*p == ' ' || *p == '\t') p++;
+    if (*p < '0' || *p > '9') return false;
+    unsigned long ts = 0;
+    while (*p >= '0' && *p <= '9') {
+        ts = ts * 10 + (unsigned long)(*p - '0');
+        p++;
+    }
+    const char *q = strstr(p, "\"msg\"");
+    if (!q) return false;
+    q = strchr(q + 5, ':');
+    if (!q) return false;
+    q++;
+    while (*q == ' ' || *q == '\t') q++;
+    if (*q != '"') return false;
+    q++;
+    size_t n = 0;
+    for (; *q && *q != '"'; ) {
+        char c = *q++;
+        if (c == '\\') {
+            char e = *q;
+            if (!e) return false;
+            q++;
+            switch (e) {
+                case '"':  c = '"';  break;
+                case '\\': c = '\\'; break;
+                case '/':  c = '/';  break;
+                case 'n':  c = '\n'; break;
+                case 'r':  c = '\r'; break;
+                case 't':  c = '\t'; break;
+                case 'b':  c = '\b'; break;
+                case 'f':  c = '\f'; break;
+                case 'u': {
+                    // \u00XX only: the writer never emits more, anything else
+                    // is somebody else's file.
+                    if (!q[0] || !q[1] || !q[2] || !q[3]) return false;
+                    if (q[0] != '0' || q[1] != '0') return false;
+                    int h1 = events_hexval(q[2]);
+                    int h2 = events_hexval(q[3]);
+                    if (h1 < 0 || h2 < 0) return false;
+                    c = (char)((h1 << 4) | h2);
+                    q += 4;
+                    break;
+                }
+                default: return false;
+            }
+        } else if ((unsigned char)c < 0x20) {
+            return false;  // a raw control byte is not valid JSON text
+        }
+        if (n + 1 < msg_cap) msg_out[n++] = c;
+    }
+    if (*q != '"') return false;
+    q++;
+    // The object must close: without this a line torn by a power loss right
+    // before the brace would salvage half an entry as a whole one, and a
+    // foreign file that merely looks similar would pass as history.
+    while (*q == ' ' || *q == '\t') q++;
+    if (*q != '}') return false;
+    msg_out[n] = '\0';
+    *ts_out = ts;
+    return true;
+}
+
+// Where the kept half of a rotated log starts: pos bytes in, then forward to
+// the next line boundary, so the survivor never opens with half an entry.
+static size_t events_align_line(const char *buf, size_t len, size_t pos) {
+    if (!buf || pos == 0) return 0;
+    if (pos > len) pos = len;
+    while (pos < len && buf[pos] != '\n') pos++;
+    if (pos < len) pos++;  // past the newline itself
+    return pos;
+}
+// host-test:end
+
+// Drop the oldest half of the log through a temp file plus rename, so a power
+// loss mid-rotation leaves either the whole old file or the whole new one.
+// Never called from the boot replay's failure paths with anything to report:
+// silence is the contract, the flag is the signal.
+static void events_log_rotate() {
+    File f = SPIFFS.open(EVENTS_LOG_FILE, FILE_READ);
+    if (!f) return;
+    String content = f.readString();
+    f.close();
+    if (content.length() == 0) return;
+    size_t keep = events_align_line(content.c_str(), content.length(),
+                                    content.length() / 2);
+    File t = SPIFFS.open(EVENTS_LOG_TMP, FILE_WRITE);
+    if (!t) { events_spiffs_ok = false; return; }
+    size_t want = keep < content.length() ? content.length() - keep : 0;
+    size_t w = want ? t.print(content.c_str() + keep) : 0;
+    t.close();
+    if (w != want) {
+        SPIFFS.remove(EVENTS_LOG_TMP);
+        events_spiffs_ok = false;
+        return;
+    }
+    SPIFFS.remove(EVENTS_LOG_FILE);
+    if (!SPIFFS.rename(EVENTS_LOG_TMP, EVENTS_LOG_FILE)) events_spiffs_ok = false;
+}
+
+// One event onto the end of the log. One open and one close; a rotation when
+// the file is at the cap costs a second pair, which is once per hundreds of
+// events. Any failure parks the flag and the log stays RAM-only.
+static void events_log_append(unsigned long ts, const char *msg) {
+    if (!events_spiffs_ok) return;
+    char line[EVENTS_LINE_MAX];
+    size_t n = events_format_line(ts, msg, line, sizeof(line));
+    File a = SPIFFS.open(EVENTS_LOG_FILE, FILE_APPEND);
+    if (!a) { events_spiffs_ok = false; return; }
+    if (a.size() + n > EVENTS_LOG_MAX) {
+        a.close();
+        events_log_rotate();
+        a = SPIFFS.open(EVENTS_LOG_FILE, FILE_APPEND);
+        if (!a) { events_spiffs_ok = false; return; }
+    }
+    size_t w = a.print(line);
+    a.close();
+    if (w != n) events_spiffs_ok = false;
+}
+
+// The tail of the log back into the ring, oldest first, up to MAX_EVENTS. Runs
+// once at boot, before the first event_add. A missing file means a fresh
+// device, a torn line is left out, anything else unparseable is left out with
+// it — the buffer starts empty either way and boot never fails here.
+static void events_log_replay() {
+    if (!events_spiffs_ok) return;
+    File f = SPIFFS.open(EVENTS_LOG_FILE, FILE_READ);
+    if (!f) return;
+    size_t fsize = f.size();
+    String content = f.readString();
+    f.close();
+    unsigned total = 0;
+    for (unsigned i = 0; i < content.length(); i++)
+        if (content.charAt(i) == '\n') total++;
+    if (content.length() > 0 && content.charAt(content.length() - 1) != '\n') total++;
+    unsigned skip = total > MAX_EVENTS ? total - MAX_EVENTS : 0;
+    events_head = 0;
+    events_count = 0;
+    unsigned seen = 0;
+    unsigned pos = 0;
+    char line[EVENTS_LINE_MAX];
+    while (pos < content.length()) {
+        unsigned eol = pos;
+        while (eol < content.length() && content.charAt(eol) != '\n') eol++;
+        size_t llen = eol - pos;
+        if (llen >= sizeof(line)) llen = sizeof(line) - 1;
+        for (size_t i = 0; i < llen; i++) line[i] = content.charAt(pos + i);
+        line[llen] = '\0';
+        if (seen >= skip) {
+            unsigned long ts = 0;
+            char msg[EVENT_MSG_LEN];
+            if (events_parse_line(line, &ts, msg, sizeof(msg))) {
+                EventEntry *e = &events_buf[events_head];
+                e->timestamp = ts;
+                snprintf(e->message, EVENT_MSG_LEN, "%s", msg);
+                events_head = (events_head + 1) % MAX_EVENTS;
+                if (events_count < MAX_EVENTS) events_count++;
+            }
+        }
+        seen++;
+        pos = eol + 1;
+    }
+    if (fsize > EVENTS_LOG_MAX) events_log_rotate();
+}
 
 static void event_add(const char *fmt, ...) {
     va_list ap;
@@ -190,9 +443,15 @@ static void event_add(const char *fmt, ...) {
         e->timestamp = millis() / 1000;
     }
     vsnprintf(e->message, EVENT_MSG_LEN, fmt, ap);
+    va_end(ap);
+    // Copied out before the append below: the ring is shared with the web
+    // server task, and this slot can be recycled before the flash write lands.
+    unsigned long ts = e->timestamp;
+    char msg[EVENT_MSG_LEN];
+    snprintf(msg, sizeof(msg), "%s", e->message);
     events_head = (events_head + 1) % MAX_EVENTS;
     if (events_count < MAX_EVENTS) events_count++;
-    va_end(ap);
+    events_log_append(ts, msg);
 }
 
 // ===== Skill/plugin interface =====
@@ -551,6 +810,29 @@ static bool write_spiffs_file_atomic(const char *path, const char *tmp_path,
     return SPIFFS.rename(tmp_path, path);
 }
 
+// The single-name form for files that never had a tmp alias: the temp name is
+// the destination plus ".tmp". Same guarantee as above, no new constant per
+// file.
+static bool spiffs_save_atomic(const char *path, const String &content) {
+    String tmp = String(path) + ".tmp";
+    if (!write_spiffs_file(tmp.c_str(), content)) return false;
+    SPIFFS.remove(path);
+    return SPIFFS.rename(tmp.c_str(), path);
+}
+
+// The matching read: an interrupted rename leaves the new snapshot under the
+// temp name and nothing under the real one, so look there before giving up. A
+// caller with an explicit tmp alias passes it; otherwise it is derived the
+// same way the save above derives it.
+static String spiffs_read_file(const char *path, const char *tmp_path = NULL) {
+    String s = read_spiffs_file(path);
+    if (s.length() == 0) {
+        if (tmp_path) s = read_spiffs_file(tmp_path);
+        else s = read_spiffs_file((String(path) + ".tmp").c_str());
+    }
+    return s;
+}
+
 // ===== Timezone =====
 //
 // The seed knows no city. It stores a raw POSIX TZ string in SPIFFS and hands
@@ -563,10 +845,15 @@ static void tz_apply() {
     tzset();
 }
 
+static bool tz_valid(const String &tz);
+
 static void tz_load() {
-    String stored = read_spiffs_file(TZ_FILE);
+    String stored = spiffs_read_file(TZ_FILE);
     stored.trim();
-    if (stored.length() > 0) tz_string = stored;
+    // Validated, not trusted: a corrupt file used to be handed straight to
+    // the C library, which silently degrades to UTC and keeps the garbage for
+    // every boot after. Anything outside tz_valid() keeps the default.
+    if (stored.length() > 0 && tz_valid(stored)) tz_string = stored;
     tz_apply();
 }
 
@@ -1004,7 +1291,7 @@ static void clock_rule_tick() {
 // seed. The AP password in ap_generate_password() is generated after RF for
 // the same reason. An existing token in SPIFFS is always kept as-is.
 static void token_load() {
-    auth_token = read_spiffs_file(TOKEN_FILE);
+    auth_token = spiffs_read_file(TOKEN_FILE);
     auth_token.trim();
 
     if (auth_token.length() == 0) {
@@ -1014,7 +1301,7 @@ static void token_load() {
         }
         buf[32] = '\0';
         auth_token = String(buf);
-        write_spiffs_file(TOKEN_FILE, auth_token);
+        spiffs_save_atomic(TOKEN_FILE, auth_token);
     }
 }
 
@@ -1046,7 +1333,7 @@ static bool require_auth(AsyncWebServerRequest *request) {
 // ===== WiFi =====
 
 static void wifi_load_config() {
-    String json = read_spiffs_file(WIFI_CONFIG_FILE);
+    String json = spiffs_read_file(WIFI_CONFIG_FILE);
     if (json.length() == 0) return;
     JsonDocument doc;
     if (deserializeJson(doc, json) != DeserializationError::Ok) return;
@@ -1060,7 +1347,7 @@ static bool wifi_save_config(const String &ssid, const String &pass) {
     doc["password"] = pass;
     String json;
     serializeJson(doc, json);
-    return write_spiffs_file(WIFI_CONFIG_FILE, json);
+    return spiffs_save_atomic(WIFI_CONFIG_FILE, json);
 }
 
 // ===== Provisioning AP =====
@@ -1364,7 +1651,7 @@ static void handle_body_collect(AsyncWebServerRequest *request, uint8_t *data,
 
 static void handle_config_get(AsyncWebServerRequest *request) {
     if (!require_auth(request)) return;
-    request->send(200, "text/markdown; charset=utf-8", read_spiffs_file(CONFIG_MD_FILE));
+    request->send(200, "text/markdown; charset=utf-8", spiffs_read_file(CONFIG_MD_FILE));
 }
 
 static void handle_config_post(AsyncWebServerRequest *request) {
@@ -1374,7 +1661,7 @@ static void handle_config_post(AsyncWebServerRequest *request) {
     String content(body);
     free(body);
     request->_tempObject = nullptr;
-    bool ok = write_spiffs_file(CONFIG_MD_FILE, content);
+    bool ok = spiffs_save_atomic(CONFIG_MD_FILE, content);
     request->send(ok ? 200 : 500, "application/json",
         ok ? "{\"ok\":true}" : "{\"error\":\"write failed\"}");
 }
@@ -1448,7 +1735,7 @@ static void handle_clock_tz(AsyncWebServerRequest *request) {
             "{\"error\":\"invalid TZ: 1-63 printable ASCII chars, no spaces\"}");
         return;
     }
-    if (!write_spiffs_file(TZ_FILE, tz)) {
+    if (!spiffs_save_atomic(TZ_FILE, tz)) {
         request->send(500, "application/json", "{\"error\":\"write failed\"}");
         return;
     }
@@ -1940,7 +2227,12 @@ void setup() {
 
     if (!SPIFFS.begin(true)) {
         Serial.println("[!] SPIFFS failed");
+    } else {
+        events_spiffs_ok = true;
     }
+    // The log's tail back into the ring before the first event_add below:
+    // wifi_setup() already logs, and that entry must come after history.
+    events_log_replay();
 
     hw_probe();       // I2C + CC1101 probe (before the display claims the SPI bus)
     display_init();
