@@ -741,10 +741,17 @@ static bool gate_stop_job() {
     return false;
 }
 
+/* Snapshot of the running (or last finished) job, for the on-device status
+   screen and GET /gate/status. Copied out rather than exposing gate_state,
+   which gate_poll() owns; every reader (the UI on the loop task, the status
+   endpoint on the web-server task) gets its own copy, so no lock is needed. */
 struct GateProgress {
     bool running;
     uint16_t job_id;
+    uint8_t kind;             /* GATE_JOB_FRAME/BUTTON/PAIR, 0 when no job yet */
+    uint8_t button;           /* 1-4 for paired jobs, 0 for raw */
     uint8_t sent, total, block, blocks;
+    uint8_t frame, frames_per_block;
     unsigned long elapsed_ms;
     const char *result;
 };
@@ -753,10 +760,14 @@ static GateProgress gate_progress() {
     GateProgress p = {};
     p.running = (gate_state.kind != GATE_JOB_IDLE);
     p.job_id = gate_state.job_id;
+    p.kind = gate_state.kind;
+    p.button = gate_state.button;
     p.sent = gate_state.sent;
     p.total = gate_state.total;
     p.block = gate_state.block_i + 1;
     p.blocks = gate_state.blocks;
+    p.frame = gate_state.frame_i + 1;
+    p.frames_per_block = gate_state.frames_per_block;
     p.elapsed_ms = millis() - gate_state.started_ms;
     p.result = gate_state.result;
     return p;

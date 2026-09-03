@@ -286,17 +286,18 @@ enum {
        below catches a missing entry; nothing can catch a reordering, which is
        why the rule is "append". */
     UI_REC,
-    UI_GATE
+    UI_GATE,
+    UI_GATE_STATUS
 };
 
 /* Capitals: this is the service text of the header bar, not prose. One entry
    per screen above, in the same order. */
 static const char *ui_titles[] = {
     "", "MENU", "MESSAGES", "MESSAGES", "TV-B-GONE", "BY BRAND", "TV-B-GONE",
-    "SETUP AP", "INFO", "RECORDING", "GATE"
+    "SETUP AP", "INFO", "RECORDING", "GATE", "GATE"
 };
 
-static_assert(sizeof(ui_titles) / sizeof(ui_titles[0]) == UI_GATE + 1,
+static_assert(sizeof(ui_titles) / sizeof(ui_titles[0]) == UI_GATE_STATUS + 1,
               "ui_titles[] must have one entry per screen, in enum order");
 
 /* Top level. The marker on a selected row is also ">", so a submenu is spelled
@@ -415,6 +416,16 @@ static bool ui_blast_ok = true;
 /* The list the blast was started from, so that finishing goes back to it. */
 static uint8_t ui_blast_back = UI_TVMENU;
 static int ui_blast_back_sel = 0;
+/* When the gate job being watched stopped running, 0 while it still is. */
+static unsigned long ui_gate_done_at = 0;
+/* False when the menu could not start a gate job and none was already running. */
+static bool ui_gate_ok = true;
+/* What the menu asked for: the title while the staged job is not yet adopted
+   (gate_poll() owns the counters until its next pass) and the row to land on
+   when the status screen goes back to the list. */
+static uint8_t ui_gate_kind = 0;
+static uint8_t ui_gate_button = 0;
+static int ui_gate_back_sel = 0;
 
 /* Which notification the card is showing. An id, not an index: the list can
    shift underneath it when something expires or a new message arrives. */
@@ -1643,6 +1654,59 @@ static void ui_draw_blast() {
     display_force = false;
 }
 
+/* One line of what the gate status screen watches: the paired kind names its
+   button, a raw job staged over HTTP has no button to name. Stack buffer, no
+   allocation — this runs on every tick while the screen is up. */
+static void ui_gate_title(char *out, size_t n, uint8_t kind, uint8_t button) {
+    if (kind == GATE_JOB_PAIR) snprintf(out, n, "Pair");
+    else if (kind == GATE_JOB_BUTTON) snprintf(out, n, "Button %u", (unsigned)button);
+    else snprintf(out, n, "Raw");
+}
+
+/* The gate TX status: what was asked for, which block is on the air, how many
+   frames left the chip, how the last job ended. The blast-screen shape: the
+   job is staged the moment the menu item is clicked, but gate_poll() only
+   adopts it — and resets the counters — on its next pass, so a staged job
+   still shows the previous counters and says "starting" instead. */
+static void ui_draw_gate_status() {
+    GateProgress p = gate_progress();
+    char buf[40];
+
+    /* The job is staged but gate_poll() has not adopted it yet. */
+    bool starting = gate_busy() && !p.running;
+
+    if (!ui_gate_ok) {
+        ui_draw_row(0, gate_ready ? "Busy" : "No radio", 40, 4, COL_TIME);
+        ui_draw_row(1, "", 78, 4, COL_DIM);
+        ui_draw_row(2, "", 112, 2, COL_DIM);
+    } else if (starting) {
+        ui_gate_title(buf, sizeof(buf), ui_gate_kind, ui_gate_button);
+        ui_draw_row(0, buf, 40, 4, COL_TIME);
+        ui_draw_row(1, "starting", 78, 4, COL_ACCENT);
+        ui_draw_row(2, "", 112, 2, COL_DIM);
+    } else if (p.running) {
+        ui_gate_title(buf, sizeof(buf), p.kind, p.button);
+        ui_draw_row(0, buf, 40, 4, COL_TIME);
+        /* p.sent, not a step count: frames the loop has actually keyed. */
+        snprintf(buf, sizeof(buf), "%u / %u", (unsigned)p.sent, (unsigned)p.total);
+        ui_draw_row(1, buf, 78, 4, COL_ACCENT);
+        /* All frames are out but the poll has not wound the job down yet. */
+        if (p.sent >= p.total) snprintf(buf, sizeof(buf), "finishing");
+        else snprintf(buf, sizeof(buf), "block %u of %u",
+                      (unsigned)p.block, (unsigned)p.blocks);
+        ui_draw_row(2, buf, 112, 2, COL_DIM);
+    } else {
+        snprintf(buf, sizeof(buf), "%s", p.result[0] ? p.result : "idle");
+        ui_draw_row(0, buf, 40, 4, COL_TIME);
+        snprintf(buf, sizeof(buf), "%u / %u sent", (unsigned)p.sent, (unsigned)p.total);
+        ui_draw_row(1, buf, 78, 4, COL_DIM);
+        ui_draw_row(2, "", 112, 2, COL_DIM);
+    }
+    /* A click or a detent leaves for the gate list; the job keeps running. */
+    ui_draw_row(3, "click to go back", 148, 2, COL_DIM);
+    display_force = false;
+}
+
 static void ui_draw_ap() {
     char buf[40];
 
@@ -1846,6 +1910,7 @@ static void ui_draw() {
         case UI_MSGLIST: ui_draw_msglist(); break;
         case UI_MSGCARD: ui_draw_card();    break;
         case UI_BLAST:   ui_draw_blast();   break;
+        case UI_GATE_STATUS: ui_draw_gate_status(); break;
         case UI_AP:      ui_draw_ap();      break;
         case UI_INFO:    ui_draw_info();    break;
         case UI_REC:     ui_draw_rec();     break;
@@ -1937,6 +2002,32 @@ static void ui_enter_blast(uint16_t job, int back_sel) {
     ui_enter(UI_BLAST);
 }
 
+/* Watch a gate job the menu just asked for. `job` is 0 when nothing started,
+   which is either a job already in flight — watched rather than restarted —
+   or a transmitter that is not there, which gets its own row instead of
+   silence. The kind and button are remembered for the "starting" window in
+   which the staged job still shows the previous counters. */
+static void ui_enter_gate(uint16_t job, uint8_t kind, uint8_t button, int back_sel) {
+    ui_gate_ok = (job != 0) || gate_busy();
+    ui_gate_kind = kind;
+    ui_gate_button = button;
+    ui_gate_back_sel = back_sel;
+    ui_gate_done_at = 0;
+    if (job != 0) {
+        event_add("gate: job %u started from the menu", (unsigned)job);
+        /* The one-shot channel: half a second of "something is happening right
+           now", the same overlay an arrival fires. The steady state is this
+           screen; the ring has no steady TX colour of its own, because the
+           steady channels are taken — the card names a message and the arc is
+           arbitrated by progress.cpp out of main.cpp, which would clear a
+           foreign value on the next pass. */
+        ring_fire(RING_FX_COMET, NOTIFY_WARN, millis());
+    } else {
+        event_add("gate: menu start refused (%s)", gate_ready ? "busy" : "no radio");
+    }
+    ui_enter(UI_GATE_STATUS);
+}
+
 /* Open one message. The card holds the id rather than the row, so that a
    message arriving or expiring while it is up cannot silently swap it for a
    different one. */
@@ -1984,11 +2075,14 @@ static void ui_activate(int item) {
     if (ui_screen == UI_GATE) {
         /* Pair fires the enrolment sequence for button 1 (the /gate/pair
            default); a button fires its own block. Both go through the same
-           staging path POST /gate/* uses — the job runs on the loop task
-           and shows its result in the event log. */
-        if (item == UI_GATE_PAIR) gate_start_code(GATE_JOB_PAIR, 1);
-        else if (item >= UI_GATE_B1 && item <= UI_GATE_B4) gate_start_code(GATE_JOB_BUTTON, item - UI_GATE_B1 + 1);
-        else ui_enter_list(UI_MENU, UI_ITEM_GATE);
+           staging path POST /gate/* uses — the job runs on the loop task —
+           and land on the status screen instead of answering with silence. */
+        if (item == UI_GATE_PAIR) {
+            ui_enter_gate(gate_start_code(GATE_JOB_PAIR, 1), GATE_JOB_PAIR, 1, item);
+        } else if (item >= UI_GATE_B1 && item <= UI_GATE_B4) {
+            uint8_t b = (uint8_t)(item - UI_GATE_B1 + 1);
+            ui_enter_gate(gate_start_code(GATE_JOB_BUTTON, b), GATE_JOB_BUTTON, b, item);
+        } else ui_enter_list(UI_MENU, UI_ITEM_GATE);
         return;
     }
 
@@ -2089,6 +2183,7 @@ static void ui_back() {
         case UI_BRAND:   ui_enter_list(UI_TVMENU, UI_TV_BRAND);   break;
         case UI_TVMENU:  ui_enter_list(UI_MENU, UI_ITEM_TVBGONE); break;
         case UI_GATE:    ui_enter_list(UI_MENU, UI_ITEM_GATE);    break;
+        case UI_GATE_STATUS: ui_enter_list(UI_GATE, ui_gate_back_sel); break;
         case UI_MSGLIST: ui_enter_list(UI_MENU, UI_ITEM_MSG);     break;
         default:         ui_enter(UI_CLOCK);                      break;
     }
@@ -2560,6 +2655,26 @@ static void ui_poll() {
                 ui_blast_done_at = millis();
             } else if (millis() - ui_blast_done_at >= UI_RESULT_MS) {
                 ui_enter_list(ui_blast_back, ui_blast_back_sel);
+                return;
+            }
+            break;
+        }
+
+        case UI_GATE_STATUS: {
+            /* A click or a detent leaves for the gate list at once; the job
+               keeps running underneath. Otherwise the screen stays while the
+               job is on the air, then holds how it ended for a moment — the
+               blast-screen shape, minus the stop: nothing here aborts a TX. */
+            if (click || back || steps != 0) {
+                ui_enter_list(UI_GATE, ui_gate_back_sel);
+                return;
+            }
+            if (gate_busy()) {
+                ui_gate_done_at = 0;
+            } else if (ui_gate_done_at == 0) {
+                ui_gate_done_at = millis();
+            } else if (millis() - ui_gate_done_at >= UI_RESULT_MS) {
+                ui_enter_list(UI_GATE, ui_gate_back_sel);
                 return;
             }
             break;
