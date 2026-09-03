@@ -18,7 +18,7 @@
  *        |         \
  *        |          +--a notification arrives while idle-->  MSGCARD
  *        |
- *        +--15s idle on any screen but a running blast
+ *        +--15s idle on any screen but a running blast or gate TX
  *
  * Back leaves a screen for the one above it — MSGCARD to MSGLIST, BRAND to
  * TVMENU, TVMENU to MENU, MENU to CLOCK — whether it comes from the Back item
@@ -47,8 +47,9 @@
  * CLOCK is the home screen and is drawn exactly as before by display_tick();
  * this file does not touch it beyond handing control back. Every other screen
  * returns to CLOCK after UI_IDLE_MS without input, so a device left in a menu
- * on the shelf goes back to being a clock. A running blast is the one screen
- * that does not time out — it is live output, and its click means "stop". An
+ * on the shelf goes back to being a clock. A running blast or a gate TX in
+ * flight is what does not time out — it is live output, and the blast's
+ * click means "stop". An
  * idle timeout never acknowledges anything: a pager that clears itself because
  * nobody was standing there is not a pager.
  *
@@ -58,8 +59,8 @@
  * the backlight is 85mA of a 150mA device, so this is most of what the battery
  * is spent on. Both thresholds live there, next to the policy that compares
  * against them, and are deliberately not repeated here. Any input puts the
- * panel straight back, and the two screens the timeout above exempts are
- * exempted from the dimming too, along with a third the timeout has no reason
+ * panel straight back, and the three screens the timeout above exempts are
+ * exempted from the dimming too, along with a fourth the timeout has no reason
  * to care about — see ui_watching_progress().
  *
  * The pager face
@@ -420,6 +421,25 @@ static int ui_blast_back_sel = 0;
 static unsigned long ui_gate_done_at = 0;
 /* False when the menu could not start a gate job and none was already running. */
 static bool ui_gate_ok = true;
+/* Why nothing started, for the row the status screen shows instead of a job.
+   Only meaningful while ui_gate_ok is false. A zero job id on its own says
+   none of this: no radio, a job already on the air, and a frame that did not
+   fit the staging buffer all return 0. */
+enum {
+    UI_GATE_FAIL_NONE = 0,
+    UI_GATE_FAIL_NORADIO,
+    UI_GATE_FAIL_BUSY,
+    UI_GATE_FAIL_TOOLONG
+};
+static uint8_t ui_gate_fail = UI_GATE_FAIL_NONE;
+
+/* The refusal row in screen capitals; the event log lowercases its own copy. */
+static const char *ui_gate_fail_text(uint8_t fail) {
+    if (fail == UI_GATE_FAIL_NORADIO) return "No radio";
+    if (fail == UI_GATE_FAIL_BUSY) return "Busy";
+    if (fail == UI_GATE_FAIL_TOOLONG) return "Too long";
+    return "";
+}
 /* What the menu asked for: the title while the staged job is not yet adopted
    (gate_poll() owns the counters until its next pass) and the row to land on
    when the status screen goes back to the list. */
@@ -1663,10 +1683,10 @@ static void ui_gate_title(char *out, size_t n, uint8_t kind, uint8_t button) {
     else snprintf(out, n, "Raw");
 }
 
-/* The gate TX status: what was asked for, which block is on the air, how many
-   frames left the chip, how the last job ended. The blast-screen shape: the
-   job is staged the moment the menu item is clicked, but gate_poll() only
-   adopts it — and resets the counters — on its next pass, so a staged job
+/* The gate TX status: what was asked for, which block and frame are on the
+   air, how many frames left the chip, how the last job ended. The blast-screen
+   shape: the job is staged the moment the menu item is clicked, but gate_poll()
+   only adopts it — and resets the counters — on its next pass, so a staged job
    still shows the previous counters and says "starting" instead. */
 static void ui_draw_gate_status() {
     GateProgress p = gate_progress();
@@ -1676,7 +1696,7 @@ static void ui_draw_gate_status() {
     bool starting = gate_busy() && !p.running;
 
     if (!ui_gate_ok) {
-        ui_draw_row(0, gate_ready ? "Busy" : "No radio", 40, 4, COL_TIME);
+        ui_draw_row(0, ui_gate_fail_text(ui_gate_fail), 40, 4, COL_TIME);
         ui_draw_row(1, "", 78, 4, COL_DIM);
         ui_draw_row(2, "", 112, 2, COL_DIM);
     } else if (starting) {
@@ -1692,8 +1712,9 @@ static void ui_draw_gate_status() {
         ui_draw_row(1, buf, 78, 4, COL_ACCENT);
         /* All frames are out but the poll has not wound the job down yet. */
         if (p.sent >= p.total) snprintf(buf, sizeof(buf), "finishing");
-        else snprintf(buf, sizeof(buf), "block %u of %u",
-                      (unsigned)p.block, (unsigned)p.blocks);
+        else snprintf(buf, sizeof(buf), "block %u of %u, frame %u of %u",
+                      (unsigned)p.block, (unsigned)p.blocks,
+                      (unsigned)p.frame, (unsigned)p.frames_per_block);
         ui_draw_row(2, buf, 112, 2, COL_DIM);
     } else {
         snprintf(buf, sizeof(buf), "%s", p.result[0] ? p.result : "idle");
@@ -2003,12 +2024,25 @@ static void ui_enter_blast(uint16_t job, int back_sel) {
 }
 
 /* Watch a gate job the menu just asked for. `job` is 0 when nothing started,
-   which is either a job already in flight — watched rather than restarted —
-   or a transmitter that is not there, which gets its own row instead of
-   silence. The kind and button are remembered for the "starting" window in
-   which the staged job still shows the previous counters. */
+   which is a job already in flight — watched rather than restarted — a
+   transmitter that is not there, or a frame that did not fit the staging
+   buffer; the last two get their own row instead of silence. The kind and
+   button are remembered for the "starting" window in which the staged job
+   still shows the previous counters. */
 static void ui_enter_gate(uint16_t job, uint8_t kind, uint8_t button, int back_sel) {
     ui_gate_ok = (job != 0) || gate_busy();
+    /* The refusal in words, in the order the states imply: no radio first,
+       because gate_busy() already implies the radio is up; busy while a job
+       is on the air; too long when the built frame did not fit the staging
+       buffer. From the menu the busy arm never refuses — a job already in
+       flight is watched above rather than restarted — so it names the state
+       for completeness while "Too long" is the refusal the menu can actually
+       meet with the radio up and nothing running. Uses the accessors only;
+       the job machine is untouched. */
+    if (ui_gate_ok) ui_gate_fail = UI_GATE_FAIL_NONE;
+    else if (!gate_ready) ui_gate_fail = UI_GATE_FAIL_NORADIO;
+    else if (gate_busy()) ui_gate_fail = UI_GATE_FAIL_BUSY;
+    else ui_gate_fail = UI_GATE_FAIL_TOOLONG;
     ui_gate_kind = kind;
     ui_gate_button = button;
     ui_gate_back_sel = back_sel;
@@ -2023,7 +2057,9 @@ static void ui_enter_gate(uint16_t job, uint8_t kind, uint8_t button, int back_s
            foreign value on the next pass. */
         ring_fire(RING_FX_COMET, NOTIFY_WARN, millis());
     } else {
-        event_add("gate: menu start refused (%s)", gate_ready ? "busy" : "no radio");
+        event_add("gate: menu start refused (%s)",
+                  ui_gate_fail == UI_GATE_FAIL_NORADIO ? "no radio"
+                  : ui_gate_fail == UI_GATE_FAIL_BUSY ? "busy" : "frame too long");
     }
     ui_enter(UI_GATE_STATUS);
 }
@@ -2212,20 +2248,27 @@ static void ui_init() {
 }
 
 /*
- * The two screens that must not be taken away from whoever is watching them.
+ * The three screens that must not be taken away from whoever is watching them.
  *
- * They are predicates rather than two locals inside ui_poll() because there is
+ * They are predicates rather than three locals inside ui_poll() because there is
  * a second consumer: the backlight's idle policy exempts exactly these, and it
- * has to exempt the SAME ones. A blast dimmed to nothing halfway through, or a
- * level meter that fades while a finger is still on the key, would be the same
- * defect the screen timeout was already written to avoid — and two copies of
- * this pair, thirty lines apart, is how they would come to disagree.
+ * has to exempt the SAME ones. A blast dimmed to nothing halfway through, a
+ * gate TX fading out mid-block, or a level meter that fades while a finger is
+ * still on the key, would be the same defect the screen timeout was already
+ * written to avoid — and two copies of this trio, thirty lines apart, is how
+ * they would come to disagree.
  *
  * A blast counts only while it is on the panel: one started over HTTP while a
  * menu is up is not live output the person in front of the device is watching,
- * and there is nothing on screen for the exemption to protect.
+ * and there is nothing on screen for the exemption to protect. A gate TX
+ * counts on the same terms, for the same reason.
  */
 static bool ui_watching_blast() { return ui_screen == UI_BLAST && ir_busy(); }
+
+/* A gate TX in flight with its status on the panel. The refusal rows ("No
+   radio", "Too long") are not live output and stay subject to the timeout —
+   gate_busy() is false for both, so they are. */
+static bool ui_watching_gate() { return ui_screen == UI_GATE_STATUS && gate_busy(); }
 
 /* The recording screen is exempt outright rather than only while it records: a
    hold can outlast fifteen seconds of "no input" — holding a key is not input
@@ -2266,7 +2309,7 @@ static bool ui_watching_progress() {
  * this device spends its life, so a brightness decision made at the bottom of
  * ui_poll() would be a brightness decision that almost never runs. What IS
  * shared with the screen timeout is everything that matters: the one timestamp,
- * and the two exemptions it also has.
+ * and the exemptions it also reads.
  *
  * That unconditional return is also why the thresholds mean exactly what they
  * say FROM THE CLOCK FACE. Elsewhere they are later, and by a knowable amount:
@@ -2299,7 +2342,9 @@ static void ui_backlight_idle() {
        silenced the ring. skills/backlight.cpp turns that into a floor, not a
        wake-up. */
     BacklightPanel panel;
-    panel.blasting = ui_watching_blast();
+    /* The gate TX rides the blast flag: both are live output on the panel,
+       and the policy cannot tell them apart — nor does it need to. */
+    panel.blasting = ui_watching_blast() || ui_watching_gate();
     panel.recording = ui_watching_rec();
     panel.on_bar = ui_watching_progress();
     panel.crit_unread = notify_crit_unread();
@@ -2673,7 +2718,7 @@ static void ui_poll() {
                 ui_gate_done_at = 0;
             } else if (ui_gate_done_at == 0) {
                 ui_gate_done_at = millis();
-            } else if (millis() - ui_gate_done_at >= UI_RESULT_MS) {
+            } else if ((long)(millis() - ui_gate_done_at) >= (long)UI_RESULT_MS) {
                 ui_enter_list(UI_GATE, ui_gate_back_sel);
                 return;
             }
@@ -2713,8 +2758,8 @@ static void ui_poll() {
     }
 
     /* Live output must not be timed out from under the user; everything else
-       falls back to the clock. Both exemptions are stated once, above, and the
-       backlight's idle policy reads the same two.
+       falls back to the clock. All three exemptions are stated once, above, and the
+       backlight's idle policy reads the same three.
 
        The card is the other screen where holding a key is normal, and it gets
        no exemption on purpose — it is where an unread message sits, and a card
@@ -2724,7 +2769,7 @@ static void ui_poll() {
        UI_IDLE_MS let this fire mid-gesture: the card went back to the clock,
        and the release then arrived there as a plain `back` on a screen that
        ignores it, so the whole gesture was swallowed. */
-    if (!ui_watching_blast() && !ui_watching_rec() &&
+    if (!ui_watching_blast() && !ui_watching_gate() && !ui_watching_rec() &&
         millis() - ui_last_input >= UI_IDLE_MS) {
         ui_enter(UI_CLOCK);
         return;

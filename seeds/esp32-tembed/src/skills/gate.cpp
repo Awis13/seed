@@ -743,8 +743,12 @@ static bool gate_stop_job() {
 
 /* Snapshot of the running (or last finished) job, for the on-device status
    screen and GET /gate/status. Copied out rather than exposing gate_state,
-   which gate_poll() owns; every reader (the UI on the loop task, the status
-   endpoint on the web-server task) gets its own copy, so no lock is needed. */
+   which gate_poll() owns. The plain fields are copied into the returned
+   struct, so each reader owns its copy and no lock is needed for them;
+   `result` is the exception — it points at gate_state.result itself. That
+   holds on the terms both readers meet: the UI draws on the loop task, the
+   same task that owns the job machine, and /gate/status copies the string
+   into the JSON document at assign time, before the response goes out. */
 struct GateProgress {
     bool running;
     uint16_t job_id;
