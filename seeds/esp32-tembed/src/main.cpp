@@ -41,7 +41,9 @@
 //   GET  /capabilities      — hardware fingerprint
 //   GET  /config.md         — node description
 //   POST /config.md         — update description
-//   GET  /events            — event log (?since=unix_ts)
+//   GET  /events            — event log (?since=unix_ts; array order is
+//     chronological, each entry carries a boot epoch, and a "boot" entry
+//     marks the reboot boundary)
 //   GET  /clock             — local time, timezone, NTP sync state
 //   POST /clock/tz          — set the POSIX TZ string
 //   GET  /firmware/version  — version, partition, uptime
@@ -171,9 +173,12 @@ static bool gpio_is_safe(int pin) {
 #define EVENT_MSG_LEN       128
 
 // The same entries, mirrored to flash so they survive a reboot. One line per
-// event, exactly the object GET /events serves: {"ts":<unix>,"msg":"..."}.
-// Rotation keeps the file around EVENTS_LOG_MAX by dropping the oldest half;
-// the boot replay reads the tail back into the ring below.
+// event: {"ts":<unix>,"boot":<epoch>,"msg":"..."} — the object GET /events
+// serves. Rotation keeps the file around EVENTS_LOG_MAX by dropping the oldest
+// half; the boot replay reads the tail back into the ring below, then closes
+// the reboot boundary with a "boot" marker under the new epoch. Array order
+// is chronological; ts values alone are not comparable across a reboot (wall
+// seconds before it, uptime seconds after, until NTP syncs).
 #define EVENTS_LOG_FILE     "/events.log"
 #define EVENTS_LOG_TMP      "/events.tmp"
 #define EVENTS_LOG_MAX      (24u * 1024u)
@@ -184,12 +189,27 @@ static bool events_spiffs_ok = false;
 
 struct EventEntry {
     unsigned long timestamp;
+    // Boot epoch that produced the entry. 0 means unknown: history written
+    // before the epoch existed. Timestamps alone are not comparable across a
+    // reboot — an old wall-clock entry is numerically larger than a fresh
+    // uptime one — so the boot id is what tells one boot's entries from
+    // another's. See events_since_match() for how GET /events uses it.
+    unsigned long boot;
     char message[EVENT_MSG_LEN];
 };
 
 static EventEntry events_buf[MAX_EVENTS];
 static int events_head = 0;
 static int events_count = 0;
+
+// This boot's epoch id, assigned once in setup() by events_boot_next() from
+// the persisted counter. 0 only when the flash is unreachable and no id could
+// be assigned; every new entry then still carries 0 rather than no epoch.
+static unsigned long events_boot_id = 0;
+
+// Forward declaration: the boot replay below closes the reboot boundary with
+// a marker through the same path every other entry takes.
+static void event_add(const char *fmt, ...);
 
 // host-test:begin events — sliced out by tools/test_events.sh
 #define EVENTS_LINE_MAX 512
@@ -228,13 +248,18 @@ static size_t events_escape(const char *src, char *dst, size_t cap) {
     return n;
 }
 
-// One log line for one event: {"ts":<unix>,"msg":"<escaped>"} plus a trailing
-// newline. Always NUL-terminated and parseable, even when the message had to
-// be cut to fit. Returns the length written, without the NUL.
-static size_t events_format_line(unsigned long ts, const char *msg,
-                                 char *out, size_t cap) {
+// One log line for one event: {"ts":<unix>,"boot":<epoch>,"msg":"<escaped>"}
+// plus a trailing newline. Always NUL-terminated and parseable, even when the
+// message had to be cut to fit. Returns the length written, without the NUL.
+//
+// The boot field sits between ts and msg on purpose: the parser looks for msg
+// after ts, so a line from before the epoch existed (no boot at all) still
+// parses, with the boot defaulting to 0 (unknown).
+static size_t events_format_line(unsigned long ts, unsigned long boot,
+                                  const char *msg,
+                                  char *out, size_t cap) {
     if (cap == 0) return 0;
-    int h = snprintf(out, cap, "{\"ts\":%lu,\"msg\":\"", ts);
+    int h = snprintf(out, cap, "{\"ts\":%lu,\"boot\":%lu,\"msg\":\"", ts, boot);
     if (h < 0) { out[0] = '\0'; return 0; }
     size_t n = (size_t)h >= cap ? cap - 1 : (size_t)h;
     n += events_escape(msg, out + n, cap - n);
@@ -254,14 +279,18 @@ static int events_hexval(char h) {
     return -1;
 }
 
-// The inverse: split one log line back into its timestamp and message. False
-// for anything but {"ts":<digits>,"msg":"<json string>"} with the object
-// closed — a torn write, a truncated line, garbage — and then only msg_out[0]
-// is touched. A message longer than the ring slot keeps the prefix that fits
-// rather than dropping the whole entry. msg_cap includes the NUL.
+// The inverse: split one log line back into its timestamp, boot epoch and
+// message. False for anything but {"ts":<digits>,...,"msg":"<json string>"}
+// with the object closed — a torn write, a truncated line, garbage — and then
+// only msg_out[0] is touched. The boot is optional: lines written before the
+// epoch existed carry no boot field and come back as 0 (unknown), anything
+// else unparseable in that field fails the whole line. A message longer than
+// the ring slot keeps the prefix that fits rather than dropping the whole
+// entry. msg_cap includes the NUL.
 static bool events_parse_line(const char *line, unsigned long *ts_out,
-                              char *msg_out, size_t msg_cap) {
-    if (!line || !ts_out || !msg_out || msg_cap == 0) return false;
+                               unsigned long *boot_out,
+                               char *msg_out, size_t msg_cap) {
+    if (!line || !ts_out || !boot_out || !msg_out || msg_cap == 0) return false;
     msg_out[0] = '\0';
     const char *p = strstr(line, "\"ts\"");
     if (!p) return false;
@@ -277,6 +306,22 @@ static bool events_parse_line(const char *line, unsigned long *ts_out,
     }
     const char *q = strstr(p, "\"msg\"");
     if (!q) return false;
+    // The epoch between the timestamp and the message, if the writer put one
+    // there. Scanned only up to the msg key, so a message that happens to
+    // mention a boot is never mistaken for the field.
+    unsigned long boot = 0;
+    const char *b = strstr(p, "\"boot\"");
+    if (b && b < q) {
+        b = strchr(b + 6, ':');
+        if (!b) return false;
+        b++;
+        while (*b == ' ' || *b == '\t') b++;
+        if (*b < '0' || *b > '9') return false;
+        while (*b >= '0' && *b <= '9') {
+            boot = boot * 10 + (unsigned long)(*b - '0');
+            b++;
+        }
+    }
     q = strchr(q + 5, ':');
     if (!q) return false;
     q++;
@@ -327,6 +372,7 @@ static bool events_parse_line(const char *line, unsigned long *ts_out,
     if (*q != '}') return false;
     msg_out[n] = '\0';
     *ts_out = ts;
+    *boot_out = boot;
     return true;
 }
 
@@ -338,6 +384,25 @@ static size_t events_align_line(const char *buf, size_t len, size_t pos) {
     while (pos < len && buf[pos] != '\n') pos++;
     if (pos < len) pos++;  // past the newline itself
     return pos;
+}
+
+// Whether one stored entry passes a GET /events ?since= cursor. The numeric
+// comparison alone lies across a reboot: entries from before it carry
+// wall-clock seconds while entries from the unsynced early minutes of this
+// boot carry uptime seconds, so every fresh entry reads "older" than the
+// cursor and a poller silently loses the whole window. A monotonic entry
+// (never synced, at or below TIME_VALID_EPOCH) from the current boot is
+// therefore always newer than a wall-clock cursor even when its number is
+// smaller. Anything else compares numerically: within one clock domain the
+// numbers mean what they say, and history from older boots keeps the old
+// behaviour rather than flooding every poll. cur_boot 0 (no epoch assigned)
+// disables the exception rather than guessing.
+static bool events_since_match(unsigned long ts, unsigned long boot,
+                               unsigned long since, unsigned long cur_boot) {
+    if (ts >= since) return true;
+    if (cur_boot != 0 && boot == cur_boot &&
+        ts <= TIME_VALID_EPOCH && since > TIME_VALID_EPOCH) return true;
+    return false;
 }
 // host-test:end
 
@@ -370,10 +435,11 @@ static void events_log_rotate() {
 // One event onto the end of the log. One open and one close; a rotation when
 // the file is at the cap costs a second pair, which is once per hundreds of
 // events. Any failure parks the flag and the log stays RAM-only.
-static void events_log_append(unsigned long ts, const char *msg) {
+static void events_log_append(unsigned long ts, unsigned long boot,
+                              const char *msg) {
     if (!events_spiffs_ok) return;
     char line[EVENTS_LINE_MAX];
-    size_t n = events_format_line(ts, msg, line, sizeof(line));
+    size_t n = events_format_line(ts, boot, msg, line, sizeof(line));
     File a = SPIFFS.open(EVENTS_LOG_FILE, FILE_APPEND);
     if (!a) { events_spiffs_ok = false; return; }
     if (a.size() + n > EVENTS_LOG_MAX) {
@@ -391,6 +457,11 @@ static void events_log_append(unsigned long ts, const char *msg) {
 // once at boot, before the first event_add. A missing file means a fresh
 // device, a torn line is left out, anything else unparseable is left out with
 // it — the buffer starts empty either way and boot never fails here.
+//
+// When history was replayed the boundary is closed with a "boot" marker under
+// the new epoch, so the ring reads old boot, marker, new boot in order and a
+// poller holding a pre-reboot cursor sees the reboot instead of a gap. A fresh
+// device needs no boundary and gets no marker.
 static void events_log_replay() {
     if (!events_spiffs_ok) return;
     File f = SPIFFS.open(EVENTS_LOG_FILE, FILE_READ);
@@ -407,6 +478,7 @@ static void events_log_replay() {
     events_count = 0;
     unsigned seen = 0;
     unsigned pos = 0;
+    unsigned loaded = 0;
     char line[EVENTS_LINE_MAX];
     while (pos < content.length()) {
         unsigned eol = pos;
@@ -417,41 +489,52 @@ static void events_log_replay() {
         line[llen] = '\0';
         if (seen >= skip) {
             unsigned long ts = 0;
+            unsigned long boot = 0;
             char msg[EVENT_MSG_LEN];
-            if (events_parse_line(line, &ts, msg, sizeof(msg))) {
+            if (events_parse_line(line, &ts, &boot, msg, sizeof(msg))) {
                 EventEntry *e = &events_buf[events_head];
                 e->timestamp = ts;
+                e->boot = boot;
                 snprintf(e->message, EVENT_MSG_LEN, "%s", msg);
                 events_head = (events_head + 1) % MAX_EVENTS;
                 if (events_count < MAX_EVENTS) events_count++;
+                loaded++;
             }
         }
         seen++;
         pos = eol + 1;
     }
     if (fsize > EVENTS_LOG_MAX) events_log_rotate();
+    if (loaded > 0) event_add("boot");
 }
 
 static void event_add(const char *fmt, ...) {
     va_list ap;
     va_start(ap, fmt);
     EventEntry *e = &events_buf[events_head];
+    // Wall clock while NTP has it (configTzTime() in wifi_setup() feeds the
+    // system clock; anything at or below TIME_VALID_EPOCH is the pre-sync
+    // epoch, not real time), uptime seconds before the first sync. The two
+    // are told apart across reboots by the boot epoch, not by the number —
+    // see events_since_match().
     struct timeval tv;
     if (gettimeofday(&tv, NULL) == 0 && tv.tv_sec > TIME_VALID_EPOCH) {
         e->timestamp = (unsigned long)tv.tv_sec;
     } else {
         e->timestamp = millis() / 1000;
     }
+    e->boot = events_boot_id;
     vsnprintf(e->message, EVENT_MSG_LEN, fmt, ap);
     va_end(ap);
     // Copied out before the append below: the ring is shared with the web
     // server task, and this slot can be recycled before the flash write lands.
     unsigned long ts = e->timestamp;
+    unsigned long boot = e->boot;
     char msg[EVENT_MSG_LEN];
     snprintf(msg, sizeof(msg), "%s", e->message);
     events_head = (events_head + 1) % MAX_EVENTS;
     if (events_count < MAX_EVENTS) events_count++;
-    events_log_append(ts, msg);
+    events_log_append(ts, boot, msg);
 }
 
 // ===== Skill/plugin interface =====
@@ -831,6 +914,36 @@ static String spiffs_read_file(const char *path, const char *tmp_path = NULL) {
         else s = read_spiffs_file((String(path) + ".tmp").c_str());
     }
     return s;
+}
+
+// ===== Event boot epoch =====
+//
+// The counter behind EventEntry.boot: incremented once per boot, so entries
+// from different boots are told apart even when their timestamps share a
+// scale. A missing or corrupt file means a fresh (or damaged) flash and the
+// count restarts at 1; a failed save keeps the RAM id and leaves the log
+// alone — the epoch is best-effort, history matters more.
+#define EVENTS_BOOT_FILE    "/events.boot"
+
+static void events_boot_next() {
+    unsigned long n = 0;
+    if (events_spiffs_ok) {
+        String s = spiffs_read_file(EVENTS_BOOT_FILE);
+        s.trim();
+        if (s.length() > 0) {
+            char *end = NULL;
+            unsigned long v = strtoul(s.c_str(), &end, 10);
+            if (end && *end == '\0') n = v;
+        }
+    } else {
+        events_boot_id = 1;
+        return;
+    }
+    if (n >= (unsigned long)(~0UL) - 1) n = 0;  // never hand out 0 or wrap to it
+    events_boot_id = n + 1;
+    if (!spiffs_save_atomic(EVENTS_BOOT_FILE, String(events_boot_id))) {
+        // Best-effort only: the RAM id stands, the log keeps working.
+    }
 }
 
 // ===== Timezone =====
@@ -1677,9 +1790,15 @@ static void handle_events(AsyncWebServerRequest *request) {
     int start = (events_count < MAX_EVENTS) ? 0 : events_head;
     for (int i = 0; i < events_count; i++) {
         int idx = (start + i) % MAX_EVENTS;
-        if (events_buf[idx].timestamp >= since) {
+        // Ring order is chronological and is the ordering contract; ts alone
+        // is not comparable across a reboot, so the matcher keeps this boot's
+        // still-unsynced entries against a wall-clock cursor instead of
+        // dropping them as "older". ts and msg keep their types; boot is new.
+        if (events_since_match(events_buf[idx].timestamp, events_buf[idx].boot,
+                               since, events_boot_id)) {
             JsonObject e = arr.add<JsonObject>();
             e["ts"] = events_buf[idx].timestamp;
+            e["boot"] = events_buf[idx].boot;
             e["msg"] = events_buf[idx].message;
         }
     }
@@ -2232,6 +2351,9 @@ void setup() {
     }
     // The log's tail back into the ring before the first event_add below:
     // wifi_setup() already logs, and that entry must come after history.
+    // The epoch first: the replay stamps the reboot marker with this boot's
+    // id, so the counter is assigned before anything is loaded or logged.
+    events_boot_next();
     events_log_replay();
 
     hw_probe();       // I2C + CC1101 probe (before the display claims the SPI bus)
