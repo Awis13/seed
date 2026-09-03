@@ -1,17 +1,26 @@
 /*
  * skills/gate.cpp — sub-GHz OOK transmitter skill for the T-Embed CC1101
  *
- * The gate-remote skill, C1: a raw 433 MHz OOK sender. A fixed-code gate or
- * garage remote is a sequence of mark/space durations on the air; this skill
- * takes such a sequence over HTTP and keys the CC1101's carrier to it. The
- * named encoders (CAME and friends), the stored code and the /gate/open hook
- * land on top of this in C2/C3 — everything they need (a validated raw
- * buffer, a job machine, a stop switch) is already here.
+ * The gate-remote skill: a raw 433 MHz OOK sender plus the paired-button
+ * encoder on top of it. A fixed-code gate or garage remote is a sequence of
+ * mark/space durations on the air; the raw path (/gate/send) keys the
+ * CC1101's carrier to such a sequence directly, while the paired path
+ * (/gate/pair, /gate/button/N) builds the frame from the persisted
+ * parameters: a HIGH preamble, nbits PWM symbols at Te, a 2-bit button code
+ * and the A/B alternation flag — the hold pattern of a real remote. Every
+ * number is tunable over HTTP (POST /gate/config, persisted to SPIFFS), so
+ * the field experiment at the gate can iterate timings and the serial
+ * without a reflash. Everything the encoder needs (a validated raw buffer,
+ * a job machine, a stop switch) lives here.
  *
  * Endpoints:
- *   POST /gate/send    — send one raw OOK frame {raw[], repeat}
- *   GET  /gate/status  — progress of the running (or last) job
- *   POST /gate/stop    — abort mid-job
+ *   POST /gate/send      — send one raw OOK frame {raw[], repeat}
+ *   POST /gate/pair[/N]  — the pairing sequence for button N (default 1)
+ *   POST /gate/button/N  — fire button N (1-4) as a paired code
+ *   GET  /gate/config    — the frame parameters (Te, preamble, bits, serial)
+ *   POST /gate/config    — set frame parameters, persisted to SPIFFS
+ *   GET  /gate/status    — progress of the running (or last) job
+ *   POST /gate/stop      — abort the running (or staged) job
  *
  * All three are registered with AsyncURIMatcher::exact() — see the note at
  * the top of skills/ir.cpp: under the library's default BackwardCompatible
@@ -235,17 +244,13 @@ static SPIClass *gate_runtime_bus() {
  *   - all commands of a frame are clocked inside that one transaction, with
  *     CS cycled per access like the probe does.
  *
- * The CHIP_RDYn wait on MISO after CS-low was also tried (the datasheet's
- * own protocol) and made things strictly worse — with it the first attempt
- * of every frame never saw the PLL lock, and the immediate retry always
- * did. Parked, documented, not retried. */
-
-/* CS handoff with the datasheet's CHIP_RDYn wait: after CS-low the chip
-   drives SO (MISO) with ready-status, and commands clocked while it is HIGH
-   are ignored. MEASURED (build B, 2026-09-02): SO-wait + a 5 ms lock window
-   gave 10/10 locked frames; widening the window to 20 ms inverted the
-   behaviour (every first attempt then failed and only the immediate retry
-   locked) — so the wait stays and the window stays tight. */
+ * CS handoff uses the datasheet's CHIP_RDYn wait: after CS-low the chip
+ * drives SO (MISO) with ready-status, and commands clocked while it is HIGH
+ * are ignored. gate_cs_ready() implements the wait with a 2 ms timeout.
+ * MEASURED (build B, 2026-09-02): SO-wait + a 5 ms lock window gave 10/10
+ * locked frames; widening the window to 20 ms inverted the behaviour (every
+ * first attempt then failed and only the immediate retry locked) — so the
+ * wait stays and the window stays tight. */
 
 static void gate_cs_ready() {
     digitalWrite(PIN_CC1101_CS, LOW);
@@ -273,7 +278,7 @@ static uint8_t gate_raw_read(uint8_t reg) {
 
 static uint8_t gate_raw_status_read(uint8_t reg) {
     gate_cs_ready();
-    gate_bus->transfer(reg | CC1101_SPI_BURST | CC1101_SPI_STATUS);
+    gate_bus->transfer(reg | CC1101_SPI_READ | CC1101_SPI_BURST | CC1101_SPI_STATUS);
     uint8_t val = gate_bus->transfer(0x00);
     digitalWrite(PIN_CC1101_CS, HIGH);
     return val;
@@ -283,6 +288,15 @@ static void gate_raw_patable(const uint8_t *vals, uint8_t count) {
     gate_cs_ready();
     gate_bus->transfer(CC1101_PATABLE | CC1101_SPI_BURST);
     for (uint8_t i = 0; i < count; i++) gate_bus->transfer(vals[i]);
+    digitalWrite(PIN_CC1101_CS, HIGH);
+}
+
+/* Single-byte command strobes (SFTX, SIDLE, ...): one header byte, no
+   payload byte and no readback — unlike the status-register reads above,
+   which clock a dummy byte out after the header. */
+static void gate_raw_strobe(uint8_t cmd) {
+    gate_cs_ready();
+    gate_bus->transfer(cmd);
     digitalWrite(PIN_CC1101_CS, HIGH);
 }
 
@@ -335,6 +349,14 @@ struct GateCfg {
     uint16_t block_gap_ms;
 };
 
+static const GateCfg gate_cfg_default = {
+    .te_us = 410, .preamble_us = 2360, .post_us = 410,
+    .nbits = 52, .ab_bit = 41, .button_shift = 42,
+    .fixed_bits = 0x1234567800ULL,
+    .frames_per_block = 5, .blocks = 2,
+    .frame_gap_ms = 20, .block_gap_ms = 300,
+};
+
 static GateCfg gate_cfg = {
     .te_us = 410, .preamble_us = 2360, .post_us = 410,
     .nbits = 52, .ab_bit = 41, .button_shift = 42,
@@ -345,32 +367,163 @@ static GateCfg gate_cfg = {
 
 #define GATE_CFG_FILE   "/gate.json"
 
+/* Per-field range predicates: the single source for POST /gate/config (which
+   reports each field by name) and gate_cfg_valid() below (which the SPIFFS
+   load answers through). */
+static bool gate_te_us_ok(int v)         { return v >= 50 && v <= 5000; }
+static bool gate_preamble_us_ok(int v)   { return v >= 100 && v <= 50000; }
+static bool gate_post_us_ok(int v)       { return v >= 50 && v <= 50000; }
+static bool gate_nbits_ok(int v)         { return v >= 8 && v <= 64; }
+static bool gate_ab_bit_ok(int v)        { return v >= 0 && v <= 63; }
+static bool gate_button_shift_ok(int v)  { return v >= 0 && v <= 62; }
+static bool gate_frames_per_block_ok(int v) { return v >= 1 && v <= 20; }
+static bool gate_blocks_ok(int v)        { return v >= 1 && v <= 8; }
+static bool gate_frame_gap_ok(int v)     { return v >= 5 && v <= 5000; }
+static bool gate_block_gap_ok(int v)     { return v >= 10 && v <= 10000; }
+
+/* One-frame airtime of a config, in microseconds: the preamble mark, the gap
+   after it, nbits PWM symbols of 3Te each, and the trailing low. Must stay
+   within GATE_FRAME_MAX_US — the same bound /gate/send enforces per raw
+   frame — or a button/pair job would hold the loop past what the frame
+   budget allows. */
+static uint32_t gate_frame_duration_us(const GateCfg &c) {
+    return (uint32_t)c.preamble_us + (uint32_t)c.post_us
+         + (uint32_t)c.nbits * 3u * (uint32_t)c.te_us
+         + (uint32_t)c.post_us;
+}
+
+/* Shared validator for POST /gate/config and the SPIFFS load below: ranges,
+   cross-field placement of the A/B flag and the 2-bit button code inside the
+   word, the staging-buffer size, and the frame airtime cap. */
+static bool gate_cfg_valid(const GateCfg &c) {
+    if (!gate_te_us_ok((int)c.te_us)) return false;
+    if (!gate_preamble_us_ok((int)c.preamble_us)) return false;
+    if (!gate_post_us_ok((int)c.post_us)) return false;
+    if (!gate_nbits_ok((int)c.nbits)) return false;
+    if (!gate_ab_bit_ok((int)c.ab_bit)) return false;
+    if (!gate_button_shift_ok((int)c.button_shift)) return false;
+    if (!gate_frames_per_block_ok((int)c.frames_per_block)) return false;
+    if (!gate_blocks_ok((int)c.blocks)) return false;
+    if (!gate_frame_gap_ok((int)c.frame_gap_ms)) return false;
+    if (!gate_block_gap_ok((int)c.block_gap_ms)) return false;
+    if ((unsigned)c.ab_bit >= (unsigned)c.nbits) return false;
+    if ((unsigned)c.button_shift + 1u >= (unsigned)c.nbits) return false;
+    if (2u + 2u * (unsigned)c.nbits + 1u > GATE_MAX_RAW) return false;
+    if (gate_frame_duration_us(c) > GATE_FRAME_MAX_US) return false;
+    return true;
+}
+
+/* Parse a fixed_bits hex word: 1-16 hex digits with an optional 0x prefix,
+   fully consumed. Anything else — a JSON number, an empty string, trailing
+   garbage — is rejected. */
+static bool gate_parse_fixed_bits(const char *s, uint64_t *out) {
+    if (!s || !out) return false;
+    if (s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) s += 2;
+    size_t len = strlen(s);
+    if (len < 1 || len > 16) return false;
+    for (size_t i = 0; i < len; i++) {
+        char ch = s[i];
+        bool hex = (ch >= '0' && ch <= '9') ||
+                   (ch >= 'a' && ch <= 'f') ||
+                   (ch >= 'A' && ch <= 'F');
+        if (!hex) return false;
+    }
+    char *end = nullptr;
+    unsigned long long v = strtoull(s, &end, 16);
+    if (!end || *end != '\0') return false;
+    *out = (uint64_t)v;
+    return true;
+}
+
+/* Button number (1-4, as in the URL and the UI) to the 2-bit code on the
+   air. THE single mapping for the pair and button paths, so the code a
+   pairing sequence teaches the receiver is the code the matching button
+   later emits. Applied inside gate_build_frame, which both paths share. */
+static uint8_t gate_button_code(uint8_t button) {
+    return (uint8_t)((button - 1) & 3);
+}
+
 static void gate_cfg_load() {
     String s = read_spiffs_file(GATE_CFG_FILE);
     if (s.length() == 0) return;
     JsonDocument doc;
-    if (deserializeJson(doc, s) != DeserializationError::Ok) return;
-    if (doc["te_us"].is<int>())            gate_cfg.te_us = doc["te_us"];
-    if (doc["preamble_us"].is<int>())      gate_cfg.preamble_us = doc["preamble_us"];
-    if (doc["post_us"].is<int>())          gate_cfg.post_us = doc["post_us"];
-    if (doc["nbits"].is<int>())            gate_cfg.nbits = doc["nbits"];
-    if (doc["ab_bit"].is<int>())           gate_cfg.ab_bit = doc["ab_bit"];
-    if (doc["button_shift"].is<int>())     gate_cfg.button_shift = doc["button_shift"];
-    if (doc["fixed_bits"].is<const char*>())
-        gate_cfg.fixed_bits = strtoull(doc["fixed_bits"].as<const char*>(), NULL, 16);
-    if (doc["frames_per_block"].is<int>()) gate_cfg.frames_per_block = doc["frames_per_block"];
-    if (doc["blocks"].is<int>())           gate_cfg.blocks = doc["blocks"];
-    if (doc["frame_gap_ms"].is<int>())     gate_cfg.frame_gap_ms = doc["frame_gap_ms"];
-    if (doc["block_gap_ms"].is<int>())     gate_cfg.block_gap_ms = doc["block_gap_ms"];
+    if (deserializeJson(doc, s) != DeserializationError::Ok) {
+        gate_cfg = gate_cfg_default;
+        event_add("gate: corrupt config, defaults restored");
+        return;
+    }
+    /* Parsed into a scratch copy first: every present field is type-checked
+       against its raw int range before the narrowing cast (a truncated
+       uint8 would otherwise launder an out-of-range value past the
+       validator), then the whole copy goes through gate_cfg_valid(). Any
+       failure restores defaults rather than landing half a document. */
+    GateCfg tmp = gate_cfg_default;
+    bool corrupt = false;
+    if (!doc["te_us"].isNull()) {
+        if (!doc["te_us"].is<int>() || !gate_te_us_ok(doc["te_us"].as<int>())) corrupt = true;
+        else tmp.te_us = (uint16_t)doc["te_us"].as<int>();
+    }
+    if (!doc["preamble_us"].isNull()) {
+        if (!doc["preamble_us"].is<int>() || !gate_preamble_us_ok(doc["preamble_us"].as<int>())) corrupt = true;
+        else tmp.preamble_us = (uint16_t)doc["preamble_us"].as<int>();
+    }
+    if (!doc["post_us"].isNull()) {
+        if (!doc["post_us"].is<int>() || !gate_post_us_ok(doc["post_us"].as<int>())) corrupt = true;
+        else tmp.post_us = (uint16_t)doc["post_us"].as<int>();
+    }
+    if (!doc["nbits"].isNull()) {
+        if (!doc["nbits"].is<int>() || !gate_nbits_ok(doc["nbits"].as<int>())) corrupt = true;
+        else tmp.nbits = (uint8_t)doc["nbits"].as<int>();
+    }
+    if (!doc["ab_bit"].isNull()) {
+        if (!doc["ab_bit"].is<int>() || !gate_ab_bit_ok(doc["ab_bit"].as<int>())) corrupt = true;
+        else tmp.ab_bit = (uint8_t)doc["ab_bit"].as<int>();
+    }
+    if (!doc["button_shift"].isNull()) {
+        if (!doc["button_shift"].is<int>() || !gate_button_shift_ok(doc["button_shift"].as<int>())) corrupt = true;
+        else tmp.button_shift = (uint8_t)doc["button_shift"].as<int>();
+    }
+    if (!doc["fixed_bits"].isNull()) {
+        uint64_t v = 0;
+        if (!doc["fixed_bits"].is<const char*>() ||
+            !gate_parse_fixed_bits(doc["fixed_bits"].as<const char*>(), &v)) corrupt = true;
+        else tmp.fixed_bits = v;
+    }
+    if (!doc["frames_per_block"].isNull()) {
+        if (!doc["frames_per_block"].is<int>() || !gate_frames_per_block_ok(doc["frames_per_block"].as<int>())) corrupt = true;
+        else tmp.frames_per_block = (uint8_t)doc["frames_per_block"].as<int>();
+    }
+    if (!doc["blocks"].isNull()) {
+        if (!doc["blocks"].is<int>() || !gate_blocks_ok(doc["blocks"].as<int>())) corrupt = true;
+        else tmp.blocks = (uint8_t)doc["blocks"].as<int>();
+    }
+    if (!doc["frame_gap_ms"].isNull()) {
+        if (!doc["frame_gap_ms"].is<int>() || !gate_frame_gap_ok(doc["frame_gap_ms"].as<int>())) corrupt = true;
+        else tmp.frame_gap_ms = (uint16_t)doc["frame_gap_ms"].as<int>();
+    }
+    if (!doc["block_gap_ms"].isNull()) {
+        if (!doc["block_gap_ms"].is<int>() || !gate_block_gap_ok(doc["block_gap_ms"].as<int>())) corrupt = true;
+        else tmp.block_gap_ms = (uint16_t)doc["block_gap_ms"].as<int>();
+    }
+    if (corrupt || !gate_cfg_valid(tmp)) {
+        gate_cfg = gate_cfg_default;
+        event_add("gate: corrupt config, defaults restored");
+        return;
+    }
+    gate_cfg = tmp;
 }
 
 /* The frame for one button: the fixed word, the 2-bit button code and the
    A/B flag folded in, then the mark/space stream. Preamble HIGH, the gap it
-   ends with, 52 [high, low] bit pairs, trailing low — 2 + 2*nbits + 1 runs. */
+   ends with, nbits [high, low] bit pairs, trailing low — 2 + 2*nbits + 1 runs.
+   `button` is the 1-4 button number; the on-air code comes from
+   gate_button_code(), the one mapping both pair and button paths share. */
 static uint16_t gate_build_frame(uint8_t button, bool ab, uint32_t *raw) {
+    if (2u + 2u * (unsigned)gate_cfg.nbits + 1u > GATE_MAX_RAW) return 0;
+    uint8_t code = gate_button_code(button);
     uint64_t word = gate_cfg.fixed_bits;
     word &= ~(3ULL << gate_cfg.button_shift);
-    word |= ((uint64_t)(button & 3)) << gate_cfg.button_shift;
+    word |= ((uint64_t)(code & 3)) << gate_cfg.button_shift;
     if (ab) word |= (1ULL << gate_cfg.ab_bit);
     else    word &= ~(1ULL << gate_cfg.ab_bit);
 
@@ -427,7 +580,10 @@ static uint16_t gate_job_seq = 0;
 static bool gate_ab_parity = false;   /* which block flavour the next press emits */
 
 static bool gate_busy() {
-    return gate_ready && gate_state.kind != GATE_JOB_IDLE;
+    /* A staged-but-unpicked job counts as busy: the staging buffer is what
+       gate_poll() transmits from, so a second stage would overwrite the
+       first before it ever reached the air. */
+    return gate_ready && (gate_state.kind != GATE_JOB_IDLE || gate_request_pending);
 }
 
 static void gate_finish(const char *result) {
@@ -569,9 +725,19 @@ static void gate_poll() {
  * gate_request_pending; gate_poll() picks it up from the loop task. */
 
 static bool gate_stop_job() {
-    if (!gate_ready || gate_state.kind == GATE_JOB_IDLE) return false;
-    gate_stop_requested = true;
-    return true;
+    if (!gate_ready) return false;
+    if (gate_state.kind != GATE_JOB_IDLE) {
+        gate_stop_requested = true;
+        return true;
+    }
+    /* Nothing running but a job staged and not yet picked up: drop it, so a
+       stop between the POST and the next loop pass reports stopped:true and
+       the stale stage never transmits. */
+    if (gate_request_pending) {
+        gate_request_pending = false;
+        return true;
+    }
+    return false;
 }
 
 struct GateProgress {
@@ -601,7 +767,10 @@ static GateProgress gate_progress() {
    flips the flavour, so successive presses alternate like a held remote; the
    PAIR sequence emits an A block and then a B block, the hold pattern. */
 static uint16_t gate_start_code(uint8_t kind, uint8_t button) {
-    if (!gate_ready || gate_state.kind != GATE_JOB_IDLE) return 0;
+    if (!gate_ready || gate_state.kind != GATE_JOB_IDLE || gate_request_pending) return 0;
+    /* Button numbers are 1-4 on every path (URL, UI, /gate/pair default);
+       the raw kind carries button 0 and never reaches the encoder. */
+    if (kind != GATE_JOB_FRAME && (button < 1 || button > 4)) return 0;
 
     gate_request.kind = kind;
     gate_request.button = button;
@@ -616,6 +785,9 @@ static uint16_t gate_start_code(uint8_t kind, uint8_t button) {
         gate_request.blocks = 1;
         gate_ab_parity = !gate_ab_parity;
     }
+    /* A zero-length build means the config cannot fit the staging buffer —
+       never stage an empty job. */
+    if (gate_request.count_a == 0 || gate_request.count_b == 0) return 0;
     gate_request.job_id = ++gate_job_seq;
     gate_request_pending = true;
     return gate_request.job_id;
@@ -625,7 +797,11 @@ static uint16_t gate_start_code(uint8_t kind, uint8_t button) {
 
 static const SkillEndpoint gate_endpoints[] = {
     {"POST", "/gate/send",    "Send one raw OOK frame {raw[], repeat}"},
-    {"POST", "/gate/pair",    "The pairing sequence: A block then B block"},
+    {"POST", "/gate/pair",    "The pairing sequence for button 1 (default)"},
+    {"POST", "/gate/pair/1",  "The pairing sequence for button 1"},
+    {"POST", "/gate/pair/2",  "The pairing sequence for button 2"},
+    {"POST", "/gate/pair/3",  "The pairing sequence for button 3"},
+    {"POST", "/gate/pair/4",  "The pairing sequence for button 4"},
     {"POST", "/gate/button/1","Fire button 1 as a paired code"},
     {"POST", "/gate/button/2","Fire button 2 as a paired code"},
     {"POST", "/gate/button/3","Fire button 3 as a paired code"},
@@ -633,7 +809,7 @@ static const SkillEndpoint gate_endpoints[] = {
     {"GET",  "/gate/config",  "The frame parameters (Te, preamble, bits, serial)"},
     {"POST", "/gate/config",  "Set frame parameters, persisted to SPIFFS"},
     {"GET",  "/gate/status",  "Progress of the running (or last) job"},
-    {"POST", "/gate/stop",    "Abort the running job"},
+    {"POST", "/gate/stop",    "Abort the running (or staged) job"},
     {NULL, NULL, NULL}
 };
 
@@ -648,7 +824,7 @@ static const char *gate_describe() {
            "### Endpoints\n\n"
            "| Method | Path | Description |\n"
            "|--------|------|-------------|\n"
-           "| POST | /gate/pair | The pairing sequence: A block then B block |\n"
+           "| POST | /gate/pair[/1..4] | Pairing sequence for button N (default 1): A block then B block |\n"
            "| POST | /gate/button/1..4 | Fire one button's block sequence |\n"
            "| POST | /gate/send | One raw OOK frame: `{\"raw\":[11000,512,...],\"repeat\":4}` |\n"
            "| GET | /gate/config | Frame parameters |\n"
@@ -659,7 +835,10 @@ static const char *gate_describe() {
            "A button press emits one block of frames_per_block identical\n"
            "frames and flips the A/B flavour; the pair sequence emits an A\n"
            "block then a B block with block_gap_ms between them — the hold\n"
-           "pattern of a real remote. Every call returns immediately; the\n"
+           "pattern of a real remote. Pairing exists per button (/gate/pair/N,\n"
+           "default N=1): it teaches the receiver the same 2-bit code the\n"
+           "matching /gate/button/N later emits. Every call returns\n"
+           "immediately; the\n"
            "symbols are clocked on the CPU (RMT is fully claimed by ir and\n"
            "ring), one frame per loop pass, and every frame is verified by\n"
            "the GDO2 PLL-lock pin. A job can be stopped within a frame.\n\n"
@@ -783,15 +962,34 @@ static void gate_register_routes(AsyncWebServer &server) {
         gate_send_json(req, 200, doc);
     }, NULL, handle_body_collect);
 
-    /* POST /gate/pair and POST /gate/button/N — the paired-code sequences.
-       A button job emits one block in the current A/B flavour and flips it;
-       the pair job emits the A block and then the B block, which is what a
-       held remote does while a receiver listens. */
-    for (int kind = 0; kind < 2; kind++) {
-        const char *path = (kind == 0) ? "/gate/pair" : "/gate/button";
-        server.on(AsyncURIMatcher::exact(path), HTTP_POST, [kind](AsyncWebServerRequest *req) {
+    /* POST /gate/pair[/N] and POST /gate/button/N — the paired-code
+       sequences. A button job emits one block in the current A/B flavour
+       and flips it; the pair job emits the A block and then the B block,
+       which is what a held remote does while a receiver listens. The bare
+       /gate/pair keeps button 1 for the UI and earlier clients. (There is
+       deliberately no bare /gate/button: a button press without a number
+       has no code to emit.) */
+    server.on(AsyncURIMatcher::exact("/gate/pair"), HTTP_POST, [](AsyncWebServerRequest *req) {
+        if (!require_auth(req)) return;
+        uint16_t job = gate_start_code(GATE_JOB_PAIR, 1);
+        JsonDocument doc;
+        if (job == 0) {
+            doc["error"] = gate_ready ? "a job is already running"
+                                      : "sub-GHz transmitter unavailable";
+            gate_send_json(req, gate_ready ? 409 : 503, doc);
+            return;
+        }
+        doc["ok"] = true;
+        doc["job"] = job;
+        doc["button"] = 1;
+        gate_send_json(req, 200, doc);
+    });
+    for (uint8_t b = 1; b <= 4; b++) {
+        char path[20];
+        snprintf(path, sizeof(path), "/gate/pair/%u", b);
+        server.on(AsyncURIMatcher::exact(path), HTTP_POST, [b](AsyncWebServerRequest *req) {
             if (!require_auth(req)) return;
-            uint16_t job = gate_start_code(kind == 0 ? GATE_JOB_PAIR : GATE_JOB_BUTTON, 0);
+            uint16_t job = gate_start_code(GATE_JOB_PAIR, b);
             JsonDocument doc;
             if (job == 0) {
                 doc["error"] = gate_ready ? "a job is already running"
@@ -801,6 +999,7 @@ static void gate_register_routes(AsyncWebServer &server) {
             }
             doc["ok"] = true;
             doc["job"] = job;
+            doc["button"] = b;
             gate_send_json(req, 200, doc);
         });
     }
@@ -868,60 +1067,80 @@ static void gate_register_routes(AsyncWebServer &server) {
             return;
         }
 
-        /* Range checks before anything is applied: a nonsense Te would put
-           symbol edges outside the entry limits the transmitter enforces. */
+        /* Validated into a scratch copy before anything is applied: per-field
+           ranges (a nonsense Te would put symbol edges outside the entry
+           limits the transmitter enforces), then the cross-field placement
+           of the A/B flag and the button code inside the word, then the
+           frame airtime cap shared with /gate/send. Only a fully valid
+           document replaces the live config — a rejected field must not
+           leave earlier fields half-applied. */
+        GateCfg tmp = gate_cfg;
         if (input["te_us"].is<int>()) {
             int v = input["te_us"];
-            if (v < 50 || v > 5000) { free(body); gate_send_error(req, 400, "te_us must be 50-5000"); return; }
-            gate_cfg.te_us = v;
+            if (!gate_te_us_ok(v)) { free(body); gate_send_error(req, 400, "te_us must be 50-5000"); return; }
+            tmp.te_us = (uint16_t)v;
         }
         if (input["preamble_us"].is<int>()) {
             int v = input["preamble_us"];
-            if (v < 100 || v > 50000) { free(body); gate_send_error(req, 400, "preamble_us must be 100-50000"); return; }
-            gate_cfg.preamble_us = v;
+            if (!gate_preamble_us_ok(v)) { free(body); gate_send_error(req, 400, "preamble_us must be 100-50000"); return; }
+            tmp.preamble_us = (uint16_t)v;
         }
         if (input["post_us"].is<int>()) {
             int v = input["post_us"];
-            if (v < 50 || v > 50000) { free(body); gate_send_error(req, 400, "post_us must be 50-50000"); return; }
-            gate_cfg.post_us = v;
+            if (!gate_post_us_ok(v)) { free(body); gate_send_error(req, 400, "post_us must be 50-50000"); return; }
+            tmp.post_us = (uint16_t)v;
         }
         if (input["nbits"].is<int>()) {
             int v = input["nbits"];
-            if (v < 8 || v > 64) { free(body); gate_send_error(req, 400, "nbits must be 8-64"); return; }
-            gate_cfg.nbits = v;
+            if (!gate_nbits_ok(v)) { free(body); gate_send_error(req, 400, "nbits must be 8-64"); return; }
+            tmp.nbits = (uint8_t)v;
         }
         if (input["ab_bit"].is<int>()) {
             int v = input["ab_bit"];
-            if (v < 0 || v > 63) { free(body); gate_send_error(req, 400, "ab_bit must be 0-63"); return; }
-            gate_cfg.ab_bit = v;
+            if (!gate_ab_bit_ok(v)) { free(body); gate_send_error(req, 400, "ab_bit must be 0-63"); return; }
+            tmp.ab_bit = (uint8_t)v;
         }
         if (input["button_shift"].is<int>()) {
             int v = input["button_shift"];
-            if (v < 0 || v > 62) { free(body); gate_send_error(req, 400, "button_shift must be 0-62"); return; }
-            gate_cfg.button_shift = v;
+            if (!gate_button_shift_ok(v)) { free(body); gate_send_error(req, 400, "button_shift must be 0-62"); return; }
+            tmp.button_shift = (uint8_t)v;
         }
-        if (input["fixed_bits"].is<const char*>())
-            gate_cfg.fixed_bits = strtoull(input["fixed_bits"].as<const char*>(), NULL, 16);
+        if (!input["fixed_bits"].isNull()) {
+            /* A JSON number is rejected, not silently ignored: fixed_bits is
+               a hex string, and a number would otherwise vanish without the
+               caller noticing the serial never changed. */
+            if (!input["fixed_bits"].is<const char*>()) { free(body); gate_send_error(req, 400, "fixed_bits must be a hex string"); return; }
+            uint64_t v = 0;
+            if (!gate_parse_fixed_bits(input["fixed_bits"].as<const char*>(), &v)) { free(body); gate_send_error(req, 400, "fixed_bits must be 1-16 hex digits"); return; }
+            tmp.fixed_bits = v;
+        }
         if (input["frames_per_block"].is<int>()) {
             int v = input["frames_per_block"];
-            if (v < 1 || v > 20) { free(body); gate_send_error(req, 400, "frames_per_block must be 1-20"); return; }
-            gate_cfg.frames_per_block = v;
+            if (!gate_frames_per_block_ok(v)) { free(body); gate_send_error(req, 400, "frames_per_block must be 1-20"); return; }
+            tmp.frames_per_block = (uint8_t)v;
         }
         if (input["blocks"].is<int>()) {
             int v = input["blocks"];
-            if (v < 1 || v > 8) { free(body); gate_send_error(req, 400, "blocks must be 1-8"); return; }
-            gate_cfg.blocks = v;
+            if (!gate_blocks_ok(v)) { free(body); gate_send_error(req, 400, "blocks must be 1-8"); return; }
+            tmp.blocks = (uint8_t)v;
         }
         if (input["frame_gap_ms"].is<int>()) {
             int v = input["frame_gap_ms"];
-            if (v < 5 || v > 5000) { free(body); gate_send_error(req, 400, "frame_gap_ms must be 5-5000"); return; }
-            gate_cfg.frame_gap_ms = v;
+            if (!gate_frame_gap_ok(v)) { free(body); gate_send_error(req, 400, "frame_gap_ms must be 5-5000"); return; }
+            tmp.frame_gap_ms = (uint16_t)v;
         }
         if (input["block_gap_ms"].is<int>()) {
             int v = input["block_gap_ms"];
-            if (v < 10 || v > 10000) { free(body); gate_send_error(req, 400, "block_gap_ms must be 10-10000"); return; }
-            gate_cfg.block_gap_ms = v;
+            if (!gate_block_gap_ok(v)) { free(body); gate_send_error(req, 400, "block_gap_ms must be 10-10000"); return; }
+            tmp.block_gap_ms = (uint16_t)v;
         }
+        /* Cross-checks against the COMBINED document, not each field alone:
+           shrinking nbits under an existing ab_bit must fail the same way a
+           single request setting both would. */
+        if ((unsigned)tmp.ab_bit >= (unsigned)tmp.nbits) { free(body); gate_send_error(req, 400, "ab_bit must be < nbits"); return; }
+        if ((unsigned)tmp.button_shift + 1u >= (unsigned)tmp.nbits) { free(body); gate_send_error(req, 400, "button_shift must leave 2 bits inside nbits"); return; }
+        if (gate_frame_duration_us(tmp) > GATE_FRAME_MAX_US) { free(body); gate_send_error(req, 400, "frame longer than 250000 us"); return; }
+        gate_cfg = tmp;
         free(body);
 
         String out;
@@ -1067,8 +1286,8 @@ static void gate_configure(SPIClass &spi) {
     const uint8_t pa[2] = { CC1101_PA_OFF, CC1101_PA_ON };
     gate_raw_patable(pa, 2);
 
-    gate_raw_status_read(CC1101_SFTX);   /* flush, then idle */
-    gate_raw_status_read(CC1101_SIDLE);
+    gate_raw_strobe(CC1101_SFTX);   /* flush, then idle: single-byte strobes */
+    gate_raw_strobe(CC1101_SIDLE);
     spi.endTransaction();
 
     gate_ready = true;

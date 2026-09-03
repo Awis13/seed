@@ -2207,5 +2207,5 @@ void loop() {
     // at 10ms that rounding is dead air on every one of several hundred frames —
     // seconds of it. 1ms while a job runs costs nothing (delay() yields either
     // way) and takes the scheduler out of the timing budget.
-    delay(ir_busy() ? 1 : 10);
+    delay((ir_busy() || gate_busy()) ? 1 : 10);
 }
