@@ -778,8 +778,9 @@ static GateProgress gate_progress() {
 }
 
 /* Stage a start: build the frames for this kind and hand the job to
-   gate_poll(). Returns the job id, or 0 when a job is already running or the
-   radio is not up. A BUTTON job emits one block (the current AB flavour) and
+   gate_poll(). Returns the job id, or 0 when a job is already running, the
+   radio is not up, or the built frame did not fit the staging buffer (the UI
+   reads that arm as Too long). A BUTTON job emits one block (the current AB flavour) and
    flips the flavour, so successive presses alternate like a held remote; the
    PAIR sequence emits an A block and then a B block, the hold pattern. */
 static uint16_t gate_start_code(uint8_t kind, uint8_t button) {

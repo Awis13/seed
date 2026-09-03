@@ -2698,7 +2698,7 @@ static void ui_poll() {
                 ui_blast_done_at = 0;
             } else if (ui_blast_done_at == 0) {
                 ui_blast_done_at = millis();
-            } else if (millis() - ui_blast_done_at >= UI_RESULT_MS) {
+            } else if ((long)(millis() - ui_blast_done_at) >= (long)UI_RESULT_MS) {
                 ui_enter_list(ui_blast_back, ui_blast_back_sel);
                 return;
             }
