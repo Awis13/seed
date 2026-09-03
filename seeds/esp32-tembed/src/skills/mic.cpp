@@ -279,14 +279,21 @@
  * enough that an ordinary click cannot reach it, because ui_poll() suppresses
  * any click held at least this long — otherwise letting go would ALSO open the
  * menu, on top of ending the recording. And it has to be short enough that
- * holding it does not feel like a hang. The user key's AP gesture is 3s, which
- * is right for something you do once a year and wrong for something you do
- * mid-sentence.
+ * holding it does not feel like a hang.
  *
- * 700ms is that compromise: about twice a deliberate click and a fifth of the
- * AP hold. A press slower than this is swallowed rather than silently doing
- * something else — and it is not silent, because the recording screen comes up
- * immediately, so the device always says what it thought you meant. */
+ * 700ms is that compromise: about twice a deliberate click, and short enough to
+ * start mid-sentence. A press slower than this is swallowed rather than
+ * silently doing something else — and it is not silent, because the recording
+ * screen comes up immediately, so the device always says what it thought you
+ * meant.
+ *
+ * Retuning it moves BOTH holds on this device. MSG_STACK_HOLD_MS in ui.h is
+ * defined as this constant, so the user key's walk of the message stack is
+ * measured against the same number rather than against one of its own: a hold
+ * is one length of time here, whichever key it is on. The user key used to
+ * carry a three-second gesture that raised the provisioning AP, which was the
+ * other number a reader would have found; it is gone, and the AP is raised from
+ * the menu row. */
 #define MIC_HOLD_MS 700
 
 /* Audio discarded at the head of every take. A conservative GUESS at the
@@ -689,13 +696,14 @@ static void mic_pump(unsigned long now) {
 /*
  * The gesture: hold the encoder key to record, let go to stop.
  *
- * A separate poller reading the pin level directly, exactly like
- * ap_key_poll(), rather than a branch inside ui_poll(). The two state machines
- * share nothing but the pin: ui_poll() sees debounced press-then-release
- * CLICKS and knows nothing about recording, this sees LEVELS and knows nothing
- * about screens. The one place they have to agree is that a press long enough
- * to mean "record" must not also count as a click, which ui_poll() enforces
- * with the same MIC_HOLD_MS threshold the user key's AP hold uses.
+ * A separate poller reading the pin level directly, rather than a branch
+ * inside ui_poll(). The two state machines share nothing but the pin:
+ * ui_poll() sees debounced press-then-release CLICKS and knows nothing about
+ * recording, this sees LEVELS and knows nothing about screens. The one place
+ * they have to agree is that a press long enough to mean "record" must not
+ * also count as a click, which ui_poll() enforces with this same MIC_HOLD_MS
+ * threshold — the same number the user key's hold on a card is measured
+ * against, so that a hold is one length of time on this device.
  *
  * `fired` is what makes the ceiling safe: a take that stopped itself at ten
  * seconds leaves it set, so nothing restarts until the key has actually come

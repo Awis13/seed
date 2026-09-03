@@ -730,7 +730,7 @@ static void voice_cfg_mark_dirty() {
    be replaced wholesale, and a target that arrived by any route other than the
    endpoint would otherwise skip every check the endpoint makes. */
 static void voice_cfg_load() {
-    String raw = read_spiffs_file(VOICE_CFG_FILE);
+    String raw = spiffs_read_file(VOICE_CFG_FILE, VOICE_CFG_TMP);
     if (raw.length() == 0) return;
     JsonDocument doc;
     if (deserializeJson(doc, raw) != DeserializationError::Ok) return;

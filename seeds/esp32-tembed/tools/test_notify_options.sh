@@ -125,6 +125,67 @@ fi
 printf '  ok:   %s refusal path(s), each clearing the id it had read\n' \
     "$(printf '%s\n' "$body" | grep -c 'return false')"
 
+# --- The other rule the C tests below cannot reach at all ---
+#
+# notify_describe() is the only account of these field widths anybody outside
+# the firmware ever gets: it is what the skill catalogue serves and what the
+# person writing the curl reads. It is a string constant, it sits outside every
+# host-test region, and nothing below compiles it — so the widths it states can
+# drift from the widths the fields have while every test here stays green. That
+# was checked rather than assumed: putting the old "title 40, body 96" back
+# leaves all ten scripts in this directory and `pio run -e tembed` clean.
+#
+# So it is read as text, and read against the constants rather than against a
+# number written out a second time here. Every "<field> N" it states has to
+# match that field's #define less its terminator. Asking only that the right
+# numbers are present would not be a gate at all: a stale line sitting beside a
+# correct one contains both, and a containment check sees only the one it was
+# told to look for. Each stated number is checked on its own, and a field that
+# stopped being described is a failure too — a gate that passes because the
+# sentence went away is not a gate.
+desc="$(awk '
+    /^static const char \*notify_describe\(\)/ { inf = 1 }
+    inf                                        { print }
+    inf && /^}/                                { exit }
+' "$src")"
+
+[ -n "$desc" ] || { echo "cannot find notify_describe() in $src"; exit 1; }
+
+echo "the widths described to callers are the widths the fields have"
+field_chars() {   # the #define, less the byte the terminator takes
+    grep -E "^#define $1[[:space:]]" "$src" | awk '{print $3 - 1}'
+}
+stated="$(printf '%s\n' "$desc" | grep -oE '(title|body|source|id) [0-9]+' || true)"
+drift=""
+seen=""
+while read -r field n; do
+    [ -n "$field" ] || continue
+    case "$field" in
+        title)  want="$(field_chars NOTIFY_TITLE_LEN)"  ;;
+        body)   want="$(field_chars NOTIFY_BODY_LEN)"   ;;
+        source) want="$(field_chars NOTIFY_SOURCE_LEN)" ;;
+        id)     want="$(field_chars NOTIFY_KEY_LEN)"    ;;
+    esac
+    [ -n "$want" ] || { echo "cannot read the constant behind '$field' in $src"; exit 1; }
+    seen="$seen $field"
+    [ "$n" = "$want" ] ||
+        drift="$drift          $field: described as $n, the field holds $want"$'\n'
+done <<< "$stated"
+for field in title body source id; do
+    case " $seen " in
+        *" $field "*) ;;
+        *) drift="$drift          $field: no width described for it any more"$'\n' ;;
+    esac
+done
+if [ -n "$drift" ]; then
+    printf '  FAIL: notify_describe() and the field it describes disagree, so a\n'
+    printf '        caller is being told a length that is not enforced:\n'
+    printf '%s' "$drift"
+    exit 1
+fi
+printf '  ok:   %s width(s) described, each matching its constant\n' \
+    "$(printf '%s\n' "$stated" | grep -c .)"
+
 json="${ARDUINOJSON_DIR:-$here/../.pio/libdeps/tembed/ArduinoJson/src}"
 if [ ! -f "$json/ArduinoJson.h" ]; then
     echo "cannot find ArduinoJson.h under $json"
@@ -165,6 +226,7 @@ PRELUDE
     slice "$src" text
     slice "$src" id
     slice "$src" store
+    slice "$src" unread
     slice "$src" snapshot
     cat <<'MAIN'
 
@@ -332,6 +394,51 @@ static int slots_occupied(void) {
     return n;
 }
 
+/* A store holding `n` entries with ids 10, 20, 30 ... newest first, which is
+   the order a stored file carries and the order the list draws. Built through
+   the real restore path rather than by filling the arrays here, so the slots,
+   notify_order[] and notify_len are wired the way the device wires them —
+   entry k lands in slot k-1, which is what lets the checks below name the slot
+   a removal is supposed to give back. */
+static void store_fill(int n, time_t now) {
+    char json[1024];
+    int at = snprintf(json, sizeof(json), "{\"n\":[");
+    for (int i = 1; i <= n; i++)
+        at += snprintf(json + at, sizeof(json) - at, "%s{\"id\":%d,\"ti\":\"m%d\"}",
+                       i > 1 ? "," : "", i * 10, i * 10);
+    snprintf(json + at, sizeof(json) - at, "]}");
+
+    store_reset();
+    if (load_text(json, now) != n) {
+        printf("  FAIL: the test store could not be built with %d entries\n", n);
+        failures++;
+    }
+}
+
+/* The ids in the list, in order, as "10,20,30". A removal is as much about
+   what is left and in what order as about what went, and one string is easier
+   to be visibly wrong about than a walk of separate checks. Reads notify_len
+   entries and not one more, so a stale index left in the tail of
+   notify_order[] by a drop is invisible here — which is the point: nothing on
+   the device reads past notify_len either. */
+static const char *order_str(void) {
+    static char buf[192];
+    int at = 0;
+    buf[0] = '\0';
+    for (int i = 0; i < notify_len; i++)
+        at += snprintf(buf + at, sizeof(buf) - at, "%s%lu", i ? "," : "",
+                       (unsigned long)notify_slot[notify_order[i]].id);
+    return buf;
+}
+
+/* Is `slot` named anywhere in the live part of the order list? A slot that is
+   free but still listed, or listed but not free, is the shape that survives
+   every check on lengths and ids. */
+static bool slot_listed(int slot) {
+    for (int i = 0; i < notify_len; i++) if (notify_order[i] == slot) return true;
+    return false;
+}
+
 /* One id as ?id= carries it, which must be accepted and must come back whole. */
 static void good_id(const char *s, uint32_t want) {
     uint32_t got = 12345;
@@ -467,6 +574,130 @@ int main(void) {
         check_str(dst, "aaaaaaa", "and pure ASCII fills the field to the last byte");
         notify_copy_text(dst, sizeof(dst), "");
         check_str(dst, "", "an empty string copies to an empty field");
+    }
+
+    printf("the constants, the struct and the queue entry agree on the widths\n");
+    {
+        /* The constants and the struct are checked separately on purpose. A
+           field widened in one place and not the other is a queue that accepts
+           what it cannot hold, and neither half says so on its own. */
+        check(NOTIFY_TITLE_LEN == 65, "a title field holds 64 characters and a terminator");
+        check(NOTIFY_BODY_LEN == 257, "a body field holds 256 characters and a terminator");
+
+        /* The device pins this with a static_assert, which cannot live here:
+           the number is a statement about the device's RAM and a host laid out
+           differently would refuse to compile rather than report. So it is
+           checked at run time, where the number it got can be printed. It does
+           hold on an ordinary 64-bit host — the padding the device spends after
+           its 32-bit `unsigned long` is what that host spends on a wider one. */
+        if (sizeof(Notification) != 392) {
+            printf("  FAIL: a queue entry is %u bytes here, not 392\n",
+                   (unsigned)sizeof(Notification));
+            failures++;
+        } else {
+            printf("  ok:   a queue entry is 392 bytes\n");
+        }
+
+        /* Through the real fields rather than through a local sized from the
+           constant, so that a struct whose members drifted from the constants
+           above cannot pass this. */
+        Notification e;
+        memset(&e, 0, sizeof(e));
+        char long_title[200], long_body[600];
+        memset(long_title, 'T', sizeof(long_title) - 1);
+        long_title[sizeof(long_title) - 1] = '\0';
+        memset(long_body, 'B', sizeof(long_body) - 1);
+        long_body[sizeof(long_body) - 1] = '\0';
+        notify_copy_text(e.title, sizeof(e.title), long_title);
+        notify_copy_text(e.body, sizeof(e.body), long_body);
+        check(strlen(e.title) == 64, "a title longer than the field is cut to 64 bytes");
+        check(strlen(e.body) == 256, "and a body to 256");
+    }
+
+    printf("the cut still lands on a character at the new width\n");
+    {
+        /* The width the cut runs at changed, so the boundary case is re-asked
+           at the width the fields actually have rather than only at the small
+           one above: 63 ASCII and then a two-byte character has exactly one
+           byte of room left, which is half a character and must go. */
+        Notification e;
+        memset(&e, 0, sizeof(e));
+        char s[NOTIFY_TITLE_LEN + 8];
+        memset(s, 'a', 63);
+        s[63] = '\0';
+        strcat(s, "\xc3\xa9\xc3\xa8");
+        notify_copy_text(e.title, sizeof(e.title), s);
+        check(strlen(e.title) == 63, "a character straddling the end of a title is dropped whole");
+        check(strncmp(e.title, s, 63) == 0, "and the 63 bytes before it are what was sent");
+
+        /* One byte earlier the same character fits exactly, so the field ends
+           on the last byte it has room for and nothing is given back. */
+        memset(s, 'a', 62);
+        s[62] = '\0';
+        strcat(s, "\xc3\xa9\xc3\xa8");
+        notify_copy_text(e.title, sizeof(e.title), s);
+        check(strlen(e.title) == 64, "one that ends exactly on the last byte is kept");
+        check((unsigned char)e.title[63] == 0xa9, "with its second byte still there");
+    }
+
+    printf("a control byte arrives as a space\n");
+    {
+        /* JSON escapes seven sequences and writes every other byte below 0x20
+           out raw, so one of these stored is a document GET /notify serves that
+           a strict reader may reject — and the same bytes go into the snapshot
+           file. A pager replaces them rather than refusing the message. */
+        Notification e;
+        memset(&e, 0, sizeof(e));
+        int bad = 0;
+        for (int c = 0x01; c <= 0x1F; c++) {
+            char s[4] = { 'a', (char)c, 'b', '\0' };
+            notify_copy_text(e.title, sizeof(e.title), s);
+            if (strcmp(e.title, "a b") != 0) { bad++; printf("  ..   0x%02X came back as \"%s\"\n", c, e.title); }
+        }
+        check(bad == 0, "every byte from 0x01 to 0x1F becomes one space");
+        {
+            char s[4] = { 'a', (char)0x7F, 'b', '\0' };
+            notify_copy_text(e.title, sizeof(e.title), s);
+            check_str(e.title, "a b", "and so does 0x7F");
+        }
+
+        /* The printable range is the one thing a filter like this can quietly
+           take away, so it is asked for byte by byte rather than sampled. */
+        bad = 0;
+        for (int c = 0x20; c <= 0x7E; c++) {
+            char s[4] = { 'a', (char)c, 'b', '\0' };
+            notify_copy_text(e.title, sizeof(e.title), s);
+            if ((unsigned char)e.title[1] != (unsigned char)c || strlen(e.title) != 3) {
+                bad++;
+                printf("  ..   0x%02X came back as 0x%02X\n", c, (unsigned char)e.title[1]);
+            }
+        }
+        check(bad == 0, "and everything from 0x20 to 0x7E passes through unchanged");
+
+        /* The rule stops at 0x80. Above it the bytes are the tail of a UTF-8
+           character the cut has already kept whole, the serialiser hands them
+           back as they are, and blanking them would damage text the API is
+           contracted to return intact. */
+        notify_copy_text(e.title, sizeof(e.title), "\xc3\xa9\xc3\xa8 \xe2\x9c\x93 \xf0\x9f\x94\x94");
+        check_str(e.title, "\xc3\xa9\xc3\xa8 \xe2\x9c\x93 \xf0\x9f\x94\x94",
+                  "a two-, three- and four-byte character all pass through untouched");
+
+        /* A run stays a run. Collapsing one would move every byte after it and
+           make the cut above and this share an offset they do not share. */
+        notify_copy_text(e.title, sizeof(e.title), "a\r\n\tb");
+        check_str(e.title, "a   b", "a run of them becomes the same number of spaces");
+        check(strlen(e.title) == 5, "so the length is the length that arrived");
+
+        /* Both rules on the same copy: the tab is replaced, and the character
+           that straddles the end of the field is still dropped whole. */
+        char s[NOTIFY_TITLE_LEN + 8];
+        s[0] = 'a'; s[1] = '\t';
+        memset(s + 2, 'a', 61);
+        s[63] = '\0';
+        strcat(s, "\xc3\xa9");
+        notify_copy_text(e.title, sizeof(e.title), s);
+        check(strlen(e.title) == 63, "a field that is both filtered and cut is still cut on a character");
+        check(e.title[1] == ' ', "and still filtered");
     }
 
     printf("a snapshot written by this firmware, read back by it\n");
@@ -624,6 +855,124 @@ int main(void) {
         check(restored == NOTIFY_MAX, "a full file restores every entry");
         check(slots_occupied() == NOTIFY_MAX, "and occupies every slot");
         check(notify_free_slot() == -1, "which is the one case that has no free slot");
+        store_reset();
+    }
+
+    printf("taking one entry back out of the queue\n");
+    {
+        /* What POST /notify/delete does to the store, which is notify_drop_id()
+           and nothing else — the endpoint around it takes the lock, raises the
+           two flags an expiry raises, and answers 404 on the -1 that comes back
+           from here.
+           Everything that can go wrong is quiet. A removal that forgets to
+           shorten the list leaves the last entry drawn twice. One that forgets
+           to free the slot loses a slot per deletion until POST /notify answers
+           "queue full" on a queue with three messages in it. One that shifts
+           wrongly reorders somebody else's messages. None of that fails a
+           build and none of it is visible from the outside.
+           Every check here was verified by putting the defect it names back
+           into notify_drop_at() or notify_pos_of() and watching it go red —
+           with TWO EXCEPTIONS, both marked below. Those two describe the store
+           the removals run against rather than the removals themselves, so no
+           defect in this code can fail them. They earn their place by saying
+           out loud what the checks under them assume; they add no coverage,
+           and reading them as though they did would overstate what this
+           section proves. */
+
+        /* From the middle: the case with a shift on both sides of it. */
+        store_fill(5, now);
+        /* PRECONDITION, not a guard: this is only what store_fill() built. */
+        check_str(order_str(), "10,20,30,40,50", "five entries, newest first");
+        check(notify_drop_id(30) == 2, "the entry in the middle is removed from position 2");
+        check_str(order_str(), "10,20,40,50", "the ones around it close up, in order");
+        check(notify_len == 4, "and the list is one shorter");
+        check(slots_occupied() == 4, "and its slot goes back to the free pool");
+        check(!slot_listed(2), "and no longer appears in the order list");
+        /* The shift has just broken the identity every other block relies on:
+           order position 2 now holds slot 3. Everywhere else in this section
+           store_fill() leaves position k holding slot k, so a search that
+           walked the slots and returned a slot index would agree with the
+           order position it was supposed to return and pass unnoticed. Here
+           the two differ, which is the whole reason notify_pos_of() lives
+           beside notify_drop_at(): both index through notify_order[]. */
+        check(notify_drop_id(40) == 2,
+              "a second drop uses the order position, not the slot index");
+
+        /* From the front — the shift starts at 0 — and from the back, where it
+           does not run at all and could read past the end if it did. */
+        store_fill(5, now);
+        check(notify_drop_id(10) == 0, "the newest entry is removed from position 0");
+        check_str(order_str(), "20,30,40,50", "leaving the rest in the order they were");
+
+        store_fill(5, now);
+        check(notify_drop_id(50) == 4, "the oldest entry is removed from the end");
+        check_str(order_str(), "10,20,30,40", "leaving the rest untouched");
+        /* The one thing order_str() cannot say, so it is said here directly:
+           the shift wrote nothing at or past the new end. A loop that ran one
+           turn too many would copy notify_order[notify_len] over the tail —
+           harmless-looking at five entries, a read one past the array itself
+           on a full queue, and either way it destroys the stale index the
+           check on id 0 below depends on to be a real test. */
+        check(notify_order[4] == 4,
+              "and writes nothing at or past the new end of the order list");
+
+        /* The last one. An empty queue has to read as empty rather than as one
+           entry nothing can see: notify_free_slot() is what POST /notify asks
+           before it decides the device is full. */
+        store_fill(1, now);
+        check(notify_drop_id(10) == 0, "the last remaining entry is removed");
+        check(notify_len == 0, "and the queue is empty");
+        check_str(order_str(), "", "with nothing left in the list");
+        check(slots_occupied() == 0, "and every slot free again");
+        check(notify_free_slot() == 0, "so the next notification has somewhere to go");
+
+        /* An id that is not here changes nothing. The endpoint answers 404 off
+           this -1, so a removal that reported success while dropping position 0
+           would delete the newest message every time a caller mistyped an id. */
+        store_fill(3, now);
+        check(notify_drop_id(99) == -1, "an id that is not in the queue is not found");
+        check_str(order_str(), "10,20,30", "and nothing is removed");
+        check(notify_len == 3, "and the list is the length it was");
+        check(slots_occupied() == 3, "and the slots are the ones they were");
+
+        /* 0 is the value that marks a slot free, so a search that walked the
+           slots rather than the order list would match one and drop it.
+
+           Asked after a removal rather than on a fresh store, which is what
+           makes it a test of the search's bound and not only of which array it
+           reads. A drop leaves the slot it freed sitting in the tail of
+           notify_order[], one past notify_len, and that slot's id is now 0. A
+           search that walked one entry too far would find it, report a
+           position past the live list, and hand notify_drop_at() an index the
+           list has already moved on from — which after a drop from the middle
+           names a LIVE slot, so deleting an id that was never here would take
+           somebody else's message with it and still answer 200. On a store
+           with no removal behind it the tail holds nothing that can match, and
+           the same three checks pass whatever the bound is. */
+        check(notify_drop_id(30) == 2, "the last of the three is removed from the end");
+        check(notify_drop_id(0) == -1, "id 0, which marks a free slot, matches nothing");
+        check(notify_len == 2, "and takes no entry with it");
+        check_str(order_str(), "10,20", "leaving the two that were not asked for");
+
+        /* Twice is once. The second call is the ordinary case for anything
+           retrying a request it did not see the answer to. */
+        store_fill(3, now);
+        check(notify_drop_id(20) == 1, "an entry is removed the first time it is asked for");
+        check(notify_drop_id(20) == -1, "and is simply not there the second time");
+        check_str(order_str(), "10,30", "with one copy of it gone, not two entries");
+
+        /* A full queue, which is the state this endpoint exists to get out of:
+           the slot that is given back has to be the one a new notification is
+           handed, or a queue that reported itself full stays full. */
+        store_fill(NOTIFY_MAX, now);
+        /* PRECONDITION, not a guard: notify_free_slot() saying -1 here is what
+           makes the check two lines down mean anything, and no removal has run
+           yet for a defect in one to reach it. */
+        check(notify_free_slot() == -1, "a full queue has no free slot");
+        check(notify_drop_id(30) == 2, "removing one entry from a full queue");
+        check(notify_free_slot() == 2, "hands its slot to the next notification");
+        check(!slot_listed(2), "and takes it out of the order list");
+        check(notify_len == NOTIFY_MAX - 1, "leaving the other nineteen");
         store_reset();
     }
 
@@ -838,6 +1187,16 @@ int main(void) {
         check(restore_text("{\"id\":5,\"ti\":\"q\",\"sr\":\"\xd0\xb4\xd0\xb0\xd0\xb4\xd0\xb0\"}",
                            out, out_op, now), "a source of multi-byte characters");
         check(strlen(out.source) < NOTIFY_SOURCE_LEN, "is cut to the field");
+
+        /* The cut is not the only thing the restore path owes the file. A
+           control byte in a stored title has to be blanked here too — a file
+           written by an older firmware carries them, and GET /notify serves
+           what was restored. Nothing but this notices an snprintf() inlined on
+           that path: the entry would restore, read correctly, and put the byte
+           straight back on the wire. */
+        check(restore_text("{\"id\":5,\"ti\":\"a\\u0001b\"}", out, out_op, now),
+              "a stored title carrying a control byte");
+        check_str(out.title, "a b", "comes back filtered, like one that was posted");
     }
 
     printf("an older file, and a newer one\n");
@@ -860,6 +1219,90 @@ int main(void) {
                            "\"op\":[\"Yes\"],\"ch\":0}", out, out_op, now),
               "a snapshot carrying fields from some later version");
         check(out.opt_count == 1 && out.chosen == 0, "restores everything it does know");
+    }
+
+    printf("the top unread level, and the one message left out of the walk\n");
+    {
+        /* What the LED ring asks the queue forty times a second, and what it
+           asks it while a message card is open: the same walk, with the card's
+           own message excluded.
+           Why the exclusion has a test of its own. While a card is up the ring
+           holds that message's colour, and an unread CRITICAL is the one thing
+           allowed to interrupt it — see progress_ring_phase(). Get the
+           exclusion wrong in one direction and the ring alternates a message
+           with itself, which is silly; get it wrong in the other — exclude by
+           slot, by index, or unconditionally — and a second critical arriving
+           while somebody reads his mail is HIDDEN, on the channel that exists
+           to make criticals impossible to miss. Neither shows up on the device
+           as anything but a ring that looked fine. */
+        uint8_t top = 200;
+
+        /* Five entries, newest first, and then one removed from the middle —
+           which is the only way to make an entry's SLOT and its POSITION in the
+           order list differ, and the two checks furthest down need them to
+           differ to mean anything. After the drop the unread crit, id 30, sits
+           in slot 2 at position 1.
+
+           Levels: 10 info, 30 crit, 40 warn, 50 crit but READ. That last one is
+           what makes "excluding the crit leaves warn" a real claim — an
+           implementation that forgot `unread` would answer crit from it. */
+        store_reset();
+        check(load_text("{\"n\":["
+                        "{\"id\":10,\"ti\":\"a\",\"lv\":0,\"ur\":true},"
+                        "{\"id\":20,\"ti\":\"b\",\"lv\":0,\"ur\":true},"
+                        "{\"id\":30,\"ti\":\"c\",\"lv\":2,\"ur\":true},"
+                        "{\"id\":40,\"ti\":\"d\",\"lv\":1,\"ur\":true},"
+                        "{\"id\":50,\"ti\":\"e\",\"lv\":2,\"ur\":false}"
+                        "]}", now) == 5,
+              "a queue of five: info, info, crit, warn, and a crit already read");
+        /* PRECONDITIONS, not guards: this is the store the checks below run
+           against, and no defect in the walk can fail either of them. */
+        check(notify_drop_id(20) == 1, "  ..the second entry is dropped");
+        check_str(order_str(), "10,30,40,50", "  ..leaving 10,30,40,50");
+
+        check(notify_top_unread_walk(0, top) && top == NOTIFY_CRIT,
+              "excluding nothing, the top unread level is crit");
+        check(notify_top_unread_walk(30, top) && top == NOTIFY_WARN,
+              "excluding the unread crit leaves warn — not the read crit below it");
+        check(notify_top_unread_walk(40, top) && top == NOTIFY_CRIT,
+              "excluding a lesser message does not disturb the crit above it");
+
+        /* The exclusion is by id and by nothing else. 2 is the slot the unread
+           crit sits in and 1 is its position in the order list; an
+           implementation that compared either of those to `except_id` still
+           passes everything above, and fails exactly one of these two. */
+        top = 200;
+        check(notify_top_unread_walk(2, top) && top == NOTIFY_CRIT,
+              "a number that is only a slot index excludes nothing");
+        check(notify_top_unread_walk(1, top) && top == NOTIFY_CRIT,
+              "and neither does one that is only a position in the list");
+        check(notify_top_unread_walk(99, top) && top == NOTIFY_CRIT,
+              "nor an id no entry carries");
+
+        /* The whole queue excluded one message at a time still answers about
+           the others: an exclusion that leaked into the loop's bookkeeping
+           would empty the queue rather than skip one entry. */
+        store_reset();
+        /* PRECONDITION again, and so is the one further down: what the store
+           was built with, which no defect in the walk can fail. */
+        check(load_text("{\"n\":[{\"id\":7,\"ti\":\"only\",\"lv\":2,\"ur\":true}]}",
+                        now) == 1, "a queue holding one unread crit");
+        check(notify_top_unread_walk(0, top) && top == NOTIFY_CRIT,
+              "reads as crit when nothing is excluded");
+        top = 200;
+        check(!notify_top_unread_walk(7, top),
+              "and as nothing unread when it is the message being excluded — "
+              "the case where the card in front IS the critical");
+        check(top == 200, "with the level left untouched rather than zeroed");
+
+        /* Nothing unread at all, and an empty queue: both must answer false
+           rather than "info", which is a different statement. */
+        store_reset();
+        check(load_text("{\"n\":[{\"id\":8,\"ti\":\"seen\",\"lv\":2,\"ur\":false}]}",
+                        now) == 1, "a queue whose only message has been read");
+        check(!notify_top_unread_walk(0, top), "reports nothing unread");
+        store_reset();
+        check(!notify_top_unread_walk(0, top), "and so does an empty queue");
     }
 
     printf("\n%s\n", failures ? "FAILED" : "all checks passed");

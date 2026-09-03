@@ -993,7 +993,7 @@ static void snd_cfg_mark_dirty() {
 /* A file that is missing, truncated or nonsense leaves the compiled defaults
    standing, exactly as the ring's does. */
 static void snd_cfg_load() {
-    String raw = read_spiffs_file(SND_CFG_FILE);
+    String raw = spiffs_read_file(SND_CFG_FILE, SND_CFG_TMP);
     if (raw.length() == 0) return;
     JsonDocument doc;
     if (deserializeJson(doc, raw) != DeserializationError::Ok) return;
@@ -1251,6 +1251,11 @@ static const char *sound_describe() {
            "The window is deliberately the ring's, set through `POST /ring`:\n"
            "one device, one idea of night. If the clock has never been set\n"
            "there is no night window and the device stays audible.\n\n"
+           "Which also means the **Quiet** row in the on-screen menu silences\n"
+           "this skill as well as the ring, and that `night_now` here can turn\n"
+           "false because somebody switched the window off from the knob. The\n"
+           "hours it was switched off from are in `GET /ring` as\n"
+           "`night_saved_from` / `night_saved_to`.\n\n"
            "### Example\n\n"
            "```\n"
            "curl -H \"Authorization: Bearer $TOKEN\" \\\n"

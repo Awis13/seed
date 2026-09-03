@@ -41,7 +41,9 @@
 //   GET  /capabilities      — hardware fingerprint
 //   GET  /config.md         — node description
 //   POST /config.md         — update description
-//   GET  /events            — event log (?since=unix_ts)
+//   GET  /events            — event log (?since=unix_ts; array order is
+//     chronological, each entry carries a boot epoch, and a "boot" entry
+//     marks the reboot boundary)
 //   GET  /clock             — local time, timezone, NTP sync state
 //   POST /clock/tz          — set the POSIX TZ string
 //   GET  /firmware/version  — version, partition, uptime
@@ -68,7 +70,7 @@
 #include <TFT_eSPI.h>
 
 // ===== Configuration =====
-#define SEED_VERSION        "0.11.0"
+#define SEED_VERSION        "0.18.0"
 #define HTTP_PORT           8080
 #define TOKEN_FILE          "/auth_token.txt"
 #define WIFI_CONFIG_FILE    "/wifi.json"
@@ -81,6 +83,35 @@
 // How long an OTA upload may go without a body chunk before loop() tears it
 // down. See the watchdog in loop() for why this number.
 #define OTA_STALL_TIMEOUT_MS 30000
+
+/*
+ * What the CPU runs at, all the time.
+ *
+ * The board definition says 240MHz and nothing ever changed it. This device is
+ * a pager: it waits. Its loop() ends in a delay of up to 10ms — one, while an
+ * IR blast wants the pass back sooner — so the idle task is in WAITI for the
+ * overwhelming majority of every second, and the S3 datasheet's own
+ * current table (Table 5-9, WAITI, Typ2 — modem sleep, which is the case here)
+ * puts 240MHz about 11.5mA above 80MHz. That is 18% of this device's 65mA
+ * floor, bought with one line and no behaviour to reason about.
+ *
+ * ALWAYS, not only while idle, for two reasons. The saving is a floor cost paid
+ * every second the device is awake, and the busiest thing this firmware does is
+ * clock bit streams out of the RMT and I2S peripherals — which run off APB and
+ * do not get faster with the core. And changing it at runtime would mean
+ * changing it underneath whatever is mid-flight; a setting that never moves has
+ * no such moment.
+ *
+ * 80 AND NOT LOWER, which is the part that would be a hardware claim if it were
+ * left implicit. APB_CLK is held at 80MHz whenever the CPU is fed from the PLL,
+ * which covers 240, 160 and 80 — every peripheral's timebase is unchanged
+ * across all three. At 40 and 20 the core switches to the crystal and APB
+ * FOLLOWS IT DOWN, which retimes the RMT: that is the IR transmitter and the
+ * LED ring, both of which would start producing waveforms nothing recognises.
+ * Checked against the SoC's own rtc_clk.c rather than assumed. Do not go below
+ * 80 without measuring what came out of GPIO2.
+ */
+#define CPU_MHZ 80
 
 // What a running IR blast calls itself on the progress bar, and how long that
 // job outlives its last update. The label is a key as well as a caption, so it
@@ -141,8 +172,29 @@ static bool gpio_is_safe(int pin) {
 #define MAX_EVENTS          64
 #define EVENT_MSG_LEN       128
 
+// The same entries, mirrored to flash so they survive a reboot. One line per
+// event: {"ts":<unix>,"boot":<epoch>,"msg":"..."} — the object GET /events
+// serves. Rotation keeps the file around EVENTS_LOG_MAX by dropping the oldest
+// half; the boot replay reads the tail back into the ring below, then closes
+// the reboot boundary with a "boot" marker under the new epoch. Array order
+// is chronological; ts values alone are not comparable across a reboot (wall
+// seconds before it, uptime seconds after, until NTP syncs).
+#define EVENTS_LOG_FILE     "/events.log"
+#define EVENTS_LOG_TMP      "/events.tmp"
+#define EVENTS_LOG_MAX      (24u * 1024u)
+// False once the flash is unreachable or full: the log degrades to RAM-only
+// without another sound, and nothing in the persist path below ever calls
+// event_add() — that would recurse straight back into the append.
+static bool events_spiffs_ok = false;
+
 struct EventEntry {
     unsigned long timestamp;
+    // Boot epoch that produced the entry. 0 means unknown: history written
+    // before the epoch existed. Timestamps alone are not comparable across a
+    // reboot — an old wall-clock entry is numerically larger than a fresh
+    // uptime one — so the boot id is what tells one boot's entries from
+    // another's. See events_since_match() for how GET /events uses it.
+    unsigned long boot;
     char message[EVENT_MSG_LEN];
 };
 
@@ -150,20 +202,339 @@ static EventEntry events_buf[MAX_EVENTS];
 static int events_head = 0;
 static int events_count = 0;
 
+// This boot's epoch id, assigned once in setup() by events_boot_next() from
+// the persisted counter. 0 only when the flash is unreachable and no id could
+// be assigned; every new entry then still carries 0 rather than no epoch.
+static unsigned long events_boot_id = 0;
+
+// Forward declaration: the boot replay below closes the reboot boundary with
+// a marker through the same path every other entry takes.
+static void event_add(const char *fmt, ...);
+
+// host-test:begin events — sliced out by tools/test_events.sh
+#define EVENTS_LINE_MAX 512
+
+// JSON-escape one message into dst (cap includes the NUL). Each source byte is
+// written whole or not at all, so a truncated result still parses. Returns the
+// length written, without the NUL.
+static size_t events_escape(const char *src, char *dst, size_t cap) {
+    static const char hex[] = "0123456789abcdef";
+    size_t n = 0;
+    if (cap == 0) return 0;
+    if (!src) { dst[0] = '\0'; return 0; }
+    for (; *src; src++) {
+        unsigned char c = (unsigned char)*src;
+        char seq[6];
+        size_t slen = 0;
+        switch (c) {
+            case '"':  seq[0] = '\\'; seq[1] = '"';  slen = 2; break;
+            case '\\': seq[0] = '\\'; seq[1] = '\\'; slen = 2; break;
+            case '\n': seq[0] = '\\'; seq[1] = 'n';  slen = 2; break;
+            case '\r': seq[0] = '\\'; seq[1] = 'r';  slen = 2; break;
+            case '\t': seq[0] = '\\'; seq[1] = 't';  slen = 2; break;
+            default:
+                if (c < 0x20) {
+                    seq[0] = '\\'; seq[1] = 'u'; seq[2] = '0'; seq[3] = '0';
+                    seq[4] = hex[c >> 4]; seq[5] = hex[c & 15]; slen = 6;
+                } else {
+                    seq[0] = (char)c; slen = 1;
+                }
+                break;
+        }
+        if (n + slen + 1 > cap) break;
+        for (size_t i = 0; i < slen; i++) dst[n++] = seq[i];
+    }
+    dst[n] = '\0';
+    return n;
+}
+
+// One log line for one event: {"ts":<unix>,"boot":<epoch>,"msg":"<escaped>"}
+// plus a trailing newline. Always NUL-terminated and parseable, even when the
+// message had to be cut to fit. Returns the length written, without the NUL.
+//
+// The boot field sits between ts and msg on purpose: the parser looks for msg
+// after ts, so a line from before the epoch existed (no boot at all) still
+// parses, with the boot defaulting to 0 (unknown).
+static size_t events_format_line(unsigned long ts, unsigned long boot,
+                                  const char *msg,
+                                  char *out, size_t cap) {
+    if (cap == 0) return 0;
+    int h = snprintf(out, cap, "{\"ts\":%lu,\"boot\":%lu,\"msg\":\"", ts, boot);
+    if (h < 0) { out[0] = '\0'; return 0; }
+    size_t n = (size_t)h >= cap ? cap - 1 : (size_t)h;
+    n += events_escape(msg, out + n, cap - n);
+    static const char tail[] = "\"}\n";
+    for (size_t i = 0; i < sizeof(tail) - 1; i++) {
+        if (n + 1 >= cap) break;
+        out[n++] = tail[i];
+    }
+    out[n] = '\0';
+    return n;
+}
+
+static int events_hexval(char h) {
+    if (h >= '0' && h <= '9') return h - '0';
+    if (h >= 'a' && h <= 'f') return h - 'a' + 10;
+    if (h >= 'A' && h <= 'F') return h - 'A' + 10;
+    return -1;
+}
+
+// The inverse: split one log line back into its timestamp, boot epoch and
+// message. False for anything but {"ts":<digits>,...,"msg":"<json string>"}
+// with the object closed — a torn write, a truncated line, garbage — and then
+// only msg_out[0] is touched. The boot is optional: lines written before the
+// epoch existed carry no boot field and come back as 0 (unknown), anything
+// else unparseable in that field fails the whole line. A message longer than
+// the ring slot keeps the prefix that fits rather than dropping the whole
+// entry. msg_cap includes the NUL.
+static bool events_parse_line(const char *line, unsigned long *ts_out,
+                               unsigned long *boot_out,
+                               char *msg_out, size_t msg_cap) {
+    if (!line || !ts_out || !boot_out || !msg_out || msg_cap == 0) return false;
+    msg_out[0] = '\0';
+    const char *p = strstr(line, "\"ts\"");
+    if (!p) return false;
+    p = strchr(p + 4, ':');
+    if (!p) return false;
+    p++;
+    while (*p == ' ' || *p == '\t') p++;
+    if (*p < '0' || *p > '9') return false;
+    unsigned long ts = 0;
+    while (*p >= '0' && *p <= '9') {
+        ts = ts * 10 + (unsigned long)(*p - '0');
+        p++;
+    }
+    const char *q = strstr(p, "\"msg\"");
+    if (!q) return false;
+    // The epoch between the timestamp and the message, if the writer put one
+    // there. Scanned only up to the msg key, so a message that happens to
+    // mention a boot is never mistaken for the field.
+    unsigned long boot = 0;
+    const char *b = strstr(p, "\"boot\"");
+    if (b && b < q) {
+        b = strchr(b + 6, ':');
+        if (!b) return false;
+        b++;
+        while (*b == ' ' || *b == '\t') b++;
+        if (*b < '0' || *b > '9') return false;
+        while (*b >= '0' && *b <= '9') {
+            boot = boot * 10 + (unsigned long)(*b - '0');
+            b++;
+        }
+    }
+    q = strchr(q + 5, ':');
+    if (!q) return false;
+    q++;
+    while (*q == ' ' || *q == '\t') q++;
+    if (*q != '"') return false;
+    q++;
+    size_t n = 0;
+    for (; *q && *q != '"'; ) {
+        char c = *q++;
+        if (c == '\\') {
+            char e = *q;
+            if (!e) return false;
+            q++;
+            switch (e) {
+                case '"':  c = '"';  break;
+                case '\\': c = '\\'; break;
+                case '/':  c = '/';  break;
+                case 'n':  c = '\n'; break;
+                case 'r':  c = '\r'; break;
+                case 't':  c = '\t'; break;
+                case 'b':  c = '\b'; break;
+                case 'f':  c = '\f'; break;
+                case 'u': {
+                    // \u00XX only: the writer never emits more, anything else
+                    // is somebody else's file.
+                    if (!q[0] || !q[1] || !q[2] || !q[3]) return false;
+                    if (q[0] != '0' || q[1] != '0') return false;
+                    int h1 = events_hexval(q[2]);
+                    int h2 = events_hexval(q[3]);
+                    if (h1 < 0 || h2 < 0) return false;
+                    c = (char)((h1 << 4) | h2);
+                    q += 4;
+                    break;
+                }
+                default: return false;
+            }
+        } else if ((unsigned char)c < 0x20) {
+            return false;  // a raw control byte is not valid JSON text
+        }
+        if (n + 1 < msg_cap) msg_out[n++] = c;
+    }
+    if (*q != '"') return false;
+    q++;
+    // The object must close: without this a line torn by a power loss right
+    // before the brace would salvage half an entry as a whole one, and a
+    // foreign file that merely looks similar would pass as history.
+    while (*q == ' ' || *q == '\t') q++;
+    if (*q != '}') return false;
+    msg_out[n] = '\0';
+    *ts_out = ts;
+    *boot_out = boot;
+    return true;
+}
+
+// Where the kept half of a rotated log starts: pos bytes in, then forward to
+// the next line boundary, so the survivor never opens with half an entry.
+static size_t events_align_line(const char *buf, size_t len, size_t pos) {
+    if (!buf || pos == 0) return 0;
+    if (pos > len) pos = len;
+    while (pos < len && buf[pos] != '\n') pos++;
+    if (pos < len) pos++;  // past the newline itself
+    return pos;
+}
+
+// Whether one stored entry passes a GET /events ?since= cursor. The numeric
+// comparison alone lies across a reboot: entries from before it carry
+// wall-clock seconds while entries from the unsynced early minutes of this
+// boot carry uptime seconds, so every fresh entry reads "older" than the
+// cursor and a poller silently loses the whole window. A monotonic entry
+// (never synced, at or below TIME_VALID_EPOCH) from the current boot is
+// therefore always newer than a wall-clock cursor even when its number is
+// smaller. Anything else compares numerically: within one clock domain the
+// numbers mean what they say, and history from older boots keeps the old
+// behaviour rather than flooding every poll. cur_boot 0 (no epoch assigned)
+// disables the exception rather than guessing.
+static bool events_since_match(unsigned long ts, unsigned long boot,
+                               unsigned long since, unsigned long cur_boot) {
+    if (ts >= since) return true;
+    if (cur_boot != 0 && boot == cur_boot &&
+        ts <= TIME_VALID_EPOCH && since > TIME_VALID_EPOCH) return true;
+    return false;
+}
+// host-test:end
+
+// Drop the oldest half of the log through a temp file plus rename, so a power
+// loss mid-rotation leaves either the whole old file or the whole new one.
+// Never called from the boot replay's failure paths with anything to report:
+// silence is the contract, the flag is the signal.
+static void events_log_rotate() {
+    File f = SPIFFS.open(EVENTS_LOG_FILE, FILE_READ);
+    if (!f) return;
+    String content = f.readString();
+    f.close();
+    if (content.length() == 0) return;
+    size_t keep = events_align_line(content.c_str(), content.length(),
+                                    content.length() / 2);
+    File t = SPIFFS.open(EVENTS_LOG_TMP, FILE_WRITE);
+    if (!t) { events_spiffs_ok = false; return; }
+    size_t want = keep < content.length() ? content.length() - keep : 0;
+    size_t w = want ? t.print(content.c_str() + keep) : 0;
+    t.close();
+    if (w != want) {
+        SPIFFS.remove(EVENTS_LOG_TMP);
+        events_spiffs_ok = false;
+        return;
+    }
+    SPIFFS.remove(EVENTS_LOG_FILE);
+    if (!SPIFFS.rename(EVENTS_LOG_TMP, EVENTS_LOG_FILE)) events_spiffs_ok = false;
+}
+
+// One event onto the end of the log. One open and one close; a rotation when
+// the file is at the cap costs a second pair, which is once per hundreds of
+// events. Any failure parks the flag and the log stays RAM-only.
+static void events_log_append(unsigned long ts, unsigned long boot,
+                              const char *msg) {
+    if (!events_spiffs_ok) return;
+    char line[EVENTS_LINE_MAX];
+    size_t n = events_format_line(ts, boot, msg, line, sizeof(line));
+    File a = SPIFFS.open(EVENTS_LOG_FILE, FILE_APPEND);
+    if (!a) { events_spiffs_ok = false; return; }
+    if (a.size() + n > EVENTS_LOG_MAX) {
+        a.close();
+        events_log_rotate();
+        a = SPIFFS.open(EVENTS_LOG_FILE, FILE_APPEND);
+        if (!a) { events_spiffs_ok = false; return; }
+    }
+    size_t w = a.print(line);
+    a.close();
+    if (w != n) events_spiffs_ok = false;
+}
+
+// The tail of the log back into the ring, oldest first, up to MAX_EVENTS. Runs
+// once at boot, before the first event_add. A missing file means a fresh
+// device, a torn line is left out, anything else unparseable is left out with
+// it — the buffer starts empty either way and boot never fails here.
+//
+// When history was replayed the boundary is closed with a "boot" marker under
+// the new epoch, so the ring reads old boot, marker, new boot in order and a
+// poller holding a pre-reboot cursor sees the reboot instead of a gap. A fresh
+// device needs no boundary and gets no marker.
+static void events_log_replay() {
+    if (!events_spiffs_ok) return;
+    File f = SPIFFS.open(EVENTS_LOG_FILE, FILE_READ);
+    if (!f) return;
+    size_t fsize = f.size();
+    String content = f.readString();
+    f.close();
+    unsigned total = 0;
+    for (unsigned i = 0; i < content.length(); i++)
+        if (content.charAt(i) == '\n') total++;
+    if (content.length() > 0 && content.charAt(content.length() - 1) != '\n') total++;
+    unsigned skip = total > MAX_EVENTS ? total - MAX_EVENTS : 0;
+    events_head = 0;
+    events_count = 0;
+    unsigned seen = 0;
+    unsigned pos = 0;
+    unsigned loaded = 0;
+    char line[EVENTS_LINE_MAX];
+    while (pos < content.length()) {
+        unsigned eol = pos;
+        while (eol < content.length() && content.charAt(eol) != '\n') eol++;
+        size_t llen = eol - pos;
+        if (llen >= sizeof(line)) llen = sizeof(line) - 1;
+        for (size_t i = 0; i < llen; i++) line[i] = content.charAt(pos + i);
+        line[llen] = '\0';
+        if (seen >= skip) {
+            unsigned long ts = 0;
+            unsigned long boot = 0;
+            char msg[EVENT_MSG_LEN];
+            if (events_parse_line(line, &ts, &boot, msg, sizeof(msg))) {
+                EventEntry *e = &events_buf[events_head];
+                e->timestamp = ts;
+                e->boot = boot;
+                snprintf(e->message, EVENT_MSG_LEN, "%s", msg);
+                events_head = (events_head + 1) % MAX_EVENTS;
+                if (events_count < MAX_EVENTS) events_count++;
+                loaded++;
+            }
+        }
+        seen++;
+        pos = eol + 1;
+    }
+    if (fsize > EVENTS_LOG_MAX) events_log_rotate();
+    if (loaded > 0) event_add("boot");
+}
+
 static void event_add(const char *fmt, ...) {
     va_list ap;
     va_start(ap, fmt);
     EventEntry *e = &events_buf[events_head];
+    // Wall clock while NTP has it (configTzTime() in wifi_setup() feeds the
+    // system clock; anything at or below TIME_VALID_EPOCH is the pre-sync
+    // epoch, not real time), uptime seconds before the first sync. The two
+    // are told apart across reboots by the boot epoch, not by the number —
+    // see events_since_match().
     struct timeval tv;
     if (gettimeofday(&tv, NULL) == 0 && tv.tv_sec > TIME_VALID_EPOCH) {
         e->timestamp = (unsigned long)tv.tv_sec;
     } else {
         e->timestamp = millis() / 1000;
     }
+    e->boot = events_boot_id;
     vsnprintf(e->message, EVENT_MSG_LEN, fmt, ap);
+    va_end(ap);
+    // Copied out before the append below: the ring is shared with the web
+    // server task, and this slot can be recycled before the flash write lands.
+    unsigned long ts = e->timestamp;
+    unsigned long boot = e->boot;
+    char msg[EVENT_MSG_LEN];
+    snprintf(msg, sizeof(msg), "%s", e->message);
     events_head = (events_head + 1) % MAX_EVENTS;
     if (events_count < MAX_EVENTS) events_count++;
-    va_end(ap);
+    events_log_append(ts, boot, msg);
 }
 
 // ===== Skill/plugin interface =====
@@ -291,6 +662,11 @@ static void i2c_scan(TwoWire &bus, I2CFound *results, int &count) {
 // CC1101 status registers are read with the burst bit set: 0x30|0xC0.
 // This runs BEFORE tft.init() — the display library owns the shared SPI bus
 // afterwards, and the seed never talks to the CC1101 again.
+//
+// Defined in skills/gate.cpp (included below): full CC1101 OOK bring-up on
+// the bus the probe is holding, before the display claims it.
+static void gate_configure(SPIClass &spi);
+
 static void probe_cc1101() {
     pinMode(PIN_CC1101_CS, OUTPUT);
     digitalWrite(PIN_CC1101_CS, HIGH);
@@ -319,45 +695,69 @@ static void probe_cc1101() {
     digitalWrite(PIN_CC1101_CS, HIGH);
 
     spi.endTransaction();
+
+    // The gate skill configures the chip completely here, on the SAME live
+    // instance the probe just proved — this boot-probe bus is the one road
+    // to the chip that has been measured reliable on this hardware (see
+    // skills/gate.cpp, "The SPI bus, honestly"). Must run before spi.end():
+    // afterwards the display owns the bus and a second SPIClass::begin()
+    // hangs the boot under arduino-esp32 3.x.
+    if (hw.cc1101_version != 0x00 && hw.cc1101_version != 0xFF) {
+        gate_configure(spi);
+    }
     spi.end();
 
     // VERSION reads 0x14 (or 0x04 on older silicon); 0x00/0xFF = nothing there
     hw.has_cc1101 = (hw.cc1101_version != 0x00 && hw.cc1101_version != 0xFF);
 }
 
-static bool bq27220_read16(uint8_t reg, uint16_t &val) {
-    Wire.beginTransmission(BQ27220_ADDR);
-    Wire.write(reg);
-    if (Wire.endTransmission(false) != 0) return false;
-    if (Wire.requestFrom((int)BQ27220_ADDR, 2) != 2) return false;
-    val = Wire.read() | (Wire.read() << 8);
-    return true;
-}
+// Defined in skills/battery.cpp, which is included further down with the other
+// skills. The fuel gauge is the skill's hardware and every register read now
+// lives there, but the probe has to happen HERE, from hw_probe(): before
+// tft.init() claims the SPI bus and before the first clock face is drawn with a
+// charge level on it. So it is declared here and called below, the same
+// arrangement the clock face already has with progress.cpp and notify.cpp.
+//
+// battery_probe() fills hw.has_battery/battery_v/battery_soc once at boot;
+// battery_refresh() re-reads them from loop(), because otherwise the figures on
+// the panel would stay frozen at the boot-time snapshot.
+//
+// battery_probe() ALSO WRITES, and it did not use to. It applies six charge
+// parameters to the gauge's data memory, describing to the gauge what the
+// charger on the same bus actually does — without them the gauge never sees a
+// charge finish and a full cell reports a few points short of 100. Data memory
+// here is RAM and is lost on a power-on reset, which is why this is a boot-time
+// apply and not a one-off calibration. The addresses, the values and the guard
+// that bounds them are at the head of skills/battery.cpp.
+static void battery_probe();
+static void battery_refresh();
 
-static void probe_battery() {
-    // BQ27220 standard commands: 0x08 = Voltage (mV), 0x2C = StateOfCharge (%)
-    uint16_t mv = 0, soc = 0;
-    if (bq27220_read16(0x08, mv) && mv > 2000 && mv < 6000) {
-        hw.has_battery = true;
-        hw.battery_v = mv / 1000.0f;
-        if (bq27220_read16(0x2C, soc) && soc <= 100) {
-            hw.battery_soc = soc;
-        } else {
-            hw.battery_soc = -1;
-        }
-    }
-}
+// The backlight is declared here for the same shape of reason, one step earlier
+// in the boot: display_init() has to light the panel the moment there is
+// something on it to light, and that is long before skills_init() runs. So the
+// bring-up — pin, stored level, first pulse train — is called from there and
+// only the skill's registration waits for the skill list. GPIO21 is the enable
+// pin of an AW9364 rather than a transistor's gate, which is why this is a
+// function at all instead of the two lines it replaces; the protocol and the
+// reason a level is not a PWM duty are at the head of skills/backlight.cpp.
+static void backlight_begin();
 
-// probe_battery() runs once at boot, so the cached figures would otherwise stay
-// frozen at the boot-time snapshot. Re-read the same two registers periodically
-// to keep the on-screen charge level honest.
-static void battery_refresh() {
-    if (!hw.has_battery) return;
-    uint16_t mv = 0, soc = 0;
-    if (!bq27220_read16(0x08, mv) || mv <= 2000 || mv >= 6000) return;
-    hw.battery_v = mv / 1000.0f;
-    hw.battery_soc = (bq27220_read16(0x2C, soc) && soc <= 100) ? (int)soc : -1;
-}
+// The charger shares that I2C bus and is a separate skill because it is a
+// separate part with a separate failure: charger_probe() sets four registers on
+// the BQ25896 — the termination current above all, which on the power-on value
+// cuts charging at 77% of this cell. The two fixes are related and land in
+// order: the charger is made to terminate at 64 mA, and the gauge's taper
+// current is set to 100 mA — deliberately ABOVE that figure rather than equal
+// to it, because the gauge waits for the current to sit inside a BAND, and a
+// ceiling equal to the charger's cut-off makes that band one the charger never
+// produces. The values, the order they go out in and the guard that bounds them
+// are at the head of skills/charger.cpp.
+//
+// Declared here, like the gauge's, because the probe has to run from hw_probe()
+// rather than from skills_init(): the charger should be off its power-on
+// defaults from the first second the device is powered.
+static void charger_probe();
+static void charger_refresh();
 
 static void hw_probe() {
     memset(&hw, 0, sizeof(hw));
@@ -376,7 +776,8 @@ static void hw_probe() {
     i2c_scan(Wire, hw.i2c0, hw.i2c0_count);
 
     probe_cc1101();
-    probe_battery();
+    battery_probe();
+    charger_probe();
 
     // Board detection heuristic
     bool fuel_gauge = false;
@@ -413,9 +814,10 @@ static unsigned long boot_time = 0;
 // password is rolled on every raise and exists only in this variable and on the
 // screen — never persisted, never sent anywhere.
 //
-// A gesture-raised session is time-boxed: someone may have leaned on the key,
-// and the radio must not then stay up forever. The boot-time session does not
-// expire, because with no working credentials the AP is the only way in.
+// A session raised from the menu is time-boxed: somebody opens it, walks away
+// and forgets, and the radio must not then stay up forever. The boot-time
+// session does not expire, because with no working credentials the AP is the
+// only way in.
 #define AP_SESSION_MS (10UL * 60UL * 1000UL)
 static bool ap_active = false;
 static String ap_password = "";
@@ -491,6 +893,59 @@ static bool write_spiffs_file_atomic(const char *path, const char *tmp_path,
     return SPIFFS.rename(tmp_path, path);
 }
 
+// The single-name form for files that never had a tmp alias: the temp name is
+// the destination plus ".tmp". Same guarantee as above, no new constant per
+// file.
+static bool spiffs_save_atomic(const char *path, const String &content) {
+    String tmp = String(path) + ".tmp";
+    if (!write_spiffs_file(tmp.c_str(), content)) return false;
+    SPIFFS.remove(path);
+    return SPIFFS.rename(tmp.c_str(), path);
+}
+
+// The matching read: an interrupted rename leaves the new snapshot under the
+// temp name and nothing under the real one, so look there before giving up. A
+// caller with an explicit tmp alias passes it; otherwise it is derived the
+// same way the save above derives it.
+static String spiffs_read_file(const char *path, const char *tmp_path = NULL) {
+    String s = read_spiffs_file(path);
+    if (s.length() == 0) {
+        if (tmp_path) s = read_spiffs_file(tmp_path);
+        else s = read_spiffs_file((String(path) + ".tmp").c_str());
+    }
+    return s;
+}
+
+// ===== Event boot epoch =====
+//
+// The counter behind EventEntry.boot: incremented once per boot, so entries
+// from different boots are told apart even when their timestamps share a
+// scale. A missing or corrupt file means a fresh (or damaged) flash and the
+// count restarts at 1; a failed save keeps the RAM id and leaves the log
+// alone — the epoch is best-effort, history matters more.
+#define EVENTS_BOOT_FILE    "/events.boot"
+
+static void events_boot_next() {
+    unsigned long n = 0;
+    if (events_spiffs_ok) {
+        String s = spiffs_read_file(EVENTS_BOOT_FILE);
+        s.trim();
+        if (s.length() > 0) {
+            char *end = NULL;
+            unsigned long v = strtoul(s.c_str(), &end, 10);
+            if (end && *end == '\0') n = v;
+        }
+    } else {
+        events_boot_id = 1;
+        return;
+    }
+    if (n >= (unsigned long)(~0UL) - 1) n = 0;  // never hand out 0 or wrap to it
+    events_boot_id = n + 1;
+    if (!spiffs_save_atomic(EVENTS_BOOT_FILE, String(events_boot_id))) {
+        // Best-effort only: the RAM id stands, the log keeps working.
+    }
+}
+
 // ===== Timezone =====
 //
 // The seed knows no city. It stores a raw POSIX TZ string in SPIFFS and hands
@@ -503,10 +958,15 @@ static void tz_apply() {
     tzset();
 }
 
+static bool tz_valid(const String &tz);
+
 static void tz_load() {
-    String stored = read_spiffs_file(TZ_FILE);
+    String stored = spiffs_read_file(TZ_FILE);
     stored.trim();
-    if (stored.length() > 0) tz_string = stored;
+    // Validated, not trusted: a corrupt file used to be handed straight to
+    // the C library, which silently degrades to UTC and keeps the garbage for
+    // every boot after. Anything outside tz_valid() keeps the default.
+    if (stored.length() > 0 && tz_valid(stored)) tz_string = stored;
     tz_apply();
 }
 
@@ -541,7 +1001,7 @@ static bool clock_local_time(struct tm &out) {
 //
 // The last two rows switch with the connectivity mode: on the network they
 // carry RSSI and the mDNS name, in setup mode the AP name, its one-shot
-// password and the auth token, and offline the gesture that raises the AP.
+// password and the auth token, and offline the way back to the setup AP.
 //
 // Three colours only: warm white for the digits, slate for everything
 // secondary, one amber accent (seconds, and the AP password in setup mode).
@@ -585,6 +1045,21 @@ static bool clock_local_time(struct tm &out) {
 #define BADGE_TEXT_X 103
 #define BADGE_PAD    20
 
+// Quiet-hours mark, in the gap the version string was given to grow into. Both
+// edges are measured against TFT_eSPI's own width table rather than estimated,
+// the way the badge above was: "v10.10.10" — the worst case that comment
+// reserves room for — is 65px and ends at x=73, and the badge dot starts at 93.
+// So the mark is right-aligned at 91 with an 18px pad, which erases 73..91 and
+// leaves both neighbours untouched.
+//
+// It is a mark and not a word because there is 18px, and the two states have
+// different TEXT rather than only different colours: draw_field caches on the
+// string alone, so a mark that changed colour without changing text would not
+// repaint. One Z is "a window is set", two is "inside it now" — the second is
+// the one that answers "why is this thing silent", and it is the amber one.
+#define QUIET_R     91
+#define QUIET_PAD   18
+
 // Progress bar under the bottom row: a 4px full-width rule at the very bottom
 // edge of the 170px panel, which is the one place a bar this wide fits without
 // renegotiating a layout three connectivity modes already share. It sits
@@ -606,6 +1081,20 @@ static bool progress_status_line(char *out, size_t n, int *pct);
 static int notify_unread_count();
 static bool notify_crit_unread();
 
+// Defined in skills/ring.cpp, and the same arrangement again: the night window
+// is one idea shared by the ring and the speaker, and the clock face asks it the
+// only two questions a mark can show — is a window set at all, and is the device
+// inside it right now.
+static bool ring_night_armed();
+static bool ring_night_now();
+
+// Defined in ui.h, which is included last of all: the idle clock the backlight
+// policy runs on. Declared up here because ap_start() below has to stamp it —
+// raising the setup AP is the offline recovery path, it puts a one-session
+// password on the screen and nowhere else, and a password drawn onto a panel
+// the policy has blanked is a password nobody can read.
+static void ui_note_input();
+
 static bool display_ready = false;
 // Set from the web server task, consumed by the clock tick in loop(): TFT_eSPI
 // owns the SPI bus and must only be driven from one task.
@@ -624,6 +1113,7 @@ static char fld_date[24]  = "";
 static char fld_left[32]  = "";
 static char fld_right[32] = "";
 static char fld_note[48]  = "";
+static char fld_quiet[4]  = "";
 // Unread count the badge currently shows, or -1 for "nothing drawn yet". 10
 // stands for "9+", so that going from 12 unread to 11 costs no SPI.
 static int clock_badge_drawn = -1;
@@ -694,9 +1184,10 @@ static void display_init() {
     tft.init();
     tft.setRotation(3);  // 320x170 landscape, knob on the right
     tft.fillScreen(COL_BG);
-    // Backlight only after the panel is initialized — avoids a garbage flash
-    pinMode(PIN_TFT_BL, OUTPUT);
-    digitalWrite(PIN_TFT_BL, HIGH);
+    // Backlight only after the panel is initialized — avoids a garbage flash.
+    // GPIO21 is not a switch: it clocks an AW9364, and the level it comes up at
+    // is the stored one rather than full. See skills/backlight.cpp.
+    backlight_begin();
 
     clock_w = tft.textWidth("00:00", 8);
     sec_w = tft.textWidth("00", 4);
@@ -756,6 +1247,15 @@ static void display_tick() {
         tft.setTextPadding(0);
     }
 
+    // Why the device is silent, answered by looking at it rather than by
+    // asking it over the network — which was the only way until the menu grew a
+    // switch. Nothing at all when no window is set, so the ordinary face is
+    // exactly as bare as it was.
+    bool night = ring_night_now();
+    const char *quiet = ring_night_armed() ? (night ? "ZZ" : "Z") : "";
+    draw_field(fld_quiet, sizeof(fld_quiet), quiet, QUIET_R, HDR_Y, 2,
+               night ? COL_ACCENT : COL_DIM, TR_DATUM, QUIET_PAD);
+
     struct tm now;
     char hhmm[8], ss[4], date[24];
     if (clock_local_time(now)) {
@@ -780,7 +1280,7 @@ static void display_tick() {
     // screen is their only channel, so nothing else has to carry them.
     char row1l[32], row1r[32], row2[48];
     if (ap_active) {
-        // A gesture-raised AP is time-boxed, so say how long it has left.
+        // An AP raised from the menu is time-boxed, so say how long it has left.
         unsigned long mins = ap_minutes_left();
         if (mins > 0) {
             snprintf(row1l, sizeof(row1l), "AP %s  %lum", ap_ssid.c_str(), mins);
@@ -796,13 +1296,17 @@ static void display_tick() {
     } else {
         snprintf(row1l, sizeof(row1l), "WiFi offline");
         row1r[0] = '\0';
-        snprintf(row2, sizeof(row2), "hold KEY 3s for setup AP");
+        // The route in, said on the one screen somebody standing in front of
+        // an offline device is looking at. It names the menu row rather than a
+        // key to hold: the AP is raised from Setup AP in the menu, and from
+        // nowhere else on the device.
+        snprintf(row2, sizeof(row2), "click for menu > Setup AP");
     }
     // A running job borrows the note row for its label and the band under it
     // for its bar, but only when the row is otherwise empty: the token and the
-    // setup gesture have nowhere else to be displayed. Whose job it is has
-    // already been decided by then — this reads the winner, it does not choose
-    // between suppliers.
+    // way back to the setup AP have nowhere else to be displayed. Whose job it
+    // is has already been decided by then — this reads the winner, it does not
+    // choose between suppliers.
     int bar_pct = -1;
     if (row2[0] == '\0') progress_status_line(row2, sizeof(row2), &bar_pct);
 
@@ -845,7 +1349,16 @@ static void display_status() {
 // that the eye keeps re-detecting, which is right for an alarm demanding an
 // action in the next second and wrong for a device sitting on a shelf saying
 // "there is something here for you". The ramp reads as present rather than
-// urgent, and it never goes dark, so the rule never looks broken.
+// urgent, and its own colour never reaches black, so the rule never looks
+// broken.
+//
+// That is a statement about the ramp and not about the panel, which the idle
+// policy can take down under it — so it is worth being exact about what keeps
+// this visible. An unread critical never expires, and while one is outstanding
+// skills/backlight.cpp holds the panel at its dim step rather than blanking it.
+// Dim, not off: this line is still on the screen and still breathing, which is
+// the whole reason that floor is there. It is the only indication left inside
+// the ring's night window, where the ring is silent by a rule of its own.
 //
 // Cost is one drawFastHLine of 304 pixels per step — about 0.25ms of SPI at
 // 40MHz, twelve times a second, and nothing at all when no critical is
@@ -891,7 +1404,7 @@ static void clock_rule_tick() {
 // seed. The AP password in ap_generate_password() is generated after RF for
 // the same reason. An existing token in SPIFFS is always kept as-is.
 static void token_load() {
-    auth_token = read_spiffs_file(TOKEN_FILE);
+    auth_token = spiffs_read_file(TOKEN_FILE);
     auth_token.trim();
 
     if (auth_token.length() == 0) {
@@ -901,7 +1414,7 @@ static void token_load() {
         }
         buf[32] = '\0';
         auth_token = String(buf);
-        write_spiffs_file(TOKEN_FILE, auth_token);
+        spiffs_save_atomic(TOKEN_FILE, auth_token);
     }
 }
 
@@ -933,7 +1446,7 @@ static bool require_auth(AsyncWebServerRequest *request) {
 // ===== WiFi =====
 
 static void wifi_load_config() {
-    String json = read_spiffs_file(WIFI_CONFIG_FILE);
+    String json = spiffs_read_file(WIFI_CONFIG_FILE);
     if (json.length() == 0) return;
     JsonDocument doc;
     if (deserializeJson(doc, json) != DeserializationError::Ok) return;
@@ -947,7 +1460,7 @@ static bool wifi_save_config(const String &ssid, const String &pass) {
     doc["password"] = pass;
     String json;
     serializeJson(doc, json);
-    return write_spiffs_file(WIFI_CONFIG_FILE, json);
+    return spiffs_save_atomic(WIFI_CONFIG_FILE, json);
 }
 
 // ===== Provisioning AP =====
@@ -961,9 +1474,6 @@ static bool wifi_save_config(const String &ssid, const String &pass) {
 // range of a seed sitting inside the owner's LAN a token — and the token is
 // POST /firmware/upload, i.e. arbitrary code on a box behind the firewall.
 // The other seeds still ship that pattern and need the same treatment.
-
-// How long the user key must be held to raise the AP.
-#define AP_KEY_HOLD_MS 3000
 
 // The AP subnet is pinned rather than left on the ESP-IDF default of
 // 192.168.4.1/24. from_setup_ap() decides "this client came in over the setup
@@ -1033,6 +1543,16 @@ static void ap_start(bool temporary) {
     event_add("setup AP up: %s", ap_ssid.c_str());  // SSID only, never the password
     mdns_restart();
     display_force = true;  // the password is only readable off the screen
+    // ...and only if the panel is lit, which is why this stamps the idle clock
+    // rather than trusting whatever led here to have stamped it. The menu row
+    // is the caller that already did — a click is input — but wifi_setup() is
+    // the other one, and it raises the AP from boot with nobody having touched
+    // the device at all. What goes on the panel either way is a fresh random
+    // password that exists nowhere else, so the stamp belongs with the act that
+    // creates it and not with the routes into it. Raising the AP is somebody
+    // standing in front of the device by definition, or is the moment the
+    // device has most to say to whoever walks up to it next.
+    ui_note_input();
 }
 
 static void ap_stop() {
@@ -1059,31 +1579,12 @@ static void ap_poll() {
         ap_stop();
         return;
     }
-    // Nobody reprovisioned in time: close the window the gesture opened. The
+    // Nobody reprovisioned in time: close the window the menu opened. The
     // subtraction is rollover-safe as long as it stays in signed arithmetic.
     if (ap_temporary && (long)(millis() - ap_expires_at) >= 0) {
         event_add("setup AP expired");
         ap_stop();
     }
-}
-
-// The only way to raise the AP after boot: hold the user key for three seconds.
-// Physical presence, not network reachability, is what authorises provisioning,
-// so nothing remote can ask for the AP back. Contact bounce reads as a release
-// and restarts the timer, which is debounce enough for a hold this long.
-static void ap_key_poll() {
-    static unsigned long held_since = 0;
-    static bool fired = false;
-
-    if (digitalRead(PIN_USER_KEY) != LOW) {  // active low
-        held_since = 0;
-        fired = false;
-        return;
-    }
-    if (held_since == 0) held_since = millis();
-    if (fired || millis() - held_since < AP_KEY_HOLD_MS) return;
-    fired = true;
-    if (!ap_active) ap_start(true);  // time-boxed: see AP_SESSION_MS
 }
 
 static void wifi_setup() {
@@ -1263,7 +1764,7 @@ static void handle_body_collect(AsyncWebServerRequest *request, uint8_t *data,
 
 static void handle_config_get(AsyncWebServerRequest *request) {
     if (!require_auth(request)) return;
-    request->send(200, "text/markdown; charset=utf-8", read_spiffs_file(CONFIG_MD_FILE));
+    request->send(200, "text/markdown; charset=utf-8", spiffs_read_file(CONFIG_MD_FILE));
 }
 
 static void handle_config_post(AsyncWebServerRequest *request) {
@@ -1273,7 +1774,7 @@ static void handle_config_post(AsyncWebServerRequest *request) {
     String content(body);
     free(body);
     request->_tempObject = nullptr;
-    bool ok = write_spiffs_file(CONFIG_MD_FILE, content);
+    bool ok = spiffs_save_atomic(CONFIG_MD_FILE, content);
     request->send(ok ? 200 : 500, "application/json",
         ok ? "{\"ok\":true}" : "{\"error\":\"write failed\"}");
 }
@@ -1289,9 +1790,15 @@ static void handle_events(AsyncWebServerRequest *request) {
     int start = (events_count < MAX_EVENTS) ? 0 : events_head;
     for (int i = 0; i < events_count; i++) {
         int idx = (start + i) % MAX_EVENTS;
-        if (events_buf[idx].timestamp >= since) {
+        // Ring order is chronological and is the ordering contract; ts alone
+        // is not comparable across a reboot, so the matcher keeps this boot's
+        // still-unsynced entries against a wall-clock cursor instead of
+        // dropping them as "older". ts and msg keep their types; boot is new.
+        if (events_since_match(events_buf[idx].timestamp, events_buf[idx].boot,
+                               since, events_boot_id)) {
             JsonObject e = arr.add<JsonObject>();
             e["ts"] = events_buf[idx].timestamp;
+            e["boot"] = events_buf[idx].boot;
             e["msg"] = events_buf[idx].message;
         }
     }
@@ -1347,7 +1854,7 @@ static void handle_clock_tz(AsyncWebServerRequest *request) {
             "{\"error\":\"invalid TZ: 1-63 printable ASCII chars, no spaces\"}");
         return;
     }
-    if (!write_spiffs_file(TZ_FILE, tz)) {
+    if (!spiffs_save_atomic(TZ_FILE, tz)) {
         request->send(500, "application/json", "{\"error\":\"write failed\"}");
         return;
     }
@@ -1545,9 +2052,9 @@ static void handle_skill(AsyncWebServerRequest *request) {
     s += "- Battery telemetry: BQ27220 fuel gauge at I2C 0x55 (SDA=8, SCL=18), not an ADC\n";
     s += "- Flashing over USB-Serial/JTAG needs `--after watchdog_reset`\n";
     s += "- The clock runs on UTC until POST /clock/tz stores a POSIX TZ string in SPIFFS\n";
-    s += "- The setup AP is only up during provisioning: hold the user key (GPIO6) 3s to\n";
-    s += "  raise it, with a fresh random password shown on the device screen. A\n";
-    s += "  gesture-raised AP closes itself after 10 minutes if nothing reprovisions\n";
+    s += "- The setup AP is only up during provisioning: raise it from Setup AP in the\n";
+    s += "  on-device menu, with a fresh random password shown on the device screen. An\n";
+    s += "  AP raised that way closes itself after 10 minutes if nothing reprovisions\n";
     s += "- POST /wifi/config needs the token unless the request comes over that AP\n";
     s += "- Paths match exactly: `/health/` is not `/health` and returns 404. Nothing\n";
     s += "  here generates a trailing slash, but a client that appends one will break.\n";
@@ -1555,11 +2062,13 @@ static void handle_skill(AsyncWebServerRequest *request) {
     s += "  `/ir/tvbgone/stop` and started a blast instead of aborting one\n";
     s += "- An OTA upload whose connection dies is torn down after 30s without data,\n";
     s += "  so a dropped transfer no longer blocks every later one until reboot\n";
-    s += "- The encoder button opens an on-device menu (messages, TV-B-Gone, setup AP,\n";
-    s += "  info). TV-B-Gone holds the three region blasts and a by-brand list of the\n";
-    s += "  nine named codes. It drives the same code paths as the API and has no\n";
-    s += "  endpoints of its own, so a job started here shows up in\n";
-    s += "  GET /ir/tvbgone/status like any other\n";
+    s += "- The encoder button opens an on-device menu (messages, quiet hours,\n";
+    s += "  backlight, auto-dim, TV-B-Gone, setup AP, info) — the rows in that\n";
+    s += "  order, and this list is the only place they are written down, so a row\n";
+    s += "  added to ui_items[] has to be added here too. TV-B-Gone holds the three\n";
+    s += "  region blasts and a by-brand list of the nine named codes. It drives the\n";
+    s += "  same code paths as the API and has no endpoints of its own, so a job\n";
+    s += "  started here shows up in GET /ir/tvbgone/status like any other\n";
     s += "- POST /notify makes this a pager: the message appears on the screen at once\n";
     s += "  if the device is idle, and the clock face carries an unread count until\n";
     s += "  somebody acknowledges it with the knob or POST /notify/ack\n";
@@ -1679,13 +2188,34 @@ static void handle_wifi_post(AsyncWebServerRequest *request) {
 #include "skills/gpio.cpp"
 #include "skills/serial.cpp"
 #include "skills/ir.cpp"
+/* After ir.cpp, same job-machine shape with the waveform on the CPU instead
+   of RMT — the S3's four RMT TX memory blocks are fully claimed by ir and
+   ring. Its SPI access rides tft.getSPIinstance() from the loop task, the
+   arbitration contract documented in its file header. No skill of its own,
+   and nothing reads it yet: the on-device button is C4, the webhook is C3. */
+#include "skills/gate.cpp"
 #include "skills/notify.cpp"
+/* After notify.cpp, for the JSON response helpers, and after nothing else: the
+   fuel gauge is its own hardware and no skill reads it. Its probe runs earlier
+   than this, from hw_probe(), through the two forward declarations above it —
+   the panel needs a charge level before any skill exists. */
+#include "skills/battery.cpp"
+/* After battery.cpp, and the order is documentation rather than a dependency:
+   the two share an I2C bus and nothing else, and neither calls into the other.
+   Reading them in this order is reading the power hardware in the order the
+   boot probe touches it. */
+#include "skills/charger.cpp"
 /* After notify.cpp, for the three JSON response helpers its endpoints already
    own — the same borrowing voice.cpp does, rather than a fourth copy of
    serializeJson into a String. It depends on no skill of its own: suppliers
    publish into it and it publishes into nothing, which is the direction that
    lets a third supplier be added without touching this list. */
 #include "skills/progress.cpp"
+/* After notify.cpp, for the JSON response helpers its endpoints borrow, and
+   before ui.h, which draws its menu row. It reads no skill and no skill reads
+   it: it owns one pin and the part on the end of it. Its bring-up already ran,
+   from display_init(), for the reason given at the forward declaration. */
+#include "skills/backlight.cpp"
 /* After notify.cpp, which it reads for the unread level it breathes, and before
    ui.h, which hands it every encoder detent. */
 #include "skills/ring.cpp"
@@ -1709,13 +2239,23 @@ static void skills_init() {
     skill_serial_init();
     skill_ir_init();
     skill_notify_init();
+    /* Only a registration: the gauge was read at boot by hw_probe() and the
+       cache behind GET /battery was filled there. */
+    skill_battery_init();
+    /* Likewise, and the write it did is already done: hw_probe() configured
+       the charger and verified it by reading it back. */
+    skill_charger_init();
     /* Nothing to bring up: no hardware, no stored state, and a store that is
        already zeroed. It is here rather than first only to match the include
        order above. */
     skill_progress_init();
+    /* A registration and nothing else: the pin was configured and the stored
+       level applied at display_init(), before the network existed. */
+    skill_backlight_init();
     /* Last, and after skill_ir_init() in particular: the two share the four RMT
        TX memory blocks this chip has, IR takes two of them, and whichever runs
-       first gets what it asks for. */
+       first gets what it asks for. The backlight above competes for none of
+       them — it clocks its own pin from the CPU, for want of a third channel. */
     skill_ring_init();
     /* No such contention here: the I2S channel comes from a different
        peripheral entirely, and the ESP32-S3 has two ports for one consumer. */
@@ -1783,6 +2323,12 @@ void setup() {
     pinMode(PIN_PWR_EN, OUTPUT);
     digitalWrite(PIN_PWR_EN, HIGH);
 
+    // Then the clock, before anything is brought up on it: the UART's divider,
+    // the radio and every peripheral configured below are set from whatever
+    // this is, so moving it afterwards would mean moving it under them. See
+    // CPU_MHZ for the 11.5mA and for why 80 is the floor.
+    setCpuFrequencyMhz(CPU_MHZ);
+
     // Park all chip-selects on the shared SPI bus before anyone talks on it
     pinMode(PIN_TFT_CS, OUTPUT);
     digitalWrite(PIN_TFT_CS, HIGH);
@@ -1791,7 +2337,7 @@ void setup() {
     pinMode(PIN_SD_CS, OUTPUT);
     digitalWrite(PIN_SD_CS, HIGH);
 
-    // Read-only: the hold-to-raise-AP gesture is the only user of this pin.
+    // Read-only: ui_button_poll() is the only user of this pin.
     pinMode(PIN_USER_KEY, INPUT_PULLUP);
 
     Serial.begin(115200);
@@ -1800,7 +2346,15 @@ void setup() {
 
     if (!SPIFFS.begin(true)) {
         Serial.println("[!] SPIFFS failed");
+    } else {
+        events_spiffs_ok = true;
     }
+    // The log's tail back into the ring before the first event_add below:
+    // wifi_setup() already logs, and that entry must come after history.
+    // The epoch first: the replay stamps the reboot marker with this boot's
+    // id, so the counter is assigned before anything is loaded or logged.
+    events_boot_next();
+    events_log_replay();
 
     hw_probe();       // I2C + CC1101 probe (before the display claims the SPI bus)
     display_init();
@@ -1823,7 +2377,10 @@ void setup() {
             WiFi.softAPIP().toString().c_str(), HTTP_PORT, ap_ssid.c_str());
     }
 
-    event_add("seed started v%s", SEED_VERSION);
+    // The clock is read back rather than reported from CPU_MHZ: this line is
+    // how a battery measurement is tied to what the chip actually settled on.
+    event_add("seed started v%s (cpu %u MHz)", SEED_VERSION,
+              (unsigned)getCpuFrequencyMhz());
 }
 
 void loop() {
@@ -1892,14 +2449,18 @@ void loop() {
         last_wifi = millis();
     }
 
-    // Retire the provisioning AP once it has done its job, and watch the user
-    // key for the gesture that brings it back. Both polls are non-blocking.
+    // Retire the provisioning AP once it has done its job. Non-blocking.
     ap_poll();
-    ap_key_poll();
 
     // Starts frames and collects completions; the transmission itself runs in
     // the RMT peripheral. Advances as far as it can each pass and never blocks.
     ir_poll();
+
+    // Same job machine, waveform on the CPU: one frame per pass, each frame a
+    // bounded CPU burst inside gate_poll (wait-for-TX poll + symbols, <= 250
+    // ms), the gap between frames waited across passes. After ir_poll() for
+    // the same reason every supplier sits in this stretch of the loop.
+    gate_poll();
 
     // A blast is a supplier of progress, not the owner of it. loop() reads the
     // same snapshot the on-device blast screen reads and publishes it under a
@@ -1931,8 +2492,8 @@ void loop() {
     // drain of whatever the I2S receive DMA has collected. Before ui_poll() so
     // that a recording started on this pass puts its screen up on this pass —
     // and it is here rather than inside ui_poll() because the gesture reads the
-    // pin level directly, the way ap_key_poll() does, and shares nothing with
-    // the click state machine but the pin itself. Idle cost is a digitalRead.
+    // pin level directly rather than through the click state machine, and
+    // shares nothing with it but the pin itself. Idle cost is a digitalRead.
     mic_poll();
 
     // The uploader's loop-task half, and only that half: the transfer itself
@@ -1974,6 +2535,28 @@ void loop() {
     // the last, and hands the bit stream to the RMT peripheral without waiting.
     ring_poll();
 
+    // What the backlight SHOULD be at, which is a question about the idle clock
+    // and not about the part: ui.h owns the timestamp and knows which screens
+    // are live output, skills/backlight.cpp owns the thresholds and the switch.
+    //
+    // Here rather than inside ui_poll() because ui_poll() returns early from
+    // nearly every path — including unconditionally from the clock face, which
+    // is the screen this device wears all day. See ui_backlight_idle().
+    // Immediately above the poll that carries it out, so a level decided on this
+    // pass reaches the panel on this pass.
+    ui_backlight_idle();
+
+    // The backlight, on the same terms: the endpoints and the menu record a
+    // wanted level and this is the only place the part is ever clocked, because
+    // its pulse train is relative to the step the part is already standing on
+    // and two of them interleaved would leave it on neither. Two comparisons
+    // when nothing has changed, which is almost every pass; a change costs one
+    // train of at most fifteen pulses — some tens of microseconds — with
+    // interrupts held off this core for the length of it so that no gap in the
+    // wave is stretched past the 500us the part allows. See
+    // skills/backlight.cpp.
+    backlight_poll();
+
     // The speaker, on the same terms again: loop() owns the I2S channel and any
     // open cue file, the endpoints only stage a request. Feeds the DMA with
     // zero-timeout writes and does bounded work per pass, so a cue cannot delay
@@ -2003,11 +2586,34 @@ void loop() {
     // line, so it does not need the tick above and must not wait for it.
     if (ui_screen == UI_CLOCK) clock_rule_tick();
 
-    // Keep the fuel gauge reading current — probe_battery() only ran at boot.
+    // Keep the fuel gauge and the charger current — the probes only ran at
+    // boot. Nothing else touches the I2C bus once hw_probe() has finished, and
+    // this is the only place the registers behind GET /battery and GET /charger
+    // are read: see the cadence argument at the head of skills/battery.cpp and
+    // the I2C rule at the head of skills/charger.cpp. Neither endpoint may ever
+    // reach the bus itself — it would run the transaction on the AsyncTCP task,
+    // interleaved with this one.
+    //
+    // Both refreshes READ, COMPARE, and write only when the comparison fails.
+    // battery_refresh() re-runs the gauge's data-memory sequence when the
+    // read-back is wrong or unreadable, which is what a power-on reset of the
+    // gauge looks like from here — capped at three attempts per boot, because
+    // that sequence suspends gauging for seconds and must not become a
+    // once-a-minute stutter on a part that will not take it.
+    //
+    // charger_refresh() READS, COMPARES, and writes only when the comparison
+    // fails. The four writes happen once at boot in charger_probe(); after that
+    // the same registers are re-read every pass and checked against the table,
+    // and the table is re-issued only if the part has stopped holding it. That
+    // conditional rewrite is what stands in for the charger's own watchdog,
+    // which is disabled rather than fed — and this is NOT a watchdog kick: 60 s
+    // is longer than its 40 s default, so feeding it from here would let it
+    // expire and revert the configuration on roughly every cycle.
     static unsigned long last_battery = 0;
     if (millis() - last_battery > 60000) {
         last_battery = millis();
         battery_refresh();
+        charger_refresh();
     }
 
     // 10ms is the idle cadence, and it is the whole pass's granularity. A blast
@@ -2015,5 +2621,5 @@ void loop() {
     // at 10ms that rounding is dead air on every one of several hundred frames —
     // seconds of it. 1ms while a job runs costs nothing (delay() yields either
     // way) and takes the scheduler out of the timing budget.
-    delay(ir_busy() ? 1 : 10);
+    delay((ir_busy() || gate_busy()) ? 1 : 10);
 }

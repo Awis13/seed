@@ -18,11 +18,17 @@
  *        |         \
  *        |          +--a notification arrives while idle-->  MSGCARD
  *        |
- *        +--15s idle on any screen but a running blast
+ *        +--15s idle on any screen but a running blast or gate TX
  *
  * Back leaves a screen for the one above it — MSGCARD to MSGLIST, BRAND to
  * TVMENU, TVMENU to MENU, MENU to CLOCK — whether it comes from the Back item
  * or the user key, so the knob alone is enough to get anywhere and out again.
+ *
+ * MENU also carries rows that open nothing. Quiet switches the night window on
+ * and off, Backlight steps through the levels, and Auto-dim switches the
+ * backlight's idle policy; each acts in place and rewrites its own label. They
+ * are settings with no arguments, and a screen holding one line of that would
+ * be a screen to get out of again.
  *
  * MSGCARD is the one screen where the click and the user key differ. A click
  * acknowledges the message and returns; the user key returns without
@@ -30,13 +36,32 @@
  * leave it unread. That keeps the user key's meaning — one level up, change
  * nothing — intact everywhere in this file.
  *
+ * It is also the one screen where the knob does not move a selection. A body
+ * can be longer than the card, so on MSGCARD the knob reads: it scrolls the
+ * text, and past the last line it arrives on the reply chips, which are drawn
+ * under the text and are where rolling past the text should land. Walking the
+ * stack of messages behind the card moved to a long press of the user key,
+ * which is a gesture on this screen only. Alone among the knobs in this file
+ * this one has end stops, and ui_card_step() says at length why.
+ *
  * CLOCK is the home screen and is drawn exactly as before by display_tick();
  * this file does not touch it beyond handing control back. Every other screen
  * returns to CLOCK after UI_IDLE_MS without input, so a device left in a menu
- * on the shelf goes back to being a clock. A running blast is the one screen
- * that does not time out — it is live output, and its click means "stop". An
+ * on the shelf goes back to being a clock. A running blast or a gate TX in
+ * flight is what does not time out — it is live output, and the blast's
+ * click means "stop". An
  * idle timeout never acknowledges anything: a pager that clears itself because
  * nobody was standing there is not a pager.
+ *
+ * The same timestamp drives a second, slower thing. ui_backlight_idle() hands
+ * the elapsed time to skills/backlight.cpp, which takes the panel down to its
+ * dimmest preset after BL_IDLE_DIM_MS and out altogether after BL_IDLE_OFF_MS —
+ * the backlight is 85mA of a 150mA device, so this is most of what the battery
+ * is spent on. Both thresholds live there, next to the policy that compares
+ * against them, and are deliberately not repeated here. Any input puts the
+ * panel straight back, and the three screens the timeout above exempts are
+ * exempted from the dimming too, along with a fourth the timeout has no reason
+ * to care about — see ui_watching_progress().
  *
  * The pager face
  * --------------
@@ -81,7 +106,8 @@
  * is ir_codes[] itself rather than a copy of the names, and the progress screen
  * renders ir_progress() whoever started the job. Opening the menu item while a
  * blast started over HTTP is running shows that blast instead of trying to
- * start a second one. Setup AP calls ap_start(), the same path as the gesture.
+ * start a second one. Setup AP calls ap_start(), which is the only way the
+ * device raises one after boot.
  *
  * Drawing discipline
  * ------------------
@@ -96,6 +122,12 @@
  * nothing for as long as it stays up. The breathing rule on the clock face is
  * one horizontal line every 80ms and lives in main.cpp. Neither runs unless
  * its screen is in front, and no frame of either calls fillScreen.
+ *
+ * Scrolling the card is deliberately not a fourth fillRect. A detent repaints
+ * the body rows through draw_field and moves one pixel of scrollbar, and it
+ * must never raise display_force: on this screen that is what erases the whole
+ * envelope and repaints the stack, the tint, the border and the accent bar,
+ * which would be a visible flash on every click of the knob.
  *
  * A solid selection bar defeats draw_field's cache — the text of a row does
  * not change when its ground inverts — so the message list repaints the whole
@@ -142,6 +174,11 @@
 #define UI_TICK_MS           250
 /* How long the finished/stopped result stays up before the menu comes back. */
 #define UI_RESULT_MS         1500
+/* How long the user key must be held on a card to move to the next message
+   behind it. MIC_HOLD_MS is the encoder key's own hold in mic.cpp; the two are
+   the same number on purpose, so a hold means one length of time on this
+   device rather than one per key. */
+#define MSG_STACK_HOLD_MS    MIC_HOLD_MS
 
 static ESP32Encoder ui_encoder;
 
@@ -196,8 +233,9 @@ static void ui_encoder_reset() {
 }
 
 /* Active-low button with a settling filter. A click is a completed
-   press-then-release, not a level: holding the key must not repeat, and the
-   user key's 3s hold gesture must not also read as a click. */
+   press-then-release, not a level: holding the key must not repeat, and a hold
+   long enough to be a gesture in its own right must not also read as a click.
+   `held_ms` is what lets the caller tell the two apart — see ui_poll(). */
 struct UiButton {
     uint8_t pin;
     bool raw;                  /* last sample, pressed = true */
@@ -248,17 +286,19 @@ enum {
        silently shifts every title after it onto the wrong screen. The assert
        below catches a missing entry; nothing can catch a reordering, which is
        why the rule is "append". */
-    UI_REC
+    UI_REC,
+    UI_GATE,
+    UI_GATE_STATUS
 };
 
 /* Capitals: this is the service text of the header bar, not prose. One entry
    per screen above, in the same order. */
 static const char *ui_titles[] = {
     "", "MENU", "MESSAGES", "MESSAGES", "TV-B-GONE", "BY BRAND", "TV-B-GONE",
-    "SETUP AP", "INFO", "RECORDING"
+    "SETUP AP", "INFO", "RECORDING", "GATE", "GATE"
 };
 
-static_assert(sizeof(ui_titles) / sizeof(ui_titles[0]) == UI_REC + 1,
+static_assert(sizeof(ui_titles) / sizeof(ui_titles[0]) == UI_GATE_STATUS + 1,
               "ui_titles[] must have one entry per screen, in enum order");
 
 /* Top level. The marker on a selected row is also ">", so a submenu is spelled
@@ -267,18 +307,64 @@ static_assert(sizeof(ui_titles) / sizeof(ui_titles[0]) == UI_REC + 1,
    happens to carry. */
 enum {
     UI_ITEM_MSG = 0,
+    UI_ITEM_QUIET,
+    UI_ITEM_BACKLIGHT,
+    UI_ITEM_DIM,
     UI_ITEM_TVBGONE,
+    UI_ITEM_GATE,
     UI_ITEM_AP,
     UI_ITEM_INFO,
     UI_ITEM_BACK,
     UI_ITEM_COUNT
 };
 
+/* Quiet sits second, under Messages: it is the other thing this device does to
+   messages, and it is the row somebody reaches for at one in the morning
+   without wanting to read a menu first. The row's name is here; the hours after
+   it come from ring_quiet_hours(), because they are the skill's to say — the
+   same division as the Messages row and its unread count.
+
+   Backlight sits third, next to Quiet, because the two are the settings a hand
+   reaches for in the dark and both act in place rather than opening a screen.
+   Same division again: the name is here, the level's word comes from
+   bl_level_label().
+
+   Auto-dim sits directly under Backlight because it decides what happens to
+   the row above it: whether that level is what the panel holds, or only what
+   it holds while somebody is there. Reading the two in that order is the whole
+   explanation of the setting, which is why it is not filed under Info. */
 static const char *ui_items[UI_ITEM_COUNT] = {
     "Messages >",   /* ui_list_label() appends the unread count */
+    "Quiet",        /* ui_list_label() appends the ring's window, or "off" */
+    "Backlight",    /* ui_list_label() appends the level's word, or its step */
+    "Auto-dim",     /* ui_list_label() appends "on" or "off" */
     "TV-B-Gone >",
+    "Gate >",
     "Setup AP",
     "Info",
+    "Back"
+};
+
+/* Gate. The spare-remote app: one pairing sequence to enrol the device into
+   the receiver (hold the gate's program button while Pair fires), then four
+   buttons that each fire their own block sequence. Rows follow the TV-B-Gone
+   submenu shape. */
+enum {
+    UI_GATE_PAIR = 0,
+    UI_GATE_B1,
+    UI_GATE_B2,
+    UI_GATE_B3,
+    UI_GATE_B4,
+    UI_GATE_BACK,
+    UI_GATE_COUNT
+};
+
+static const char *ui_gate_items[UI_GATE_COUNT] = {
+    "Pair (hold gate btn)",
+    "Button 1",
+    "Button 2",
+    "Button 3",
+    "Button 4",
     "Back"
 };
 
@@ -308,6 +394,20 @@ static int ui_sel_drawn = -1;
 static int ui_first = 0;
 static unsigned long ui_last_input = 0;
 static unsigned long ui_last_draw = 0;
+
+/*
+ * Somebody is at the device. The one place ui_last_input is written, so that
+ * "what counts as input" is a question with a list of callers rather than an
+ * assignment scattered across two files.
+ *
+ * It matters more than it did before the panel could go dark. A screen timeout
+ * that fires wrongly costs a trip back into a menu; a blank that fires wrongly
+ * costs the owner the screen they are looking at, and every path that puts
+ * something on the panel without going through here is a path that draws it
+ * into the dark. main.cpp's ap_start() is one such path and calls this; that is
+ * the reason it is a named function and not an assignment.
+ */
+static void ui_note_input() { ui_last_input = millis(); }
 /* When the blast being watched stopped running, 0 while it still is. */
 static unsigned long ui_blast_done_at = 0;
 /* The same, for the recording screen: when the take ended, 0 while it runs. */
@@ -317,6 +417,35 @@ static bool ui_blast_ok = true;
 /* The list the blast was started from, so that finishing goes back to it. */
 static uint8_t ui_blast_back = UI_TVMENU;
 static int ui_blast_back_sel = 0;
+/* When the gate job being watched stopped running, 0 while it still is. */
+static unsigned long ui_gate_done_at = 0;
+/* False when the menu could not start a gate job and none was already running. */
+static bool ui_gate_ok = true;
+/* Why nothing started, for the row the status screen shows instead of a job.
+   Only meaningful while ui_gate_ok is false. A zero job id on its own says
+   none of this: no radio, a job already on the air, and a frame that did not
+   fit the staging buffer all return 0. */
+enum {
+    UI_GATE_FAIL_NONE = 0,
+    UI_GATE_FAIL_NORADIO,
+    UI_GATE_FAIL_BUSY,
+    UI_GATE_FAIL_TOOLONG
+};
+static uint8_t ui_gate_fail = UI_GATE_FAIL_NONE;
+
+/* The refusal row in screen capitals; the event log lowercases its own copy. */
+static const char *ui_gate_fail_text(uint8_t fail) {
+    if (fail == UI_GATE_FAIL_NORADIO) return "No radio";
+    if (fail == UI_GATE_FAIL_BUSY) return "Busy";
+    if (fail == UI_GATE_FAIL_TOOLONG) return "Too long";
+    return "";
+}
+/* What the menu asked for: the title while the staged job is not yet adopted
+   (gate_poll() owns the counters until its next pass) and the row to land on
+   when the status screen goes back to the list. */
+static uint8_t ui_gate_kind = 0;
+static uint8_t ui_gate_button = 0;
+static int ui_gate_back_sel = 0;
 
 /* Which notification the card is showing. An id, not an index: the list can
    shift underneath it when something expires or a new message arrives. */
@@ -370,9 +499,15 @@ static int ui_first_drawn = -1;
  * line below at 140. Text is inset 14px from the left so it clears the 3px
  * accent bar, and 10px from the right, which gives the title 276px — 11
  * characters at the widest glyph font 4 has, and around 18 of ordinary mixed
- * case. The body gets two lines of the same 276px, 27 characters worst case in
- * font 2 and around 34 in practice.
+ * case. The body gets the same 276px, 27 characters worst case in font 2 and
+ * around 34 in practice, over as many lines as the band below the title holds.
  */
+/* The numbers below are compiled verbatim on the host by tools/test_card.sh,
+   which is what turns the line counts into arithmetic something checks. Keep
+   every marker line self-closed and on a line of its own, and keep every
+   comment inside the region fully closed: the slicer copies from the marker
+   without understanding what it copies. */
+/* host-test:begin cardgeom — sliced out by tools/test_card.sh */
 #define MSG_CARD_X     8
 #define MSG_CARD_Y    28
 #define MSG_CARD_W   300
@@ -392,8 +527,90 @@ static int ui_first_drawn = -1;
    string that changes length — and the chip row changes length whenever it is
    answered — leaves nothing of the previous one behind. Narrowing this is what
    would produce ghosting, so it is a budget the chip row is fitted into rather
-   than a number to tune. */
-#define MSG_HINT_W   300
+   than a number to tune. Written as the card's width and not as the number that
+   happens to be: this region exists so that these stop being literals. */
+#define MSG_HINT_W   MSG_CARD_W
+
+/*
+ * The card's own rows, as offsets from its top edge.
+ *
+ * These were bare literals inside ui_draw_card() — y + 7, y + 28, y + 60,
+ * y + 78 — which made the one number this screen turns on, how many lines of
+ * body a reader gets, something no test could reach and no reader could check
+ * without a ruler. They are named here so the count below is arithmetic
+ * instead of a claim in a comment.
+ *
+ * MSG_LINE_H is chr_hgt_f16 from TFT_eSPI's Fonts/Font16.h, which is what
+ * fontHeight(2) returns and what setTextPadding erases: the pitch is two
+ * pixels more than that, so there is a 2px band between lines that no field's
+ * padding ever covers. That band is why the scroll position is a line index
+ * and never a pixel offset — see ui_card_line[].
+ */
+#define MSG_HDR_DY      7   /* source and age */
+#define MSG_TITLE_DY   28   /* the title, font 4, 26px tall */
+#define MSG_BODY_DY    60   /* first body line, under a title */
+#define MSG_BODY_DY_TOP 25  /* first body line when the title is not drawn */
+#define MSG_BODY_PITCH 18
+#define MSG_LINE_H     16   /* chr_hgt_f16 */
+/* The last row inside the card: the border occupies MSG_CARD_H - 1. */
+#define MSG_BODY_BOTTOM (MSG_CARD_H - 2)
+#define MSG_BODY_W      (MSG_CARD_W - MSG_PAD_L - MSG_PAD_R)
+
+/* Whole lines of MSG_LINE_H at MSG_BODY_PITCH that fit between `dy` and the
+   bottom of the card. */
+#define MSG_BODY_FIT(dy) \
+    ((MSG_BODY_BOTTOM - (dy) + 1 - MSG_LINE_H) / MSG_BODY_PITCH + 1)
+/* Two with the title, four without it. The title is what the fourth and third
+   lines cost, and ui_draw_card() spends it only on a body that needs them. */
+#define MSG_BODY_ROWS     MSG_BODY_FIT(MSG_BODY_DY)
+#define MSG_BODY_ROWS_MAX MSG_BODY_FIT(MSG_BODY_DY_TOP)
+static_assert(MSG_BODY_ROWS == 2,
+              "the short band is no longer two lines — the title rule below "
+              "and the tests that pin it are stated in twos");
+static_assert(MSG_BODY_ROWS_MAX == 4,
+              "the full band is no longer four lines");
+static_assert(MSG_BODY_ROWS_MAX > MSG_BODY_ROWS,
+              "hiding the title buys no lines, so there is nothing to spend it on");
+static_assert(MSG_BODY_DY_TOP >= MSG_HDR_DY + MSG_LINE_H,
+              "the first body line would be drawn over the source and age row");
+
+/* Font 2's extreme glyph widths, from TFT_eSPI's Fonts/Font16.c: 3px is the
+   punctuation ('!', an apostrophe, a comma, a colon, a semicolon, a bar) and
+   10px is 'M' and 'W'. Both are read back out of that table by
+   tools/test_card.sh rather than trusted here, because both are load-bearing:
+   the narrow one sizes the line cache and the wide one bounds the line count. */
+#define MSG_GLYPH_W_MIN 3
+#define MSG_GLYPH_W_MAX 10
+
+/*
+ * The most lines a body can wrap into, which is what ui_card_line[] is sized
+ * for rather than a number chosen to look safe.
+ *
+ * A line ends either on a space or, for a word wider than the whole line, on
+ * the last character that fits — so a line costs at least two bytes ("a ") and
+ * a line that cheap forces the next one to be expensive: the space that made it
+ * cheap was the LAST one inside the fitting prefix, so the following
+ * MSG_BODY_W / MSG_GLYPH_W_MAX - 2 characters carry no space at all and the
+ * next line must swallow them. Two consecutive lines therefore cost at least
+ * one fitting prefix between them, and the worst case is bounded by two lines
+ * per prefix, plus one for the remainder. tools/test_card.sh measures the real
+ * worst case against this bound rather than restating it.
+ */
+#define MSG_BODY_FIT_MIN   (MSG_BODY_W / MSG_GLYPH_W_MAX)
+#define MSG_BODY_MAX_LINES (2 * (NOTIFY_BODY_LEN / MSG_BODY_FIT_MIN + 1) + 1)
+
+/* Where the scrollbar goes: one pixel at the card's inner right edge, running
+   the height of the body band. Meshtastic puts its thumb at width - 2 of the
+   screen it owns; the card is what this owns, so the same two pixels are
+   measured off its own right edge instead. */
+#define MSG_SCROLL_DX (MSG_CARD_W - 2)
+#define MSG_SCROLL_MIN_H 6
+
+/* One drawn body line, as bytes: a full line of the narrowest glyph, plus the
+   terminator. It is the pixel budget that decides how much of a body a line
+   carries, so it is the pixel budget that sizes the buffer. */
+#define MSG_LINE_LEN (MSG_BODY_W / MSG_GLYPH_W_MIN + 1)
+/* host-test:end */
 
 /* Arrival: three frames of rising blend plus a few pixels of upward travel.
    40ms a frame, so the whole thing is over in 120ms — present enough to read
@@ -407,23 +624,51 @@ static int ui_first_drawn = -1;
    of them is on screen at a time, and entering any screen wipes the panel and
    raises display_force, which makes draw_field ignore whatever the previous
    screen left in here. Wide enough for an ellipsised font 4 title, which is
-   the longest string any of them draws. */
-static char ui_row[UI_ROW_COUNT][48];
+   the longest string any of them draws — so it is keyed to the title field and
+   not to a number, because draw_field compares only the first cache_size - 1
+   bytes: a line narrower than what it is asked to hold makes two different
+   titles agreeing on that prefix compare equal, and the card then keeps the
+   previous message's title on screen. */
+#define UI_ROW_LEN   (NOTIFY_TITLE_LEN + 4)
+static char ui_row[UI_ROW_COUNT][UI_ROW_LEN];
+/* Says the same thing to a reader who pins this back to a number: the four
+   bytes are the ellipsis and its terminator, and a line short of that is a
+   cache that cannot hold what the widest column draws through it. */
+static_assert(sizeof(ui_row[0]) >= NOTIFY_TITLE_LEN + 4,
+              "a row cache line is narrower than an ellipsised title");
 
 /* The message list needs its own cache: three cells per row, and it is the one
    screen whose rows are not a single string. Each cell is wide enough for the
    longest string its column can ever be asked to draw — an ellipsised title —
    so that the cache always holds the whole of what is on the panel and two
-   different rows can never compare equal. */
-#define MSG_CELL_LEN (NOTIFY_TITLE_LEN + 4)
+   different rows can never compare equal.
+   Which is the same width, and the same reason, as a row cache line, so it is
+   defined from it rather than spelled out again: two names for one expression
+   are two places to change and one of them gets missed. */
+#define MSG_CELL_LEN UI_ROW_LEN
 static char ui_msg_cell[MSG_ROWS][3][MSG_CELL_LEN];
 
-/* The card's two body lines get their own, wider cache. A body is 96
-   characters and the panel is 276px, which at the narrowest glyphs font 2 has
-   (3px, the punctuation) is more characters than fit in a row cache line. The
-   pixel budget is the bound that matters; the buffer must not be a second,
-   quieter one that cuts a line the display could have shown. */
-static char ui_card_body[2][NOTIFY_BODY_LEN + 4];
+/* The card's body lines get their own cache, one line per drawn row and each
+   wide enough for the widest thing a row can hold: MSG_BODY_W pixels of the
+   narrowest glyph font 2 has, plus the terminator. Sized to the pixels rather
+   than to the body, because it is the pixels that decide how much of the body
+   a line carries — and it must not be sized to ui_row[], which is
+   UI_ROW_LEN = 69: draw_field compares only cache_size - 1 bytes, so two
+   different lines of narrow glyphs agreeing on the first 68 would compare
+   equal and the repaint would be skipped, leaving the previous scroll
+   position's text on the panel. */
+static char ui_card_body[MSG_BODY_ROWS_MAX][MSG_LINE_LEN];
+static_assert(MSG_LINE_LEN > MSG_BODY_W / MSG_GLYPH_W_MIN,
+              "a body cache line cannot hold a full line of the narrowest glyph");
+static_assert(MSG_LINE_LEN > UI_ROW_LEN,
+              "a body line is no wider than a row line — check MSG_BODY_W and "
+              "the font table before making them share a cache");
+
+/* The body itself is not cached as text: it is wrapped once into byte offsets
+   into the message, and copied out one line at a time as it is drawn. Offsets
+   rather than copies because a 256-byte body can wrap into MSG_BODY_MAX_LINES
+   lines, and that many line-sized buffers would be several kilobytes on a
+   device with 320 of them. See ui_wrap_lines() and ui_card_line[]. */
 
 static void ui_draw_row(int i, const char *text, int32_t y, uint8_t font,
                         uint16_t color) {
@@ -488,40 +733,139 @@ static void ui_ellipsis(char *dst, size_t n, const char *src, uint8_t font,
 }
 /* host-test:end */
 
-/* Break `src` over two lines of `max_px`, on a space where there is one. The
-   second line carries the ellipsis, so a body too long for the card ends
-   visibly rather than just stopping. */
-static void ui_wrap2(const char *src, char *l1, size_t n1, char *l2, size_t n2,
-                     uint8_t font, int max_px) {
-    l1[0] = '\0';
-    l2[0] = '\0';
-    if (!src || !src[0]) return;
-    if (tft.textWidth(src, font) <= max_px) {
-        size_t i = 0;
-        while (src[i] && i + 1 < n1) { l1[i] = src[i]; i++; }
-        l1[i] = '\0';
-        return;
+/* ===== Wrapping the body over lines =====
+ *
+ * This replaces a two-line wrap that put an ellipsis on its second line to say
+ * "it stops here". It stops nowhere now: the card scrolls, and the scrollbar
+ * says where in the body a reader is far better than three dots ever did.
+ * ui_ellipsis() is still what cuts the title, the list cells and the chips,
+ * which are columns with no second line to continue onto.
+ */
+/* host-test:begin wrap — sliced out by tools/test_card.sh */
+/* One wrapped line, as a place in the body rather than a copy of it. */
+struct UiLine {
+    uint16_t start;
+    uint16_t len;
+};
+
+/*
+ * Break `src` into lines of at most `max_px`, on a space where there is one,
+ * and record where each line begins and how long it is. Returns the number of
+ * lines, which is never more than `max_lines`.
+ *
+ * Called once when a card opens, not once a frame: the body of a stored
+ * message does not change while it is being read, and re-measuring 256
+ * characters against the font table at UI_TICK_MS would be work nothing asked
+ * for. The scroll position then moves a line index over the result.
+ *
+ * A line never starts on a space — the gap a break was taken at belongs to
+ * neither side — so no line is empty and no line is blank, which is what lets
+ * the drawing below tell "this row has nothing on it" from "this row has text
+ * that happens to be spaces".
+ *
+ * A word wider than the whole line has no space to break on and is cut, the
+ * way the same case has always been cut here. `take` is floored at one
+ * character so that a line always consumes something: a glyph wider than
+ * `max_px` would otherwise consume nothing and this would not terminate.
+ */
+static int ui_wrap_lines(const char *src, UiLine *out, int max_lines,
+                         uint8_t font, int max_px) {
+    if (!src || !out || max_lines <= 0) return 0;
+
+    int n = 0;
+    size_t p = 0;
+    while (n < max_lines) {
+        while (src[p] == ' ') p++;
+        if (!src[p]) break;
+
+        int acc = 0, last_space = -1;
+        size_t i = p;
+        for (; src[i]; i++) {
+            /* A gap is noted before it is measured, so the gap the line runs
+               out ON is still a place to break. Measuring first loses the last
+               word of a line that fills the band exactly: the space after it
+               does not fit, and the break falls back to the space before it. */
+            if (src[i] == ' ') last_space = (int)(i - p);
+            int cw = ui_char_w(src[i], font);
+            if (acc + cw > max_px) break;
+            acc += cw;
+        }
+
+        size_t take;
+        if (!src[i])             take = i - p;              /* the rest fits */
+        else if (last_space > 0) take = (size_t)last_space;
+        else                     take = i - p;              /* one long word */
+        if (take == 0) take = 1;
+
+        out[n].start = (uint16_t)p;
+        out[n].len   = (uint16_t)take;
+        n++;
+        p += take;
     }
-
-    int acc = 0, last_space = -1, i = 0;
-    for (; src[i]; i++) {
-        int cw = ui_char_w(src[i], font);
-        if (acc + cw > max_px) break;
-        if (src[i] == ' ') last_space = i;
-        acc += cw;
-    }
-    /* A single word wider than the line has no space to break on: cut it. */
-    int brk = (last_space > 0) ? last_space : i;
-
-    size_t take = (size_t)brk;
-    if (take >= n1) take = n1 - 1;
-    memcpy(l1, src, take);
-    l1[take] = '\0';
-
-    const char *rest = src + brk;
-    while (*rest == ' ') rest++;
-    ui_ellipsis(l2, n2, rest, font, max_px);
+    return n;
 }
+
+/* Copy one line out of the body it was measured in. */
+static void ui_line_text(char *dst, size_t n, const char *src, UiLine ln) {
+    if (!dst || n == 0) return;
+    dst[0] = '\0';
+    if (!src) return;
+    size_t take = ln.len;
+    if (take > n - 1) take = n - 1;
+    memcpy(dst, src + ln.start, take);
+    dst[take] = '\0';
+}
+
+/*
+ * Force the next draw of a cached field, without display_force.
+ *
+ * A scroll step changes what every body row says, and the obvious way to make
+ * draw_field notice is display_force — which on this screen is the second half
+ * of `if (fading || display_force)` and would re-erase the whole 306x112
+ * envelope, redraw the stack outlines, the tint, the border and the accent bar.
+ * That is a visible flash on every detent, for the two or four lines of body
+ * text a step actually changes.
+ *
+ * So the cache is poisoned instead. Emptying it is not enough: draw_field
+ * compares the cache against the new text, and a row that has nothing to show
+ * would be handed "" and match an emptied cache exactly, leaving the previous
+ * line on the panel. The poison is a byte notify_copy_text() replaces with a
+ * space in everything it stores, so no line drawn here can ever equal it —
+ * including the empty one.
+ */
+#define UI_CACHE_POISON '\x01'
+static_assert(UI_CACHE_POISON < 0x20,
+              "the cache poison is a byte a stored message can contain");
+static void ui_cache_drop(char *cache) {
+    cache[0] = UI_CACHE_POISON;
+    cache[1] = '\0';
+}
+/* host-test:end */
+
+/* The wrapped body and where the reader is in it. Below the region above
+   because they are typed by it. */
+static UiLine ui_card_line[MSG_BODY_MAX_LINES];
+static int ui_card_lines = 0;         /* lines the body wrapped into */
+static uint32_t ui_card_wrapped = 0;  /* the id ui_card_line[] describes */
+static int ui_card_first = 0;         /* first visible line */
+/* Scroll position the body rows were last drawn at, so that a moved one is
+   recognised — the same shape as ui_first_drawn on the message list. */
+static int ui_card_first_drawn = -1;
+/* Whether the title is drawn, decided once with the wrap: a body that fits the
+   short band keeps its title, a longer one spends it on two more lines. */
+static bool ui_card_titled = true;
+/* Thumb the scrollbar currently has on the panel, so a pass that changes
+   nothing costs no SPI — the same rule every text field here follows, kept by
+   hand because the bar is pixels rather than a string. -1 is "the band is bare
+   card", which is also what a repaint of the card leaves behind. */
+static int ui_card_thumb_y = -1;
+static int ui_card_thumb_h = -1;
+/* A press that was still down when the card it began on went away — the message
+   expired or was evicted mid-hold. Its release is still to come, and on the list
+   the card dropped to it would read as a plain step up: one gesture, two levels
+   out. This is what ui_poll() discards it by. Set only while the key is down and
+   cleared by the very release it was set for. */
+static bool ui_drop_user_click = false;
 
 /* Service text is capitals. Sources arrive as whatever an agent typed. */
 /* host-test:begin fit — sliced out by tools/test_chips.sh */
@@ -628,36 +972,26 @@ static void ui_chip_row(char *dst, size_t n, const NotifyOptions &opts,
 }
 
 /*
- * One detent on the chip row. It wraps at both ends, the way every other list
- * on this device does, because the knob has no end stops.
+ * The selection the click is allowed to record, given the options the message
+ * actually carries.
  *
- * A negative `sel` is "nothing is selected yet", which is how a card opens
- * before anybody has turned the knob on it. The first detent then lands ON the
- * first chip instead of stepping past it, in either direction: there was no
- * position to step from, so the step is what makes one. Everything after that
- * is the ordinary walk.
+ * This used to be a stepper as well, and the knob walked the chips through it.
+ * The knob is the body's now — see ui_card_step(), which owns every position on
+ * this card, chips included — so what is left here is the check that was always
+ * the important half: `sel` at or above `count` is a value that did not come
+ * from a detent on this row. A `chosen` read back out of the store or out of a
+ * snapshot is the way in, and a snapshot is only as trustworthy as the file it
+ * came from, so it is clamped rather than handed to notify_choose_id() as an
+ * answer to a question with fewer answers than that.
  *
- * `sel` at or above `count` is a value that did not come from a previous detent
- * — a `chosen` read back out of the store or out of a snapshot, which is only
- * as trustworthy as the file it came from. It is clamped back into range rather
- * than trusted, and the click path steps by zero for exactly that clamp before
- * handing the value to notify_choose_id() as the answer.
- *
- * The reduction of `steps` is a guard rather than arithmetic the caller needs:
- * it keeps the addition below in range for any int, and no test claims it.
+ * A negative `sel` reports the first chip rather than an index, which is why
+ * the click path asks ui_chip_answers() whether there is a selection at all
+ * before it asks this what the selection is.
  */
-static int ui_chip_step(int sel, int steps, uint8_t count) {
+static int ui_chip_clamp(int sel, uint8_t count) {
     if (count == 0) return 0;
-    int n = (int)count;
-    if (sel < 0) {
-        sel = 0;
-        if (steps > 0)      steps--;
-        else if (steps < 0) steps++;
-    }
-    if (sel >= n) sel = n - 1;
-    steps %= n;
-    sel = (sel + steps) % n;
-    if (sel < 0) sel += n;
+    if (sel < 0) return 0;
+    if (sel >= (int)count) return (int)count - 1;
     return sel;
 }
 
@@ -714,6 +1048,133 @@ static bool ui_chip_answers(int sel, uint8_t count) {
    silently skips the repaint. */
 static char ui_card_hint[UI_CHIP_ROW_LEN];
 
+/* ===== The knob, on a card =====
+ *
+ * The body no longer fits the card, so the knob reads it. That leaves the
+ * chips, which the knob used to walk, with no input of their own — and this is
+ * where they get it back: the card is one axis, the body's lines first and the
+ * chips under the last of them, exactly as they are drawn. Rolling past the end
+ * of the text arrives on the reply row because on the panel that is where the
+ * reply row is.
+ *
+ * Walking the stack of messages behind this one has moved off the knob and onto
+ * a long press of the user key. It kept the knob for as long as a card was one
+ * screenful; now that a card can be six, browsing and reading cannot share a
+ * control.
+ */
+/* host-test:begin scroll — sliced out by tools/test_card.sh */
+/* Where the knob is on a card: which body line is at the top of the band, and
+   which chip is picked, or -1 for none. */
+struct UiCardPos {
+    int first;
+    int chip;
+};
+
+/*
+ * One turn of the knob on a card.
+ *
+ * It STOPS at both ends, and that is a deliberate exception to this device's
+ * own rule that a knob has no end stops — the message list, the menu and the
+ * brand list all wrap, and say so where they do it. The reason is that this one
+ * is not a list: it is a paragraph. Of four shipped firmwares read for this
+ * (Bruce, which ships a board file for this exact hardware, Meshtastic, Flipper
+ * and EdgeTX) not one wraps scrolled text. Reading is not browsing, and landing
+ * in the middle of the first sentence after the last line loses a reader's
+ * place with no way to tell that it happened. Do not "fix" this into a wrap.
+ *
+ * The chips sit at the top of the axis rather than in a mode of their own, so
+ * the invariant ui_chip_start() exists for survives a card that scrolls: a
+ * message nobody deliberately read still has no chip selected when the click
+ * arrives, because the only way onto the chips is to have turned the knob past
+ * every line of the body. On a message short enough not to scroll that is one
+ * detent, which is exactly what it was before this screen scrolled at all.
+ *
+ * The backlog is clamped before it is added rather than applied a step at a
+ * time: ui_encoder_steps() returns the net detents since the last pass, and a
+ * fast spin is one jump here, not one redraw per detent.
+ */
+static UiCardPos ui_card_step(UiCardPos pos, int steps, int max_first, int chips) {
+    if (max_first < 0) max_first = 0;
+    if (chips < 0) chips = 0;
+    int span = max_first + chips;
+
+    /* A guard rather than arithmetic any caller needs: it keeps the addition
+       below in range for any int, whatever a spun encoder hands in. The clamp
+       at the end of the axis gives the same answer without it, so no test
+       claims it — tools/test_card.sh says so by name. */
+    if (steps > span)  steps = span;
+    if (steps < -span) steps = -span;
+
+    /* Where the position given is on that axis. A chip index or a scroll
+       position that the message no longer supports is clamped to its own end of
+       the axis rather than allowed to spill across the join: a stale scroll
+       position is a place in the text, and it must not arrive on a chip and put
+       an answer under the next click. */
+    int at;
+    if (pos.chip >= 0 && chips > 0) {
+        /* The clamp here is the same guard as the one on `steps`: the axis
+           clamp below already brings a stale index back to the last chip, and
+           this only keeps the addition in range on the way. */
+        int c = (pos.chip < chips) ? pos.chip : chips - 1;
+        at = max_first + 1 + c;
+    } else {
+        at = pos.first;
+        if (at < 0) at = 0;
+        if (at > max_first) at = max_first;
+        /* A chip on a message that carries none is not a position at all; the
+           bottom of the text is the nearest place it can mean. */
+        if (pos.chip >= 0) at = max_first;
+    }
+
+    at += steps;
+    if (at < 0) at = 0;
+    if (at > span) at = span;
+
+    UiCardPos out;
+    if (at > max_first) {
+        out.first = max_first;
+        out.chip = at - max_first - 1;
+    } else {
+        out.first = at;
+        out.chip = -1;
+    }
+    return out;
+}
+
+/*
+ * The scrollbar's thumb, in pixels down the track.
+ *
+ * Meshtastic's geometry, kept as it stands there: a thumb and no track, a
+ * minimum height so that a long body still leaves something to see, and — the
+ * part worth copying rather than reinventing — a position normalised over
+ * `track_h - thumb_h` instead of over the whole track. That is what puts the
+ * bottom of the thumb flush with the bottom of the track at maximum scroll.
+ * Flipper and EdgeTX normalise over the full track, and their thumbs either
+ * overrun the end or stop short of it.
+ */
+static void ui_scroll_thumb(int first, int total, int visible, int track_h,
+                            int *thumb_y, int *thumb_h) {
+    /* The card asks for two lines or four and never for none, so this stands
+       between nothing and the division below. Kept because "nothing calls it
+       that way today" is not a reason for the arithmetic to be undefined when
+       something does. */
+    if (visible < 1) visible = 1;
+    if (total < visible) total = visible;
+
+    int h = (int)((long)track_h * visible / total);
+    if (h < MSG_SCROLL_MIN_H) h = MSG_SCROLL_MIN_H;
+    if (h > track_h) h = track_h;
+
+    int max_scroll = total - visible;
+    if (first < 0) first = 0;
+    if (first > max_scroll) first = max_scroll;
+    if (max_scroll < 1) max_scroll = 1;
+
+    if (thumb_h) *thumb_h = h;
+    if (thumb_y) *thumb_y = (int)((long)(track_h - h) * first / max_scroll);
+}
+/* host-test:end */
+
 static uint16_t ui_level_color(uint8_t level) {
     switch (level) {
         case NOTIFY_CRIT: return COL_CRIT;
@@ -753,15 +1214,17 @@ static int ui_list_count() {
         case UI_MENU:    return UI_ITEM_COUNT;
         case UI_TVMENU:  return UI_TV_COUNT;
         case UI_BRAND:   return ir_code_count + 1;  /* the codes, then Back */
+        case UI_GATE:    return UI_GATE_COUNT;
         case UI_MSGLIST: return notify_count() + 1; /* the messages, then Back */
     }
     return 0;
 }
 
 static const char *ui_list_label(int i) {
-    /* The Messages row carries its unread count, so its label is built rather
-       than looked up. ui_draw_list() consumes the return value into the row
-       string before asking for the next one, so one shared buffer is enough. */
+    /* The Messages row carries its unread count and the Quiet row carries the
+       window's hours, so those labels are built rather than looked up.
+       ui_draw_list() consumes the return value into the row string before
+       asking for the next one, so one shared buffer is enough. */
     static char built[24];
 
     switch (ui_screen) {
@@ -773,9 +1236,55 @@ static const char *ui_list_label(int i) {
                     return built;
                 }
             }
+            if (i == UI_ITEM_QUIET) {
+                /* "Quiet 00:00-08:00" or "Quiet off" — the row's name from the
+                   table above, the window from the skill that owns it. The
+                   longer of the two is 17 characters, which with the row's
+                   marker measures 218px of font 4 against the 296px
+                   ui_draw_row() has — measured against TFT_eSPI's own width
+                   table, like every other column here, and pinned by
+                   tools/test_quiet.sh at the hours' end. */
+                char win[16];
+                ring_quiet_hours(ring_night_from, ring_night_to, win, sizeof(win));
+                snprintf(built, sizeof(built), "%s %s", ui_items[i], win);
+                return built;
+            }
+            if (i == UI_ITEM_BACKLIGHT) {
+                /* "Backlight day" for one of the four the menu offers, or
+                   "Backlight step 13" for a level only the endpoint can set —
+                   the row never rounds one into the other. The longest is the
+                   step form, 210px of font 4 with the row's marker against the
+                   296px ui_draw_row() has, measured against TFT_eSPI's own
+                   width table like every other column here and pinned by
+                   tools/test_backlight.sh at the label's end. */
+                char level[BL_LABEL_MAX];
+                bl_level_label(bl_wanted, level, sizeof(level));
+                snprintf(built, sizeof(built), "%s %s", ui_items[i], level);
+                return built;
+            }
+            if (i == UI_ITEM_DIM) {
+                /* "Auto-dim on" or "Auto-dim off" — the row's name from the
+                   table above, the state from the skill that owns it, exactly
+                   as the two rows before it are built. "Auto-dim off" is the
+                   longer of the two states at twelve characters against the
+                   Backlight row's seventeen, so it needs no measurement of its
+                   own: the row it sits under already cleared the width with
+                   five characters to spare. */
+                snprintf(built, sizeof(built), "%s %s", ui_items[i], bl_idle_word());
+                return built;
+            }
             return ui_items[i];
         case UI_TVMENU: return ui_tv_items[i];
         case UI_BRAND:  return (i < ir_code_count) ? ir_codes[i].brand : "Back";
+        case UI_GATE:
+            /* The Pair row says so when there is no radio to pair with: the
+               screen is reachable either way, and a row that silently did
+               nothing would read as a broken button. */
+            if (i == UI_GATE_PAIR && !gate_ready) {
+                snprintf(built, sizeof(built), "%s (no radio)", ui_gate_items[i]);
+                return built;
+            }
+            return ui_gate_items[i];
     }
     return "";
 }
@@ -914,9 +1423,38 @@ static void ui_draw_msglist() {
  * thing on the screen.
  *
  * During the fade the whole block is repainted, because the card is also
- * moving; once settled nothing repaints but the age, and that goes through
- * draw_field against the tint rather than against black.
+ * moving; once settled nothing repaints but the age, the body rows the knob
+ * moved and the scrollbar's thumb — all through draw_field or a one-pixel
+ * fillRect against the tint rather than against black.
  */
+
+/* The body, wrapped once for this card and not again. ui_msg_id is the key,
+   and ui_enter_card() is what clears it. */
+static void ui_card_wrap(const NotifyView &v) {
+    if (ui_card_wrapped == ui_msg_id) return;
+    ui_card_lines = ui_wrap_lines(v.body, ui_card_line, MSG_BODY_MAX_LINES, 2,
+                                  MSG_BODY_W);
+    /* The title is the price of the third and fourth lines, and it is only
+       worth paying when there is something to put on them. A message short
+       enough to be read in the short band keeps its title; a longer one gives
+       it up, because a title a reader can see anyway in the list is worth less
+       than half the words of the message. */
+    ui_card_titled = (ui_card_lines <= MSG_BODY_ROWS);
+    ui_card_wrapped = ui_msg_id;
+}
+
+/* Body lines this card shows at once, and the furthest down it can be scrolled.
+   Both are read by the drawing and by the input, which is why they are here
+   rather than inside either. */
+static int ui_card_rows() {
+    return ui_card_titled ? MSG_BODY_ROWS : MSG_BODY_ROWS_MAX;
+}
+
+static int ui_card_max_first() {
+    int m = ui_card_lines - ui_card_rows();
+    return m > 0 ? m : 0;
+}
+
 static void ui_draw_card() {
     NotifyView v;
     int idx = 0, total = 0;
@@ -926,6 +1464,11 @@ static void ui_draw_card() {
        return; ui_poll() leaves for the list on this same pass, so there is
        nothing to draw. */
     if (!notify_view_by_id(ui_msg_id, v, &idx, &total)) return;
+
+    /* Before anything is measured against it: both the title rule and the
+       number of rows below come out of the wrap, and it is done once per card
+       rather than once per frame. */
+    ui_card_wrap(v);
 
     uint16_t level = ui_level_color(v.level);
 
@@ -950,7 +1493,8 @@ static void ui_draw_card() {
                      MSG_CARD_H + 4 * MSG_CARD_PEEK, COL_BG);
 
         /* Two more cards behind, when there are two more to be behind: the
-           stack the knob can rotate through. Outlines only, dimmer with depth. */
+           stack a long press of the user key walks. Outlines only, dimmer with
+           depth. */
         if (total > 1) {
             for (int p = 2; p >= 1; p--) {
                 uint8_t a = (uint8_t)(MSG_BORDER_A / (p + 1) * step / MSG_FADE_STEPS);
@@ -968,28 +1512,105 @@ static void ui_draw_card() {
 
     int32_t tx = x + MSG_PAD_L;
     int32_t rx = x + MSG_CARD_W - MSG_PAD_R;
-    int text_w = MSG_CARD_W - MSG_PAD_L - MSG_PAD_R;
 
+    /* Every column below is MSG_BODY_W, written out by that name each time
+       rather than through a local: it is the same budget ui_card_wrap()
+       measured the body against, and a local would be a second name for it —
+       which is exactly what one of them being changed and the other not looks
+       like. */
     char caps[NOTIFY_SOURCE_LEN], src[NOTIFY_SOURCE_LEN], age[16];
     ui_caps(caps, sizeof(caps), v.source[0] ? v.source : "device");
-    ui_ellipsis(src, sizeof(src), caps, 2, text_w - MSG_AGE_W - 8);
+    ui_ellipsis(src, sizeof(src), caps, 2, MSG_BODY_W - MSG_AGE_W - 8);
     notify_age_str(v.age_s, age, sizeof(age));
-    draw_field(ui_row[0], sizeof(ui_row[0]), src, tx, y + 7, 2,
-               c_sec, TL_DATUM, (uint16_t)(text_w - MSG_AGE_W - 8), tint);
-    draw_field(ui_row[1], sizeof(ui_row[1]), age, rx, y + 7, 2,
+    draw_field(ui_row[0], sizeof(ui_row[0]), src, tx, y + MSG_HDR_DY, 2,
+               c_sec, TL_DATUM, (uint16_t)(MSG_BODY_W - MSG_AGE_W - 8), tint);
+    draw_field(ui_row[1], sizeof(ui_row[1]), age, rx, y + MSG_HDR_DY, 2,
                c_sec, TR_DATUM, MSG_AGE_W, tint);
 
-    char title[48];
-    ui_ellipsis(title, sizeof(title), v.title, 4, text_w);
-    draw_field(ui_row[2], sizeof(ui_row[2]), title, tx, y + 28, 4,
-               c_pri, TL_DATUM, (uint16_t)text_w, tint);
+    /* Keyed to the field, like the row cache it is drawn through: at the
+       narrowest glyphs font 4 has, about fifty-five characters cross this
+       column, so a fixed buffer sized for the old title would cut the card's
+       title before the pixels did. The card geometry note above counts the
+       same 276px the other way — 11 characters at the widest glyph and around
+       18 of ordinary mixed case — because that is what a reader gets; a buffer
+       has to survive the narrowest.
+       Two asserts, because the two directions fail differently and both fail
+       quietly. Wider than the cache is the aliasing one: draw_field compares
+       only the first cache_size - 1 bytes, so a string wider than the cache it
+       is drawn through makes two different titles compare equal and leaves the
+       previous message's title on the card. Narrower than the field is the
+       hardcoded 48 this buffer stopped being — a second, quieter cut ahead of
+       the pixels — so it is pinned from below as well.
+       Both are about the buffer declared below and not about UI_ROW_LEN, which
+       the assert beside ui_row[] already pins. They read as a restatement of it
+       only for as long as this buffer is declared from the same macro: write
+       `char title[64]` here and the lower of the two is the one that fails, and
+       nothing else in the file would. */
+    if (ui_card_titled) {
+        char title[UI_ROW_LEN];
+        static_assert(sizeof(title) <= sizeof(ui_row[0]),
+                      "the card title is wider than the cache it is compared in");
+        static_assert(sizeof(title) >= NOTIFY_TITLE_LEN + 4,
+                      "the card title is narrower than an ellipsised title");
+        ui_ellipsis(title, sizeof(title), v.title, 4, MSG_BODY_W);
+        draw_field(ui_row[2], sizeof(ui_row[2]), title, tx, y + MSG_TITLE_DY, 4,
+                   c_pri, TL_DATUM, (uint16_t)MSG_BODY_W, tint);
+    }
 
-    char b1[NOTIFY_BODY_LEN + 4], b2[NOTIFY_BODY_LEN + 4];
-    ui_wrap2(v.body, b1, sizeof(b1), b2, sizeof(b2), 2, text_w);
-    draw_field(ui_card_body[0], sizeof(ui_card_body[0]), b1, tx, y + 60, 2,
-               c_sec, TL_DATUM, (uint16_t)text_w, tint);
-    draw_field(ui_card_body[1], sizeof(ui_card_body[1]), b2, tx, y + 78, 2,
-               c_sec, TL_DATUM, (uint16_t)text_w, tint);
+    /*
+     * The body: as many lines as the band holds, starting at the one the knob
+     * has scrolled to.
+     *
+     * A moved scroll position changes what every row says, and the way to make
+     * draw_field notice is emphatically NOT display_force — on this screen that
+     * is the second half of the branch above, and raising it would re-erase the
+     * whole envelope and repaint the stack, the tint, the border and the accent
+     * bar on every single detent. The caches are dropped instead; see
+     * ui_cache_drop() for why they are poisoned rather than emptied.
+     */
+    int32_t body_y = y + (ui_card_titled ? MSG_BODY_DY : MSG_BODY_DY_TOP);
+    int rows = ui_card_rows();
+
+    if (ui_card_first != ui_card_first_drawn) {
+        for (int r = 0; r < MSG_BODY_ROWS_MAX; r++) ui_cache_drop(ui_card_body[r]);
+        ui_card_first_drawn = ui_card_first;
+    }
+
+    for (int r = 0; r < rows; r++) {
+        char line[MSG_LINE_LEN];
+        static_assert(sizeof(line) == sizeof(ui_card_body[0]),
+                      "a body line is not the size of the cache it is compared "
+                      "in — draw_field only compares cache_size - 1 bytes, so "
+                      "the wider of the two aliases silently");
+        int i = ui_card_first + r;
+        line[0] = '\0';
+        if (i < ui_card_lines) ui_line_text(line, sizeof(line), v.body, ui_card_line[i]);
+        draw_field(ui_card_body[r], sizeof(ui_card_body[r]), line, tx,
+                   body_y + r * MSG_BODY_PITCH, 2, c_sec, TL_DATUM,
+                   (uint16_t)MSG_BODY_W, tint);
+    }
+
+    /* One pixel at the card's right edge, and only when there is something
+       below the fold. It is drawn by hand rather than through draw_field
+       because it is pixels and not a string, so it carries its own change test
+       — like the progress bar on the clock face, and for the same reason. */
+    if (ui_card_lines > rows) {
+        int32_t track_y = body_y;
+        /* Always the tall band, with no arm for the short one: a body with more
+           lines than the band holds is a body that gave its title up for them,
+           because ui_card_wrap() keeps the title only for a body that fits
+           MSG_BODY_ROWS — and this branch is precisely the case where it does
+           not. A `titled ? :` here would be a second layout that cannot occur. */
+        int track_h = MSG_BODY_BOTTOM - MSG_BODY_DY_TOP + 1;
+        int ty = 0, th = 0;
+        ui_scroll_thumb(ui_card_first, ui_card_lines, rows, track_h, &ty, &th);
+        if (display_force || ty != ui_card_thumb_y || th != ui_card_thumb_h) {
+            tft.fillRect(x + MSG_SCROLL_DX, track_y, 1, track_h, tint);
+            tft.fillRect(x + MSG_SCROLL_DX, track_y + ty, 1, th, c_sec);
+            ui_card_thumb_y = ty;
+            ui_card_thumb_h = th;
+        }
+    }
 
     /* Below the card, on the ground: what the knob does next. A message that
        carries reply options answers that with the options themselves, drawn in
@@ -1050,6 +1671,60 @@ static void ui_draw_blast() {
         ui_draw_row(2, "", 112, 2, COL_DIM);
     }
     ui_draw_row(3, (ui_blast_ok && ir_busy()) ? "click to stop" : "", 148, 2, COL_DIM);
+    display_force = false;
+}
+
+/* One line of what the gate status screen watches: the paired kind names its
+   button, a raw job staged over HTTP has no button to name. Stack buffer, no
+   allocation — this runs on every tick while the screen is up. */
+static void ui_gate_title(char *out, size_t n, uint8_t kind, uint8_t button) {
+    if (kind == GATE_JOB_PAIR) snprintf(out, n, "Pair");
+    else if (kind == GATE_JOB_BUTTON) snprintf(out, n, "Button %u", (unsigned)button);
+    else snprintf(out, n, "Raw");
+}
+
+/* The gate TX status: what was asked for, which block and frame are on the
+   air, how many frames left the chip, how the last job ended. The blast-screen
+   shape: the job is staged the moment the menu item is clicked, but gate_poll()
+   only adopts it — and resets the counters — on its next pass, so a staged job
+   still shows the previous counters and says "starting" instead. */
+static void ui_draw_gate_status() {
+    GateProgress p = gate_progress();
+    char buf[40];
+
+    /* The job is staged but gate_poll() has not adopted it yet. */
+    bool starting = gate_busy() && !p.running;
+
+    if (!ui_gate_ok) {
+        ui_draw_row(0, ui_gate_fail_text(ui_gate_fail), 40, 4, COL_TIME);
+        ui_draw_row(1, "", 78, 4, COL_DIM);
+        ui_draw_row(2, "", 112, 2, COL_DIM);
+    } else if (starting) {
+        ui_gate_title(buf, sizeof(buf), ui_gate_kind, ui_gate_button);
+        ui_draw_row(0, buf, 40, 4, COL_TIME);
+        ui_draw_row(1, "starting", 78, 4, COL_ACCENT);
+        ui_draw_row(2, "", 112, 2, COL_DIM);
+    } else if (p.running) {
+        ui_gate_title(buf, sizeof(buf), p.kind, p.button);
+        ui_draw_row(0, buf, 40, 4, COL_TIME);
+        /* p.sent, not a step count: frames the loop has actually keyed. */
+        snprintf(buf, sizeof(buf), "%u / %u", (unsigned)p.sent, (unsigned)p.total);
+        ui_draw_row(1, buf, 78, 4, COL_ACCENT);
+        /* All frames are out but the poll has not wound the job down yet. */
+        if (p.sent >= p.total) snprintf(buf, sizeof(buf), "finishing");
+        else snprintf(buf, sizeof(buf), "block %u of %u, frame %u of %u",
+                      (unsigned)p.block, (unsigned)p.blocks,
+                      (unsigned)p.frame, (unsigned)p.frames_per_block);
+        ui_draw_row(2, buf, 112, 2, COL_DIM);
+    } else {
+        snprintf(buf, sizeof(buf), "%s", p.result[0] ? p.result : "idle");
+        ui_draw_row(0, buf, 40, 4, COL_TIME);
+        snprintf(buf, sizeof(buf), "%u / %u sent", (unsigned)p.sent, (unsigned)p.total);
+        ui_draw_row(1, buf, 78, 4, COL_DIM);
+        ui_draw_row(2, "", 112, 2, COL_DIM);
+    }
+    /* A click or a detent leaves for the gate list; the job keeps running. */
+    ui_draw_row(3, "click to go back", 148, 2, COL_DIM);
     display_force = false;
 }
 
@@ -1243,17 +1918,20 @@ static void ui_draw_rec() {
    therefore have nothing to gain from the periodic repaint. The message list
    is deliberately not one of them: its age column advances on its own. */
 static bool ui_input_driven(uint8_t screen) {
-    return screen == UI_MENU || screen == UI_TVMENU || screen == UI_BRAND;
+    return screen == UI_MENU || screen == UI_TVMENU || screen == UI_BRAND ||
+           screen == UI_GATE;
 }
 
 static void ui_draw() {
     switch (ui_screen) {
         case UI_MENU:
         case UI_TVMENU:
-        case UI_BRAND:   ui_draw_list();    break;
+        case UI_BRAND:
+        case UI_GATE:    ui_draw_list();    break;
         case UI_MSGLIST: ui_draw_msglist(); break;
         case UI_MSGCARD: ui_draw_card();    break;
         case UI_BLAST:   ui_draw_blast();   break;
+        case UI_GATE_STATUS: ui_draw_gate_status(); break;
         case UI_AP:      ui_draw_ap();      break;
         case UI_INFO:    ui_draw_info();    break;
         case UI_REC:     ui_draw_rec();     break;
@@ -1265,9 +1943,36 @@ static void ui_draw() {
    outside display_status(). */
 static void ui_enter(uint8_t screen) {
     ui_screen = screen;
-    ui_last_input = millis();
+    /* A screen change is input, including the ones nobody pressed for: a card
+       arriving and a recording taking the panel both land here, and both put
+       something on a screen that has to be lit to be worth putting it on. */
+    ui_note_input();
     ui_last_draw = millis();
     ui_encoder_reset();
+
+    /* Tell the ring what is on the panel, the same way loop() tells it which
+       job is on the bar: the UI hands over a fact, and skills/ring.cpp decides
+       on its own what to do with it.
+       This is the only place a screen changes, which is exactly why the telling
+       is here. Every way out of a card passes through it — the click that
+       acknowledges the message, the user key, the idle timeout, the message
+       expiring underneath the card — so the ring cannot be left naming a
+       message nobody is looking at by a new exit path somebody forgets to
+       update. The lookup can fail on a card whose message went away between the
+       decision to show it and this line, and that is a card about to be closed
+       on the next pass; the ring says nothing for it in the meantime.
+       No host test covers these six lines and none can: they are a call into a
+       driver from a function that draws. What IS covered is everything they
+       feed — progress_ring_phase() by tools/test_progress.sh and the exclusion
+       of the card's own message by tools/test_notify_options.sh — so the part
+       left to inspection is that this sits in ui_enter() and nowhere else. */
+    if (screen == UI_MSGCARD) {
+        NotifyView v;
+        if (notify_view_by_id(ui_msg_id, v, NULL, NULL)) ring_card_set(v.id, v.level);
+        else ring_card_clear();
+    } else {
+        ring_card_clear();
+    }
 
     if (screen == UI_CLOCK) {
         display_status();  /* repaints the clock chrome and every clock field */
@@ -1318,6 +2023,47 @@ static void ui_enter_blast(uint16_t job, int back_sel) {
     ui_enter(UI_BLAST);
 }
 
+/* Watch a gate job the menu just asked for. `job` is 0 when nothing started,
+   which is a job already in flight — watched rather than restarted — a
+   transmitter that is not there, or a frame that did not fit the staging
+   buffer; the last two get their own row instead of silence. The kind and
+   button are remembered for the "starting" window in which the staged job
+   still shows the previous counters. */
+static void ui_enter_gate(uint16_t job, uint8_t kind, uint8_t button, int back_sel) {
+    ui_gate_ok = (job != 0) || gate_busy();
+    /* The refusal in words, in the order the states imply: no radio first,
+       because gate_busy() already implies the radio is up; busy while a job
+       is on the air; too long when the built frame did not fit the staging
+       buffer. From the menu the busy arm never refuses — a job already in
+       flight is watched above rather than restarted — so it names the state
+       for completeness while "Too long" is the refusal the menu can actually
+       meet with the radio up and nothing running. Uses the accessors only;
+       the job machine is untouched. */
+    if (ui_gate_ok) ui_gate_fail = UI_GATE_FAIL_NONE;
+    else if (!gate_ready) ui_gate_fail = UI_GATE_FAIL_NORADIO;
+    else if (gate_busy()) ui_gate_fail = UI_GATE_FAIL_BUSY;
+    else ui_gate_fail = UI_GATE_FAIL_TOOLONG;
+    ui_gate_kind = kind;
+    ui_gate_button = button;
+    ui_gate_back_sel = back_sel;
+    ui_gate_done_at = 0;
+    if (job != 0) {
+        event_add("gate: job %u started from the menu", (unsigned)job);
+        /* The one-shot channel: half a second of "something is happening right
+           now", the same overlay an arrival fires. The steady state is this
+           screen; the ring has no steady TX colour of its own, because the
+           steady channels are taken — the card names a message and the arc is
+           arbitrated by progress.cpp out of main.cpp, which would clear a
+           foreign value on the next pass. */
+        ring_fire(RING_FX_COMET, NOTIFY_WARN, millis());
+    } else {
+        event_add("gate: menu start refused (%s)",
+                  ui_gate_fail == UI_GATE_FAIL_NORADIO ? "no radio"
+                  : ui_gate_fail == UI_GATE_FAIL_BUSY ? "busy" : "frame too long");
+    }
+    ui_enter(UI_GATE_STATUS);
+}
+
 /* Open one message. The card holds the id rather than the row, so that a
    message arriving or expiring while it is up cannot silently swap it for a
    different one. */
@@ -1337,6 +2083,16 @@ static void ui_enter_card(uint32_t id) {
     ui_chip_sel = notify_view_by_id(id, v, NULL, NULL)
                       ? ui_chip_start(v.chosen, v.opt_count)
                       : -1;
+    /* A new card is a new body: drop the wrap, the scroll position and the
+       thumb together, in the one place the card's identity changes. The fade
+       that follows repaints the whole card, which is what erases the previous
+       thumb from the panel — hence the drawn state going back to "nothing
+       drawn" rather than to a position. */
+    ui_card_wrapped = 0;
+    ui_card_first = 0;
+    ui_card_first_drawn = -1;
+    ui_card_thumb_y = -1;
+    ui_card_thumb_h = -1;
     ui_enter(UI_MSGCARD);
 }
 
@@ -1349,6 +2105,20 @@ static void ui_activate(int item) {
         } else {
             ui_enter_list(UI_MENU, UI_ITEM_MSG);
         }
+        return;
+    }
+
+    if (ui_screen == UI_GATE) {
+        /* Pair fires the enrolment sequence for button 1 (the /gate/pair
+           default); a button fires its own block. Both go through the same
+           staging path POST /gate/* uses — the job runs on the loop task —
+           and land on the status screen instead of answering with silence. */
+        if (item == UI_GATE_PAIR) {
+            ui_enter_gate(gate_start_code(GATE_JOB_PAIR, 1), GATE_JOB_PAIR, 1, item);
+        } else if (item >= UI_GATE_B1 && item <= UI_GATE_B4) {
+            uint8_t b = (uint8_t)(item - UI_GATE_B1 + 1);
+            ui_enter_gate(gate_start_code(GATE_JOB_BUTTON, b), GATE_JOB_BUTTON, b, item);
+        } else ui_enter_list(UI_MENU, UI_ITEM_GATE);
         return;
     }
 
@@ -1379,12 +2149,58 @@ static void ui_activate(int item) {
         case UI_ITEM_MSG:
             ui_enter_list(UI_MSGLIST, 0);
             break;
+        case UI_ITEM_QUIET:
+            /* The one row that acts without leaving the menu: the answer is the
+               row's own label, which now says the other thing. A screen of its
+               own would be a screen with one line on it.
+
+               display_force, because ui_draw_list() returns early when the
+               selection has not moved — and it has not: what changed is a
+               string the cache still holds the old copy of. */
+            ring_quiet_toggle();
+            display_force = true;
+            ui_draw();
+            break;
+        case UI_ITEM_BACKLIGHT:
+            /* Acts without leaving the menu, exactly as Quiet does, and for the
+               same reason: the answer is the row's own label, and a screen with
+               one line on it would be a worse way to say it. The level is only
+               recorded here — the pulse train that carries it out belongs to
+               backlight_poll() on the next pass, so the redraw below happens
+               while the panel is still at the old brightness and the new one
+               arrives a few milliseconds later. That is the right order:
+               brightness changing after the row that announced it reads as the
+               row causing it. */
+            backlight_menu_click();
+            display_force = true;
+            ui_draw();
+            break;
+        case UI_ITEM_DIM:
+            /* The third row that acts in place, for the third time the same
+               reason: two states, no arguments, and the answer is the row's
+               own label — which is why display_force is needed here as it is
+               for Quiet, since ui_draw_list() returns early on a selection
+               that has not moved. The brightness itself does not change on
+               this pass: the click has just stamped ui_last_input, so the
+               policy is handing the level back either way, and the switch
+               only decides what happens once the dim threshold passes. */
+            backlight_idle_toggle();
+            display_force = true;
+            ui_draw();
+            break;
         case UI_ITEM_TVBGONE:
             ui_enter_list(UI_TVMENU, UI_TV_ALL);
             break;
+        case UI_ITEM_GATE:
+            ui_enter_list(UI_GATE, UI_GATE_PAIR);
+            break;
         case UI_ITEM_AP:
-            /* Same entry point as the hold gesture, and time-boxed the same
-               way. Raising it from the menu is the reliable route in. */
+            /* The only route in on the device, and time-boxed: a session
+               nobody reprovisions closes itself. It used to share the job with
+               a three-second hold of the user key, which is now what walks the
+               message stack — but this row was always the reliable one, and
+               ap_start() has one more caller in wifi_setup(), which raises the
+               AP at boot when the stored credentials do not connect. */
             if (!ap_active) ap_start(true);
             ui_enter(UI_AP);
             break;
@@ -1402,6 +2218,8 @@ static void ui_back() {
     switch (ui_screen) {
         case UI_BRAND:   ui_enter_list(UI_TVMENU, UI_TV_BRAND);   break;
         case UI_TVMENU:  ui_enter_list(UI_MENU, UI_ITEM_TVBGONE); break;
+        case UI_GATE:    ui_enter_list(UI_MENU, UI_ITEM_GATE);    break;
+        case UI_GATE_STATUS: ui_enter_list(UI_GATE, ui_gate_back_sel); break;
         case UI_MSGLIST: ui_enter_list(UI_MENU, UI_ITEM_MSG);     break;
         default:         ui_enter(UI_CLOCK);                      break;
     }
@@ -1424,8 +2242,122 @@ static void ui_init() {
     ui_encoder.setFilter(1023);
     ui_encoder.clearCount();
     ui_encoder_reset();
-    ui_last_input = millis();
+    /* A boot is input: the device came up because somebody pressed something or
+       plugged it in, so the idle clock starts here rather than at zero. */
+    ui_note_input();
 }
+
+/*
+ * The three screens that must not be taken away from whoever is watching them.
+ *
+ * They are predicates rather than three locals inside ui_poll() because there is
+ * a second consumer: the backlight's idle policy exempts exactly these, and it
+ * has to exempt the SAME ones. A blast dimmed to nothing halfway through, a
+ * gate TX fading out mid-block, or a level meter that fades while a finger is
+ * still on the key, would be the same defect the screen timeout was already
+ * written to avoid — and two copies of this trio, thirty lines apart, is how
+ * they would come to disagree.
+ *
+ * A blast counts only while it is on the panel: one started over HTTP while a
+ * menu is up is not live output the person in front of the device is watching,
+ * and there is nothing on screen for the exemption to protect. A gate TX
+ * counts on the same terms, for the same reason.
+ */
+static bool ui_watching_blast() { return ui_screen == UI_BLAST && ir_busy(); }
+
+/* A gate TX in flight with its status on the panel. The refusal rows ("No
+   radio", "Too long") are not live output and stay subject to the timeout —
+   gate_busy() is false for both, so they are. */
+static bool ui_watching_gate() { return ui_screen == UI_GATE_STATUS && gate_busy(); }
+
+/* The recording screen is exempt outright rather than only while it records: a
+   hold can outlast fifteen seconds of "no input" — holding a key is not input
+   to the click state machine — and its own exit is deterministic, so neither
+   the timeout nor the dimming has anything to add and both could only fire
+   mid-sentence. */
+static bool ui_watching_rec() { return ui_screen == UI_REC; }
+
+/*
+ * The progress bar, which is live output too — but only to the backlight, and
+ * that asymmetry is the whole reason it is a third predicate rather than a
+ * third case in the pair above.
+ *
+ * The screen timeout may fire under a bar and cost nothing: what it does is
+ * return to the clock face, and the clock face is where the bar is drawn. Going
+ * dark is not the same act. A job pushed with POST /progress — a backup script,
+ * a long build, anything holding a percentage up on somebody's desk — has
+ * nothing to do with the knob, so nothing stamps ui_last_input for it and the
+ * panel it is drawn on would otherwise go out two minutes in.
+ *
+ * On the clock face only, for the same reason a blast counts only while it is
+ * on the panel: a bar nobody can see is not output being protected. And bounded
+ * without any help from here, because a job carries a deadline of its own — the
+ * bar clears itself and the panel goes back to blanking on schedule.
+ */
+static bool ui_watching_progress() {
+    return ui_screen == UI_CLOCK && progress_current(NULL);
+}
+
+/*
+ * Hand the backlight policy the idle clock. Called from loop(), once a pass,
+ * immediately above backlight_poll().
+ *
+ * NOT from inside ui_poll(), and the reason is worth stating because the
+ * opposite looks obviously right: ui_poll() returns early from most paths, and
+ * from the clock face it returns UNCONDITIONALLY — `case UI_CLOCK` has nothing
+ * to time out to, so it answers the click and leaves. The clock face is where
+ * this device spends its life, so a brightness decision made at the bottom of
+ * ui_poll() would be a brightness decision that almost never runs. What IS
+ * shared with the screen timeout is everything that matters: the one timestamp,
+ * and the exemptions it also reads.
+ *
+ * That unconditional return is also why the thresholds mean exactly what they
+ * say FROM THE CLOCK FACE. Elsewhere they are later, and by a knowable amount:
+ * ui_enter() stamps the timestamp, so the automatic return to the clock at
+ * UI_IDLE_MS restarts the dim clock once. Input on a menu therefore dims at
+ * UI_IDLE_MS + BL_IDLE_DIM_MS and blanks at UI_IDLE_MS + BL_IDLE_OFF_MS — one
+ * restart and not a repeating one, because from the clock face there is no
+ * further timeout to stamp anything. Worth knowing before timing the device
+ * with a stopwatch and concluding the thresholds are wrong.
+ *
+ * The subtraction is here, in the one place that owns ui_last_input, and it is
+ * the unsigned form that survives the 49-day wrap of millis(). bl_idle_level()
+ * is handed the elapsed time and no clocks at all.
+ */
+static void ui_backlight_idle() {
+    /* The message card needs no exemption of its own, and this is why. A card
+       is returned to the clock face after UI_IDLE_MS whether it was read or
+       not, so with the dim threshold strictly longer than that, a card is
+       never on the panel when the first dimming happens — there is no moment
+       at which a notification could fade out from under somebody reading it.
+       That is arithmetic between two constants in two files, so it is checked
+       here rather than trusted: shortening either one below the other stops
+       the build instead of quietly costing somebody a message. */
+    static_assert(BL_IDLE_DIM_MS > UI_IDLE_MS,
+                  "the backlight must not dim while a message card can still "
+                  "be on the panel: BL_IDLE_DIM_MS must exceed UI_IDLE_MS");
+    /* The fourth fact is not about a screen at all: an unread critical never
+       expires, and blanking the panel would take away the breathing hairline
+       that is the only sign of one left once the ring's night window has
+       silenced the ring. skills/backlight.cpp turns that into a floor, not a
+       wake-up. */
+    BacklightPanel panel;
+    /* The gate TX rides the blast flag: both are live output on the panel,
+       and the policy cannot tell them apart — nor does it need to. */
+    panel.blasting = ui_watching_blast() || ui_watching_gate();
+    panel.recording = ui_watching_rec();
+    panel.on_bar = ui_watching_progress();
+    panel.crit_unread = notify_crit_unread();
+    backlight_idle(millis() - ui_last_input, panel);
+}
+
+/* A press that began on a panel the idle policy had blanked. Its whole job was
+   to bring the light back, and the release that ends it must not also be read
+   as a click — but by then the panel is lit, and lit by this very press, so
+   there is nothing left at the release to tell the two apart. Hence a mark, set
+   where the press starts and spent by the release it was set for. See the wake
+   in ui_poll(), which is the only reader and the only writer. */
+static bool ui_wake_press = false;
 
 /* Called every loop() pass. Nothing here blocks and nothing here draws unless
    something actually changed. */
@@ -1440,15 +2372,143 @@ static void ui_poll() {
        clock, on top of stopping the take — the same trap the user key was
        already guarded against below, and for the same reason. */
     bool click = ui_enc_key.click && ui_enc_key.held_ms < MIC_HOLD_MS;
-    /* The user key's long hold belongs to the AP gesture in ap_key_poll(), so
-       only a short press counts as "back" here. */
-    bool back = ui_user_key.click && ui_user_key.held_ms < AP_KEY_HOLD_MS;
+    /*
+     * The user key's long hold walks the stack of messages behind the card,
+     * which is the job the knob used to do before the knob became the way to
+     * read a body longer than the card. It is a gesture on one screen only:
+     * everywhere else a press of this key is "one level up" however long it
+     * lasted, which is what it has always been, and confining the new meaning
+     * to the card is what keeps a slow press on a menu from doing nothing at
+     * all.
+     *
+     * The threshold is the one mic.cpp already uses for the encoder key's own
+     * hold, so the device has one idea of how long a hold is rather than two.
+     * It is not the three seconds the retired AP gesture used: that was long on
+     * purpose, because it authorised provisioning, and walking a stack does not.
+     *
+     * `back` discards the release that ends the hold, the way it discarded the
+     * one that ended the AP gesture — a hold produces a click on release like
+     * any other press, and without this a long hold would both walk the stack
+     * and leave the card.
+     *
+     * What `back` no longer does is throw away a slow press. It used to be
+     * `click && held_ms < AP_KEY_HOLD_MS`, which meant a press of three seconds
+     * or more did nothing at all on ANY screen: the filter was there to stop the
+     * AP gesture's release from stepping up a level as well, and with the
+     * gesture gone it protected nothing. So the device-wide consequence of that
+     * one line is that a slow press is now one level up everywhere, which is
+     * what this key means and what somebody leaning on it expects. The card is
+     * the only screen that reads the length of a press at all, and it reads it
+     * through `card_hold`.
+     */
+    bool card_hold = ui_user_key.click && ui_screen == UI_MSGCARD &&
+                     ui_user_key.held_ms >= MSG_STACK_HOLD_MS;
+    bool back = ui_user_key.click && !card_hold;
 
-    if (steps != 0 || click || back) ui_last_input = millis();
+    /*
+     * The release of a press whose card went away underneath it. It is not a
+     * step up and it is not a walk of the stack: it is the end of a gesture
+     * whose subject no longer exists. See ui_drop_user_click.
+     *
+     * First of the three rules that follow, and the order between them is the
+     * whole of why they agree. This is the only one that decides what a press
+     * MEANT, so it runs before anything reads that meaning. It also has to run
+     * on every pass that carries the release, whatever else is true of that
+     * pass: the flag is cleared by the very release it was set for, and a pass
+     * that skipped it would leave it standing over somebody else's click.
+     */
+    if (ui_user_key.click && ui_drop_user_click) {
+        ui_drop_user_click = false;
+        card_hold = false;
+        back = false;
+    }
+
+    /*
+     * A key that is DOWN is input, and nothing above can see it: ui_button_poll()
+     * reports a click on RELEASE only, so a press that has not been let go of
+     * yet produces no steps, no click and no back at all. Three decisions turn
+     * on that — whether this pass belongs to somebody already touching the
+     * device, whether the device has been idle, and whether a panel that is lit
+     * was lit by the press still being held — and the first two were wrong for
+     * the whole length of every hold without it.
+     */
+    bool key_down = ui_user_key.level || ui_enc_key.level;
+
+    /*
+     * Any click of either key, whatever it was read as — including the one
+     * discarded just above, which is still a hand on the device — and a key
+     * still down, which is a hand on it too.
+     *
+     * Second, and deliberately above the wake rather than below it: a press
+     * that does nothing but bring the light back is still somebody standing at
+     * the device, and a wake that did not restart the idle clock would dim
+     * again under the hand it had just answered. ui_note_input() is the one
+     * writer of the timestamp, and this condition is the whole of what
+     * ui_poll() calls input.
+     */
+    if (steps != 0 || click || ui_user_key.click || key_down) ui_note_input();
+
+    /*
+     * Last: a press on a panel the policy has blanked wakes it and does nothing
+     * else.
+     *
+     * Before there was a dark state every press was deliberate, because there
+     * was always something on the screen to press AT. Now the first press is
+     * usually somebody wanting to see the time — and on the clock face a click
+     * opens the menu, so without this they get the menu instead. That is how
+     * every phone and every watch behaves and the opposite is a surprise every
+     * single time.
+     *
+     * Only while it was BLANK. A press on a merely dimmed panel is a press on a
+     * screen its owner can read, and swallowing that would be taking away a
+     * click they meant. backlight_blanked() answers the narrow question — dark
+     * because of the policy, which a press undoes — and not "dark", which on a
+     * device somebody set to level 0 by hand a press does not.
+     *
+     * The recording gesture is untouched and must stay so: a hold is not a
+     * glance. mic_key_poll() reads it off the pin level from loop() and never
+     * through the click state machine, and the MIC_HOLD_MS guard above already
+     * keeps its release out of `click` — so a hold on the encoder still starts
+     * a take from a dark panel, and nothing here decides anything about it.
+     *
+     * ui_wake_press is what the key-down rule above costs, and it is not
+     * optional. A key that is DOWN now stamps input, so the panel is already
+     * lit again by the time the release that carries the click arrives:
+     * backlight_blanked() is false on the one pass that has something to
+     * swallow, and every press would reach the screen behind the dark exactly
+     * as if none of this were here. So the press is marked where it starts, on
+     * the pass the panel was still blank, and the release is read against the
+     * mark rather than against a panel it lit itself. A detent needs no mark:
+     * the knob reports a turn on the pass it happens, while the panel is still
+     * dark. Nothing else can arrive with the panel blank AND a key down —
+     * a held key stamps every pass, so a panel cannot blank underneath one.
+     *
+     * card_hold is discarded with the other two and cannot currently arise: the
+     * card has no exemption from the screen timeout, which fires at UI_IDLE_MS
+     * against a blank at BL_IDLE_OFF_MS, so a blank panel is a panel that went
+     * back to the clock face long ago. It is written down because it is one of
+     * the three things a press is read as here, and a rule that covers two of
+     * them is a rule waiting on somebody giving the card an exemption.
+     */
+    bool blanked = backlight_blanked();
+    if (blanked && key_down) ui_wake_press = true;
+
+    if (blanked && steps != 0) steps = 0;
+    if (ui_wake_press) {
+        click = false;
+        card_hold = false;
+        back = false;
+    }
+    /* Spent: either the release it was set for has just been discarded, or the
+       press ended without ever producing one. */
+    if (!key_down) ui_wake_press = false;
 
     /* The knob's own feedback on the ring, which outranks whatever the ring was
        saying by itself: a hand is on the control. The screen and the ring get
-       the same detents, and neither is told what the other did with them. */
+       the same detents, and neither is told what the other did with them.
+       Below the wake, deliberately: the detent that brings the panel back is
+       spent on bringing it back, and lighting an arc for a turn that moved
+       nothing would be the same surprise in a different colour. */
     ring_knob(steps);
 
     /*
@@ -1474,10 +2534,27 @@ static void ui_poll() {
      * from somebody using one: the unread badge and the Messages list are how
      * it gets noticed then. Either way the flag is consumed on the pass it
      * arrives, so a card can never appear fifteen seconds later when the idle
-     * timer happens to land. And it yields to a hand already on the knob: a
+     * timer happens to land. And it yields to a hand already on the device: a
      * pass carrying input is that user's pass.
+     *
+     * A key merely still DOWN counts as that input, which is why `key_down` is
+     * here and not only the clicks. A press begun on the clock — where a press
+     * of the user key has always meant nothing — carries no click until it is
+     * released, so without this the card would open UNDER a press that started
+     * before it existed, and the release would then be answering a card the
+     * presser never saw: at MSG_STACK_HOLD_MS it walks straight past the
+     * arrival, leaving the message unread.
+     *
+     * That does defer the flag rather than consume it, for as long as the key
+     * is held. It is the one way the paragraph above is not quite exact, and
+     * the bound is the length of a press and not the idle timer: the pass after
+     * the release picks the arrival up, on whatever screen that release left.
+     *
+     * `card_hold` is deliberately not named here. It can only be true on the
+     * card and this branch only fires on the clock, so listing it would read as
+     * a case that can arise; `key_down` is what covers the press it is made of.
      */
-    if (steps == 0 && !click && !back) {
+    if (steps == 0 && !click && !back && !key_down) {
         uint32_t arrived = 0;
         if (notify_take_arrival(&arrived) && arrived != 0 &&
             ui_screen == UI_CLOCK) {
@@ -1496,6 +2573,7 @@ static void ui_poll() {
         case UI_MENU:
         case UI_TVMENU:
         case UI_BRAND:
+        case UI_GATE:
         case UI_MSGLIST: {
             if (back) { ui_back(); return; }
             if (steps != 0) {
@@ -1514,7 +2592,15 @@ static void ui_poll() {
         case UI_MSGCARD: {
             int idx = notify_index_of(ui_msg_id);
             /* Expired or evicted out from under the card. */
-            if (idx < 0) { ui_enter_list(UI_MSGLIST, 0); return; }
+            if (idx < 0) {
+                /* A hold that is still down has just lost what it was a hold
+                   ON, and its release is still to come. Mark it so that the
+                   list this drops to does not read that release as a second
+                   step up on top of the one being taken here. */
+                if (ui_user_key.level) ui_drop_user_click = true;
+                ui_enter_list(UI_MSGLIST, 0);
+                return;
+            }
 
             /* What the message carries is what decides what the knob does, and
                it is read on the pass that carries the input rather than kept
@@ -1525,46 +2611,22 @@ static void ui_poll() {
                row being answered cannot be different rows. */
             NotifyView v;
             uint8_t opts = 0;
-            if ((click || steps != 0) &&
-                notify_view_by_id(ui_msg_id, v, NULL, NULL)) {
-                opts = v.opt_count;
-            }
+            bool have = (click || card_hold || steps != 0) &&
+                        notify_view_by_id(ui_msg_id, v, NULL, NULL);
+            if (have) opts = v.opt_count;
 
-            /* A click is "I have seen this" — or, when ui_chip_answers() says
-               this one is an answer, the answer, which is stronger:
-               notify_choose_id() marks it read as part of recording the choice.
-               Everything else falls through to the plain acknowledgement,
-               including a click on a card that asks something nobody has
-               turned the knob to yet. The step by zero is the clamp, for a
-               selection restored from a `chosen` the store no longer has
-               options for. The user key is the same plain step up it is on
-               every other screen and leaves the message unread, and its
-               question unanswered, on purpose. */
-            if (click) {
-                if (ui_chip_answers(ui_chip_sel, opts)) {
-                    notify_choose_id(ui_msg_id,
-                                     (uint8_t)ui_chip_step(ui_chip_sel, 0, opts));
-                } else {
-                    notify_ack_id(ui_msg_id);
-                }
-                ui_enter_list(UI_MSGLIST, idx);
-                return;
-            }
-            if (back) { ui_enter_list(UI_MSGLIST, idx); return; }
-            if (steps != 0) {
-                /* Rotation belongs to the chips only while there are chips to
-                   pick. On every other message it keeps walking the stack
-                   exactly as it always has, so nothing is taken away from a
-                   message that asks nothing. */
-                if (opts > 0) {
-                    ui_chip_sel = ui_chip_step(ui_chip_sel, steps, opts);
-                    ui_draw();
-                    break;
-                }
+            /* A long press moves to the next card in the stack. It wraps, and
+               the text below does not: this one is browsing, which is what a
+               ring of cards is for, and the body is reading, which has a first
+               line and a last one.
+               It is answered BEFORE the click, because the two keys can be let
+               go on the same pass and only one of them can be obeyed: this is
+               the deliberate one, seven hundred milliseconds of it, and the
+               click is what a hand resting on the device produces by accident. */
+            if (card_hold) {
                 int count = notify_count();
-                if (count > 0) {
-                    int n = (idx + steps) % count;
-                    if (n < 0) n += count;
+                if (count > 1) {
+                    int n = (idx + 1) % count;
                     /* Its own name: `v` above is the card on screen, this is
                        the neighbour being stepped to, and they are two
                        different messages. */
@@ -1573,6 +2635,50 @@ static void ui_poll() {
                        as one card replacing another rather than as text
                        changing inside a frame that never moved. */
                     if (notify_view(n, next)) { ui_sel = n; ui_enter_card(next.id); return; }
+                }
+                /* Nowhere to go on a stack of one, and going nowhere is better
+                   than re-opening the same card: that would drop the reader
+                   back at the first line of what they were reading. Falling
+                   through rather than breaking, because a detent that arrived on
+                   the same pass is still a detent, and this hold did nothing
+                   with it. */
+            }
+
+            /* A click is "I have seen this" — or, when ui_chip_answers() says
+               this one is an answer, the answer, which is stronger:
+               notify_choose_id() marks it read as part of recording the choice.
+               Everything else falls through to the plain acknowledgement,
+               including a click on a card that asks something nobody has
+               scrolled far enough to reach. ui_chip_clamp() is what keeps a
+               selection restored from a `chosen` the store no longer has
+               options for from being handed over as an answer. A short press
+               of the user key is the same plain step up it is on every other
+               screen and leaves the message unread, and its question
+               unanswered, on purpose. */
+            if (click) {
+                if (ui_chip_answers(ui_chip_sel, opts)) {
+                    notify_choose_id(ui_msg_id,
+                                     (uint8_t)ui_chip_clamp(ui_chip_sel, opts));
+                } else {
+                    notify_ack_id(ui_msg_id);
+                }
+                ui_enter_list(UI_MSGLIST, idx);
+                return;
+            }
+            if (back) { ui_enter_list(UI_MSGLIST, idx); return; }
+
+            if (steps != 0 && have) {
+                /* The wrap is normally already done — entering the card drew
+                   it — but the position the detent moves is read from it, so
+                   the input asks for it by name rather than assuming the draw
+                   ran first. */
+                ui_card_wrap(v);
+                UiCardPos pos = { ui_card_first, ui_chip_sel };
+                pos = ui_card_step(pos, steps, ui_card_max_first(), (int)opts);
+                if (pos.first != ui_card_first || pos.chip != ui_chip_sel) {
+                    ui_card_first = pos.first;
+                    ui_chip_sel = pos.chip;
+                    ui_draw();
                 }
             }
             break;
@@ -1592,8 +2698,28 @@ static void ui_poll() {
                 ui_blast_done_at = 0;
             } else if (ui_blast_done_at == 0) {
                 ui_blast_done_at = millis();
-            } else if (millis() - ui_blast_done_at >= UI_RESULT_MS) {
+            } else if ((long)(millis() - ui_blast_done_at) >= (long)UI_RESULT_MS) {
                 ui_enter_list(ui_blast_back, ui_blast_back_sel);
+                return;
+            }
+            break;
+        }
+
+        case UI_GATE_STATUS: {
+            /* A click or a detent leaves for the gate list at once; the job
+               keeps running underneath. Otherwise the screen stays while the
+               job is on the air, then holds how it ended for a moment — the
+               blast-screen shape, minus the stop: nothing here aborts a TX. */
+            if (click || back || steps != 0) {
+                ui_enter_list(UI_GATE, ui_gate_back_sel);
+                return;
+            }
+            if (gate_busy()) {
+                ui_gate_done_at = 0;
+            } else if (ui_gate_done_at == 0) {
+                ui_gate_done_at = millis();
+            } else if ((long)(millis() - ui_gate_done_at) >= (long)UI_RESULT_MS) {
+                ui_enter_list(UI_GATE, ui_gate_back_sel);
                 return;
             }
             break;
@@ -1631,15 +2757,20 @@ static void ui_poll() {
             break;
     }
 
-    /* A running blast is live output and must not be timed out from under the
-       user; everything else falls back to the clock. The recording screen is
-       exempt outright rather than only while it records: a hold can outlast
-       fifteen seconds of "no input" — holding a key is not input to the click
-       state machine — and its own exit above is deterministic, so the idle
-       timer has nothing to add and could only fire mid-sentence. */
-    bool watching_blast = (ui_screen == UI_BLAST && ir_busy());
-    bool watching_rec = (ui_screen == UI_REC);
-    if (!watching_blast && !watching_rec && millis() - ui_last_input >= UI_IDLE_MS) {
+    /* Live output must not be timed out from under the user; everything else
+       falls back to the clock. All three exemptions are stated once, above, and the
+       backlight's idle policy reads the same three.
+
+       The card is the other screen where holding a key is normal, and it gets
+       no exemption on purpose — it is where an unread message sits, and a card
+       that never times out is a card left on the panel of a device nobody is
+       standing at. What it needed instead was for a hold to count as input,
+       which is what `key_down` above does. Before that, a hold outlasting
+       UI_IDLE_MS let this fire mid-gesture: the card went back to the clock,
+       and the release then arrived there as a plain `back` on a screen that
+       ignores it, so the whole gesture was swallowed. */
+    if (!ui_watching_blast() && !ui_watching_gate() && !ui_watching_rec() &&
+        millis() - ui_last_input >= UI_IDLE_MS) {
         ui_enter(UI_CLOCK);
         return;
     }
